@@ -463,6 +463,7 @@ mod tests {
     /// A float `v_cmpx` lowered by #1426 leaves EXEC as the compare in the lanes that were in
     /// EXEC, not the compare alone (thehollowedone's program on #1269): EXEC = lanes 0–15, then
     /// `v_cmpx_le_f32 0, v1` true in every lane, then `v_mov v2, 7` writes lanes 0–15 only.
+    #[cfg(windows)]
     #[test]
     fn a_bridged_v_cmpx_keeps_the_lanes_outside_exec_out() {
         if !gpu() {
@@ -579,6 +580,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_branch_on_a_mixed_mask_matches_the_hlsl_path_on_the_gpu() {
         if !gpu() { return; }
