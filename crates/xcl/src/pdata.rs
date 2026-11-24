@@ -40,6 +40,8 @@ pub struct UnwindInfo {
     pub frame_offset_scaled: u8,
     pub codes: Vec<UnwindOp>,
     pub handler_rva: Option<u32>,
+    /// Raw 2-byte slot count (`CountOfCodes`); needed to locate handler data.
+    pub slots: usize,
 }
 
 pub const UNW_FLAG_EHANDLER: u8 = 0x01;
@@ -297,6 +299,7 @@ pub fn parse_unwind_info(data: &[u8]) -> Result<UnwindInfo, String> {
         frame_offset_scaled,
         codes,
         handler_rva,
+        slots: count,
     })
 }
 

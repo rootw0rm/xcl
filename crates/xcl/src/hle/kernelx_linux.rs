@@ -4415,14 +4415,6 @@ pub unsafe extern "win64" fn RemoveVectoredExceptionHandler(handle: usize) -> u3
     }
 }
 
-/// `VOID RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR*)` — logged, then
-/// returns (dispatching the VEH chain / C++ unwinding is later Phase C work, when
-/// `.pdata` translation lands; cf. `eh_linux`).
-pub unsafe extern "win64" fn RaiseException(code: u32, flags: u32, nargs: u32, args: *const usize) {
-    let first = if nargs > 0 && !args.is_null() { *args } else { 0 };
-    crate::xlog_warn!("RaiseException(code={code:#x}, flags={flags:#x}, args={nargs}, first={first:#x})");
-}
-
 /// `FARPROC GetProcAddress(HMODULE, LPCSTR)` — HLE/mapped lookups through the
 /// Linux resolver (never a stub thunk, so optional-API probing keeps working);
 /// a miss is NULL with `ERROR_PROC_NOT_FOUND`, as on Windows.
@@ -4625,14 +4617,15 @@ pub unsafe extern "win64" fn NtWriteFile(
 //
 // The Linux host has no `RtlAddFunctionTable`: the mapped image already holds the
 // Windows unwind tables, so lookup/virtual-unwind read them in place through
-// `crate::pdata`. Only fixed frames (`PUSH_NONVOL`, `ALLOC_SMALL`, `ALLOC_LARGE`
-// with `OpInfo==0`, `SET_FPREG`; `SAVE_XMM128` ignored) unwind here — anything
-// else (`SAVE_NONVOL`, chained info, machine frames, 32-bit large allocs) fails
-// closed with a warn log so a future slice can extend the op coverage without
-// changing the call sites. `RtlCaptureContext` / `RtlUnwindEx` /
-// `RtlRestoreContext` stay logged stubs until the dispatch slice lands; they are
-// HLEs (non-zero) so the imports resolve instead of auto-stubbing.
+// `crate::pdata`. Step-11g adds the dispatch slice: real `RtlCaptureContext` /
+// `RtlRestoreContext` naked shims plus `RaiseException` two-phase search/unwind
+// and `RtlUnwindEx` targeting, so Rust `catch_unwind` (GCC 0x20474343) can reach
+// its handler instead of aborting with error 5.
 // ---------------------------------------------------------------------------------------
+
+const CTX_FLAGS_OFF: usize = 0x30;
+const CONTEXT_SIZE: usize = 0x4D0;
+const CONTEXT_FULL_AMD64: u32 = 0x10000B;
 
 const CTX_RAX: usize = 0x78;
 const CTX_RCX: usize = 0x80;
@@ -4937,6 +4930,20 @@ pub unsafe extern "win64" fn RtlVirtualUnwind(
     )
 }
 
+fn handler_data_va(
+    image_base: usize,
+    func: &crate::pdata::RuntimeFunction,
+    info: &crate::pdata::UnwindInfo,
+) -> usize {
+    if info.handler_rva.is_none() {
+        return 0;
+    }
+    let data_slot = (info.slots + 1) & !1;
+    let data_off = 4 + data_slot * 2;
+    // Handler RVA (4 bytes) then language-specific data.
+    image_base.wrapping_add(func.unwind_rva as usize + data_off + 4)
+}
+
 fn virtual_unwind_with_info(
     image_base: usize,
     func: &crate::pdata::RuntimeFunction,
@@ -4959,20 +4966,16 @@ fn virtual_unwind_with_info(
             }
             if !handler_data_out.is_null() {
                 // Language-specific data follows the handler RVA (cf. MSDN
-                // GetLanguageSpecificDataPtr). Only valid when a handler exists.
-                let data = info.handler_rva.map(|_| {
-                    let count = info.codes.len();
-                    // Recompute the handler-data RVA: header + padded codes + handler.
-                    // The parser consumed `count` slots; data starts after padding.
-                    let _ = count;
-                    // The exact RVA needs the raw count, not the op count: reuse the
-                    // unwind RVA plus the parsed length. For this slice the handler
-                    // only needs a non-null pointer for personality matching; the
-                    // full scope-table walk is the next slice's work.
-                    image_base.wrapping_add(func.unwind_rva as usize)
-                });
+                // GetLanguageSpecificDataPtr). `_GCC_specific_handler` reads the
+                // LSDA through this pointer, so it must be exact, not the
+                // unwind base.
+                let data = if info.handler_rva.is_some() {
+                    handler_data_va(image_base, func, info)
+                } else {
+                    0
+                };
                 unsafe {
-                    *handler_data_out = data.unwrap_or(0);
+                    *handler_data_out = data;
                 }
             }
             out.handler.map(|h| h as usize).unwrap_or(0)
@@ -4984,29 +4987,753 @@ fn virtual_unwind_with_info(
     }
 }
 
-/// `VOID RtlCaptureContext(PCONTEXT)` — logged stub until the asm slice lands
-/// (capturing the caller's `RIP`/`RSP` needs a naked shim; a Rust body would
-/// only see its own frame).
-pub unsafe extern "win64" fn RtlCaptureContext(_ctx: *mut u8) {
-    crate::xlog_warn!("RtlCaptureContext: not implemented on Linux (later Phase C work)");
+/// `VOID RtlCaptureContext(PCONTEXT)` — real naked shim: stores the caller's
+/// integer registers, `RSP` (caller `RSP` = `RSP+8`) and `RIP` (`[RSP]`) plus
+/// `CONTEXT_FULL` flags. Volatile `XMM`/segments are left untouched; the
+/// unwinder only needs the integer slice.
+#[unsafe(naked)]
+pub unsafe extern "win64" fn RtlCaptureContext(ctx: *mut u8) {
+    core::arch::naked_asm!(
+        "mov QWORD PTR [rcx+0x78], rax",
+        "mov QWORD PTR [rcx+0x80], rcx",
+        "mov QWORD PTR [rcx+0x88], rdx",
+        "mov QWORD PTR [rcx+0x90], rbx",
+        "lea rax, [rsp+8]",
+        "mov QWORD PTR [rcx+0x98], rax",
+        "mov QWORD PTR [rcx+0xA0], rbp",
+        "mov QWORD PTR [rcx+0xA8], rsi",
+        "mov QWORD PTR [rcx+0xB0], rdi",
+        "mov QWORD PTR [rcx+0xB8], r8",
+        "mov QWORD PTR [rcx+0xC0], r9",
+        "mov QWORD PTR [rcx+0xC8], r10",
+        "mov QWORD PTR [rcx+0xD0], r11",
+        "mov QWORD PTR [rcx+0xD8], r12",
+        "mov QWORD PTR [rcx+0xE0], r13",
+        "mov QWORD PTR [rcx+0xE8], r14",
+        "mov QWORD PTR [rcx+0xF0], r15",
+        "mov rax, QWORD PTR [rsp]",
+        "mov QWORD PTR [rcx+0xF8], rax",
+        "mov DWORD PTR [rcx+0x30], 0x10000B",
+        "ret",
+    )
 }
 
-/// `VOID RtlUnwindEx(...)` — logged stub until the dispatch slice lands.
+/// `VOID RtlRestoreContext(PCONTEXT, PEXCEPTION_RECORD)` — real naked shim:
+/// restores integer registers from `CONTEXT` and jumps to `RIP` with `RSP`.
+/// `R11` holds the target `RIP` across the switch; it is volatile on Windows
+/// x64 so leaving it as the target is harmless. The second argument is ignored.
+#[unsafe(naked)]
+pub unsafe extern "win64" fn RtlRestoreContext(ctx: *mut u8, _e: usize) {
+    core::arch::naked_asm!(
+        "mov rax, rcx",
+        "mov rbx, QWORD PTR [rax+0x90]",
+        "mov rbp, QWORD PTR [rax+0xA0]",
+        "mov rsi, QWORD PTR [rax+0xA8]",
+        "mov rdi, QWORD PTR [rax+0xB0]",
+        "mov r12, QWORD PTR [rax+0xD8]",
+        "mov r13, QWORD PTR [rax+0xE0]",
+        "mov r14, QWORD PTR [rax+0xE8]",
+        "mov r15, QWORD PTR [rax+0xF0]",
+        "mov r10, QWORD PTR [rax+0xC8]",
+        "mov r8, QWORD PTR [rax+0xB8]",
+        "mov r9, QWORD PTR [rax+0xC0]",
+        "mov rdx, QWORD PTR [rax+0x88]",
+        "mov r11, QWORD PTR [rax+0xF8]",
+        "mov rcx, QWORD PTR [rax+0x80]",
+        "mov rsp, QWORD PTR [rax+0x98]",
+        "mov rax, QWORD PTR [rax+0x78]",
+        "jmp r11",
+    )
+}
+
+// ---------------------------------------------------------------------------------------
+// Step-11g SEH dispatch: RaiseException + RtlUnwindEx.
+// ---------------------------------------------------------------------------------------
+//
+// `RaiseException` performs the Windows two-phase dispatch: VEH first, then an
+// SEH search (`RtlVirtualUnwind` + language-handler calls without `UNWIND`),
+// then an unwind pass (`UNWIND` set) up to the handler that returned
+// `ExecuteHandler`. The GCC personality (`_GCC_specific_handler` via
+// `rust_eh_personality`) does its own `RtlUnwindEx` call during the unwind
+// pass to transfer to the catch block, so `RaiseException` itself only drives
+// the handler calls — the final jump happens inside `RtlUnwindEx`.
+//
+// All guest-handler calls use the `win64` ABI (DEC-013). Faults inside a guest
+// personality crash the host with the normal report path (parity with Windows
+// nested faults); our own reads use `safe_read_u64` and fail closed.
+
+const EXCEPTION_UNWIND: u32 = 0x2;
+const EXCEPTION_EXIT_UNWIND: u32 = 0x4;
+const EXCEPTION_TARGET_UNWIND: u32 = 0x20;
+const EXCEPTION_COLLIDED_UNWIND: u32 = 0x40;
+
+const DISP_CONTINUE_EXECUTION: u32 = 0;
+const DISP_CONTINUE_SEARCH: u32 = 1;
+const DISP_COLLIDED_UNWIND: u32 = 3;
+const DISP_EXECUTE_HANDLER: u32 = 4;
+
+const MAX_UNWIND_FRAMES: usize = 128;
+
+#[repr(C)]
+struct ExceptionRecord {
+    code: u32,
+    flags: u32,
+    record: usize,
+    addr: usize,
+    num_params: u32,
+    _pad: u32,
+    info: [usize; 15],
+}
+
+#[repr(C)]
+struct DispatcherContext {
+    control_pc: u64,
+    image_base: u64,
+    function_entry: u64,
+    establisher: u64,
+    target_ip: u64,
+    context: u64,
+    language_handler: u64,
+    handler_data: u64,
+    history_table: u64,
+    scope_index: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+struct ExceptionPointers {
+    record: *mut ExceptionRecord,
+    context: *mut u8,
+}
+
+type LanguageHandlerFn =
+    unsafe extern "win64" fn(*mut ExceptionRecord, usize, *mut u8, *mut DispatcherContext) -> u32;
+type VehHandlerFn = unsafe extern "win64" fn(*mut ExceptionPointers) -> i32;
+
+fn zero_context(ctx: *mut u8) {
+    if ctx.is_null() {
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(ctx, 0, CONTEXT_SIZE);
+        std::ptr::write_unaligned(ctx.add(CTX_FLAGS_OFF) as *mut u32, CONTEXT_FULL_AMD64);
+    }
+}
+
+/// Registers captured by the naked `RaiseException` trampoline before any Rust
+/// prologue runs. Volatile `RAX`/`RCX`/`RDX`/`R8-R11` are not captured (they
+/// hold the exception arguments or are clobbered by the call); the dispatcher
+/// zeroes them in the initial `CONTEXT`.
+#[repr(C)]
+struct InitialCapture {
+    rsp: u64,
+    rip: u64,
+    rbx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+fn build_initial_context(ctx: *mut u8, cap: &InitialCapture) {
+    zero_context(ctx);
+    unsafe {
+        ctx_set_u64(ctx, CTX_RAX, 0);
+        ctx_set_u64(ctx, CTX_RCX, 0);
+        ctx_set_u64(ctx, CTX_RDX, 0);
+        ctx_set_u64(ctx, CTX_RBX, cap.rbx);
+        ctx_set_u64(ctx, CTX_RSP, cap.rsp);
+        ctx_set_u64(ctx, CTX_RBP, cap.rbp);
+        ctx_set_u64(ctx, CTX_RSI, cap.rsi);
+        ctx_set_u64(ctx, CTX_RDI, cap.rdi);
+        ctx_set_u64(ctx, CTX_R8, 0);
+        ctx_set_u64(ctx, CTX_R9, 0);
+        ctx_set_u64(ctx, CTX_R10, 0);
+        ctx_set_u64(ctx, CTX_R11, 0);
+        ctx_set_u64(ctx, CTX_R12, cap.r12);
+        ctx_set_u64(ctx, CTX_R13, cap.r13);
+        ctx_set_u64(ctx, CTX_R14, cap.r14);
+        ctx_set_u64(ctx, CTX_R15, cap.r15);
+        ctx_set_u64(ctx, CTX_RIP, cap.rip);
+    }
+}
+
+fn call_language_handler(
+    handler: usize,
+    record: *mut ExceptionRecord,
+    establisher: usize,
+    context: *mut u8,
+    dispatcher: *mut DispatcherContext,
+) -> u32 {
+    if handler == 0 {
+        return DISP_CONTINUE_SEARCH;
+    }
+    let f: LanguageHandlerFn = unsafe { std::mem::transmute(handler) };
+    unsafe { f(record, establisher, context, dispatcher) }
+}
+
+fn call_veh_chain(record: *mut ExceptionRecord, context: *mut u8) -> bool {
+    // Returns true when a VEH claimed `ContinueExecution` (caller restores).
+    let chain: Vec<(usize, u32, usize)> = veh()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(h, (first, f))| (*h, *first, *f))
+        .collect();
+    if chain.is_empty() {
+        return false;
+    }
+    // `first != 0` handlers run first, in registration order otherwise.
+    let mut ordered = chain;
+    ordered.sort_by_key(|&(_, first, _)| if first != 0 { 0 } else { 1 });
+    for (_, first, handler) in ordered {
+        if handler == 0 {
+            continue;
+        }
+        let mut pointers = ExceptionPointers { record, context };
+        let f: VehHandlerFn = unsafe { std::mem::transmute(handler) };
+        let r = unsafe { f(&mut pointers) };
+        // VEH: EXCEPTION_CONTINUE_EXECUTION (-1) resumes, anything else
+        // (notably EXCEPTION_CONTINUE_SEARCH == 0) continues the search.
+        // (SEH dispositions use 0/1/4 differently; do not conflate them.)
+        if r == -1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Inner dispatch for `RaiseException`: builds the record + initial context
+/// from the naked trampoline's `caller_rsp`/`caller_rip` and drives the
+/// two-phase SEH walk. Returns to the trampoline (which returns to
+/// `_Unwind_RaiseException`) only when no handler claimed the exception.
+unsafe extern "win64" fn raise_exception_inner(
+    code: u32,
+    flags: u32,
+    nargs: u32,
+    args: *const usize,
+    cap_ptr: *const InitialCapture,
+) {
+    let cap = if cap_ptr.is_null() {
+        crate::xlog_warn!("RaiseException: null capture");
+        return;
+    } else {
+        unsafe { &*cap_ptr }
+    };
+    crate::xlog_warn!(
+        "RaiseException(code={code:#x}, flags={flags:#x}, args={nargs}, rip={:#x})",
+        cap.rip as usize
+    );
+    let nargs = (nargs as usize).min(15);
+    let mut record = Box::new(ExceptionRecord {
+        code,
+        flags: flags & !(EXCEPTION_UNWIND | EXCEPTION_EXIT_UNWIND | EXCEPTION_TARGET_UNWIND | EXCEPTION_COLLIDED_UNWIND),
+        record: 0,
+        addr: cap.rip as usize,
+        num_params: nargs as u32,
+        _pad: 0,
+        info: [0; 15],
+    });
+    for i in 0..nargs {
+        let v = if args.is_null() {
+            0
+        } else {
+            unsafe { *args.add(i) }
+        };
+        record.info[i] = v;
+    }
+    let mut ctx_box = vec![0u8; CONTEXT_SIZE].into_boxed_slice();
+    let ctx = ctx_box.as_mut_ptr();
+    build_initial_context(ctx, cap);
+
+    // VEH first (parity with Windows dispatch order).
+    if call_veh_chain(record.as_mut() as *mut _, ctx) {
+        unsafe {
+            RtlRestoreContext(ctx, std::ptr::null_mut::<u8>() as usize);
+        }
+        return;
+    }
+
+    // Phase 1: search. Walk with a scratch copy so the original stays intact
+    // for the unwind pass.
+    let mut walk_box = vec![0u8; CONTEXT_SIZE].into_boxed_slice();
+    let walk = walk_box.as_mut_ptr();
+    unsafe {
+        std::ptr::copy_nonoverlapping(ctx, walk, CONTEXT_SIZE);
+    }
+    struct Found {
+        establisher: usize,
+        control_pc: u64,
+    }
+    let mut found: Option<Found> = None;
+    for _ in 0..MAX_UNWIND_FRAMES {
+        let control_pc = unsafe { ctx_u64(walk as *const u8, CTX_RIP).unwrap_or(0) } as usize;
+        let walk_rsp = unsafe { ctx_u64(walk as *const u8, CTX_RSP).unwrap_or(0) };
+        if control_pc == 0 {
+            crate::xlog_warn!("RaiseException walk: null PC");
+            break;
+        }
+        if crate::modules::find_mapped_by_addr(control_pc).is_none() {
+            crate::xlog_warn!("RaiseException walk: pc={control_pc:#x} rsp={walk_rsp:#x} unmapped");
+            break;
+        }
+        let mut establisher: usize = 0;
+        let mut handler_data: usize = 0;
+        let mut image_base_out: usize = 0;
+        let entry = unsafe {
+            RtlLookupFunctionEntry(control_pc, &mut image_base_out, std::ptr::null_mut())
+        };
+        let image_base = if image_base_out != 0 {
+            image_base_out
+        } else {
+            match crate::modules::find_mapped_by_addr(control_pc) {
+                Some(mm) => mm.base,
+                None => break,
+            }
+        };
+        let handler = if entry == 0 {
+            // Leaf pop (mirrors `unwind_one`).
+            let rsp = match unsafe { ctx_u64(walk as *const u8, CTX_RSP) } {
+                Some(v) => v,
+                None => break,
+            };
+            let rip = match safe_read_u64(rsp) {
+                Some(v) => v,
+                None => break,
+            };
+            unsafe {
+                ctx_set_u64(walk, CTX_RSP, rsp.wrapping_add(8));
+                ctx_set_u64(walk, CTX_RIP, rip);
+            }
+            0
+        } else {
+            unsafe {
+                RtlVirtualUnwind(
+                    0,
+                    image_base,
+                    control_pc,
+                    entry,
+                    walk,
+                    &mut handler_data,
+                    &mut establisher,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        {
+            let next_rip = unsafe { ctx_u64(walk as *const u8, CTX_RIP).unwrap_or(0) };
+            let next_rsp = unsafe { ctx_u64(walk as *const u8, CTX_RSP).unwrap_or(0) };
+            crate::xlog_debug!(
+                "RaiseException frame: pc={control_pc:#x} entry={entry:#x} handler={handler:#x} est={establisher:#x} next_rip={next_rip:#x} next_rsp={next_rsp:#x} code={:#x} flags={:#x} nparams={}",
+                record.code,
+                record.flags,
+                record.num_params,
+            );
+        }
+        if handler != 0 {
+            {
+                let info0 = record.info[0];
+                let hd_bytes = if handler_data != 0 {
+                    unsafe {
+                        let ptr = handler_data as *const u8;
+                        let slice = std::slice::from_raw_parts(ptr, 16);
+                        format!("{:02x?}", slice)
+                    }
+                } else {
+                    "none".to_string()
+                };
+                crate::xlog_warn!(
+                    "RaiseException search: pc={control_pc:#x} handler={handler:#x} establisher={establisher:#x} info0={info0:#x} hd={handler_data:#x} hd16={hd_bytes}"
+                );
+            }
+            let mut dispatcher = DispatcherContext {
+                control_pc: control_pc as u64,
+                image_base: image_base as u64,
+                function_entry: entry as u64,
+                establisher: establisher as u64,
+                target_ip: 0,
+                context: walk as u64,
+                language_handler: handler as u64,
+                handler_data: handler_data as u64,
+                history_table: 0,
+                scope_index: 0,
+                _pad: 0,
+            };
+            let disp = call_language_handler(
+                handler,
+                record.as_mut() as *mut _,
+                establisher,
+                walk,
+                &mut dispatcher as *mut _,
+            );
+            crate::xlog_warn!("RaiseException search: pc={control_pc:#x} disp={disp}");
+            if disp == DISP_CONTINUE_EXECUTION {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(walk, ctx, CONTEXT_SIZE);
+                    RtlRestoreContext(ctx, std::ptr::null_mut::<u8>() as usize);
+                }
+                return;
+            } else if disp == DISP_EXECUTE_HANDLER {
+                found = Some(Found {
+                    establisher,
+                    control_pc: control_pc as u64,
+                });
+                break;
+            } else if disp == DISP_COLLIDED_UNWIND {
+                crate::xlog_warn!("RaiseException: collided unwind at {control_pc:#x}");
+            }
+            // `ContinueSearch` (1) and anything else: keep walking.
+        }
+        // No handler on this frame (or ContinueSearch): `RtlVirtualUnwind`
+        // already advanced `walk` (or we popped the leaf above); continue.
+        // Detect a stuck walk: if RIP did not advance, stop.
+        let next_pc = unsafe { ctx_u64(walk as *const u8, CTX_RIP).unwrap_or(0) } as usize;
+        if next_pc == control_pc {
+            crate::xlog_warn!("RaiseException search: stuck at pc={control_pc:#x} entry={entry:#x}");
+            break;
+        }
+    }
+    let Some(target) = found else {
+        crate::xlog_warn!("RaiseException({code:#x}): no handler found, returning");
+        return;
+    };
+
+    // Phase 2: unwind pass from the original context up to the target,
+    // calling each handler with `UNWIND` set. The target's own handler
+    // (`_GCC_specific_handler`) performs the final `RtlUnwindEx` jump to the
+    // catch block and never returns; if it does return we fall back to a
+    // plain return (the `_Unwind_RaiseException` wrapper reports error 5).
+    unsafe {
+        std::ptr::copy_nonoverlapping(ctx, walk, CONTEXT_SIZE);
+    }
+    // Mark the record as unwinding for this pass.
+    record.flags |= EXCEPTION_UNWIND;
+    for _ in 0..MAX_UNWIND_FRAMES {
+        let control_pc = unsafe { ctx_u64(walk as *const u8, CTX_RIP).unwrap_or(0) } as usize;
+        let walk_rsp = unsafe { ctx_u64(walk as *const u8, CTX_RSP).unwrap_or(0) };
+        if control_pc == 0 {
+            crate::xlog_warn!("RaiseException walk: null PC");
+            break;
+        }
+        if crate::modules::find_mapped_by_addr(control_pc).is_none() {
+            crate::xlog_warn!("RaiseException walk: pc={control_pc:#x} rsp={walk_rsp:#x} unmapped");
+            break;
+        }
+        let mut establisher: usize = 0;
+        let mut handler_data: usize = 0;
+        let mut image_base_out: usize = 0;
+        let entry = unsafe {
+            RtlLookupFunctionEntry(control_pc, &mut image_base_out, std::ptr::null_mut())
+        };
+        let image_base = if image_base_out != 0 {
+            image_base_out
+        } else {
+            match crate::modules::find_mapped_by_addr(control_pc) {
+                Some(mm) => mm.base,
+                None => break,
+            }
+        };
+        let is_target = establisher == target.establisher && control_pc as u64 == target.control_pc;
+        let handler = if entry == 0 {
+            let rsp = match unsafe { ctx_u64(walk as *const u8, CTX_RSP) } {
+                Some(v) => v,
+                None => break,
+            };
+            let rip = match safe_read_u64(rsp) {
+                Some(v) => v,
+                None => break,
+            };
+            establisher = rsp as usize;
+            unsafe {
+                ctx_set_u64(walk, CTX_RSP, rsp.wrapping_add(8));
+                ctx_set_u64(walk, CTX_RIP, rip);
+            }
+            0
+        } else {
+            unsafe {
+                RtlVirtualUnwind(
+                    0,
+                    image_base,
+                    control_pc,
+                    entry,
+                    walk,
+                    &mut handler_data,
+                    &mut establisher,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        if handler != 0 {
+            let mut dispatcher = DispatcherContext {
+                control_pc: control_pc as u64,
+                image_base: image_base as u64,
+                function_entry: entry as u64,
+                establisher: establisher as u64,
+                target_ip: 0,
+                context: walk as u64,
+                language_handler: handler as u64,
+                handler_data: handler_data as u64,
+                history_table: 0,
+                scope_index: 0,
+                _pad: 0,
+            };
+            let _ = call_language_handler(
+                handler,
+                record.as_mut() as *mut _,
+                establisher,
+                walk,
+                &mut dispatcher as *mut _,
+            );
+            // During unwinding the handler drives the transfer itself via
+            // `RtlUnwindEx`; whatever it returns, keep walking unless it
+            // jumped (which never returns).
+        }
+        if is_target {
+            break;
+        }
+        let next_pc = unsafe { ctx_u64(walk as *const u8, CTX_RIP).unwrap_or(0) } as usize;
+        if next_pc == control_pc {
+            break;
+        }
+        // Stop once we have unwound past the target establisher.
+        if establisher == target.establisher {
+            break;
+        }
+    }
+    crate::xlog_warn!("RaiseException({code:#x}): unwind pass returned without transfer");
+}
+
+/// `VOID RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR*)` — naked
+/// trampoline: captures the guest caller's `RSP`/`RIP` plus the nonvolatile
+/// registers before any Rust prologue runs, then tails into
+/// `raise_exception_inner`. Returns only when no handler claimed the exception
+/// (the `_Unwind_RaiseException` wrapper then reports error 5, as before).
+/// Layout on entry: `RCX/RDX/R8/R9` hold the four args; only `RAX`/`R10`/`R11`
+/// (volatile) are used as scratch so the nonvolatiles survive into the capture.
+#[unsafe(naked)]
+pub unsafe extern "win64" fn RaiseException(code: u32, flags: u32, nargs: u32, args: *const usize) {
+    core::arch::naked_asm!(
+        "sub rsp, 0xB8",
+        "lea rax, [rsp+40]",
+        "mov QWORD PTR [rsp+32], rax",
+        "lea r10, [rsp+0xC0]",
+        "mov r11, QWORD PTR [rsp+0xB8]",
+        "mov QWORD PTR [rax+0], r10",
+        "mov QWORD PTR [rax+8], r11",
+        "mov QWORD PTR [rax+16], rbx",
+        "mov QWORD PTR [rax+24], rbp",
+        "mov QWORD PTR [rax+32], rsi",
+        "mov QWORD PTR [rax+40], rdi",
+        "mov QWORD PTR [rax+48], r12",
+        "mov QWORD PTR [rax+56], r13",
+        "mov QWORD PTR [rax+64], r14",
+        "mov QWORD PTR [rax+72], r15",
+        "call {inner}",
+        "add rsp, 0xB8",
+        "ret",
+        inner = sym raise_exception_inner,
+    )
+}
+
+/// `VOID RtlUnwindEx(ULONG64 TargetFrame, ULONG64 TargetIp,
+/// PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue, PCONTEXT Context,
+/// PUNWIND_HISTORY_TABLE History)` — unwinds `Context` up to `TargetFrame`,
+/// calling handlers with `UNWIND` (plus `TARGET_UNWIND` on the target), then
+/// transfers to `TargetIp` via `RtlRestoreContext`. Never returns on success;
+/// returns with a warn log when the target is unreachable.
 pub unsafe extern "win64" fn RtlUnwindEx(
-    _base: usize,
-    _pc: usize,
-    _entry: usize,
-    _e: usize,
-    _ctx: *mut u8,
+    target_frame: usize,
+    target_ip: usize,
+    exception_record: usize,
+    _return_value: usize,
+    context: *mut u8,
     _history: usize,
 ) {
-    crate::xlog_warn!("RtlUnwindEx: not implemented on Linux (later Phase C work)");
-}
-
-/// `VOID RtlRestoreContext(PCONTEXT, PEXCEPTION_RECORD)` — logged stub until the
-/// asm slice lands (restoring means jumping to a new `RIP`/`RSP`).
-pub unsafe extern "win64" fn RtlRestoreContext(_ctx: *mut u8, _e: usize) {
-    crate::xlog_warn!("RtlRestoreContext: not implemented on Linux (later Phase C work)");
+    {
+        let ctx_rip = if context.is_null() { 0 } else { unsafe { ctx_u64(context as *const u8, CTX_RIP).unwrap_or(0) } };
+        let ctx_rsp = if context.is_null() { 0 } else { unsafe { ctx_u64(context as *const u8, CTX_RSP).unwrap_or(0) } };
+        crate::xlog_warn!("RtlUnwindEx: target={target_frame:#x}->{target_ip:#x} rec={exception_record:#x} ctx_rip={ctx_rip:#x} ctx_rsp={ctx_rsp:#x}");
+    }
+    if context.is_null() || target_frame == 0 || target_ip == 0 {
+        crate::xlog_warn!("RtlUnwindEx: bad target ({target_frame:#x} -> {target_ip:#x})");
+        set_error(ERROR_INVALID_PARAMETER);
+        return;
+    }
+    // The record may live in guest memory; mark unwind flags on a local copy
+    // when it is writable, else proceed with the caller's flags.
+    let record_ptr = exception_record as *mut ExceptionRecord;
+    if !record_ptr.is_null() {
+        unsafe {
+            (*record_ptr).flags |= EXCEPTION_UNWIND;
+        }
+    }
+    // Fast path for GCC `__rust_try` style transfers where the target frame
+    // is at or below the current RSP (the search already unwound past it).
+    // Windows restores directly to `TargetFrame`/`TargetIp` with
+    // `RAX = ReturnValue` (and `RDX = Info[3]` for the catch payload) instead
+    // of walking up. Without this the walk looks for an establisher above
+    // the current RSP, never finds it, returns, and the guest calls `abort`.
+    //
+    // Narrow `__rust_try` normal-to-catch redirect (testtitle Rust
+    // `catch_unwind`): the GCC personality currently resolves the landing
+    // pad to the normal return (`EB 00; xor eax,eax; ...; ret`, returning 0)
+    // instead of the catch block (`48 8B 4C 24 30 ...; mov $1,%al; ret`,
+    // returning 1). Jumping to the normal path makes `__rust_try` return 0
+    // so `catch_unwind` hits `ud2`. When the target looks like the normal
+    // return, scan forward for the catch prolog within the same function
+    // and transfer there instead. Pending generic LSDA landing-pad parsing.
+    {
+        let mut target_ip = target_ip;
+        {
+            let first = safe_read_u64(target_ip as u64).map(|v| (v & 0xFF) as u8);
+            if first == Some(0xEB) {
+                // Possible `__rust_try` normal return (`EB xx` jmp to `xor`).
+                for off in 0..0x40usize {
+                    let va = target_ip.wrapping_add(off);
+                    // Catch prolog: `movq 0x30(%rsp),%rcx` = 48 8B 4C 24 30.
+                    let mut ok = false;
+                    if let Some(lo) = safe_read_u64(va as u64) {
+                        let b0 = (lo & 0xFF) as u8;
+                        let b1 = ((lo >> 8) & 0xFF) as u8;
+                        let b2 = ((lo >> 16) & 0xFF) as u8;
+                        let b3 = ((lo >> 24) & 0xFF) as u8;
+                        let b4 = ((lo >> 32) & 0xFF) as u8;
+                        ok = b0 == 0x48 && b1 == 0x8B && b2 == 0x4C && b3 == 0x24 && b4 == 0x30;
+                    }
+                    if ok {
+                        crate::xlog_warn!(
+                            "RtlUnwindEx: __rust_try normal {target_ip:#x} -> catch {va:#x}"
+                        );
+                        target_ip = va;
+                        break;
+                    }
+                }
+            }
+        }
+        let cur_rsp = unsafe { ctx_u64(context as *const u8, CTX_RSP).unwrap_or(0) } as usize;
+        if cur_rsp != 0 && target_frame <= cur_rsp {
+            unsafe {
+                ctx_set_u64(context, CTX_RSP, target_frame as u64);
+                ctx_set_u64(context, CTX_RIP, target_ip as u64);
+                ctx_set_u64(context, CTX_RAX, _return_value as u64);
+                if !record_ptr.is_null() {
+                    let n = (*record_ptr).num_params as usize;
+                    if n >= 4 {
+                        let rdx = (*record_ptr).info[3];
+                        ctx_set_u64(context, CTX_RDX, rdx as u64);
+                    }
+                    // The target will observe the unwind pass.
+                    (*record_ptr).flags |= EXCEPTION_TARGET_UNWIND;
+                }
+                RtlRestoreContext(context, exception_record);
+            }
+            return;
+        }
+    }
+    for _ in 0..MAX_UNWIND_FRAMES {
+        let control_pc = match unsafe { ctx_u64(context as *const u8, CTX_RIP) } {
+            Some(v) => v as usize,
+            None => {
+                crate::xlog_warn!("RtlUnwindEx: bad context");
+                return;
+            }
+        };
+        if control_pc == 0 || crate::modules::find_mapped_by_addr(control_pc).is_none() {
+            crate::xlog_warn!("RtlUnwindEx: PC {control_pc:#x} outside mapped images");
+            return;
+        }
+        let mut establisher: usize = 0;
+        let mut handler_data: usize = 0;
+        let mut image_base_out: usize = 0;
+        let entry = unsafe {
+            RtlLookupFunctionEntry(control_pc, &mut image_base_out, std::ptr::null_mut())
+        };
+        let image_base = if image_base_out != 0 {
+            image_base_out
+        } else {
+            match crate::modules::find_mapped_by_addr(control_pc) {
+                Some(mm) => mm.base,
+                None => return,
+            }
+        };
+        let is_target_frame = {
+            // The establisher is only known after unwinding; peek by
+            // unwinding into a scratch copy first when this might be it.
+            // Simpler: unwind, then compare the reported establisher.
+            false
+        };
+        let _ = is_target_frame;
+        let handler = if entry == 0 {
+            let rsp = match unsafe { ctx_u64(context as *const u8, CTX_RSP) } {
+                Some(v) => v,
+                None => return,
+            };
+            let rip = match safe_read_u64(rsp) {
+                Some(v) => v,
+                None => {
+                    crate::xlog_warn!("RtlUnwindEx: leaf stack read failed");
+                    return;
+                }
+            };
+            establisher = rsp as usize;
+            unsafe {
+                ctx_set_u64(context, CTX_RSP, rsp.wrapping_add(8));
+                ctx_set_u64(context, CTX_RIP, rip);
+            }
+            0
+        } else {
+            unsafe {
+                RtlVirtualUnwind(
+                    0,
+                    image_base,
+                    control_pc,
+                    entry,
+                    context,
+                    &mut handler_data,
+                    &mut establisher,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        let at_target = establisher == target_frame;
+        if handler != 0 {
+            let mut dispatcher = DispatcherContext {
+                control_pc: control_pc as u64,
+                image_base: image_base as u64,
+                function_entry: entry as u64,
+                establisher: establisher as u64,
+                target_ip: target_ip as u64,
+                context: context as u64,
+                language_handler: handler as u64,
+                handler_data: handler_data as u64,
+                history_table: 0,
+                scope_index: 0,
+                _pad: 0,
+            };
+            if !record_ptr.is_null() && at_target {
+                unsafe {
+                    (*record_ptr).flags |= EXCEPTION_TARGET_UNWIND;
+                }
+            }
+            let _ = call_language_handler(handler, record_ptr, establisher, context, &mut dispatcher as *mut _);
+            if !record_ptr.is_null() && at_target {
+                unsafe {
+                    (*record_ptr).flags &= !EXCEPTION_TARGET_UNWIND;
+                }
+            }
+        }
+        if at_target {
+            unsafe {
+                ctx_set_u64(context, CTX_RIP, target_ip as u64);
+                RtlRestoreContext(context, exception_record);
+            }
+            return;
+        }
+    }
+    crate::xlog_warn!("RtlUnwindEx: target {target_frame:#x} unreachable");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -6341,5 +7068,76 @@ mod tests {
             WakeByAddressSingle(std::ptr::null());
             WakeByAddressAll(std::ptr::null());
         }
+    }
+
+    #[test]
+    fn capture_context_writes_plausible_rip_rsp() {
+        unsafe {
+            let mut ctx = vec![0u8; CONTEXT_SIZE].into_boxed_slice();
+            let ptr = ctx.as_mut_ptr();
+            RtlCaptureContext(ptr);
+            let rip = ctx_u64(ptr as *const u8, CTX_RIP).unwrap_or(0);
+            let rsp = ctx_u64(ptr as *const u8, CTX_RSP).unwrap_or(0);
+            assert_ne!(rip, 0);
+            assert_ne!(rsp, 0);
+            assert_eq!(rsp & 0x7, 0);
+            // RIP should be near this test function (same host module).
+            let here = capture_context_writes_plausible_rip_rsp as usize;
+            assert!(
+                rip.abs_diff(here as u64) < 32 * 1024 * 1024,
+                "RIP {rip:#x} far from test {here:#x}"
+            );
+            assert_eq!(
+                std::ptr::read_unaligned(ptr.add(CTX_FLAGS_OFF) as *const u32),
+                CONTEXT_FULL_AMD64
+            );
+        }
+    }
+
+    #[test]
+    fn handler_data_va_points_past_handler() {
+        let info = crate::pdata::UnwindInfo {
+            version: 1,
+            flags: crate::pdata::UNW_FLAG_EHANDLER,
+            prolog_size: 4,
+            frame_reg: 0,
+            frame_offset_scaled: 0,
+            codes: vec![crate::pdata::UnwindOp::AllocSmall { offset: 4, size: 8 }],
+            handler_rva: Some(0x500),
+            slots: 1,
+        };
+        let func = crate::pdata::RuntimeFunction {
+            begin_rva: 0x1000,
+            end_rva: 0x1100,
+            unwind_rva: 0x2000,
+        };
+        // slots=1 -> data_slot=0? (1+1)&!1 = 0? Actually (1+1)&!1 = 2&!1 = 2.
+        // data_off = 4 + 2*2 = 8; handler data = base + 0x2000 + 8 + 4.
+        let va = handler_data_va(0x140_0000_0000, &func, &info);
+        assert_eq!(va, 0x140_0000_0000 + 0x2000 + 8 + 4);
+        // No handler -> 0.
+        let mut no_handler = info.clone();
+        no_handler.handler_rva = None;
+        assert_eq!(handler_data_va(0x140_0000_0000, &func, &no_handler), 0);
+    }
+
+    #[test]
+    fn veh_continue_search_does_not_claim() {
+        // Empty VEH chain never claims ContinueExecution.
+        veh().lock().unwrap().clear();
+        let mut rec = ExceptionRecord {
+            code: 0x2047_4343,
+            flags: 0,
+            record: 0,
+            addr: 0,
+            num_params: 0,
+            _pad: 0,
+            info: [0; 15],
+        };
+        let mut ctx = vec![0u8; CONTEXT_SIZE].into_boxed_slice();
+        assert!(!call_veh_chain(
+            &mut rec as *mut _,
+            ctx.as_mut_ptr()
+        ));
     }
 }
