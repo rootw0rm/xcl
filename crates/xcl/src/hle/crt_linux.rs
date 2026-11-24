@@ -460,6 +460,229 @@ pub unsafe extern "win64" fn setvbuf(
     0
 }
 
+// ---------------------------------------------------------------------------------------
+// Step-11l file reads past stubs: `fopen`/`fread`/`fwrite`/`fclose`/`fflush` through
+// the linked-in Linux VFS (same `vfs_hooks::open` the kernelx file APIs use).
+// ---------------------------------------------------------------------------------------
+//
+// The Windows build hooks KERNELBASE so the CRT goes through the VFS. Linux has no
+// KERNELBASE: these shims resolve the narrow path through `vfs_hooks::open` directly.
+// `FILE*` is a boxed `CrtFile` owning its host `File`; `fread`/`fwrite` are itemwise
+// (`size * count`) as on Windows, `fflush(NULL)` succeeds without iterating the table.
+
+struct CrtFile {
+    file: std::fs::File,
+    append: bool,
+}
+
+fn crt_mode(mode: &str) -> Option<(u32, u32, bool)> {
+    use crate::vfs::{CREATE_ALWAYS, GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS, OPEN_EXISTING};
+    let mut chars = mode.chars();
+    let first = chars.next()?;
+    let mut read = false;
+    let mut write = false;
+    let mut append = false;
+    match first {
+        'r' => read = true,
+        'w' => write = true,
+        'a' => {
+            write = true;
+            append = true;
+        }
+        _ => return None,
+    }
+    for c in chars {
+        match c {
+            '+' => {
+                read = true;
+                write = true;
+            }
+            'b' | 't' | 'c' | 'n' | 'S' | 'R' | 'T' | 'D' => {}
+            'x' => {}
+            _ => {}
+        }
+    }
+    let access = (if read { GENERIC_READ } else { 0 }) | (if write { GENERIC_WRITE } else { 0 });
+    let disp = match first {
+        'r' => OPEN_EXISTING,
+        'w' => CREATE_ALWAYS,
+        'a' => OPEN_ALWAYS,
+        _ => return None,
+    };
+    Some((access, disp, append))
+}
+
+pub unsafe extern "win64" fn fopen(path: *const u8, mode: *const u8) -> *mut u8 {
+    if path.is_null() || mode.is_null() {
+        return std::ptr::null_mut();
+    }
+    let (Some(p), Some(m)) = (
+        crate::util::from_cstr_ptr(path),
+        crate::util::from_cstr_ptr(mode),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    let Some((access, disp, append)) = crt_mode(&m) else {
+        return std::ptr::null_mut();
+    };
+    let opened = match crate::vfs_hooks::open(&p, access, disp, 0) {
+        Ok(o) => o,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let mut file = opened.file;
+    if append {
+        use std::io::Seek;
+        let _ = file.seek(std::io::SeekFrom::End(0));
+    }
+    let boxed = Box::new(CrtFile { file, append });
+    Box::into_raw(boxed) as *mut u8
+}
+
+unsafe fn crt_file_mut<'a>(stream: *mut u8) -> Option<&'a mut CrtFile> {
+    if stream.is_null() {
+        return None;
+    }
+    Some(&mut *(stream as *mut CrtFile))
+}
+
+pub unsafe extern "win64" fn fread(
+    ptr: *mut c_void,
+    size: usize,
+    count: usize,
+    stream: *mut u8,
+) -> usize {
+    let total = size.saturating_mul(count);
+    if total == 0 || ptr.is_null() {
+        return 0;
+    }
+    let Some(f) = crt_file_mut(stream) else {
+        return 0;
+    };
+    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, total);
+    use std::io::Read;
+    // `fread` may return a short count at EOF; loop until full or no progress.
+    let mut done = 0usize;
+    while done < total {
+        match f.file.read(&mut slice[done..]) {
+            Ok(0) => break,
+            Ok(k) => done += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    if size == 0 {
+        0
+    } else {
+        done / size
+    }
+}
+
+pub unsafe extern "win64" fn fwrite(
+    ptr: *const c_void,
+    size: usize,
+    count: usize,
+    stream: *mut u8,
+) -> usize {
+    let total = size.saturating_mul(count);
+    if total == 0 || ptr.is_null() {
+        return 0;
+    }
+    let Some(f) = crt_file_mut(stream) else {
+        return 0;
+    };
+    if f.append {
+        use std::io::Seek;
+        let _ = f.file.seek(std::io::SeekFrom::End(0));
+    }
+    let slice = std::slice::from_raw_parts(ptr as *const u8, total);
+    use std::io::Write;
+    let mut done = 0usize;
+    while done < total {
+        match f.file.write(&slice[done..]) {
+            Ok(0) => break,
+            Ok(k) => done += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    if size == 0 {
+        0
+    } else {
+        done / size
+    }
+}
+
+pub unsafe extern "win64" fn fputc(c: i32, stream: *mut u8) -> i32 {
+    let b = [c as u8];
+    let n = fwrite(
+        b.as_ptr() as *const c_void,
+        1,
+        1,
+        stream,
+    );
+    if n == 1 {
+        c & 0xFF
+    } else {
+        -1
+    }
+}
+
+pub unsafe extern "win64" fn fflush(stream: *mut u8) -> i32 {
+    use std::io::Write;
+    if stream.is_null() {
+        return 0;
+    }
+    let Some(f) = crt_file_mut(stream) else {
+        return -1;
+    };
+    match f.file.flush() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+pub unsafe extern "win64" fn fclose(stream: *mut u8) -> i32 {
+    if stream.is_null() {
+        return -1;
+    }
+    let mut boxed = Box::from_raw(stream as *mut CrtFile);
+    use std::io::Write;
+    let rc = match boxed.file.flush() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    };
+    drop(boxed);
+    rc
+}
+
+pub unsafe extern "win64" fn fseek(stream: *mut u8, offset: i64, origin: i32) -> i32 {
+    let Some(f) = crt_file_mut(stream) else {
+        return -1;
+    };
+    use std::io::Seek;
+    let pos = match origin {
+        0 => std::io::SeekFrom::Start(offset as u64),
+        1 => std::io::SeekFrom::Current(offset),
+        2 => std::io::SeekFrom::End(offset),
+        _ => return -1,
+    };
+    match f.file.seek(pos) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+pub unsafe extern "win64" fn ftell(stream: *mut u8) -> i64 {
+    let Some(f) = crt_file_mut(stream) else {
+        return -1;
+    };
+    use std::io::Seek;
+    match f.file.seek(std::io::SeekFrom::Current(0)) {
+        Ok(p) => p as i64,
+        Err(_) => -1,
+    }
+}
+
 /// Export table: name → real code address (never `0`/stub metadata).
 pub fn exports() -> Vec<(&'static str, usize)> {
     vec![
@@ -507,6 +730,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("wcsnlen", wcsnlen as usize),
         ("getenv", getenv as usize),
         ("setvbuf", setvbuf as usize),
+        ("fopen", fopen as usize),
+        ("fread", fread as usize),
+        ("fwrite", fwrite as usize),
+        ("fputc", fputc as usize),
+        ("fflush", fflush as usize),
+        ("fclose", fclose as usize),
+        ("fseek", fseek as usize),
+        ("ftell", ftell as usize),
     ]
 }
 
@@ -679,6 +910,53 @@ mod tests {
             assert_eq!(setvbuf(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0), 0);
             assert_eq!(__acrt_iob_func(2).is_null(), false);
             assert_eq!(setvbuf(__acrt_iob_func(2), std::ptr::null_mut(), 2, 4096), 0);
+        }
+    }
+
+    #[test]
+    fn fopen_reads_and_writes_through_the_host() {
+        unsafe {
+            let dir = std::env::temp_dir().join(format!("xcl_crt_11l_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("probe.txt");
+            let cpath = format!("{}\0", path.display());
+            let f = fopen(cpath.as_ptr(), b"wb\0".as_ptr());
+            assert!(!f.is_null());
+            let payload = b"hello-crt-11l";
+            assert_eq!(
+                fwrite(
+                    payload.as_ptr() as *const c_void,
+                    1,
+                    payload.len(),
+                    f
+                ),
+                payload.len()
+            );
+            assert_eq!(fflush(f), 0);
+            assert_eq!(fclose(f), 0);
+            let g = fopen(cpath.as_ptr(), b"rb\0".as_ptr());
+            assert!(!g.is_null());
+            let mut buf = [0u8; 32];
+            assert_eq!(
+                fread(buf.as_mut_ptr() as *mut c_void, 1, payload.len(), g),
+                payload.len()
+            );
+            assert_eq!(&buf[..payload.len()], payload);
+            // Seek + tell round-trip.
+            assert_eq!(fseek(g, 6, 0), 0);
+            assert_eq!(ftell(g), 6);
+            let mut tail = [0u8; 16];
+            assert_eq!(
+                fread(tail.as_mut_ptr() as *mut c_void, 1, payload.len() - 6, g),
+                payload.len() - 6
+            );
+            assert_eq!(&tail[..payload.len() - 6], &payload[6..]);
+            assert_eq!(fclose(g), 0);
+            // Missing files fail closed.
+            let miss = dir.join("missing.txt");
+            let cmiss = format!("{}\0", miss.display());
+            assert!(fopen(cmiss.as_ptr(), b"rb\0".as_ptr()).is_null());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

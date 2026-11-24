@@ -3531,6 +3531,221 @@ pub unsafe extern "win64" fn SetEndOfFile(handle: usize) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Step-11l file reads past stubs: `NtReadFile`, `GetFileInformationByHandle(Ex)` and
+// `RtlNtStatusToDosError`. Rust `std::fs` reads through `NtReadFile` (synchronous) and
+// sizes files via `GetFileInformationByHandle(Ex)`, so the auto-stubs returning 0 made
+// every `G:\`/`GAME:` read look empty. These shims read the same VFS `FILES` table as
+// `ReadFile`/`GetFileSizeEx` (read-only game layer, overlay writes).
+// ---------------------------------------------------------------------------------------
+
+/// Windows `BY_HANDLE_FILE_INFORMATION` (52 bytes). The game reads this layout
+/// directly, so field order must match the Windows definition.
+#[repr(C)]
+pub struct ByHandleFileInformation {
+    pub attrs: u32,
+    pub creation_low: u32,
+    pub creation_high: u32,
+    pub access_low: u32,
+    pub access_high: u32,
+    pub write_low: u32,
+    pub write_high: u32,
+    pub volume_serial: u32,
+    pub size_high: u32,
+    pub size_low: u32,
+    pub number_of_links: u32,
+    pub index_high: u32,
+    pub index_low: u32,
+}
+
+fn by_handle_info_for(handle: usize) -> Option<ByHandleFileInformation> {
+    let (len, readonly, is_dir, m) = with_file(handle, |f| {
+        let m = f.metadata().ok()?;
+        Some((m.len(), m.permissions().readonly(), m.is_dir(), m))
+    })??;
+    let mut attrs = if is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_ARCHIVE
+    };
+    if readonly {
+        attrs |= FILE_ATTRIBUTE_READONLY;
+    }
+    let (c_l, c_h) = m
+        .created()
+        .map(filetime_from_system)
+        .unwrap_or((0, 0));
+    let (a_l, a_h) = m
+        .accessed()
+        .map(filetime_from_system)
+        .unwrap_or((c_l, c_h));
+    let (w_l, w_h) = m
+        .modified()
+        .map(filetime_from_system)
+        .unwrap_or((c_l, c_h));
+    Some(ByHandleFileInformation {
+        attrs,
+        creation_low: c_l,
+        creation_high: c_h,
+        access_low: a_l,
+        access_high: a_h,
+        write_low: w_l,
+        write_high: w_h,
+        volume_serial: 0,
+        size_high: (len >> 32) as u32,
+        size_low: len as u32,
+        number_of_links: 1,
+        index_high: 0,
+        index_low: 0,
+    })
+}
+
+pub unsafe extern "win64" fn GetFileInformationByHandle(
+    handle: usize,
+    out: *mut ByHandleFileInformation,
+) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    match by_handle_info_for(handle) {
+        Some(info) => {
+            *out = info;
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        None => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+/// `FILE_INFO_BY_HANDLE_CLASS`: only the two classes Rust `std` needs are
+/// implemented (`0` = `FileBasicInfo`, `1` = `FileStandardInfo`).
+pub unsafe extern "win64" fn GetFileInformationByHandleEx(
+    handle: usize,
+    class: u32,
+    out: *mut c_void,
+    size: u32,
+) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let info = match by_handle_info_for(handle) {
+        Some(i) => i,
+        None => {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    };
+    match class {
+        0 => {
+            // `FILE_BASIC_INFO` (40 bytes): 4x i64 FILETIME + attrs + pad.
+            if size < 40 {
+                set_error(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            let c: i64 = ((info.creation_high as u64) << 32 | info.creation_low as u64) as i64;
+            let a: i64 = ((info.access_high as u64) << 32 | info.access_low as u64) as i64;
+            let w: i64 = ((info.write_high as u64) << 32 | info.write_low as u64) as i64;
+            unsafe {
+                (out as *mut i64).write_unaligned(c);
+                (out.add(8) as *mut i64).write_unaligned(a);
+                (out.add(16) as *mut i64).write_unaligned(w);
+                (out.add(24) as *mut i64).write_unaligned(w);
+                (out.add(32) as *mut u32).write_unaligned(info.attrs);
+                (out.add(36) as *mut u32).write_unaligned(0);
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        1 => {
+            // `FILE_STANDARD_INFO` (24 bytes): allocation + EOF + links + flags.
+            if size < 24 {
+                set_error(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            let len: i64 = ((info.size_high as u64) << 32 | info.size_low as u64) as i64;
+            let alloc = (len + 4095) & !4095;
+            let is_dir = (info.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            unsafe {
+                (out as *mut i64).write_unaligned(alloc);
+                (out.add(8) as *mut i64).write_unaligned(len);
+                (out.add(16) as *mut u32).write_unaligned(1);
+                (out.add(20) as *mut u8).write_unaligned(0);
+                (out.add(21) as *mut u8).write_unaligned(is_dir as u8);
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        _ => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn NtReadFile(
+    handle: usize,
+    _event: usize,
+    _apc: usize,
+    _apc_ctx: usize,
+    iosb: *mut IoStatusBlock,
+    buf: *mut u8,
+    len: u32,
+    byte_offset: *const i64,
+    _key: *mut u32,
+) -> u32 {
+    if len == 0 {
+        return iosb_write(iosb, STATUS_SUCCESS, 0);
+    }
+    if buf.is_null() {
+        return iosb_write(iosb, STATUS_INVALID_HANDLE, 0);
+    }
+    // Console stdin: the pseudo handle from `GetStdHandle(STD_INPUT_HANDLE)` reads fd 0.
+    if handle == std_handle_value(STD_INPUT_HANDLE) {
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf, len as usize) };
+        let r = unsafe { libc::read(0, slice.as_mut_ptr() as *mut c_void, slice.len()) };
+        if r < 0 {
+            return iosb_write(iosb, STATUS_UNSUCCESSFUL, 0);
+        }
+        return iosb_write(iosb, STATUS_SUCCESS, r as usize);
+    }
+    let arc = files().lock().unwrap().get(&handle).cloned();
+    let Some(arc) = arc else {
+        return iosb_write(iosb, STATUS_INVALID_HANDLE, 0);
+    };
+    let mut g = arc.lock().unwrap();
+    use std::io::{Read, Seek};
+    if !byte_offset.is_null() {
+        let off = unsafe { *byte_offset };
+        if off >= 0 {
+            let _ = g.seek(std::io::SeekFrom::Start(off as u64));
+        }
+    }
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf, len as usize) };
+    match g.read(slice) {
+        Ok(k) => iosb_write(iosb, STATUS_SUCCESS, k),
+        Err(_) => iosb_write(iosb, STATUS_UNSUCCESSFUL, 0),
+    }
+}
+
+pub unsafe extern "win64" fn RtlNtStatusToDosError(status: u32) -> u32 {
+    match status {
+        STATUS_SUCCESS => ERROR_SUCCESS,
+        STATUS_INVALID_HANDLE => 6, // ERROR_INVALID_HANDLE
+        STATUS_UNSUCCESSFUL => 1,   // ERROR_INVALID_FUNCTION
+        0xC000_0005 => 998,         // STATUS_ACCESS_VIOLATION -> ERROR_NOACCESS
+        0xC000_000F => 2,           // STATUS_NO_SUCH_FILE -> ERROR_FILE_NOT_FOUND
+        0xC000_0034 => 2,           // STATUS_OBJECT_NAME_NOT_FOUND -> ERROR_FILE_NOT_FOUND
+        0xC000_0035 => 80,          // STATUS_OBJECT_NAME_COLLISION -> ERROR_FILE_EXISTS
+        0xC000_003A => 3,           // STATUS_OBJECT_PATH_NOT_FOUND -> ERROR_PATH_NOT_FOUND
+        _ => status & 0xFFFF,
+    }
+}
+
 pub unsafe extern "win64" fn DeleteFileW(name: *const u16) -> i32 {
     let Some(path) = wide_str(name) else {
         set_error(ERROR_INVALID_PARAMETER);
@@ -4392,6 +4607,194 @@ fn disk_clusters_answer(
             0
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Step-11l path canonicalization: `GetCurrentDirectoryW/A` + `GetFullPathNameW/A`.
+// Rust `std::fs` resolves every path through `get_long_path` (`GetFullPathNameW`
+// before `CreateFileW`), so the auto-stub returning 0 made even present `GAME:`
+// files fail with `ERROR_FILE_NOT_FOUND` before any open. Console-absolute paths
+// (`G:`/`GAME:`/drive/UNC/device) are copied through; relative paths resolve
+// against the game root as `G:\<rel>` (the console cwd is the game folder, and this
+// keeps overlay reads coherent, unlike the host cwd).
+// ---------------------------------------------------------------------------------------
+
+fn game_cwd() -> String {
+    if let Some(v) = crate::vfs::get() {
+        return v.game_root().to_string();
+    }
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/".to_string())
+}
+
+fn is_console_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        return true;
+    }
+    if p.starts_with("\\\\") || p.starts_with("//") {
+        return true;
+    }
+    if p.starts_with('\\') || p.starts_with('/') {
+        return true;
+    }
+    if p.starts_with("\\\\?\\") || p.starts_with("//?/") {
+        return true;
+    }
+    // `GAME:`/`G:` mounts (and any `XXX:` console mount) are absolute.
+    if let Some(colon) = p.find(':') {
+        let prefix = &p[..colon];
+        if !prefix.is_empty()
+            && prefix
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            return true;
+        }
+    }
+    // NT device paths.
+    if p.starts_with("\\??\\") || p.starts_with("\\\\.\\") || p.starts_with("//./") {
+        return true;
+    }
+    false
+}
+
+fn full_path_for(input: &str) -> String {
+    if is_console_absolute(input) {
+        return input.to_string();
+    }
+    // Relative: game-relative `G:\<rel>` so the VFS overlay applies.
+    let rel = input.replace('/', "\\");
+    let rel = rel.strip_prefix('\\').unwrap_or(&rel);
+    format!("G:\\{rel}")
+}
+
+unsafe fn write_wide_out(s: &[u16], n: u32, buf: *mut u16) -> u32 {
+    let need = s.len() as u32 + 1;
+    if n == 0 || buf.is_null() {
+        return need;
+    }
+    if n < need {
+        return need;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), buf, s.len());
+        *buf.add(s.len()) = 0;
+    }
+    s.len() as u32
+}
+
+unsafe fn write_ansi_out(s: &str, n: u32, buf: *mut u8) -> u32 {
+    let need = s.len() as u32 + 1;
+    if n == 0 || buf.is_null() {
+        return need;
+    }
+    if n < need {
+        return need;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), buf, s.len());
+        *buf.add(s.len()) = 0;
+    }
+    s.len() as u32
+}
+
+pub unsafe extern "win64" fn GetCurrentDirectoryW(n: u32, buf: *mut u16) -> u32 {
+    let cwd = game_cwd();
+    let w: Vec<u16> = cwd.encode_utf16().collect();
+    let r = unsafe { write_wide_out(&w, n, buf) };
+    if r == w.len() as u32 {
+        set_error(ERROR_SUCCESS);
+    } else if n != 0 && !buf.is_null() {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    }
+    r
+}
+
+pub unsafe extern "win64" fn GetCurrentDirectoryA(n: u32, buf: *mut u8) -> u32 {
+    let cwd = game_cwd();
+    let r = unsafe { write_ansi_out(&cwd, n, buf) };
+    if r == cwd.len() as u32 {
+        set_error(ERROR_SUCCESS);
+    } else if n != 0 && !buf.is_null() {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    }
+    r
+}
+
+pub unsafe extern "win64" fn GetFullPathNameW(
+    name: *const u16,
+    n: u32,
+    buf: *mut u16,
+    part: *mut *mut u16,
+) -> u32 {
+    let Some(input) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let full = full_path_for(&input);
+    let w: Vec<u16> = full.encode_utf16().collect();
+    let r = unsafe { write_wide_out(&w, n, buf) };
+    if r != w.len() as u32 {
+        if n != 0 && !buf.is_null() {
+            set_error(ERROR_INSUFFICIENT_BUFFER);
+        }
+        return r;
+    }
+    if !part.is_null() {
+        unsafe {
+            *part = std::ptr::null_mut();
+            if !buf.is_null() {
+                let mut last: *mut u16 = std::ptr::null_mut();
+                for i in 0..w.len() {
+                    if w[i] == b'\\' as u16 || w[i] == b'/' as u16 || w[i] == b':' as u16 {
+                        last = buf.add(i + 1);
+                    }
+                }
+                *part = last;
+            }
+        }
+    }
+    set_error(ERROR_SUCCESS);
+    r
+}
+
+pub unsafe extern "win64" fn GetFullPathNameA(
+    name: *const u8,
+    n: u32,
+    buf: *mut u8,
+    part: *mut *mut u8,
+) -> u32 {
+    let Some(input) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let full = full_path_for(&input);
+    let r = unsafe { write_ansi_out(&full, n, buf) };
+    if r != full.len() as u32 {
+        if n != 0 && !buf.is_null() {
+            set_error(ERROR_INSUFFICIENT_BUFFER);
+        }
+        return r;
+    }
+    if !part.is_null() {
+        unsafe {
+            *part = std::ptr::null_mut();
+            if !buf.is_null() {
+                let b = full.as_bytes();
+                let mut last: *mut u8 = std::ptr::null_mut();
+                for i in 0..b.len() {
+                    if b[i] == b'\\' || b[i] == b'/' || b[i] == b':' {
+                        last = buf.add(i + 1);
+                    }
+                }
+                *part = last;
+            }
+        }
+    }
+    set_error(ERROR_SUCCESS);
+    r
 }
 
 // ---------------------------------------------------------------------------------------
@@ -6809,6 +7212,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetFileSizeEx", GetFileSizeEx as usize),
         ("SetFilePointerEx", SetFilePointerEx as usize),
         ("SetEndOfFile", SetEndOfFile as usize),
+        ("GetFileInformationByHandle", GetFileInformationByHandle as usize),
+        ("GetFileInformationByHandleEx", GetFileInformationByHandleEx as usize),
+        ("NtReadFile", NtReadFile as usize),
+        ("RtlNtStatusToDosError", RtlNtStatusToDosError as usize),
+        ("GetCurrentDirectoryW", GetCurrentDirectoryW as usize),
+        ("GetCurrentDirectoryA", GetCurrentDirectoryA as usize),
+        ("GetFullPathNameW", GetFullPathNameW as usize),
+        ("GetFullPathNameA", GetFullPathNameA as usize),
         ("DeleteFileW", DeleteFileW as usize),
         ("DeleteFileA", DeleteFileA as usize),
         ("CreateDirectoryW", CreateDirectoryW as usize),
@@ -7914,6 +8325,184 @@ mod tests {
                 std::ptr::null_mut(),
             );
             assert_eq!(st, STATUS_INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn file_info_and_nt_read_match_read_file() {        unsafe {
+            let _ = ensure_test_vfs();
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const OPEN_EXISTING: u32 = 3;
+            const CREATE_ALWAYS: u32 = 2;
+            // Seed a probe file under T: (title scratch, always writable).
+            let name = format!("T:\\ntread_11l_{}.bin", std::process::id());
+            let w = crate::util::wide(&name);
+            let h = CreateFileW(
+                w.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                CREATE_ALWAYS,
+                0,
+                0,
+            );
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+            let payload = b"hello-ntread-11l";
+            let mut done = 0u32;
+            assert_eq!(
+                WriteFile(
+                    h,
+                    payload.as_ptr() as *const c_void,
+                    payload.len() as u32,
+                    &mut done,
+                    std::ptr::null_mut()
+                ),
+                1
+            );
+            assert_eq!(CloseHandle(h), 1);
+            // Reopen for reading: size, info, Ex, and NtReadFile agree.
+            let h = open_w(&name, GENERIC_READ, OPEN_EXISTING);
+            let mut len = 0u64;
+            assert_eq!(GetFileSizeEx(h, &mut len), 1);
+            assert_eq!(len, payload.len() as u64);
+            let mut info: ByHandleFileInformation = std::mem::zeroed();
+            assert_eq!(GetFileInformationByHandle(h, &mut info), 1);
+            assert_eq!(
+                ((info.size_high as u64) << 32 | info.size_low as u64),
+                payload.len() as u64
+            );
+            assert_eq!(info.number_of_links, 1);
+            let mut basic = [0u8; 40];
+            assert_eq!(
+                GetFileInformationByHandleEx(
+                    h,
+                    0,
+                    basic.as_mut_ptr() as *mut c_void,
+                    basic.len() as u32
+                ),
+                1
+            );
+            let mut standard = [0u8; 24];
+            assert_eq!(
+                GetFileInformationByHandleEx(
+                    h,
+                    1,
+                    standard.as_mut_ptr() as *mut c_void,
+                    standard.len() as u32
+                ),
+                1
+            );
+            let eof = i64::from_le_bytes(standard[8..16].try_into().unwrap());
+            assert_eq!(eof, payload.len() as i64);
+            // Small buffer fails cleanly.
+            let mut tiny = [0u8; 8];
+            assert_eq!(
+                GetFileInformationByHandleEx(
+                    h,
+                    1,
+                    tiny.as_mut_ptr() as *mut c_void,
+                    tiny.len() as u32
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            // NtReadFile from the start matches ReadFile bytes.
+            let mut buf = [0u8; 32];
+            let mut iosb = IoStatusBlock { status: 0xDEAD, _pad: 0, info: 0 };
+            let st = NtReadFile(
+                h,
+                0,
+                0,
+                0,
+                &mut iosb,
+                buf.as_mut_ptr(),
+                payload.len() as u32,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(st, STATUS_SUCCESS);
+            assert_eq!(iosb.status, STATUS_SUCCESS);
+            assert_eq!(iosb.info, payload.len());
+            assert_eq!(&buf[..payload.len()], payload);
+            // Explicit byte offset reads the tail.
+            let off: i64 = 6;
+            let mut tail = [0u8; 32];
+            let mut iosb2 = IoStatusBlock { status: 0xDEAD, _pad: 0, info: 0 };
+            let st = NtReadFile(
+                h,
+                0,
+                0,
+                0,
+                &mut iosb2,
+                tail.as_mut_ptr(),
+                (payload.len() - 6) as u32,
+                &off,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(st, STATUS_SUCCESS);
+            assert_eq!(iosb2.info, payload.len() - 6);
+            assert_eq!(&tail[..payload.len() - 6], &payload[6..]);
+            // Unknown handles fail closed with STATUS_INVALID_HANDLE.
+            let mut iosb3 = IoStatusBlock { status: 0, _pad: 0, info: 0xCAFE };
+            assert_eq!(
+                NtReadFile(
+                    0xDEAD_BEEF,
+                    0,
+                    0,
+                    0,
+                    &mut iosb3,
+                    buf.as_mut_ptr(),
+                    4,
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(CloseHandle(h), 1);
+            assert_eq!(GetFileInformationByHandle(0xDEAD_BEEF, &mut info), 0);
+            // Status mapping covers the SUCCESS + INVALID_HANDLE round-trip.
+            assert_eq!(RtlNtStatusToDosError(STATUS_SUCCESS), ERROR_SUCCESS);
+            assert_eq!(RtlNtStatusToDosError(STATUS_INVALID_HANDLE), 6);
+        }
+    }
+
+    #[test]
+    fn current_directory_and_full_path_cover_console_paths() {
+        unsafe {
+            let _ = ensure_test_vfs();
+            // Console-absolute paths pass through unchanged.
+            for p in ["G:\\data\\hello.txt", "GAME:\\data\\sub\\nested.bin"] {
+                let w = crate::util::wide(p);
+                let mut buf = [0u16; 260];
+                let n = GetFullPathNameW(w.as_ptr(), 260, buf.as_mut_ptr(), std::ptr::null_mut());
+                assert_eq!(n as usize, p.encode_utf16().count(), "{p}");
+                assert_eq!(String::from_utf16_lossy(&buf[..n as usize]), p);
+                // Zero-length query returns the required size including NUL.
+                let need = GetFullPathNameW(w.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut());
+                assert_eq!(need, n + 1);
+                // Small buffers report the required size.
+                let mut tiny = [0u16; 4];
+                assert_eq!(
+                    GetFullPathNameW(w.as_ptr(), 4, tiny.as_mut_ptr(), std::ptr::null_mut()),
+                    need
+                );
+            }
+            // Relative paths resolve against the game root as `G:\<rel>`.
+            let rel = crate::util::wide("data\\hello.txt");
+            let mut buf = [0u16; 260];
+            let n = GetFullPathNameW(rel.as_ptr(), 260, buf.as_mut_ptr(), std::ptr::null_mut());
+            assert!(n > 0);
+            assert_eq!(
+                String::from_utf16_lossy(&buf[..n as usize]),
+                "G:\\data\\hello.txt"
+            );
+            // Current directory answers the game root.
+            let mut cwd = [0u16; 260];
+            let m = GetCurrentDirectoryW(260, cwd.as_mut_ptr());
+            assert!(m > 0);
+            assert!(!String::from_utf16_lossy(&cwd[..m as usize]).is_empty());
+            assert_eq!(GetFullPathNameW(std::ptr::null(), 260, buf.as_mut_ptr(), std::ptr::null_mut()), 0);
         }
     }
 

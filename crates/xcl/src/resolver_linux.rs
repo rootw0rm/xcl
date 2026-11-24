@@ -447,6 +447,13 @@ mod tests {
             ("kernel32.dll", "LoadPackagedLibrary"),
             ("kernel32.dll", "FreeLibrary"),
             ("kernel32.dll", "DisableThreadLibraryCalls"),
+            // Step-11l file reads past stubs (Rust std + CRT through the VFS).
+            ("kernel32.dll", "GetFileInformationByHandle"),
+            ("kernel32.dll", "GetFileInformationByHandleEx"),
+            ("ntdll.dll", "NtReadFile"),
+            ("ntdll.dll", "RtlNtStatusToDosError"),
+            ("kernel32.dll", "GetCurrentDirectoryW"),
+            ("kernel32.dll", "GetFullPathNameW"),
             // Step 11j XMem: heap, graphics UMA pool and physical pages.
             ("kernelx.dll", "XMemAlloc"),
             ("kernelx.dll", "XMemAllocDefault"),
@@ -494,6 +501,10 @@ mod tests {
             ("api-ms-win-crt-heap-l1-1-0.dll", "malloc"),
             ("api-ms-win-crt-environment-l1-1-0.dll", "getenv"),
             ("api-ms-win-crt-stdio-l1-1-0.dll", "setvbuf"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "fopen"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "fread"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "fclose"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "fflush"),
             ("ucrtbase.dll", "memcpy"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);

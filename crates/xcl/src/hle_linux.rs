@@ -452,6 +452,13 @@ mod tests {
             "LoadPackagedLibrary",
             "FreeLibrary",
             "DisableThreadLibraryCalls",
+            // Step-11l file reads past stubs (Rust std + CRT through the VFS).
+            "GetFileInformationByHandle",
+            "GetFileInformationByHandleEx",
+            "NtReadFile",
+            "RtlNtStatusToDosError",
+            "GetCurrentDirectoryW",
+            "GetFullPathNameW",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);
@@ -483,6 +490,11 @@ mod tests {
             "strlen",
             "getenv",
             "setvbuf",
+            "fopen",
+            "fread",
+            "fwrite",
+            "fclose",
+            "fflush",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, UCRT);
