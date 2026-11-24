@@ -78,7 +78,7 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
   containment and that runtime unresolved imports need executable stub thunks, not null IAT
   entries.
 
-## Current state (planner refresh, 2026-11-24, `linux` @ `ed0fd32`)
+## Current state (planner refresh, 2026-11-24, `linux` @ `f3bee90`)
 
 - Steps 1–11 closed (11a–11s HLE slices, CRT forwarding `dd7a3a7` + `c4187df`/`b96aa6e`/
   `cf92746`, report parity `b45ca53`, clippy `ed0fd32`); `cargo test -p xcl --lib` 369/0.

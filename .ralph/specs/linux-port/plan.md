@@ -237,7 +237,7 @@ Windows behavior unchanged.
   import-free synthetic PE must run through TLS attach/callbacks/entry/detach before HLE.
   Runtime unresolved imports use executable stub thunks; metadata address `0` is only a
   classification marker. Step 11 now depends on 10e. Later steps remain provisional.
-- Planner refresh (2026-11-24, `linux` @ `ed0fd32`): steps 1–11 are closed (11a–11s slices +
+- Planner refresh (2026-11-24, `linux` @ `f3bee90`): steps 1–11 are closed (11a–11s slices +
   CRT forwarding `dd7a3a7` and follow-ups `c4187df`/`b96aa6e`/`cf92746`, report parity
   `b45ca53`, clippy fix `ed0fd32`); `cargo test -p xcl --lib` is 369 passed / 0 failed.
   Queue holds 11 open tasks. Step 12 (retail smoke) is SKIPPED on hosts without

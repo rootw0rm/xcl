@@ -685,3 +685,9 @@ entry stack, or C++/`.pdata` unwinding. Those remain in steps 10a/10d and later 
   (`xcl_testtitle: done, failures: 0`) as the crt-copy regression gate.
 - Next: Builder takes `linux:crt-copy` (plan.md step 12a). One commit, synthetic
   verification only.
+
+## Planner refresh (2026-11-24, `linux` @ `f3bee90`, build.start, no game files on host)
+
+- HEAD is `f3bee90` (PROMPT snapshot on top of `141768c`; code identical to `ed0fd32` + upstream `20cf130` sync). Prior refresh lines referencing `ed0fd32` updated to `f3bee90`; no phase flip.
+- Queue: 40 closed, 11 open. `task-1795560125-71aa` (`linux:crt-copy`, plan.md step 12a) is `in_progress` since 23:38Z — the Builder owns it. `code-assist:linux-port:step-12:retail-smoke` is the only `ready --all` item but is SKIPPED here (`/run/media/...` absent); steps 13–21 stay chained behind step-12. Phase D stays blocked until the synthetic title runs to `ExitProcess`.
+- No code changes in this planner pass. Next: Builder continues `linux:crt-copy` (NUL-safe `strcpy`/`strncpy`/`strcat`/`wcs*`/`wmemcpy`/`wmemmove` via ucrtbase HLE, one commit, synthetic verification only).
