@@ -566,6 +566,18 @@ mod tests {
             ("msvcp140.dll", "wcscmp"),
             ("vcruntime140.dll", "strchr"),
             ("concrt140.dll", "memchr"),
+            ("msvcp140.dll", "??2@YAPAXI@Z"),
+            ("vcruntime140.dll", "??2@YAPEAX_K@Z"),
+            ("msvcp140.dll", "??_U@YAPAXI@Z"),
+            ("vcruntime140.dll", "??_U@YAPEAX_K@Z"),
+            ("msvcp140.dll", "??3@YAXPAX@Z"),
+            ("vcruntime140.dll", "??3@YAXPEAX@Z"),
+            ("msvcp140.dll", "??_V@YAXPAX@Z"),
+            ("vcruntime140.dll", "??_V@YAXPEAX@Z"),
+            ("vcruntime140.dll", "??3@YAXPEAX_K@Z"),
+            ("msvcp140.dll", "_callnewh"),
+            ("vcruntime140.dll", "_set_new_handler"),
+            ("concrt140.dll", "_query_new_handler"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
@@ -584,6 +596,19 @@ mod tests {
             let src = *b"ABCDEFGH";
             assert_eq!(memcpy(dst.as_mut_ptr(), src.as_ptr(), 8), dst.as_mut_ptr());
             assert_eq!(&dst, &src);
+        }
+        // The routed operator new/delete is directly callable with the Windows x64 ABI.
+        let (addr, _) = resolve_inner(&dll_key("msvcp140.dll"), &name("??2@YAPEAX_K@Z"), 0);
+        let op_new: unsafe extern "win64" fn(u64) -> *mut u8 = unsafe { std::mem::transmute(addr) };
+        let (addr, _) = resolve_inner(&dll_key("msvcp140.dll"), &name("??3@YAXPEAX@Z"), 0);
+        let op_del: unsafe extern "win64" fn(*mut u8) = unsafe { std::mem::transmute(addr) };
+        unsafe {
+            let p = op_new(32);
+            assert!(!p.is_null());
+            *p = 0xAB;
+            assert_eq!(*p, 0xAB);
+            op_del(p);
+            op_del(std::ptr::null_mut());
         }
         // Even when a bundled file exists on disk, the HLE route wins over GameDll.
         let nonce = std::time::SystemTime::now()

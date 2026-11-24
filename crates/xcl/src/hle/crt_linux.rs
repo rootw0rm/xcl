@@ -353,6 +353,92 @@ pub unsafe extern "win64" fn free(p: *mut c_void) {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// C++ operator new/delete (Phase C step-12c): msvcp140/vcruntime DllMain + game code
+// allocate facets/exceptions through the mangled operators, not plain malloc. A logging
+// stub returning NULL faults on first write, the same class as memcpy->NULL at
+// msvcp140 DllMain+0x2efd. All forms forward to libc malloc/free; throwing forms abort
+// on OOM like `malloc` above (a genuine bad_alloc throw needs EH plumbing, later).
+// ---------------------------------------------------------------------------------------
+
+fn scalar_new_bytes(n: usize) -> *mut c_void {
+    unsafe {
+        let p = libc::malloc(n.max(1)) as *mut c_void;
+        assert!(!p.is_null(), "crt: out of memory");
+        p
+    }
+}
+
+/// `void* operator new(unsigned int)` (`??2@YAPAXI@Z`).
+pub unsafe extern "win64" fn msvc_new_u32(n: u32) -> *mut c_void {
+    scalar_new_bytes(n as usize)
+}
+
+/// `void* operator new(unsigned __int64)` (`??2@YAPEAX_K@Z`, x64 `size_t`).
+pub unsafe extern "win64" fn msvc_new_u64(n: u64) -> *mut c_void {
+    scalar_new_bytes(n as usize)
+}
+
+/// `void* operator new[](unsigned int)` (`??_U@YAPAXI@Z`).
+pub unsafe extern "win64" fn msvc_new_array_u32(n: u32) -> *mut c_void {
+    scalar_new_bytes(n as usize)
+}
+
+/// `void* operator new[](unsigned __int64)` (`??_U@YAPEAX_K@Z`).
+pub unsafe extern "win64" fn msvc_new_array_u64(n: u64) -> *mut c_void {
+    scalar_new_bytes(n as usize)
+}
+
+/// `void operator delete(void*)` (`??3@YAXPAX@Z` + `??3@YAXPEAX@Z`).
+pub unsafe extern "win64" fn msvc_delete(p: *mut c_void) {
+    if !p.is_null() {
+        unsafe { libc::free(p as *mut libc::c_void) };
+    }
+}
+
+/// `void operator delete[](void*)` (`??_V@YAXPAX@Z` + `??_V@YAXPEAX@Z`).
+pub unsafe extern "win64" fn msvc_delete_array(p: *mut c_void) {
+    if !p.is_null() {
+        unsafe { libc::free(p as *mut libc::c_void) };
+    }
+}
+
+/// `void operator delete(void*, unsigned __int64)` (sized delete).
+pub unsafe extern "win64" fn msvc_delete_sized(p: *mut c_void, _n: u64) {
+    if !p.is_null() {
+        unsafe { libc::free(p as *mut libc::c_void) };
+    }
+}
+
+/// `void operator delete[](void*, unsigned __int64)` (sized vector delete).
+pub unsafe extern "win64" fn msvc_delete_array_sized(p: *mut c_void, _n: u64) {
+    if !p.is_null() {
+        unsafe { libc::free(p as *mut libc::c_void) };
+    }
+}
+
+static NEWHANDLER: AtomicUsize = AtomicUsize::new(0);
+
+/// `int _callnewh(size_t)` — invoke the installed new handler; `0` = none/failure.
+pub unsafe extern "win64" fn _callnewh(_n: usize) -> i32 {
+    let h = NEWHANDLER.load(Ordering::Relaxed);
+    if h == 0 {
+        return 0;
+    }
+    let f: unsafe extern "win64" fn(usize) -> i32 = unsafe { std::mem::transmute(h) };
+    unsafe { f(_n) }
+}
+
+/// `_PNH _set_new_handler(_PNH)` — install, return previous (initially NULL).
+pub unsafe extern "win64" fn _set_new_handler(h: usize) -> usize {
+    NEWHANDLER.swap(h, Ordering::Relaxed)
+}
+
+/// `_PNH _query_new_handler(void)` — current handler or NULL.
+pub unsafe extern "win64" fn _query_new_handler() -> usize {
+    NEWHANDLER.load(Ordering::Relaxed)
+}
+
 /// `void* memcpy(dst, src, n)` — returns `dst`.
 pub unsafe extern "win64" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     if n != 0 {
@@ -809,6 +895,19 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("calloc", calloc as usize),
         ("realloc", realloc as usize),
         ("free", free as usize),
+        ("??2@YAPAXI@Z", msvc_new_u32 as usize),
+        ("??2@YAPEAX_K@Z", msvc_new_u64 as usize),
+        ("??_U@YAPAXI@Z", msvc_new_array_u32 as usize),
+        ("??_U@YAPEAX_K@Z", msvc_new_array_u64 as usize),
+        ("??3@YAXPAX@Z", msvc_delete as usize),
+        ("??3@YAXPEAX@Z", msvc_delete as usize),
+        ("??_V@YAXPAX@Z", msvc_delete_array as usize),
+        ("??_V@YAXPEAX@Z", msvc_delete_array as usize),
+        ("??3@YAXPEAX_K@Z", msvc_delete_sized as usize),
+        ("??_V@YAXPEAX_K@Z", msvc_delete_array_sized as usize),
+        ("_callnewh", _callnewh as usize),
+        ("_set_new_handler", _set_new_handler as usize),
+        ("_query_new_handler", _query_new_handler as usize),
         ("memcpy", memcpy as usize),
         ("memmove", memmove as usize),
         ("memcmp", memcmp as usize),
@@ -984,8 +1083,49 @@ mod tests {
     }
 
     #[test]
-    fn string_compare_and_search_match_libc() {
+    fn operator_new_delete_roundtrip_and_handlers() {
         unsafe {
+            // Scalar + vector, 32/64-bit size forms, all backed by the libc heap.
+            let a = msvc_new_u32(32) as *mut u8;
+            assert!(!a.is_null());
+            memset(a, 0x5A, 32);
+            assert_eq!(*a, 0x5A);
+            let b = msvc_new_u64(48) as *mut u8;
+            assert!(!b.is_null());
+            memset(b, 0xA5, 48);
+            assert_eq!(*b.add(47), 0xA5);
+            let c = msvc_new_array_u32(16) as *mut u8;
+            let d = msvc_new_array_u64(16) as *mut u8;
+            assert!(!c.is_null() && !d.is_null());
+            msvc_delete(a as *mut c_void);
+            msvc_delete(b as *mut c_void);
+            msvc_delete_array(c as *mut c_void);
+            msvc_delete_array(d as *mut c_void);
+            // Null deletes are no-ops (C++ delete on nullptr).
+            msvc_delete(std::ptr::null_mut());
+            msvc_delete_array(std::ptr::null_mut());
+            msvc_delete_sized(std::ptr::null_mut(), 8);
+            // Sized delete frees a live block.
+            let e = msvc_new_u64(24) as *mut c_void;
+            msvc_delete_sized(e, 24);
+            let f = msvc_new_array_u64(24) as *mut c_void;
+            msvc_delete_array_sized(f, 24);
+            // New-handler plumbing: none installed -> _callnewh fails closed.
+            assert_eq!(_query_new_handler(), 0);
+            assert_eq!(_callnewh(64), 0);
+            unsafe extern "win64" fn probe(_n: usize) -> i32 {
+                1
+            }
+            assert_eq!(_set_new_handler(probe as usize), 0);
+            assert_eq!(_query_new_handler(), probe as usize);
+            assert_eq!(_callnewh(64), 1);
+            assert_eq!(_set_new_handler(0), probe as usize);
+            assert_eq!(_query_new_handler(), 0);
+        }
+    }
+
+    #[test]
+    fn string_compare_and_search_match_libc() {        unsafe {
             assert_eq!(strcmp(b"abc\0".as_ptr(), b"abc\0".as_ptr()), 0);
             assert!(strcmp(b"abc\0".as_ptr(), b"abd\0".as_ptr()) < 0);
             assert!(strcmp(b"abd\0".as_ptr(), b"abc\0".as_ptr()) > 0);
