@@ -710,7 +710,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
             a.add(&path.display().to_string(), &data);
-            return print(path, "single file", a, top, json, t0, compile);
+            return finish(print(path, "single file", a, top, json, t0, compile), compile);
         }
     };
     if args.iter().any(|a| a == "--precompile") {
@@ -720,7 +720,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
-    print(path, &what, agg, top, json, t0, compile)
+    finish(print(path, &what, agg, top, json, t0, compile), compile)
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
@@ -1015,8 +1015,23 @@ fn compile_samples_maybe(samples: &[(String, String, &'static str)]) -> Option<(
 // LINUX-TODO: Phase D — compile through the in-process SPIR-V backend instead.
 #[cfg(not(windows))]
 fn compile_samples_maybe(_samples: &[(String, String, &'static str)]) -> Option<(usize, Vec<String>)> {
-    eprintln!("xcl shaders --compile: DXC is Windows-only; not supported on Linux yet (Phase D)");
     None
+}
+
+/// Turn the analysis exit code into the command's: `--compile N` needs DXC, which is
+/// Windows-only until Phase D, so a Linux request is reported once and fails.
+#[cfg(not(windows))]
+fn finish(rc: i32, compile: usize) -> i32 {
+    if compile > 0 {
+        eprintln!("xcl shaders --compile: DXC is Windows-only; not supported on Linux yet (Phase D)");
+        return 2;
+    }
+    rc
+}
+
+#[cfg(windows)]
+fn finish(rc: i32, _compile: usize) -> i32 {
+    rc
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1283,6 +1298,21 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    /// `--compile N` needs DXC, which is Windows-only until Phase D: Linux reports it and
+    /// fails instead of pretending the translations were compiled.
+    #[cfg(not(windows))]
+    #[test]
+    fn compile_reports_dxc_is_windows_only() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("xcl-shaders-compile-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cs.dxbc");
+        std::fs::write(&file, sample(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+        let rc = run(&file, &["--compile".to_string(), "1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc, 2);
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
