@@ -3,14 +3,12 @@
 //! next iteration.
 
 use std::collections::BTreeMap;
-#[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(windows)]
 use crate::resolver::{self, Source};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -93,7 +91,6 @@ pub struct Report {
 static CRASH: Mutex<Option<String>> = Mutex::new(None);
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(windows)]
 fn source_label(s: &Source) -> String {
     match s {
         Source::Hle(m) => format!("hle:{m}"),
@@ -104,7 +101,6 @@ fn source_label(s: &Source) -> String {
     }
 }
 
-#[cfg(windows)]
 fn import_stats() -> (BTreeMap<String, usize>, Vec<MissingImport>) {
     let records = resolver::records();
     let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
@@ -122,12 +118,6 @@ fn import_stats() -> (BTreeMap<String, usize>, Vec<MissingImport>) {
     (by_source, stubbed)
 }
 
-#[cfg(not(windows))]
-fn import_stats() -> (BTreeMap<String, usize>, Vec<MissingImport>) {
-    Default::default()
-}
-
-#[cfg(windows)]
 fn called_stubs() -> Vec<StubCall> {
     let mut called: Vec<StubCall> = crate::stubs::all_stubs()
         .into_iter()
@@ -141,11 +131,6 @@ fn called_stubs() -> Vec<StubCall> {
         .collect();
     called.sort_by(|a, b| b.calls.cmp(&a.calls));
     called
-}
-
-#[cfg(not(windows))]
-fn called_stubs() -> Vec<StubCall> {
-    Vec::new()
 }
 
 pub fn build() -> Report {
