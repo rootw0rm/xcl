@@ -171,9 +171,9 @@ fn errno_to_win(errno: i32) -> u32 {
 mod tests {
     use super::*;
     use crate::vfs::{
-        Vfs, CREATE_ALWAYS, CREATE_NEW, ERROR_ACCESS_DENIED, ERROR_FILE_EXISTS,
-        ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, GENERIC_READ,
-        GENERIC_WRITE, OPEN_EXISTING, TRUNCATE_EXISTING,
+        Vfs, CREATE_ALWAYS, CREATE_NEW, ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY,
+        ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND,
+        GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING, TRUNCATE_EXISTING,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -429,6 +429,11 @@ mod tests {
 
         let f = Fixture::new("failed_open_parent");
         let v = &f.vfs;
+        // Non-empty directories cannot be removed (upstream #997): white out the
+        // children first so `remove_dir("data")` publishes the ancestor whiteout.
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        v.delete_file("data\\hello.txt").unwrap();
+        v.delete_file("data\\gone.txt").unwrap();
         v.remove_dir("data").unwrap();
         let overlay_data = f.data.join("overlay").join("data");
         std::fs::create_dir_all(&overlay_data).unwrap();
@@ -440,7 +445,14 @@ mod tests {
         assert_eq!(result.err(), Some(ERROR_ACCESS_DENIED));
         assert!(v.is_whiteout("data"));
         assert!(v.is_whiteout("data\\gone.txt"));
-        assert_eq!(v.redirected_writes(), vec!["data".to_string()]);
+        assert_eq!(
+            v.redirected_writes(),
+            vec![
+                "data".to_string(),
+                "data\\gone.txt".to_string(),
+                "data\\hello.txt".to_string()
+            ]
+        );
         assert!(!overlay_data.join("gone.txt").exists());
     }
 
