@@ -427,6 +427,41 @@ pub unsafe extern "win64" fn GetThreadId(handle: usize) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Process termination: ExitProcess / TerminateProcess (step 11h)
+// ---------------------------------------------------------------------------------------
+//
+// The test title ends with `std::process::exit(failures)`, which calls
+// `kernel32!ExitProcess`. The auto-stub used to return 0, so the guest fell through
+// into the compiler's `ud2` after the call (SIGILL at the shared rust-panic address).
+// These shims never return: they write `report.json` with the title's exit code
+// (the launcher's `summarize` patch only runs on the entry-return path) and end the
+// host process with the same code.
+
+pub unsafe extern "win64" fn ExitProcess(code: u32) -> ! {
+    crate::xlog_info!("ExitProcess({code:#x})");
+    crate::log::flush();
+    // Best-effort DLL/FLS/TLS process-detach would run here on Windows; on Linux the
+    // mapped images stay valid until `_exit`, and taking more locks from inside an
+    // arbitrary guest call risks deadlock, so only the report is written.
+    crate::report::write_final_with_code(None, code as i64);
+    crate::log::flush();
+    std::process::exit(code as i32);
+}
+
+pub unsafe extern "win64" fn TerminateProcess(proc_: usize, code: u32) -> i32 {
+    if proc_ != current_process_handle() {
+        crate::xlog_warn!("TerminateProcess({proc_:#x}): only the current process can be terminated on Linux");
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    crate::xlog_info!("TerminateProcess(current, {code:#x})");
+    crate::log::flush();
+    crate::report::write_final_with_code(None, code as i64);
+    crate::log::flush();
+    std::process::exit(code as i32);
+}
+
 pub unsafe extern "win64" fn CreateThread(
     _attrs: *const c_void,
     stack: usize,
@@ -5794,6 +5829,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetCurrentProcessId", GetCurrentProcessId as usize),
         ("GetCurrentThreadId", GetCurrentThreadId as usize),
         ("GetThreadId", GetThreadId as usize),
+        ("ExitProcess", ExitProcess as usize),
+        ("TerminateProcess", TerminateProcess as usize),
         ("GetThreadPriority", GetThreadPriority as usize),
         ("SetThreadPriority", SetThreadPriority as usize),
         ("GetLastError", GetLastError as usize),
@@ -7139,5 +7176,36 @@ mod tests {
             &mut rec as *mut _,
             ctx.as_mut_ptr()
         ));
+    }
+
+    #[test]
+    fn exit_process_ends_the_child_with_its_code() {
+        // ExitProcess never returns, so it runs in an isolated child.
+        const CHILD: &str = "XCL_KERNELX_EXIT_CHILD";
+        const CODE: u32 = 0x2a;
+        if std::env::var_os(CHILD).is_some() {
+            unsafe { ExitProcess(CODE) };
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("hle::kernelx_linux::tests::exit_process_ends_the_child_with_its_code")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(CODE as i32),
+            "child must exit with the title code: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn terminate_process_rejects_foreign_handles() {
+        unsafe {
+            assert_eq!(TerminateProcess(0x1234_0000, 7), 0);
+            assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
+        }
     }
 }

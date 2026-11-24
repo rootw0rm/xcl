@@ -413,6 +413,9 @@ mod tests {
             "WaitOnAddress",
             "WakeByAddressSingle",
             "WakeByAddressAll",
+            // Step-11h process exit: ExitProcess never returns, TerminateProcess ends self.
+            "ExitProcess",
+            "TerminateProcess",
             // Step-11f SEH search: `.pdata` reader plus Rtl* shims.
             "RtlPcToFileHeader",
             "RtlLookupFunctionEntry",

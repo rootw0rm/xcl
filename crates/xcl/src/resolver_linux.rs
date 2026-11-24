@@ -394,6 +394,8 @@ mod tests {
             ("kernel32.dll", "VirtualAlloc"),
             ("api-ms-win-core-memory-l1-1-0.dll", "VirtualProtect"),
             ("api-ms-win-core-processthreads-l1-1-0.dll", "CreateThread"),
+            ("kernel32.dll", "ExitProcess"),
+            ("kernel32.dll", "TerminateProcess"),
             ("api-ms-win-core-synch-l1-1-0.dll", "WaitForSingleObject"),
             ("api-ms-win-core-synch-l1-1-0.dll", "EnterCriticalSection"),
             ("api-ms-win-core-profile-l1-1-0.dll", "QueryPerformanceCounter"),

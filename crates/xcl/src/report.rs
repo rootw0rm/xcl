@@ -230,6 +230,27 @@ pub fn write_crash(crash: String) {
     }
 }
 
+/// Write `report.json` (host side) with an explicit exit code. `ExitProcess` uses
+/// this: it terminates via `std::process::exit`, so the launcher's post-return
+/// `summarize` patch never runs for that path.
+pub fn write_final_with_code(crash: Option<String>, code: i64) {
+    #[cfg(windows)]
+    crate::hle::kbm::release();
+    let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };
+    if let Some(c) = crash {
+        if let Some(mut g) = lock_within(&CRASH, wait) {
+            g.get_or_insert(c);
+        }
+    }
+    let Some(_g) = lock_within(&WRITE_LOCK, wait) else { return };
+    let Some(boot) = crate::state::boot() else { return };
+    let mut r = build();
+    r.exit_code = Some(code);
+    if let Ok(s) = serde_json::to_string_pretty(&r) {
+        let _ = std::fs::write(boot.report_path(), s);
+    }
+}
+
 /// Write `report.json` (host side). `crash` is remembered for later writes.
 pub fn write_final(crash: Option<String>) {
     // the process ends: a cursor held in the XCL window is let go
