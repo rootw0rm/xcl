@@ -219,6 +219,52 @@ pub unsafe extern "win64" fn VirtualFree(addr: *mut c_void, size: usize, ftype: 
         return 0;
     }
     let base = addr as usize;
+    // Graphics-pool ranges (XMemVirtualAlloc/XMemAlloc/XMemMapPhysicalPages) release
+    // back to the pool; decommit keeps the VA reserved.
+    if gfx_contains(base) {
+        if ftype & MEM_RELEASE != 0 {
+            if size != 0 {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            // Only whole-allocation releases are supported (the title always does
+            // `VirtualFree(base, 0, MEM_RELEASE)`); anything else is a caller bug.
+            if !gfx_free(base) {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            // Dropping a reservation also drops any page mappings inside it.
+            if let Some(st) = away().lock().unwrap().as_mut() {
+                let dead: Vec<usize> = st.at.keys().copied().filter(|&a| gfx_contains(a) && {
+                    // The freed base is gone from `allocs`; any mapping at an address
+                    // no longer inside a live allocation is stale. Recompute via free
+                    // list absence is expensive, so drop mappings at the exact base
+                    // range conservatively: the caller freed whole allocations, and
+                    // physical-page tests free pages before releasing the VA.
+                    a == base
+                }).collect();
+                for a in dead {
+                    if let Some(p) = st.at.remove(&a) {
+                        st.page.remove(&p);
+                    }
+                }
+            }
+            set_error(ERROR_SUCCESS);
+            return 1;
+        }
+        if ftype & MEM_DECOMMIT != 0 {
+            let len = align_up(size, page_size());
+            if base % page_size() != 0 || len == 0 {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            gfx_decommit_at(base, len);
+            set_error(ERROR_SUCCESS);
+            return 1;
+        }
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     if ftype & MEM_RELEASE != 0 {
         if size != 0 {
             set_error(ERROR_INVALID_PARAMETER);
@@ -1822,6 +1868,723 @@ pub unsafe extern "win64" fn XMemSetAllocationHooks(alloc: usize, free: usize) {
         XMEM_ALLOC_HOOK.store(alloc, Ordering::Release);
         XMEM_FREE_HOOK.store(free, Ordering::Release);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// XMem heap + graphics memory + physical pages (Phase C step 11j)
+// ---------------------------------------------------------------------------------------
+//
+// The Windows twin serves heap types from an aligned `HeapAlloc` and graphics types
+// from the sparse-VRAM pool / UMA. Linux has neither `HeapAlloc` alignment nor UMA
+// (`gpu::uma` is `cfg(windows)`), so this slice provides the same title-visible
+// contract with host means:
+//
+// * heap (`memory_type == 0`): `libc` memory, aligned to `1 << alignment`, zeroed.
+//   The raw pointer hides 8 bytes below the aligned block; sizes live in
+//   `XMEM_HEAP_SIZES` so unknown pointers fail cleanly instead of aborting libc.
+// * graphics (`memory_type != 0`): a process-lifetime high-VA pool (one 8 GiB
+//   `mmap` at/above 16 GiB, `PROT_NONE`) with a first-fit free list, 64 KiB grain
+//   (4 MiB when `page_size == 2`), alignment from the attrs, zeroed on commit,
+//   coalescing on free so freed blocks merge and are reused at the same address.
+// * physical pages (64 KiB): `malloc`-backed homes plus page numbers counting
+//   4 KiB frames (as on the console); mapping commits graphics-VA copies and moves
+//   data with the page, unmapping (null pages) copies back home and decommits.
+//   Freed pages keep their last VA contents; the mapping goes.
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+/// `XALLOC_ATTRIBUTES` bit fields (matches the Windows twin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XAllocAttrs {
+    pub object_type: u32,
+    pub page_size: u32,
+    pub allocator_id: u32,
+    pub alignment: u32,
+    pub memory_type: u32,
+}
+
+impl XAllocAttrs {
+    pub fn decode(a: u64) -> Self {
+        XAllocAttrs {
+            object_type: (a & 0x3FFF) as u32,
+            page_size: ((a >> 14) & 0x3) as u32,
+            allocator_id: ((a >> 16) & 0xFF) as u32,
+            alignment: ((a >> 24) & 0x1F) as u32,
+            memory_type: ((a >> 29) & 0xF) as u32,
+        }
+    }
+}
+
+const GFX_GRAIN: usize = 0x1_0000;
+const GFX_POOL: usize = 8 << 30;
+
+struct GfxState {
+    base: usize,
+    size: usize,
+    free: BTreeMap<usize, usize>,
+    /// addr → (size, committed)
+    allocs: BTreeMap<usize, (usize, bool)>,
+}
+
+static GFX: OnceLock<Mutex<GfxState>> = OnceLock::new();
+
+fn gfx_state() -> Option<&'static Mutex<GfxState>> {
+    GFX.get_or_init(|| {
+        // High-VA pool so `addr >> 32 >= 4` holds, as titles require of graphics
+        // memory. `MAP_FIXED_NOREPLACE` probes a few 16 GiB-aligned candidates;
+        // the pool is `PROT_NONE` until sub-ranges commit.
+        const MAP_FIXED_NOREPLACE: libc::c_int = 0x10_0000;
+        let mut base = 0usize;
+        for cand in [0x10_0000_0000usize, 0x20_0000_0000, 0x30_0000_0000, 0x40_0000_0000] {
+            let p = unsafe {
+                libc::mmap(
+                    cand as *mut c_void,
+                    GFX_POOL,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                base = p as usize;
+                break;
+            }
+        }
+        if base == 0 {
+            // Last resort: anywhere (low addresses fail the title's high-VA check,
+            // but allocation still works and the failure is visible, not a null).
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    GFX_POOL,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                crate::xlog_warn!("XMem: graphics pool mmap failed; graphics allocations fall back to plain memory");
+                return Mutex::new(GfxState {
+                    base: 0,
+                    size: 0,
+                    free: BTreeMap::new(),
+                    allocs: BTreeMap::new(),
+                });
+            }
+            base = p as usize;
+            crate::xlog_warn!("XMem: graphics pool at low {base:#x}; high-VA checks will fail");
+        }
+        let mut free = BTreeMap::new();
+        free.insert(base, GFX_POOL);
+        Mutex::new(GfxState {
+            base,
+            size: GFX_POOL,
+            free,
+            allocs: BTreeMap::new(),
+        })
+    });
+    let g = GFX.get().unwrap().lock().unwrap();
+    if g.base == 0 {
+        drop(g);
+        return None;
+    }
+    drop(g);
+    Some(GFX.get().unwrap())
+}
+
+fn gfx_contains(addr: usize) -> bool {
+    GFX.get().is_some_and(|m| {
+        let g = m.lock().unwrap();
+        g.base != 0 && addr >= g.base && addr < g.base + g.size
+    })
+}
+
+/// First-fit `size` bytes at `align` inside the graphics pool. Committed ranges are
+/// `mprotect`ed `READWRITE` and zeroed; reserved ranges stay `PROT_NONE`.
+fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
+    let m = gfx_state()?;
+    let mut g = m.lock().unwrap();
+    let align = align.max(GFX_GRAIN).next_power_of_two();
+    let size = size.max(1).div_ceil(GFX_GRAIN) * GFX_GRAIN;
+    let mut pick: Option<(usize, usize, usize)> = None; // (free_base, free_len, aligned_at)
+    for (&b, &n) in g.free.iter() {
+        let at = b.next_multiple_of(align);
+        let pad = at - b;
+        if n >= pad + size {
+            pick = Some((b, n, at));
+            break;
+        }
+    }
+    let (b, n, at) = pick?;
+    g.free.remove(&b);
+    let pad = at - b;
+    if pad > 0 {
+        g.free.insert(b, pad);
+    }
+    let tail = n - pad - size;
+    if tail > 0 {
+        g.free.insert(at + size, tail);
+    }
+    g.allocs.insert(at, (size, commit));
+    drop(g);
+    if commit {
+        let m = gfx_state()?;
+        let _ = m; // lock ordering: mprotect outside the table lock
+        if unsafe { libc::mprotect(at as *mut c_void, size, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+            let m = gfx_state().unwrap();
+            let mut g = m.lock().unwrap();
+            g.allocs.remove(&at);
+            g.free.insert(at, size);
+            // coalesce with neighbours
+            let mut cur = at;
+            let mut len = size;
+            if let Some((&pb, &pn)) = g.free.range(..cur).next_back() {
+                if pb + pn == cur {
+                    g.free.remove(&pb);
+                    cur = pb;
+                    len += pn;
+                }
+            }
+            if let Some(&nn) = g.free.get(&(cur + len)) {
+                g.free.remove(&(cur + len));
+                len += nn;
+            }
+            g.free.insert(cur, len);
+            return None;
+        }
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0, size) };
+    }
+    Some(at)
+}
+
+fn gfx_coalesce_locked(g: &mut GfxState, mut base: usize, mut len: usize) {
+    if let Some((&pb, &pn)) = g.free.range(..base).next_back() {
+        if pb + pn == base {
+            g.free.remove(&pb);
+            base = pb;
+            len += pn;
+        }
+    }
+    if let Some(&nn) = g.free.get(&(base + len)) {
+        g.free.remove(&(base + len));
+        len += nn;
+    }
+    g.free.insert(base, len);
+}
+
+/// Release a graphics allocation back to the pool (decommitted, reusable).
+fn gfx_free(addr: usize) -> bool {
+    let Some(m) = gfx_state() else { return false };
+    let mut g = m.lock().unwrap();
+    let Some((size, _)) = g.allocs.remove(&addr) else { return false };
+    let (size, addr) = (size, addr);
+    drop(g);
+    unsafe {
+        libc::mprotect(addr as *mut c_void, size, libc::PROT_NONE);
+        libc::madvise(addr as *mut c_void, size, libc::MADV_DONTNEED);
+    }
+    let Some(m) = gfx_state() else { return false };
+    let mut g = m.lock().unwrap();
+    gfx_coalesce_locked(&mut g, addr, size);
+    true
+}
+
+/// Commit `len` bytes at `at` inside an existing graphics allocation (no zeroing;
+// the caller copies data or zeroes explicitly).
+fn gfx_commit_at(at: usize, len: usize) -> bool {
+    if unsafe { libc::mprotect(at as *mut c_void, len, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+        return false;
+    }
+    // Mark the whole allocation committed when it lies inside one.
+    if let Some(m) = GFX.get() {
+        let mut g = m.lock().unwrap();
+        if let Some((&b, &mut (n, ref mut c))) = g.allocs.range_mut(..=at).next_back() {
+            if at + len <= b + n {
+                *c = true;
+            }
+        }
+    }
+    true
+}
+
+fn gfx_decommit_at(at: usize, len: usize) {
+    unsafe {
+        libc::madvise(at as *mut c_void, len, libc::MADV_DONTNEED);
+        libc::mprotect(at as *mut c_void, len, libc::PROT_NONE);
+    }
+}
+
+static XMEM_HEAP_SIZES: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+fn xmem_heap_sizes() -> &'static Mutex<HashMap<usize, usize>> {
+    XMEM_HEAP_SIZES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe fn xmem_heap_alloc(size: usize, align: usize) -> *mut c_void {
+    let align = align.max(16).next_power_of_two();
+    let Some(total) = size.max(1).checked_add(align).and_then(|n| n.checked_add(16)) else {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    };
+    let raw = libc::malloc(total) as usize;
+    if raw == 0 {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    }
+    let aligned = (raw + 16 + align - 1) & !(align - 1);
+    *((aligned - 8) as *mut usize) = raw;
+    unsafe { std::ptr::write_bytes(aligned as *mut u8, 0, size) };
+    xmem_heap_sizes().lock().unwrap().insert(aligned, size);
+    set_error(ERROR_SUCCESS);
+    aligned as *mut c_void
+}
+
+unsafe fn xmem_heap_free(p: *mut c_void) {
+    if p.is_null() {
+        return;
+    }
+    if xmem_heap_sizes().lock().unwrap().remove(&(p as usize)).is_none() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return;
+    }
+    let raw = *((p as usize - 8) as *const usize);
+    libc::free(raw as *mut libc::c_void);
+    set_error(ERROR_SUCCESS);
+}
+
+/// Rounded size + alignment for a graphics allocation honoring `page_size`
+/// (`2` = 4 MiB pages, otherwise the 64 KiB grain) and `alignment`.
+fn xmem_graphics_layout(size: usize, a: XAllocAttrs) -> Option<(usize, usize)> {
+    let page_grain = if a.page_size == 2 { 4 << 20 } else { GFX_GRAIN };
+    let align = (1usize << a.alignment.min(usize::BITS - 2)).max(page_grain);
+    let rounded = size.max(1).div_ceil(page_grain) * page_grain;
+    Some((rounded, align))
+}
+
+pub unsafe extern "win64" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut c_void {
+    let a = XAllocAttrs::decode(attrs);
+    if a.memory_type == 0 {
+        return xmem_heap_alloc(size, 1usize << a.alignment.clamp(4, usize::BITS - 2));
+    }
+    let Some((rounded, align)) = xmem_graphics_layout(size, a) else {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    };
+    match gfx_alloc(rounded, align, true) {
+        Some(at) => {
+            set_error(ERROR_SUCCESS);
+            at as *mut c_void
+        }
+        None => {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+pub unsafe extern "win64" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
+    if p.is_null() {
+        return;
+    }
+    if XAllocAttrs::decode(attrs).memory_type == 0 {
+        xmem_heap_free(p);
+    } else if !gfx_free(p as usize) {
+        set_error(ERROR_INVALID_PARAMETER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+}
+
+type XMemAllocFn = unsafe extern "win64" fn(usize, u64) -> *mut c_void;
+type XMemFreeFn = unsafe extern "win64" fn(*mut c_void, u64);
+
+pub unsafe extern "win64" fn XMemAlloc(size: usize, attrs: u64) -> *mut c_void {
+    match XMEM_ALLOC_HOOK.load(Ordering::Acquire) {
+        0 => XMemAllocDefault(size, attrs),
+        f => {
+            let g: XMemAllocFn = std::mem::transmute(f);
+            g(size, attrs)
+        }
+    }
+}
+
+pub unsafe extern "win64" fn XMemFree(p: *mut c_void, attrs: u64) {
+    match XMEM_FREE_HOOK.load(Ordering::Acquire) {
+        0 => XMemFreeDefault(p, attrs),
+        f => {
+            let g: XMemFreeFn = std::mem::transmute(f);
+            g(p, attrs)
+        }
+    }
+}
+
+/// `void* XMemVirtualAlloc(void*, SIZE_T, DWORD, XALLOC_ATTRIBUTES, DWORD)`:
+/// graphics types come from the high-VA pool (reserve or commit), everything else
+/// from the plain `VirtualAlloc` path.
+pub unsafe extern "win64" fn XMemVirtualAlloc(
+    addr: *const c_void,
+    size: usize,
+    t: u32,
+    attrs: u64,
+    p: u32,
+) -> *mut c_void {
+    const MEM_GRAPHICS: u32 = 0x1000_0000;
+    let a = XAllocAttrs::decode(attrs);
+    if a.memory_type == 0 {
+        return VirtualAlloc(addr, size, t, p);
+    }
+    let mut t = t | MEM_GRAPHICS;
+    if a.memory_type != 0 && a.page_size == 2 {
+        t |= 0x8000_0000;
+    }
+    let page_grain = if a.page_size == 2 { 4 << 20 } else { GFX_GRAIN };
+    let align = (1usize << a.alignment.min(usize::BITS - 2)).max(page_grain);
+    if !addr.is_null() {
+        // Fixed-address commit inside a graphics reservation (physical-page maps take
+        // this path through `VirtualAlloc`-equivalent semantics on the pool).
+        let base = addr as usize;
+        if base % GFX_GRAIN != 0 || size == 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+        if !gfx_contains(base) || !gfx_contains(base + size - 1) {
+            set_error(ERROR_INVALID_ADDRESS);
+            return std::ptr::null_mut();
+        }
+        if t & MEM_COMMIT != 0 {
+            if !gfx_commit_at(base, size.div_ceil(GFX_GRAIN) * GFX_GRAIN) {
+                set_error(ERROR_INVALID_ADDRESS);
+                return std::ptr::null_mut();
+            }
+            unsafe { std::ptr::write_bytes(base as *mut u8, 0, size.div_ceil(GFX_GRAIN) * GFX_GRAIN) };
+        }
+        set_error(ERROR_SUCCESS);
+        return base as *mut c_void;
+    }
+    let commit = t & MEM_COMMIT != 0;
+    let reserve_only = !commit && t & MEM_RESERVE != 0;
+    let rounded = size.max(1).div_ceil(page_grain) * page_grain;
+    // A bare reserve (no commit) still needs 64 KiB granularity for the page maps.
+    let rounded = if reserve_only { size.max(1).div_ceil(GFX_GRAIN) * GFX_GRAIN } else { rounded };
+    match gfx_alloc(rounded, align, commit) {
+        Some(at) => {
+            set_error(ERROR_SUCCESS);
+            at as *mut c_void
+        }
+        None => {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// --- Physical pages (64 KiB) ---
+
+const PHYS_PAGE: usize = 0x1_0000;
+/// A page number counts 4 KiB frames, as on the console (64 KiB = 16 frames).
+const FRAMES: usize = PHYS_PAGE >> 12;
+
+fn page_number(index: usize) -> usize {
+    (index + 1) * FRAMES
+}
+
+fn page_index(page: usize) -> Option<usize> {
+    page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
+}
+
+/// first page index → (pages in the block, pages still allocated, home base)
+static PHYS_BLOCKS: OnceLock<Mutex<BTreeMap<usize, (usize, usize, usize)>>> = OnceLock::new();
+
+fn phys_blocks() -> &'static Mutex<BTreeMap<usize, (usize, usize, usize)>> {
+    PHYS_BLOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+static NEXT_PAGE_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+/// Addresses holding a page away from home: address → page, and page → address.
+#[derive(Default)]
+struct Away {
+    at: BTreeMap<usize, usize>,
+    page: HashMap<usize, usize>,
+}
+
+static AWAY: OnceLock<Mutex<Option<Away>>> = OnceLock::new();
+
+fn away() -> &'static Mutex<Option<Away>> {
+    AWAY.get_or_init(|| Mutex::new(None))
+}
+
+fn page_home(page: usize) -> Option<usize> {
+    let index = page_index(page)?;
+    let blocks = phys_blocks().lock().ok()?;
+    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
+    (live > 0 && index < first.checked_add(count)?)
+        .then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?))
+        .flatten()
+}
+
+/// Copy home → `dst` for a live page (homes are always committed `malloc` memory).
+unsafe fn copy_home_to(page: usize, dst: usize) -> bool {
+    let Some(home) = page_home(page) else { return false };
+    unsafe { std::ptr::copy_nonoverlapping(home as *const u8, dst as *mut u8, PHYS_PAGE) };
+    true
+}
+
+/// Map `n` pages at `base` (`arr` null unmaps). Returns `base` on success, null on failure.
+unsafe fn map_pages(base: usize, n: usize, pages: Option<Vec<usize>>) -> *mut c_void {
+    if n == 0 || (base == 0 && pages.is_none()) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    if base % PHYS_PAGE != 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let pages: Vec<usize> = match pages {
+        Some(v) => v,
+        None => vec![0; n],
+    };
+    if pages.len() < n {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    if pages.iter().any(|&p| p != 0 && page_home(p).is_none()) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    // Every target page must be inside the graphics pool when an address is given.
+    if base != 0 {
+        for i in 0..n {
+            if !gfx_contains(base + i * PHYS_PAGE) {
+                set_error(ERROR_INVALID_ADDRESS);
+                return std::ptr::null_mut();
+            }
+        }
+    }
+    let mut g = away().lock().unwrap();
+    let st = g.get_or_insert_with(Away::default);
+    for (i, &p) in pages.iter().enumerate().take(n) {
+        let at = base + i * PHYS_PAGE;
+        // Whatever was mapped at `at` goes first: its data belongs home again.
+        if let Some(old) = st.at.remove(&at) {
+            st.page.remove(&old);
+            if let Some(home) = page_home(old) {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE)
+                };
+            }
+            gfx_decommit_at(at, PHYS_PAGE);
+        }
+        if p == 0 {
+            continue;
+        }
+        // A page mapped elsewhere moves: old VA → new VA, old VA given up.
+        if let Some(&old) = st.page.get(&p) {
+            if old != at {
+                if !gfx_commit_at(at, PHYS_PAGE) {
+                    set_error(ERROR_INVALID_ADDRESS);
+                    return std::ptr::null_mut();
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE)
+                };
+                gfx_decommit_at(old, PHYS_PAGE);
+                st.at.remove(&old);
+                st.at.insert(at, p);
+                st.page.insert(p, at);
+                continue;
+            } else {
+                continue;
+            }
+        }
+        if !gfx_commit_at(at, PHYS_PAGE) {
+            set_error(ERROR_INVALID_ADDRESS);
+            return std::ptr::null_mut();
+        }
+        if !copy_home_to(p, at) {
+            gfx_decommit_at(at, PHYS_PAGE);
+            set_error(ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+        st.at.insert(at, p);
+        st.page.insert(p, at);
+    }
+    set_error(ERROR_SUCCESS);
+    base as *mut c_void
+}
+
+pub unsafe extern "win64" fn AllocateTitlePhysicalPages(
+    _proc: usize,
+    _t: u32,
+    num: *mut usize,
+    arr: *mut usize,
+) -> i32 {
+    if num.is_null() || arr.is_null() || unsafe { *num } == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = unsafe { *num };
+    let Some(bytes) = n.checked_mul(PHYS_PAGE) else {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    };
+    let home = unsafe { libc::calloc(1, bytes) } as usize;
+    if home == 0 {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    let first = NEXT_PAGE_INDEX.fetch_add(n, Ordering::Relaxed);
+    for i in 0..n {
+        unsafe { *arr.add(i) = page_number(first + i) };
+    }
+    phys_blocks().lock().unwrap().insert(first, (n, n, home));
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+pub unsafe extern "win64" fn FreeTitlePhysicalPages(_proc: usize, n: usize, arr: *mut usize) -> i32 {
+    if arr.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // Freed pages mapped elsewhere keep their VA contents; only the mapping goes.
+    if let Some(st) = away().lock().unwrap().as_mut() {
+        for i in 0..n {
+            let p = unsafe { *arr.add(i) };
+            if let Some(at) = st.page.remove(&p) {
+                st.at.remove(&at);
+            }
+        }
+    }
+    let mut blocks = phys_blocks().lock().unwrap();
+    for i in 0..n {
+        let p = unsafe { *arr.add(i) };
+        let Some(index) = page_index(p) else { continue };
+        let Some((&first, &(count, _, home))) = blocks.range(..=index).next_back() else { continue };
+        if index >= first + count {
+            continue;
+        }
+        let e = blocks.get_mut(&first).unwrap();
+        e.1 = e.1.saturating_sub(1);
+        if e.1 == 0 {
+            blocks.remove(&first);
+            unsafe { libc::free(home as *mut libc::c_void) };
+        }
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+pub unsafe extern "win64" fn MapTitlePhysicalPages(
+    va: *mut c_void,
+    n: usize,
+    _t: u32,
+    _p: u32,
+    arr: *mut usize,
+) -> *mut c_void {
+    if va.is_null() {
+        // No address chosen: fresh graphics memory holding the pages' homes.
+        if arr.is_null() || n == 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+        let pages: Vec<usize> = unsafe { (0..n).map(|i| *arr.add(i)).collect() };
+        if pages.iter().any(|&p| p != 0 && page_home(p).is_none()) {
+            set_error(ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+        let bytes = n * PHYS_PAGE;
+        let Some(at) = gfx_alloc(bytes, GFX_GRAIN, true) else {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            return std::ptr::null_mut();
+        };
+        let mut g = away().lock().unwrap();
+        let st = g.get_or_insert_with(Away::default);
+        for (i, &p) in pages.iter().enumerate() {
+            if p == 0 {
+                continue;
+            }
+            // A page mapped elsewhere moves without touching home.
+            if let Some(&old) = st.page.get(&p) {
+                let dst = at + i * PHYS_PAGE;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(old as *const u8, dst as *mut u8, PHYS_PAGE)
+                };
+                gfx_decommit_at(old, PHYS_PAGE);
+                st.at.remove(&old);
+                st.at.insert(dst, p);
+                st.page.insert(p, dst);
+                continue;
+            }
+            if !copy_home_to(p, at + i * PHYS_PAGE) {
+                // Roll back this mapping; the VA stays allocated (released below).
+                for (j, &q) in pages.iter().enumerate().take(i) {
+                    if q != 0 {
+                        if let Some(a) = st.page.remove(&q) {
+                            st.at.remove(&a);
+                        }
+                    }
+                }
+                gfx_free(at);
+                set_error(ERROR_INVALID_PARAMETER);
+                return std::ptr::null_mut();
+            }
+            st.at.insert(at + i * PHYS_PAGE, p);
+            st.page.insert(p, at + i * PHYS_PAGE);
+        }
+        set_error(ERROR_SUCCESS);
+        return at as *mut c_void;
+    }
+    let base = va as usize;
+    let pages = if arr.is_null() { None } else { Some(unsafe { (0..n).map(|i| *arr.add(i)).collect() }) };
+    map_pages(base, n, pages)
+}
+
+/// `BOOL XMemAllocatePhysicalPages(XALLOC_ATTRIBUTES, SIZE_T*, ULONG64*)`.
+pub unsafe extern "win64" fn XMemAllocatePhysicalPages(
+    _attrs: u64,
+    num: *mut usize,
+    arr: *mut u64,
+) -> i32 {
+    AllocateTitlePhysicalPages(0, 0, num, arr as *mut usize)
+}
+
+/// `void* XMemMapPhysicalPages(void*, SIZE_T, ULONG64*)`.
+pub unsafe extern "win64" fn XMemMapPhysicalPages(
+    va: *mut c_void,
+    n: usize,
+    arr: *mut u64,
+) -> *mut c_void {
+    MapTitlePhysicalPages(va, n, 0, 0, arr as *mut usize)
+}
+
+/// `BOOL XMemMapPhysicalPagesScatter(void**, SIZE_T, ULONG64*)`: one page per address.
+pub unsafe extern "win64" fn XMemMapPhysicalPagesScatter(
+    addresses: *const *mut c_void,
+    n: usize,
+    pages: *mut u64,
+) -> i32 {
+    if addresses.is_null() || pages.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    for i in 0..n {
+        let at = unsafe { *addresses.add(i) } as usize;
+        let p = unsafe { *(pages.add(i) as *mut usize) };
+        let one = vec![p];
+        if map_pages(at, 1, Some(one)).is_null() {
+            return 0;
+        }
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `BOOL XMemFreePhysicalPages(SIZE_T, ULONG64*)`.
+pub unsafe extern "win64" fn XMemFreePhysicalPages(n: usize, arr: *mut u64) -> i32 {
+    FreeTitlePhysicalPages(0, n, arr as *mut usize)
 }
 
 pub unsafe extern "win64" fn OutputDebugStringA(s: *const u8) {
@@ -5789,8 +6552,20 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("VirtualFreeEx", VirtualFreeEx as usize),
         ("VirtualProtect", VirtualProtect as usize),
         ("VirtualProtectEx", VirtualProtectEx as usize),
+        ("XMemAlloc", XMemAlloc as usize),
+        ("XMemFree", XMemFree as usize),
+        ("XMemAllocDefault", XMemAllocDefault as usize),
+        ("XMemFreeDefault", XMemFreeDefault as usize),
         ("XMemSetAllocationHooks", XMemSetAllocationHooks as usize),
+        ("XMemVirtualAlloc", XMemVirtualAlloc as usize),
         ("XMemVirtualQuery", XMemVirtualQuery as usize),
+        ("XMemAllocatePhysicalPages", XMemAllocatePhysicalPages as usize),
+        ("XMemMapPhysicalPages", XMemMapPhysicalPages as usize),
+        ("XMemMapPhysicalPagesScatter", XMemMapPhysicalPagesScatter as usize),
+        ("XMemFreePhysicalPages", XMemFreePhysicalPages as usize),
+        ("AllocateTitlePhysicalPages", AllocateTitlePhysicalPages as usize),
+        ("FreeTitlePhysicalPages", FreeTitlePhysicalPages as usize),
+        ("MapTitlePhysicalPages", MapTitlePhysicalPages as usize),
         ("XMemGetWorkingSetStatistics", XMemGetWorkingSetStatistics as usize),
         ("XMemTransferMemory", XMemTransferMemory as usize),
         ("TitleMemoryStatus", TitleMemoryStatus as usize),
@@ -7206,6 +7981,101 @@ mod tests {
         unsafe {
             assert_eq!(TerminateProcess(0x1234_0000, 7), 0);
             assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn xmem_heap_graphics_and_physical_pages_behave() {
+        // Mirrors the test-title checks: heap alignment + zeroing, graphics high-VA
+        // with merge-reuse, XMemVirtualAlloc reserve/commit, and physical-page
+        // map/move/unmap roundtrips. One test (no parallelism inside the XMem
+        // slice) so the pool's first-fit addresses are deterministic.
+        unsafe {
+            // Heap: 256-byte alignment, zeroed.
+            let attrs = 8u64 << 24;
+            let p = XMemAlloc(1000, attrs);
+            assert!(!p.is_null());
+            assert_eq!(p as usize % 256, 0);
+            assert!(std::slice::from_raw_parts(p as *const u8, 1000).iter().all(|&b| b == 0));
+            XMemFree(p, attrs);
+
+            // Graphics: high-VA, 64 KiB aligned, contiguous, reusable.
+            let g_attrs = 1u64 << 29;
+            let a = XMemAlloc(0x20000, g_attrs);
+            let b = XMemAlloc(0x10000, g_attrs);
+            assert!(!a.is_null() && !b.is_null());
+            assert!((a as usize) >> 32 >= 4 && (b as usize) >> 32 >= 4);
+            assert_eq!((a as usize) & 0xFFFF, 0);
+            assert_eq!(b as usize, a as usize + 0x20000);
+            *(b as *mut u64) = 0x1122_3344;
+            assert_eq!(*(b as *const u64), 0x1122_3344);
+            XMemFree(b, g_attrs);
+            XMemFree(a, g_attrs);
+            let c = XMemAlloc(0x30000, g_attrs);
+            assert_eq!(c, a);
+            assert!(std::slice::from_raw_parts(c as *const u8, 0x30000).iter().all(|&x| x == 0));
+            XMemFree(c, g_attrs);
+            // 4 MiB pages: 4 MiB aligned + zeroed.
+            let big = XMemAlloc(0x1000, (1u64 << 29) | (2u64 << 14));
+            assert!(!big.is_null() && big as usize % (4 << 20) == 0);
+            assert_eq!(*(big as *const u64), 0);
+            XMemFree(big, (1u64 << 29) | (2u64 << 14));
+
+            // XMemVirtualAlloc: graphics commits high, plain commits low, both free.
+            let (commit, rw) = (0x3000u32, 4u32);
+            let g = XMemVirtualAlloc(std::ptr::null(), 0x1_0000, commit, 1u64 << 29, rw);
+            let q = XMemVirtualAlloc(std::ptr::null(), 0x1_0000, commit, 0, rw);
+            assert!(!g.is_null() && !q.is_null());
+            assert!((g as usize) >> 32 >= 4);
+            *(g as *mut u32) = 7;
+            *(q as *mut u32) = 7;
+            assert_eq!(VirtualFree(g, 0, 0x8000), 1);
+            assert_eq!(VirtualFree(q, 0, 0x8000), 1);
+
+            // Physical pages: allocate 4, map fresh, write second page, free.
+            let page = 0x1_0000usize;
+            let (mut n, mut pages) = (4usize, [0u64; 4]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            assert_eq!(n, 4);
+            let mp = XMemMapPhysicalPages(std::ptr::null_mut(), 4, pages.as_mut_ptr()) as *mut u32;
+            assert!(!mp.is_null() && mp as usize >> 32 >= 4);
+            *mp.add(page / 4) = 7;
+            assert_eq!(XMemFreePhysicalPages(4, pages.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(mp as *mut c_void, 0, 0x8000), 1);
+
+            // Reserved VA keeps page contents across move/unmap/remap.
+            let va = XMemVirtualAlloc(std::ptr::null(), 4 * page, 0x2000, 1u64 << 29, rw) as usize;
+            assert_ne!(va, 0);
+            assert_eq!(va % page, 0);
+            let (mut m, mut pp) = (2usize, [0u64; 2]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut m, pp.as_mut_ptr()), 1);
+            let mut ba = [pp[1], pp[0]];
+            assert_eq!(
+                XMemMapPhysicalPages((va + page) as *mut c_void, 2, ba.as_mut_ptr() as *mut u64)
+                    as usize,
+                va + page
+            );
+            *((va + page) as *mut u32) = 0xB;
+            *((va + 2 * page) as *mut u32) = 0xA;
+            let mut one = [pp[0]];
+            assert_eq!(
+                XMemMapPhysicalPages(va as *mut c_void, 1, one.as_mut_ptr() as *mut u64) as usize,
+                va
+            );
+            assert_eq!(*(va as *const u32), 0xA);
+            assert_eq!(
+                XMemMapPhysicalPages(va as *mut c_void, 1, std::ptr::null_mut()) as usize,
+                va
+            );
+            assert_eq!(
+                XMemMapPhysicalPages((va + 3 * page) as *mut c_void, 1, one.as_mut_ptr() as *mut u64)
+                    as usize,
+                va + 3 * page
+            );
+            assert_eq!(*((va + 3 * page) as *const u32), 0xA);
+            assert_eq!(*((va + page) as *const u32), 0xB);
+            assert_eq!(XMemFreePhysicalPages(2, pp.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(va as *mut c_void, 0, 0x8000), 1);
         }
     }
 }

@@ -374,7 +374,6 @@ mod tests {
         // they are covered by `kernelx_core_imports_resolve_to_hle` instead.
         for (dll, sym) in [
             ("kernel32.dll", "LoadLibraryW"),
-            ("kernelx.dll", "XMemAlloc"),
             ("d3d12_xs.dll", "D3D12XboxCreateDevice"),
             ("xaudio2_9.dll", "XAudio2Create"),
         ] {
@@ -441,6 +440,15 @@ mod tests {
             ("kernel32.dll", "RtlCaptureContext"),
             ("kernel32.dll", "RtlUnwindEx"),
             ("kernel32.dll", "RtlRestoreContext"),
+            // Step 11j XMem: heap, graphics UMA pool and physical pages.
+            ("kernelx.dll", "XMemAlloc"),
+            ("kernelx.dll", "XMemAllocDefault"),
+            ("kernelx.dll", "XMemFree"),
+            ("kernelx.dll", "XMemVirtualAlloc"),
+            ("kernelx.dll", "XMemAllocatePhysicalPages"),
+            ("kernelx.dll", "XMemMapPhysicalPages"),
+            ("kernelx.dll", "XMemFreePhysicalPages"),
+            ("xmem.dll", "XMemAllocatePhysicalPages"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
@@ -577,11 +585,13 @@ mod tests {
     fn load_library_and_get_proc_address_contract() {
         let h = load_library("kernelx.dll").expect("HLE pseudo handle");
         assert!(modules::hle_name_by_handle(h).is_some());
-        // HLE exports are Stub metadata: GetProcAddress returns None (no stub synthesis).
-        assert_eq!(get_proc_address(h, &name("XMemAlloc")), None);
+        // HLE exports that stay Stub metadata: GetProcAddress returns None (no stub synthesis).
+        assert_eq!(get_proc_address(h, &name("LoadLibraryW")), None);
         // Implemented HLE bodies resolve to callable addresses through the same path.
         let va = get_proc_address(h, &name("VirtualAlloc")).expect("VirtualAlloc HLE");
         assert!(stubs::info_of_stub(va).is_none());
+        let xa = get_proc_address(h, &name("XMemAlloc")).expect("XMemAlloc HLE");
+        assert!(stubs::info_of_stub(xa).is_none());
         // Unknown handles have no lookup.
         assert_eq!(get_proc_address(0x1234_5000, &name("XMemAlloc")), None);
         // Stub routes still hand out a pseudo handle.

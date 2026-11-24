@@ -428,6 +428,14 @@ mod tests {
             // Step-11h process exit: ExitProcess never returns, TerminateProcess ends self.
             "ExitProcess",
             "TerminateProcess",
+            // Step-11j XMem: heap, graphics UMA pool and physical pages.
+            "XMemAlloc",
+            "XMemAllocDefault",
+            "XMemFree",
+            "XMemVirtualAlloc",
+            "XMemAllocatePhysicalPages",
+            "XMemMapPhysicalPages",
+            "XMemFreePhysicalPages",
             // Step-11f SEH search: `.pdata` reader plus Rtl* shims.
             "RtlPcToFileHeader",
             "RtlLookupFunctionEntry",
@@ -442,7 +450,7 @@ mod tests {
             assert_ne!(addr, 0, "{name} must be implemented");
         }
         // Steps 10d stay stubs here (names present in the Windows export list).
-        for name in ["LoadLibraryW", "XMemAlloc"] {
+        for name in ["LoadLibraryW"] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);
             assert_eq!(addr, 0, "{name} stays Stub until its slice lands");
