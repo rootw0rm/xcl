@@ -476,6 +476,8 @@ pub unsafe extern "win64" fn CreateThread(
         }
         let f: ThreadStart = std::mem::transmute(start);
         let code = f(param_usize as *mut c_void);
+        // Run FLS callbacks for dying values before the static-TLS blocks go away.
+        fls_thread_exit();
         crate::tls::detach_current_thread();
         code
     });
@@ -2114,6 +2116,27 @@ pub unsafe extern "win64" fn ReadFile(
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    // Console stdin: the pseudo handle from `GetStdHandle(STD_INPUT_HANDLE)` reads fd 0.
+    if handle == std_handle_value(STD_INPUT_HANDLE) {
+        if n == 0 {
+            if !done.is_null() {
+                *done = 0;
+            }
+            set_error(ERROR_SUCCESS);
+            return 1;
+        }
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, n as usize) };
+        let r = unsafe { libc::read(0, slice.as_mut_ptr() as *mut c_void, slice.len()) };
+        if r < 0 {
+            set_error(std::io::Error::last_os_error().raw_os_error().unwrap_or(5) as u32);
+            return 0;
+        }
+        if !done.is_null() {
+            *done = r as u32;
+        }
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
     let arc = files().lock().unwrap().get(&handle).cloned();
     let Some(arc) = arc else {
         set_error(ERROR_INVALID_PARAMETER);
@@ -2146,6 +2169,49 @@ pub unsafe extern "win64" fn WriteFile(
     if buf.is_null() && n != 0 {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    // Console stdout/stderr: the pseudo handles from `GetStdHandle` write to fd 1/2.
+    // Rust's TLS-guard failure path and `println!` both end up here.
+    if handle == std_handle_value(STD_OUTPUT_HANDLE) || handle == std_handle_value(STD_ERROR_HANDLE) {
+        let fd = if handle == std_handle_value(STD_OUTPUT_HANDLE) {
+            1
+        } else {
+            2
+        };
+        if n == 0 {
+            if !done.is_null() {
+                *done = 0;
+            }
+            set_error(ERROR_SUCCESS);
+            return 1;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) };
+        let mut written = 0usize;
+        while written < slice.len() {
+            let r = unsafe {
+                libc::write(
+                    fd,
+                    slice.as_ptr().add(written) as *const c_void,
+                    slice.len() - written,
+                )
+            };
+            if r < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(5);
+                // Interrupted writes retry; anything else fails the call.
+                if e == libc::EINTR {
+                    continue;
+                }
+                set_error(e as u32);
+                return 0;
+            }
+            written += r as usize;
+            break; // pipes/ttys accept the write in one go for these sizes; no partial loop needed.
+        }
+        if !done.is_null() {
+            *done = written as u32;
+        }
+        set_error(ERROR_SUCCESS);
+        return 1;
     }
     let arc = files().lock().unwrap().get(&handle).cloned();
     let Some(arc) = arc else {
@@ -3475,6 +3541,420 @@ pub unsafe extern "win64" fn GetModuleFileNameA(h: usize, buf: *mut u8, size: u3
 }
 
 // ---------------------------------------------------------------------------------------
+// Std handles, module handles, environment, FLS and fibers (Phase C step 11c)
+// ---------------------------------------------------------------------------------------
+//
+// The cross-built title's Rust std takes its TLS-guard path through `FlsAlloc` /
+// `FlsSetValue`: the auto-stub returned 0, so the guard fell into its stderr-write
+// failure path and faulted at `exe+0xae3e4` (fault 0x0). These shims hand out a real
+// 128-slot FLS table (per-thread values, process-wide allocation bitmap, callbacks run
+// on thread exit through `fls_thread_exit`), real std handles (fd-backed so the guard's
+// `WriteFile(GetStdHandle(STD_ERROR))` lands on host stderr), module handles (mapped
+// images plus HLE pseudo handles, non-loading probe semantics) and the process
+// environment. Fibers are not implemented: game threads are host pthreads, so
+// `IsThreadAFiber` reports false and the conversion entry points fail cleanly.
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+pub const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+
+const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+
+fn std_handle_value(which: u32) -> usize {
+    // Windows HANDLEs for the std streams are the sign-extended constants themselves.
+    which as i32 as isize as usize
+}
+
+/// `HANDLE GetStdHandle(DWORD)` — pseudo handles for stdin/stdout/stderr backed by
+/// host fds 0/1/2 (see `ReadFile`/`WriteFile`); 0 for anything else.
+pub unsafe extern "win64" fn GetStdHandle(which: u32) -> usize {
+    match which {
+        STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE => {
+            set_error(ERROR_SUCCESS);
+            std_handle_value(which)
+        }
+        _ => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+/// `BOOL SetStdHandle(DWORD, HANDLE)` — accept the three std pseudo handles (and only
+/// those); the mapping is fixed to fds 0/1/2, so this only validates.
+pub unsafe extern "win64" fn SetStdHandle(which: u32, h: usize) -> i32 {
+    let ok = matches!(which, STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE)
+        && (h == std_handle_value(which));
+    if ok {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+fn main_or_zero_base() -> usize {
+    crate::modules::main_module().map(|m| m.base).unwrap_or(0)
+}
+
+fn module_handle_impl(name: &str) -> usize {
+    let key = crate::util::dll_key(name);
+    // HLE-routed names hand out the stable pseudo handle (creating it, like LoadLibrary).
+    if let Some(m) = crate::hle::registry().hle_for(&key) {
+        return crate::modules::hle_handle(m.name);
+    }
+    // @stub routes are non-loading probes: only a previously seen handle answers.
+    if let Some(r) = crate::hle::registry().route(&key) {
+        if *r == crate::hle::Route::Stub {
+            return crate::modules::find_hle_handle(&key).unwrap_or(0);
+        }
+    }
+    if let Some(m) = crate::modules::find_mapped_by_name(&key) {
+        return m.base;
+    }
+    // No system loader on Linux: unknown names miss (ERROR_MOD_NOT_FOUND at the caller).
+    0
+}
+
+/// `HMODULE GetModuleHandleW(LPCWSTR)` — NULL is the main image base.
+pub unsafe extern "win64" fn GetModuleHandleW(name: *const u16) -> usize {
+    match from_wide_ptr(name) {
+        None => main_or_zero_base(),
+        Some(n) if n.is_empty() => main_or_zero_base(),
+        Some(n) => {
+            let h = module_handle_impl(&n);
+            if h == 0 {
+                set_error(ERROR_MOD_NOT_FOUND);
+            } else {
+                set_error(ERROR_SUCCESS);
+            }
+            h
+        }
+    }
+}
+
+/// `HMODULE GetModuleHandleA(LPCSTR)` — ANSI (UTF-8 on Linux) form.
+pub unsafe extern "win64" fn GetModuleHandleA(name: *const u8) -> usize {
+    match from_ansi_ptr(name) {
+        None => main_or_zero_base(),
+        Some(n) if n.is_empty() => main_or_zero_base(),
+        Some(n) => {
+            let h = module_handle_impl(&n);
+            if h == 0 {
+                set_error(ERROR_MOD_NOT_FOUND);
+            } else {
+                set_error(ERROR_SUCCESS);
+            }
+            h
+        }
+    }
+}
+
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+
+/// Shared `GetModuleHandleEx` body: `FROM_ADDRESS` resolves the mapped image containing
+/// `addr` (the game's own return address); otherwise it is the non-loading
+/// `GetModuleHandle` probe above. NULL name without `FROM_ADDRESS` is the main image.
+fn module_handle_ex(flags: u32, name: Option<String>, addr: usize, out: *mut usize) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let h = if flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0 {
+        match crate::modules::image_base_for_addr(addr) {
+            Some(b) => b,
+            None => {
+                set_error(ERROR_MOD_NOT_FOUND);
+                unsafe {
+                    *out = 0;
+                }
+                return 0;
+            }
+        }
+    } else {
+        match name {
+            None => main_or_zero_base(),
+            Some(n) if n.is_empty() => main_or_zero_base(),
+            Some(n) => module_handle_impl(&n),
+        }
+    };
+    unsafe {
+        *out = h;
+    }
+    if h == 0 {
+        set_error(ERROR_MOD_NOT_FOUND);
+        0
+    } else {
+        set_error(ERROR_SUCCESS);
+        1
+    }
+}
+
+/// `BOOL GetModuleHandleExW(DWORD, LPCWSTR, HMODULE*)`.
+pub unsafe extern "win64" fn GetModuleHandleExW(flags: u32, name: *const u16, out: *mut usize) -> i32 {
+    let n = if flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0 {
+        None
+    } else {
+        from_wide_ptr(name)
+    };
+    module_handle_ex(flags, n, name as usize, out)
+}
+
+/// `BOOL GetModuleHandleExA(DWORD, LPCSTR, HMODULE*)`.
+pub unsafe extern "win64" fn GetModuleHandleExA(flags: u32, name: *const u8, out: *mut usize) -> i32 {
+    let n = if flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0 {
+        None
+    } else {
+        from_ansi_ptr(name)
+    };
+    module_handle_ex(flags, n, name as usize, out)
+}
+
+fn env_lookup(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// `DWORD GetEnvironmentVariableW(LPCWSTR, LPWSTR, DWORD)` — process environment.
+/// Returns the chars copied (without NUL) on success, the required size (with NUL)
+/// with `ERROR_INSUFFICIENT_BUFFER` when the buffer is too small, or 0 with
+/// `ERROR_ENVVAR_NOT_FOUND` when missing.
+pub unsafe extern "win64" fn GetEnvironmentVariableW(
+    name: *const u16,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    let Some(n) = from_wide_ptr(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let Some(v) = env_lookup(&n) else {
+        set_error(ERROR_ENVVAR_NOT_FOUND);
+        return 0;
+    };
+    let w: Vec<u16> = v.encode_utf16().collect();
+    let need = w.len() + 1;
+    if size == 0 || buf.is_null() {
+        set_error(ERROR_SUCCESS);
+        return need as u32;
+    }
+    if (size as usize) < need {
+        // Fill what fits (truncated, NUL-terminated) and report the required size.
+        let n = crate::util::write_wide_out(&v, buf, size);
+        let _ = n;
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return need as u32;
+    }
+    let n = crate::util::write_wide_out(&v, buf, size);
+    set_error(ERROR_SUCCESS);
+    n
+}
+
+/// `DWORD GetEnvironmentVariableA(LPCSTR, LPSTR, DWORD)` — UTF-8 form.
+pub unsafe extern "win64" fn GetEnvironmentVariableA(
+    name: *const u8,
+    buf: *mut u8,
+    size: u32,
+) -> u32 {
+    let Some(n) = from_ansi_ptr(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let Some(v) = env_lookup(&n) else {
+        set_error(ERROR_ENVVAR_NOT_FOUND);
+        return 0;
+    };
+    let need = v.len() + 1;
+    if size == 0 || buf.is_null() {
+        set_error(ERROR_SUCCESS);
+        return need as u32;
+    }
+    if (size as usize) < need {
+        let n = crate::util::write_ansi_out(&v, buf, size);
+        let _ = n;
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return need as u32;
+    }
+    let n = crate::util::write_ansi_out(&v, buf, size);
+    set_error(ERROR_SUCCESS);
+    n
+}
+
+// FLS: 128 slots (Windows `FLS_MAXIMUM_AVAILABLE`), process-wide allocation bitmap plus
+// per-thread values. Rust std allocates one slot for its thread-locals and never frees
+// it; callbacks run on thread exit via `fls_thread_exit` (called from the `CreateThread`
+// wrapper and the main-thread exit path).
+
+pub const FLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+const FLS_SLOTS: usize = 128;
+
+static FLS_STATE: OnceLock<Mutex<([bool; FLS_SLOTS], [usize; FLS_SLOTS])>> = OnceLock::new();
+
+fn fls_state() -> &'static Mutex<([bool; FLS_SLOTS], [usize; FLS_SLOTS])> {
+    FLS_STATE.get_or_init(|| Mutex::new(([false; FLS_SLOTS], [0; FLS_SLOTS])))
+}
+
+thread_local! {
+    static FLS_VALUES: std::cell::RefCell<[usize; FLS_SLOTS]> =
+        const { std::cell::RefCell::new([0; FLS_SLOTS]) };
+}
+
+/// `DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION)` — first free slot, or `FLS_OUT_OF_INDEXES`.
+pub unsafe extern "win64" fn FlsAlloc(callback: usize) -> u32 {
+    let mut g = fls_state().lock().unwrap();
+    for (i, used) in g.0.iter_mut().enumerate() {
+        if !*used {
+            *used = true;
+            g.1[i] = callback;
+            // A reused slot starts clean for this thread; other threads keep their own
+            // values (freed slots are never reused by Rust std in practice).
+            FLS_VALUES.with(|v| v.borrow_mut()[i] = 0);
+            set_error(ERROR_SUCCESS);
+            return i as u32;
+        }
+    }
+    set_error(ERROR_NOT_ENOUGH_MEMORY);
+    FLS_OUT_OF_INDEXES
+}
+
+/// Run the pending FLS callbacks for the dying thread: every non-zero value with a
+/// non-zero callback is invoked (win64 ABI) and cleared. Lock-free across the call:
+///
+/// the callback address and value are copied out first so game code never runs under
+/// the global lock.
+pub fn fls_thread_exit() {
+    let pending: Vec<(usize, usize)> = FLS_VALUES.with(|v| {
+        let g = fls_state().lock().unwrap();
+        let vals = v.borrow();
+        vals.iter()
+            .enumerate()
+            .filter_map(|(i, &val)| {
+                if val != 0 && g.0[i] && g.1[i] != 0 {
+                    Some((g.1[i], val))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    });
+    type FlsCb = unsafe extern "win64" fn(usize);
+    for (cb, val) in pending {
+        let f: FlsCb = unsafe { std::mem::transmute(cb) };
+        unsafe { f(val) };
+    }
+    FLS_VALUES.with(|v| {
+        let g = fls_state().lock().unwrap();
+        let mut vals = v.borrow_mut();
+        for (i, slot) in vals.iter_mut().enumerate() {
+            if *slot != 0 && g.0[i] && g.1[i] != 0 {
+                *slot = 0;
+            }
+        }
+    });
+}
+
+/// `BOOL FlsFree(DWORD)` — frees the slot; the current thread's callback runs first
+/// when its value is non-zero. Unknown slots fail cleanly.
+pub unsafe extern "win64" fn FlsFree(index: u32) -> i32 {
+    let i = index as usize;
+    if i >= FLS_SLOTS {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let (cb, val) = {
+        let g = fls_state().lock().unwrap();
+        if !g.0[i] {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        (g.1[i], FLS_VALUES.with(|v| v.borrow()[i]))
+    };
+    if val != 0 && cb != 0 {
+        let f: unsafe extern "win64" fn(usize) = unsafe { std::mem::transmute(cb) };
+        unsafe { f(val) };
+        FLS_VALUES.with(|v| v.borrow_mut()[i] = 0);
+    }
+    {
+        let mut g = fls_state().lock().unwrap();
+        g.0[i] = false;
+        g.1[i] = 0;
+    }
+    FLS_VALUES.with(|v| v.borrow_mut()[i] = 0);
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `PVOID FlsGetValue(DWORD)` — the calling thread's value, or NULL on a bad index.
+pub unsafe extern "win64" fn FlsGetValue(index: u32) -> usize {
+    let i = index as usize;
+    if i >= FLS_SLOTS {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if !fls_state().lock().unwrap().0[i] {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    set_error(ERROR_SUCCESS);
+    FLS_VALUES.with(|v| v.borrow()[i])
+}
+
+/// `BOOL FlsSetValue(DWORD, PVOID)` — stores the calling thread's value.
+pub unsafe extern "win64" fn FlsSetValue(index: u32, data: usize) -> i32 {
+    let i = index as usize;
+    if i >= FLS_SLOTS {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if !fls_state().lock().unwrap().0[i] {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    FLS_VALUES.with(|v| v.borrow_mut()[i] = data);
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+// Fibers: game threads are host pthreads, never fibers. `IsThreadAFiber` reports false;
+// the conversion entry points fail cleanly instead of aborting the title.
+
+/// `BOOL IsThreadAFiber(void)` — always false on Linux (threads, never fibers).
+pub unsafe extern "win64" fn IsThreadAFiber() -> i32 {
+    set_error(ERROR_SUCCESS);
+    0
+}
+
+/// `LPVOID ConvertThreadToFiber(LPVOID)` — no fiber support; always NULL.
+pub unsafe extern "win64" fn ConvertThreadToFiber(_param: *const c_void) -> usize {
+    set_error(ERROR_INVALID_PARAMETER);
+    0
+}
+
+/// `BOOL ConvertFiberToThread(void)` — there is nothing to convert; fail cleanly.
+pub unsafe extern "win64" fn ConvertFiberToThread() -> i32 {
+    set_error(ERROR_INVALID_PARAMETER);
+    0
+}
+
+/// `LPVOID CreateFiber(SIZE_T, LPFIBER_START_ROUTINE, LPVOID)` — no fibers; NULL.
+pub unsafe extern "win64" fn CreateFiber(
+    _stack: usize,
+    _start: usize,
+    _param: *mut c_void,
+) -> usize {
+    set_error(ERROR_INVALID_PARAMETER);
+    0
+}
+
+/// `void DeleteFiber(LPVOID)` — no-op (there is nothing allocated).
+pub unsafe extern "win64" fn DeleteFiber(_fiber: usize) {}
+
+/// `void SwitchToFiber(LPVOID)` — no-op (the target never exists).
+pub unsafe extern "win64" fn SwitchToFiber(_fiber: usize) {}
+
+// ---------------------------------------------------------------------------------------
 // Export table
 // ---------------------------------------------------------------------------------------
 
@@ -3576,6 +4056,25 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("HeapValidate", HeapValidate as usize),
         ("GetModuleFileNameW", GetModuleFileNameW as usize),
         ("GetModuleFileNameA", GetModuleFileNameA as usize),
+        // Step-11c startup neighbors: FLS, std handles, module handles, environment, fibers.
+        ("FlsAlloc", FlsAlloc as usize),
+        ("FlsFree", FlsFree as usize),
+        ("FlsGetValue", FlsGetValue as usize),
+        ("FlsSetValue", FlsSetValue as usize),
+        ("IsThreadAFiber", IsThreadAFiber as usize),
+        ("ConvertThreadToFiber", ConvertThreadToFiber as usize),
+        ("ConvertFiberToThread", ConvertFiberToThread as usize),
+        ("CreateFiber", CreateFiber as usize),
+        ("DeleteFiber", DeleteFiber as usize),
+        ("SwitchToFiber", SwitchToFiber as usize),
+        ("GetStdHandle", GetStdHandle as usize),
+        ("SetStdHandle", SetStdHandle as usize),
+        ("GetModuleHandleW", GetModuleHandleW as usize),
+        ("GetModuleHandleA", GetModuleHandleA as usize),
+        ("GetModuleHandleExW", GetModuleHandleExW as usize),
+        ("GetModuleHandleExA", GetModuleHandleExA as usize),
+        ("GetEnvironmentVariableW", GetEnvironmentVariableW as usize),
+        ("GetEnvironmentVariableA", GetEnvironmentVariableA as usize),
         // Step-10c file APIs through the linked-in Linux VFS (kernel-family fallbacks).
         ("CreateFileW", CreateFileW as usize),
         ("CreateFileA", CreateFileA as usize),
@@ -4352,6 +4851,161 @@ mod tests {
             // Null buffer/size fails cleanly.
             assert_eq!(GetModuleFileNameW(h, std::ptr::null_mut(), 260), 0);
             assert_eq!(GetModuleFileNameW(h, wbuf.as_mut_ptr(), 0), 0);
+        }
+    }
+
+    #[test]
+    fn fls_slots_are_per_thread_with_callbacks_on_exit() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static LAST: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "win64" fn cb(v: usize) {
+            LAST.store(v, Ordering::Release);
+            CALLS.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe {
+            let idx = FlsAlloc(cb as usize);
+            assert_ne!(idx, FLS_OUT_OF_INDEXES);
+            assert_eq!(FlsGetValue(idx), 0);
+            assert_eq!(FlsSetValue(idx, 0x1234), 1);
+            assert_eq!(FlsGetValue(idx), 0x1234);
+            // A second thread sees its own (zero) value, not the creator's.
+            let seen = crate::tls::spawn("fls-probe", move || FlsGetValue(idx)).unwrap().join().unwrap();
+            assert_eq!(seen, 0);
+            // Freeing runs the current thread's callback once.
+            let before = CALLS.load(Ordering::Acquire);
+            assert_eq!(FlsFree(idx), 1);
+            assert_eq!(CALLS.load(Ordering::Acquire), before + 1);
+            assert_eq!(LAST.load(Ordering::Acquire), 0x1234);
+            // Double free and bad indexes fail cleanly, never abort.
+            assert_eq!(FlsFree(idx), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(FlsGetValue(idx), 0);
+            assert_eq!(FlsSetValue(idx, 1), 0);
+            assert_eq!(FlsGetValue(999), 0);
+            assert_eq!(FlsSetValue(999, 1), 0);
+            // Exit path: a value left set on a dying thread fires its callback.
+            CALLS.store(0, Ordering::Release);
+            let idx2 = FlsAlloc(cb as usize);
+            assert_ne!(idx2, FLS_OUT_OF_INDEXES);
+            crate::tls::spawn("fls-exit", move || {
+                FlsSetValue(idx2, 0xABCD);
+                fls_thread_exit();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+            assert_eq!(CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(LAST.load(Ordering::Acquire), 0xABCD);
+            assert_eq!(FlsFree(idx2), 1);
+        }
+    }
+
+    #[test]
+    fn std_handles_write_to_the_host_fds() {
+        unsafe {
+            assert_eq!(GetStdHandle(STD_OUTPUT_HANDLE), std_handle_value(STD_OUTPUT_HANDLE));
+            assert_eq!(GetStdHandle(STD_ERROR_HANDLE), std_handle_value(STD_ERROR_HANDLE));
+            assert_eq!(GetStdHandle(STD_INPUT_HANDLE), std_handle_value(STD_INPUT_HANDLE));
+            assert_eq!(GetStdHandle(0), 0);
+            assert_eq!(SetStdHandle(STD_OUTPUT_HANDLE, std_handle_value(STD_OUTPUT_HANDLE)), 1);
+            assert_eq!(SetStdHandle(STD_OUTPUT_HANDLE, 0x1234), 0);
+            // Zero-length writes succeed and report 0 through both console handles.
+            let mut done = 0xFFFF_FFFFu32;
+            assert_eq!(
+                WriteFile(
+                    std_handle_value(STD_ERROR_HANDLE),
+                    std::ptr::null(),
+                    0,
+                    &mut done,
+                    std::ptr::null_mut()
+                ),
+                1
+            );
+            assert_eq!(done, 0);
+            // Closing a std handle fails cleanly (the host fd stays open).
+            assert_eq!(CloseHandle(std_handle_value(STD_OUTPUT_HANDLE)), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // Fibers: never fibers on Linux; conversions fail cleanly.
+            assert_eq!(IsThreadAFiber(), 0);
+            assert_eq!(ConvertThreadToFiber(std::ptr::null()), 0);
+            assert_eq!(ConvertFiberToThread(), 0);
+            assert_eq!(CreateFiber(0, 0, std::ptr::null_mut()), 0);
+            DeleteFiber(0);
+            SwitchToFiber(0);
+        }
+    }
+
+    #[test]
+    fn module_handles_probe_without_loading() {
+        unsafe {
+            // NULL is the main image (or 0 when nothing is mapped in this test process).
+            let _ = GetModuleHandleW(std::ptr::null());
+            // HLE names hand out the stable pseudo handle.
+            let a = GetModuleHandleW(crate::util::wide("kernelx.dll").as_ptr());
+            assert_ne!(a, 0);
+            assert_eq!(a, crate::modules::hle_handle("kernelx.dll"));
+            let b = GetModuleHandleA(c"kernelx.dll".as_ptr() as *const u8);
+            assert_eq!(b, a);
+            // Unknown names miss without creating a handle.
+            assert!(crate::modules::find_hle_handle("no_such_probe_xyz.dll").is_none());
+            assert_eq!(GetModuleHandleW(crate::util::wide("no_such_probe_xyz.dll").as_ptr()), 0);
+            assert_eq!(GetLastError(), ERROR_MOD_NOT_FOUND);
+            assert!(crate::modules::find_hle_handle("no_such_probe_xyz.dll").is_none());
+            // ExW without FROM_ADDRESS matches GetModuleHandle; FROM_ADDRESS resolves the
+            // mapped image containing the address (or fails cleanly off-image).
+            let mut out = 0usize;
+            assert_eq!(
+                GetModuleHandleExW(0, crate::util::wide("kernelx.dll").as_ptr(), &mut out),
+                1
+            );
+            assert_eq!(out, a);
+            let mut out2 = 0usize;
+            assert_eq!(
+                GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                    0x1234 as *const u16,
+                    &mut out2
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_MOD_NOT_FOUND);
+            assert!(GetModuleHandleExW(0, std::ptr::null(), std::ptr::null_mut()) == 0);
+        }
+    }
+
+    #[test]
+    fn environment_variables_round_trip() {
+        unsafe {
+            std::env::set_var("XCL_FLS_PROBE_VAR", "hello-fls");
+            let name = crate::util::wide("XCL_FLS_PROBE_VAR");
+            // Size query (null buffer) returns the required size with NUL.
+            let need = GetEnvironmentVariableW(name.as_ptr(), std::ptr::null_mut(), 0);
+            assert_eq!(need, "hello-fls".len() as u32 + 1);
+            let mut buf = [0u16; 64];
+            let n = GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), 64);
+            assert_eq!(n, "hello-fls".len() as u32);
+            assert_eq!(
+                String::from_utf16_lossy(&buf[..n as usize]),
+                "hello-fls"
+            );
+            // Small buffer reports the required size with INSUFFICIENT_BUFFER.
+            let mut tiny = [0u16; 4];
+            let need2 = GetEnvironmentVariableW(name.as_ptr(), tiny.as_mut_ptr(), 4);
+            assert_eq!(need2, "hello-fls".len() as u32 + 1);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            // Missing names fail with ENVVAR_NOT_FOUND.
+            let missing = crate::util::wide("XCL_DEFINITELY_MISSING_ENV_VAR_XYZ");
+            assert_eq!(
+                GetEnvironmentVariableW(missing.as_ptr(), buf.as_mut_ptr(), 64),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_ENVVAR_NOT_FOUND);
+            // ANSI form agrees.
+            let aname = c"XCL_FLS_PROBE_VAR";
+            let mut abuf = [0u8; 64];
+            let m = GetEnvironmentVariableA(aname.as_ptr() as *const u8, abuf.as_mut_ptr(), 64);
+            assert_eq!(m, "hello-fls".len() as u32);
+            std::env::remove_var("XCL_FLS_PROBE_VAR");
         }
     }
 }

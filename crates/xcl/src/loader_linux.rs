@@ -344,6 +344,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
             }
         }
         run_tls_callbacks(m, crate::tls::DLL_PROCESS_DETACH);
+        crate::hle::kernelx_linux::fls_thread_exit();
         crate::tls::detach_current_thread();
         crate::xlog_info!("{}: entry point returned code {code:#x}", m.name);
         code

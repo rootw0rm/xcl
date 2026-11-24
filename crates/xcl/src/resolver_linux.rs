@@ -409,6 +409,15 @@ mod tests {
             ("kernel32.dll", "HeapFree"),
             ("kernel32.dll", "HeapReAlloc"),
             ("kernel32.dll", "GetModuleFileNameW"),
+            // Step 11c startup neighbors: FLS, std handles, module handles, environment.
+            ("kernel32.dll", "FlsAlloc"),
+            ("kernel32.dll", "FlsSetValue"),
+            ("kernel32.dll", "FlsGetValue"),
+            ("kernel32.dll", "IsThreadAFiber"),
+            ("kernel32.dll", "GetStdHandle"),
+            ("kernel32.dll", "GetModuleHandleA"),
+            ("kernel32.dll", "GetModuleHandleExW"),
+            ("kernel32.dll", "GetEnvironmentVariableW"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
