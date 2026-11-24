@@ -119,3 +119,15 @@ macro_rules! xlog_info { ($($a:tt)*) => { $crate::log::write($crate::log::Level:
 macro_rules! xlog_debug { ($($a:tt)*) => { if $crate::log::enabled($crate::log::Level::Debug) { $crate::log::write($crate::log::Level::Debug, format_args!($($a)*)) } } }
 #[macro_export]
 macro_rules! xlog_trace { ($($a:tt)*) => { if $crate::log::enabled($crate::log::Level::Trace) { $crate::log::write($crate::log::Level::Trace, format_args!($($a)*)) } } }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(windows))]
+    #[test]
+    fn thread_id_is_stable_on_a_thread_and_distinct_across_threads() {
+        let here = super::thread_id();
+        assert_eq!(here, super::thread_id());
+        let there = std::thread::spawn(super::thread_id).join().unwrap();
+        assert_ne!(here, there);
+    }
+}

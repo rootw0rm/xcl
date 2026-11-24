@@ -27,7 +27,8 @@ XCL – Xbox Series X|S → Windows compatibility layer
 Usage:
   xcl run <game folder | file.exe> [-- game arguments]
       Runs the game. The game folder is only read; writes, game saves and logs go to
-      %LOCALAPPDATA%\\XCL\\<title>\\ (or %XCL_DATA_ROOT%\\<title>\\).
+      %LOCALAPPDATA%\\XCL\\<title>\\ on Windows or $XDG_DATA_HOME/XCL/<title>/ on Linux
+      (%XCL_DATA_ROOT%\\<title>\\ overrides the root).
   xcl inspect <file.exe|file.dll> [--json]
       Analysis without running: imports and what XCL has for them (HLE / Windows / stub).
   xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
@@ -141,7 +142,7 @@ fn started_by_double_click() -> bool {
 /// in this console. On an error the console stays open until Enter, so the message can be read.
 #[cfg(windows)]
 fn run_picked_game() -> i32 {
-    let last_file = xcl::launcher::data_root().join("last-game.txt");
+    let last_file = xcl::platform::data_root().join("last-game.txt");
     let last = std::fs::read_to_string(&last_file).ok().map(|s| PathBuf::from(s.trim())).filter(|p| p.exists());
     let target = {
         let _ui = Ui::enter();
@@ -157,7 +158,7 @@ fn run_picked_game() -> i32 {
         })
     };
     let Some(target) = target else { return 0 };
-    let _ = std::fs::create_dir_all(xcl::launcher::data_root());
+    let _ = std::fs::create_dir_all(xcl::platform::data_root());
     let _ = std::fs::write(&last_file, target.to_string_lossy().as_bytes());
     println!("xcl run \"{}\"", target.display());
     let code = xcl::launcher::run(&target, &[]);

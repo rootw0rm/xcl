@@ -308,6 +308,26 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_publishes_complete_data_and_never_replaces() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-rpf-publish-{}-{nonce}", std::process::id()));
+        let output = root.join("record.bin");
+        std::fs::create_dir_all(&root).unwrap();
+
+        atomic_write(&output, b"complete payload").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete payload");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "the temporary file is gone");
+
+        // The extraction contract is no-clobber: a destination that already exists stays.
+        let error = atomic_write(&output, b"replacement").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete payload");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn extraction_reports_an_unusable_output_directory() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("xcl-rpf-error-{}-{nonce}", std::process::id()));

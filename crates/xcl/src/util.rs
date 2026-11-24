@@ -91,8 +91,8 @@ pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
     from_code_page_ptr(p, windows_sys::Win32::Globalization::CP_ACP)
 }
 
-/// Linux has no ANSI code page: game strings are UTF-8 (lossy for invalid bytes).
-// LINUX-TODO: Phase A step 2 — the title's ANSI paths use the host locale, not UTF-8 blindly.
+/// Linux has no ANSI code page to query: Xbox titles use UTF-8 for their `A` APIs, so the
+/// bytes are decoded as UTF-8 (lossy for invalid bytes) – the contract `write_ansi_out` writes.
 #[cfg(not(windows))]
 pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
     from_cstr_ptr(p)
@@ -325,9 +325,9 @@ pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
     write_codepage_out(src, windows_sys::Win32::Globalization::CP_ACP, buf, size)
 }
 
-/// Win32-style "copy ANSI string" on Linux: there is no ANSI code page, so the bytes are
-/// UTF-8. Same return/truncation contract as the Windows version; never splits a character.
-// LINUX-TODO: Phase A step 2 — map the host locale, not UTF-8, once the platform leaf lands.
+/// Win32-style "copy ANSI string" on Linux: Xbox titles use UTF-8 as their ANSI code page,
+/// so the bytes are UTF-8. Same return/truncation contract as the Windows version; never
+/// splits a character.
 #[cfg(not(windows))]
 pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
     if buf.is_null() || size == 0 {
@@ -511,5 +511,56 @@ mod tests {
             assert_eq!(decode_cp(&buf, CP_UTF8), "a😀");
             assert_eq!(buf[5], 0);
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_ansi_strings_are_utf8_lossy_round_trips() {
+        unsafe {
+            assert_eq!(from_ansi_ptr(std::ptr::null()), None);
+            let mut buf = [0xCCu8; 64];
+            let src = "C:\\Jeux\\Été\\😀\\game.exe";
+            let n = write_ansi_out(src, buf.as_mut_ptr(), buf.len() as u32);
+            assert_eq!(n as usize, src.len());
+            assert_eq!(buf[n as usize], 0);
+            assert_eq!(from_ansi_ptr(buf.as_ptr()).as_deref(), Some(src));
+            assert_eq!(from_file_ansi_ptr(buf.as_ptr()).as_deref(), Some(src));
+
+            // Invalid bytes become the replacement character, not an error.
+            let invalid = b"bad\xFFname\0";
+            assert_eq!(from_ansi_ptr(invalid.as_ptr()).as_deref(), Some("bad\u{FFFD}name"));
+            assert_eq!(from_file_ansi_ptr(invalid.as_ptr()).as_deref(), Some("bad\u{FFFD}name"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_ansi_out_never_splits_a_utf8_character() {
+        unsafe {
+            let mut tiny = [0xAAu8; 4];
+            assert_eq!(write_ansi_out("abc", std::ptr::null_mut(), 4), 0);
+            assert_eq!(write_ansi_out("abc", tiny.as_mut_ptr(), 0), 0);
+            assert_eq!(write_ansi_out("", tiny.as_mut_ptr(), 1), 0);
+            assert_eq!(tiny[0], 0);
+
+            // "a😀b": 1 + 4 + 1 bytes. A 4-byte capacity cannot hold the emoji, so only "a".
+            let mut buf = [0xCCu8; 16];
+            assert_eq!(write_ansi_out("a😀b", buf.as_mut_ptr(), 5), 5);
+            assert_eq!(&buf[..2], b"a\0");
+            // A 5-byte capacity holds "a😀" exactly, but still reports truncation.
+            buf.fill(0xCC);
+            assert_eq!(write_ansi_out("a😀b", buf.as_mut_ptr(), 6), 6);
+            assert_eq!(&buf[..6], "a😀\0".as_bytes());
+            // One more byte holds the whole string.
+            buf.fill(0xCC);
+            assert_eq!(write_ansi_out("a😀b", buf.as_mut_ptr(), 7), 6);
+            assert_eq!(&buf[..7], "a😀b\0".as_bytes());
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_unix_host_is_not_wine() {
+        assert!(!under_wine());
     }
 }

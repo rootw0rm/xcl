@@ -1,5 +1,5 @@
-//! Per-title configuration (`%LOCALAPPDATA%\XCL\<title>\xcl.toml`) and the boot record
-//! the launcher hands to the host process.
+//! Per-title configuration (`<data root>\<title>\xcl.toml`, where the data root comes from
+//! `platform::data_root`) and the boot record the launcher hands to the host process.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -34,6 +34,7 @@ pub mod loader;
 #[cfg(windows)]
 pub mod modules;
 pub mod pe;
+pub mod platform;
 #[cfg(windows)]
 pub mod preflight;
 #[cfg(windows)]

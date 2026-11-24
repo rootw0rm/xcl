@@ -7,15 +7,6 @@ use crate::config::{Boot, Config};
 use crate::manifest::{decode_game_config, xml_attrs};
 use crate::util::wide;
 
-/// Data root: `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`.
-pub fn data_root() -> PathBuf {
-    if let Ok(p) = std::env::var("XCL_DATA_ROOT") {
-        return PathBuf::from(p);
-    }
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    PathBuf::from(base).join("XCL")
-}
-
 fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     xml_attrs(xml, tag, attr).into_iter().next()
 }
@@ -189,7 +180,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let data_dir = data_root().join(&title);
+    let data_dir = crate::platform::data_root().join(&title);
     let mut config = match Config::load_or_create(&data_dir.join("xcl.toml")) {
         Ok(c) => c,
         Err(e) => {
