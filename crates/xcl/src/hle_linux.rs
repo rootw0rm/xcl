@@ -25,6 +25,8 @@ pub mod minuserx_linux;
 pub mod gameinput_linux;
 #[path = "hle/xtaskqueue_linux.rs"]
 pub mod xtaskqueue_linux;
+#[path = "hle/xuser_linux.rs"]
+pub mod xuser_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -187,6 +189,13 @@ fn xgameruntime_exports() -> Vec<(&'static str, usize)> {
         }
     }
     for (name, addr) in xtaskqueue_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    for (name, addr) in xuser_linux::exports() {
         if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
             slot.1 = addr;
         } else {
@@ -580,6 +589,7 @@ mod tests {
             assert_ne!(addr, 0, "{name} must be implemented");
         }
         // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.
+        // Step-11p XUser/XAsync/save/PLS slice: sign-in + storage are real.
         for name in [
             "XTaskQueueCreate",
             "XTaskQueueCreateComposite",
@@ -595,6 +605,26 @@ mod tests {
             "XTaskQueueRegisterMonitor",
             "XNetworkingQueryPreferredLocalUdpMultiplayerPort",
             "XNetworkingGetConnectivityHint",
+            "XAsyncBegin",
+            "XAsyncSchedule",
+            "XAsyncComplete",
+            "XAsyncGetStatus",
+            "XAsyncGetResultSize",
+            "XAsyncGetResult",
+            "XAsyncCancel",
+            "XAsyncRun",
+            "XUserAddAsync",
+            "XUserAddResult",
+            "XUserGetGamertag",
+            "XUserFindForDevice",
+            "XUserCloseHandle",
+            "XUserGetTokenAndSignatureAsync",
+            "XUserGetTokenAndSignatureResultSize",
+            "XGameSaveFilesGetFolderWithUiAsync",
+            "XGameSaveFilesGetFolderWithUiResult",
+            "XPersistentLocalStorageGetPath",
+            "XPersistentLocalStorageGetPathSize",
+            "XPersistentLocalStorageGetSpaceInfo",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, XGAMERUNTIME);

@@ -682,6 +682,47 @@ mod tests {
     }
 
     #[test]
+    fn xuser_imports_resolve_to_hle() {
+        // Step 11p: XAsync engine + offline user + save-folder/PLS storage.
+        for (dll, sym) in [
+            ("xgameruntime.dll", "XAsyncBegin"),
+            ("xgameruntime.dll", "XAsyncGetStatus"),
+            ("xgameruntime.dll", "XAsyncGetResult"),
+            ("xgameruntime.dll", "XAsyncRun"),
+            ("xgameruntime.dll", "XUserAddAsync"),
+            ("xgameruntime.dll", "XUserAddResult"),
+            ("xgameruntime.dll", "XUserGetGamertag"),
+            ("xgameruntime.dll", "XUserFindForDevice"),
+            ("xgameruntime.dll", "XUserGetTokenAndSignatureAsync"),
+            ("xgameruntime.dll", "XGameSaveFilesGetFolderWithUiAsync"),
+            ("xgameruntime.dll", "XGameSaveFilesGetFolderWithUiResult"),
+            ("xgameruntime.dll", "XPersistentLocalStorageGetPath"),
+            ("xgameruntime.dll", "XPersistentLocalStorageGetSpaceInfo"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // Direct ABI: silent sign-in completes, gamertag matches config.
+        let (addr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XUserAddAsync"), 0);
+        let add: unsafe extern "win64" fn(u32, *mut u8) -> i32 = unsafe { std::mem::transmute(addr) };
+        let (saddr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XAsyncGetStatus"), 0);
+        let status: unsafe extern "win64" fn(*mut u8, bool) -> i32 = unsafe { std::mem::transmute(saddr) };
+        unsafe {
+            let mut b = [0u8; 48];
+            assert_eq!(add(1, b.as_mut_ptr()), 0);
+            assert_eq!(status(b.as_mut_ptr(), true), 0);
+        }
+    }
+
+    #[test]
     fn stub_thunk_calls_log_and_return() {
         let (addr, src) = resolve_inner("kernelx.dll", &name("LinuxProbeThunk"), 0);
         assert_eq!(src, Source::Stub);
