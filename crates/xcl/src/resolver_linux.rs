@@ -402,6 +402,13 @@ mod tests {
             ("api-ms-win-core-file-l1-1-0.dll", "WriteFile"),
             ("api-ms-win-core-file-l1-1-0.dll", "DeleteFileW"),
             ("api-ms-win-core-file-l1-2-0.dll", "GetDiskFreeSpaceExW"),
+            // Step 11b startup: command line, process heap and module file names.
+            ("kernel32.dll", "GetCommandLineW"),
+            ("kernel32.dll", "GetProcessHeap"),
+            ("kernel32.dll", "HeapAlloc"),
+            ("kernel32.dll", "HeapFree"),
+            ("kernel32.dll", "HeapReAlloc"),
+            ("kernel32.dll", "GetModuleFileNameW"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(

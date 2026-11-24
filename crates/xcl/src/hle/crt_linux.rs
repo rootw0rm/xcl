@@ -50,10 +50,19 @@ fn cached_ptr(slot: &AtomicUsize, n: usize) -> *mut u8 {
 static FMODE_PTR: AtomicUsize = AtomicUsize::new(0);
 static COMMODE_PTR: AtomicUsize = AtomicUsize::new(0);
 static ARGC_PTR: AtomicUsize = AtomicUsize::new(0);
-static ARGV_PTR: AtomicUsize = AtomicUsize::new(0);
-static WARGV_PTR: AtomicUsize = AtomicUsize::new(0);
-static ENVIRON_PTR: AtomicUsize = AtomicUsize::new(0);
-static WENVIRON_PTR: AtomicUsize = AtomicUsize::new(0);
+// `__p___argv` is `char***`: `ARGV_VAR` is the `char**` variable, pointing at the
+// `char*[2]` array in `ARGV_ARRAY`. One extra level versus the array itself, matching
+// what mingw `__getmainargs` dereferences once before storing the `argv` global
+// (returning the array directly made the startup copy loop `strlen` the bytes of the
+// program-name string as if they were pointers).
+static ARGV_VAR: AtomicUsize = AtomicUsize::new(0);
+static ARGV_ARRAY: AtomicUsize = AtomicUsize::new(0);
+static WARGV_VAR: AtomicUsize = AtomicUsize::new(0);
+static WARGV_ARRAY: AtomicUsize = AtomicUsize::new(0);
+static ENVIRON_VAR: AtomicUsize = AtomicUsize::new(0);
+static ENVIRON_ARRAY: AtomicUsize = AtomicUsize::new(0);
+static WENVIRON_VAR: AtomicUsize = AtomicUsize::new(0);
+static WENVIRON_ARRAY: AtomicUsize = AtomicUsize::new(0);
 static IOB_PTR: AtomicUsize = AtomicUsize::new(0);
 static LOCALE_PTR: AtomicUsize = AtomicUsize::new(0);
 
@@ -85,65 +94,89 @@ pub unsafe extern "win64" fn __p___argc() -> *mut i32 {
     p
 }
 
-fn narrow_argv() -> *mut *mut u8 {
-    let table = cached_ptr(&ARGV_PTR, 16) as *mut *mut u8;
+fn narrow_argv() -> *mut *mut *mut u8 {
+    let array = cached_ptr(&ARGV_ARRAY, 16) as *mut *mut u8;
     unsafe {
-        if (*table).is_null() {
+        if (*array).is_null() {
             // Static placeholder program name; real argv wiring is a later slice.
             static NAME: &[u8] = b"xcl\0";
-            *table = NAME.as_ptr() as *mut u8;
-            *table.add(1) = std::ptr::null_mut();
+            *array = NAME.as_ptr() as *mut u8;
+            *array.add(1) = std::ptr::null_mut();
         }
     }
-    table
+    let var = cached_ptr(&ARGV_VAR, 8) as *mut *mut *mut u8;
+    unsafe {
+        if (*var).is_null() {
+            *var = array;
+        }
+    }
+    var
 }
 
 /// `char***` to the narrow argument vector (`argv[argc] == NULL`).
-pub unsafe extern "win64" fn __p___argv() -> *mut *mut u8 {
+pub unsafe extern "win64" fn __p___argv() -> *mut *mut *mut u8 {
     narrow_argv()
 }
 
-fn wide_argv() -> *mut *mut u16 {
-    let table = cached_ptr(&WARGV_PTR, 16) as *mut *mut u16;
+fn wide_argv() -> *mut *mut *mut u16 {
+    let array = cached_ptr(&WARGV_ARRAY, 16) as *mut *mut u16;
     unsafe {
-        if (*table).is_null() {
+        if (*array).is_null() {
             static NAME: &[u16] = &[b'x' as u16, b'c' as u16, b'l' as u16, 0];
-            *table = NAME.as_ptr() as *mut u16;
-            *table.add(1) = std::ptr::null_mut();
+            *array = NAME.as_ptr() as *mut u16;
+            *array.add(1) = std::ptr::null_mut();
         }
     }
-    table
+    let var = cached_ptr(&WARGV_VAR, 8) as *mut *mut *mut u16;
+    unsafe {
+        if (*var).is_null() {
+            *var = array;
+        }
+    }
+    var
 }
 
 /// `wchar_t***` to the wide argument vector.
-pub unsafe extern "win64" fn __p___wargv() -> *mut *mut u16 {
+pub unsafe extern "win64" fn __p___wargv() -> *mut *mut *mut u16 {
     wide_argv()
 }
 
-fn narrow_environ() -> *mut *mut u8 {
-    let table = cached_ptr(&ENVIRON_PTR, 8) as *mut *mut u8;
+fn narrow_environ() -> *mut *mut *mut u8 {
+    let array = cached_ptr(&ENVIRON_ARRAY, 8) as *mut *mut u8;
     unsafe {
         // Empty environment: a single NULL entry.
-        *table = std::ptr::null_mut();
+        *array = std::ptr::null_mut();
     }
-    table
+    let var = cached_ptr(&ENVIRON_VAR, 8) as *mut *mut *mut u8;
+    unsafe {
+        if (*var).is_null() {
+            *var = array;
+        }
+    }
+    var
 }
 
 /// `char***` to the narrow environment block (currently empty).
-pub unsafe extern "win64" fn __p__environ() -> *mut *mut u8 {
+pub unsafe extern "win64" fn __p__environ() -> *mut *mut *mut u8 {
     narrow_environ()
 }
 
-fn wide_environ() -> *mut *mut u16 {
-    let table = cached_ptr(&WENVIRON_PTR, 8) as *mut *mut u16;
+fn wide_environ() -> *mut *mut *mut u16 {
+    let array = cached_ptr(&WENVIRON_ARRAY, 8) as *mut *mut u16;
     unsafe {
-        *table = std::ptr::null_mut();
+        *array = std::ptr::null_mut();
     }
-    table
+    let var = cached_ptr(&WENVIRON_VAR, 8) as *mut *mut *mut u16;
+    unsafe {
+        if (*var).is_null() {
+            *var = array;
+        }
+    }
+    var
 }
 
 /// `wchar_t***` to the wide environment block (currently empty).
-pub unsafe extern "win64" fn __p__wenviron() -> *mut *mut u16 {
+pub unsafe extern "win64" fn __p__wenviron() -> *mut *mut *mut u16 {
     wide_environ()
 }
 
@@ -464,15 +497,21 @@ mod tests {
     fn argc_argv_environ_have_c_shape() {
         unsafe {
             assert_eq!(*__p___argc(), 1);
-            let argv = __p___argv();
-            assert!(!argv.is_null() && !(*argv).is_null());
+            // `__p___argv` is `char***`: one deref is the `argv` array itself.
+            let argv_var = __p___argv();
+            assert!(!argv_var.is_null() && !(*argv_var).is_null());
+            let argv = *argv_var;
+            assert!(!(*argv).is_null());
             assert!((*argv.add(1)).is_null());
             assert_eq!(strlen(*argv), 3);
-            let wargv = __p___wargv();
-            assert!(!wargv.is_null() && !(*wargv).is_null());
+            assert_eq!(__p___argv(), argv_var);
+            let wargv_var = __p___wargv();
+            assert!(!wargv_var.is_null() && !(*wargv_var).is_null());
+            let wargv = *wargv_var;
+            assert!(!(*wargv).is_null());
             assert!((*wargv.add(1)).is_null());
-            assert!((*__p__environ()).is_null());
-            assert!((*__p__wenviron()).is_null());
+            assert!((**__p__environ()).is_null());
+            assert!((**__p__wenviron()).is_null());
         }
     }
 

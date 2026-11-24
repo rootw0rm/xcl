@@ -3121,6 +3121,360 @@ fn disk_clusters_answer(
 }
 
 // ---------------------------------------------------------------------------------------
+// Startup: command line, process heap, module file names (Phase C step 11b)
+// ---------------------------------------------------------------------------------------
+//
+// mingw `mainCRTStartup` parses `GetCommandLineW` into `argc`/`argv` (`__getmainargs`),
+// allocating the vector with `HeapAlloc(GetProcessHeap(), ...)`. The auto-stub returned
+// null for the command line, so `__getmainargs` built a garbage `argv` and the CRT
+// `strlen` faulted on it. These shims hand out a real command line (the mapped exe plus
+// the game args the launcher saw), a libc-backed process heap, and the mapped image path
+// for `GetModuleFileNameW`, all with `extern "win64"` (DEC-013).
+
+/// Quote one command-line argument with the same rules as the Windows launcher (`quote`
+/// in `launcher.rs`): bare when it has no spaces/tabs/quotes, otherwise `"`-quoted with
+/// backslash/doubled-quote escaping.
+fn quote_cmd_arg(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+        return a.to_string();
+    }
+    let mut s = String::from("\"");
+    let mut bs = 0;
+    for c in a.chars() {
+        match c {
+            '\\' => bs += 1,
+            '"' => {
+                for _ in 0..bs * 2 + 1 {
+                    s.push('\\');
+                }
+                s.push('"');
+                bs = 0;
+            }
+            _ => {
+                for _ in 0..bs {
+                    s.push('\\');
+                }
+                bs = 0;
+                s.push(c);
+            }
+        }
+    }
+    for _ in 0..bs * 2 {
+        s.push('\\');
+    }
+    s.push('"');
+    s
+}
+
+static GAME_ARGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn game_args_slot() -> &'static Mutex<Vec<String>> {
+    GAME_ARGS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Remember the game args the launcher saw; the command line is built from them plus
+/// the mapped exe. Called once by `launcher::run` before `host::run_boot`.
+pub fn set_game_args(args: &[String]) {
+    *game_args_slot().lock().unwrap() = args.to_vec();
+}
+
+fn game_args() -> Vec<String> {
+    game_args_slot().lock().unwrap().clone()
+}
+
+fn exe_for_cmdline() -> String {
+    if let Some(m) = crate::modules::main_module() {
+        return m.path.to_string_lossy().into_owned();
+    }
+    if let Some(b) = crate::state::boot() {
+        return b.exe_path.to_string_lossy().into_owned();
+    }
+    "xcl".to_string()
+}
+
+fn current_command_line() -> String {
+    let mut s = quote_cmd_arg(&exe_for_cmdline());
+    for a in game_args() {
+        s.push(' ');
+        s.push_str(&quote_cmd_arg(&a));
+    }
+    s
+}
+
+fn immortal_wide(s: &str) -> *const u16 {
+    let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let p = libc::malloc(w.len() * 2) as *mut u16;
+        assert!(!p.is_null(), "kernelx: out of memory");
+        std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+        p as *const u16
+    }
+}
+
+fn immortal_ansi(s: &str) -> *const u8 {
+    let b = s.as_bytes();
+    unsafe {
+        let p = libc::malloc(b.len() + 1) as *mut u8;
+        assert!(!p.is_null(), "kernelx: out of memory");
+        std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());
+        *p.add(b.len()) = 0;
+        p as *const u8
+    }
+}
+
+static CMDLINE_W: OnceLock<Mutex<Option<(String, usize)>>> = OnceLock::new();
+static CMDLINE_A: OnceLock<Mutex<Option<(String, usize)>>> = OnceLock::new();
+
+/// `LPWSTR GetCommandLineW(void)` — the mapped exe plus game args, quoted. The pointer
+/// is process-lifetime; the same source string keeps the same pointer.
+pub unsafe extern "win64" fn GetCommandLineW() -> *const u16 {
+    let src = current_command_line();
+    let mut g = CMDLINE_W.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if let Some((cached, ptr)) = g.as_ref() {
+        if *cached == src {
+            return *ptr as *const u16;
+        }
+    }
+    let p = immortal_wide(&src);
+    *g = Some((src, p as usize));
+    p
+}
+
+/// `LPSTR GetCommandLineA(void)` — ANSI (UTF-8 on Linux) form of the same command line.
+pub unsafe extern "win64" fn GetCommandLineA() -> *const u8 {
+    let src = current_command_line();
+    let mut g = CMDLINE_A.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if let Some((cached, ptr)) = g.as_ref() {
+        if *cached == src {
+            return *ptr as *const u8;
+        }
+    }
+    let p = immortal_ansi(&src);
+    *g = Some((src, p as usize));
+    p
+}
+
+// Process heap: a single libc-backed heap; private heaps alias to it.
+
+/// Pseudo-handle returned by `GetProcessHeap` (`"XCLH"`; never collides with the
+/// `0x1_0000`-based thread/event/file handles or the mmap-backed HLE handles).
+pub const PROCESS_HEAP: usize = 0x5843_4C48;
+
+const HEAP_ZERO_MEMORY: u32 = 0x8;
+
+static HEAP_SIZES: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+fn heap_sizes() -> &'static Mutex<HashMap<usize, usize>> {
+    HEAP_SIZES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `HANDLE GetProcessHeap(void)` — the process heap pseudo-handle.
+pub unsafe extern "win64" fn GetProcessHeap() -> usize {
+    PROCESS_HEAP
+}
+
+/// `HANDLE HeapCreate(DWORD, SIZE_T, SIZE_T)` — alias to the process heap (no private
+/// heaps on Linux; every heap is the same libc heap).
+pub unsafe extern "win64" fn HeapCreate(
+    _options: u32,
+    _init: usize,
+    _max: usize,
+) -> usize {
+    set_error(ERROR_SUCCESS);
+    PROCESS_HEAP
+}
+
+/// `BOOL HeapDestroy(HANDLE)` — success for the process heap, clean failure otherwise.
+pub unsafe extern "win64" fn HeapDestroy(h: usize) -> i32 {
+    if h == PROCESS_HEAP {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+/// `LPVOID HeapAlloc(HANDLE, DWORD, SIZE_T)` — `libc` memory; `0` bytes yields a
+/// freeable minimum block; `HEAP_ZERO_MEMORY` zeroes. Null (with `ERROR_NOT_ENOUGH_MEMORY`
+/// or `ERROR_INVALID_PARAMETER`) on failure, never a host abort.
+pub unsafe extern "win64" fn HeapAlloc(h: usize, flags: u32, bytes: usize) -> *mut c_void {
+    if h != PROCESS_HEAP {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let n = bytes.max(1);
+    let p = if flags & HEAP_ZERO_MEMORY != 0 {
+        libc::calloc(1, n) as *mut c_void
+    } else {
+        libc::malloc(n) as *mut c_void
+    };
+    if p.is_null() {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    }
+    heap_sizes().lock().unwrap().insert(p as usize, n);
+    set_error(ERROR_SUCCESS);
+    p
+}
+
+/// `LPVOID HeapReAlloc(HANDLE, DWORD, LPVOID, SIZE_T)` — `NULL` behaves as `HeapAlloc`;
+/// `0` bytes frees the block and returns `NULL`. Grown tails are zeroed under
+/// `HEAP_ZERO_MEMORY` (sizes are tracked for this).
+pub unsafe extern "win64" fn HeapReAlloc(
+    h: usize,
+    flags: u32,
+    p: *mut c_void,
+    bytes: usize,
+) -> *mut c_void {
+    if h != PROCESS_HEAP {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    if p.is_null() {
+        return HeapAlloc(h, flags, bytes);
+    }
+    if bytes == 0 {
+        HeapFree(h, flags, p);
+        return std::ptr::null_mut();
+    }
+    let old = heap_sizes().lock().unwrap().get(&(p as usize)).copied().unwrap_or(0);
+    let q = libc::realloc(p as *mut libc::c_void, bytes) as *mut c_void;
+    if q.is_null() {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    }
+    if q as usize != p as usize {
+        let mut g = heap_sizes().lock().unwrap();
+        g.remove(&(p as usize));
+        g.insert(q as usize, bytes);
+    } else {
+        heap_sizes().lock().unwrap().insert(q as usize, bytes);
+    }
+    if flags & HEAP_ZERO_MEMORY != 0 && bytes > old {
+        std::ptr::write_bytes((q as *mut u8).add(old), 0, bytes - old);
+    }
+    set_error(ERROR_SUCCESS);
+    q
+}
+
+/// `BOOL HeapFree(HANDLE, DWORD, LPVOID)` — `NULL` is a no-op success (as for `free`);
+/// unknown pointers fail cleanly instead of aborting the host in `libc::free`.
+pub unsafe extern "win64" fn HeapFree(h: usize, _flags: u32, p: *mut c_void) -> i32 {
+    if p.is_null() {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    if h != PROCESS_HEAP {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if heap_sizes().lock().unwrap().remove(&(p as usize)).is_none() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    libc::free(p as *mut libc::c_void);
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `SIZE_T HeapSize(HANDLE, DWORD, LPCVOID)` — tracked size, or `SIZE_T(-1)` on failure.
+pub unsafe extern "win64" fn HeapSize(h: usize, _flags: u32, p: *const c_void) -> usize {
+    if h != PROCESS_HEAP || p.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return usize::MAX;
+    }
+    match heap_sizes().lock().unwrap().get(&(p as usize)).copied() {
+        Some(n) => {
+            set_error(ERROR_SUCCESS);
+            n
+        }
+        None => {
+            set_error(ERROR_INVALID_PARAMETER);
+            usize::MAX
+        }
+    }
+}
+
+/// `BOOL HeapValidate(HANDLE, DWORD, LPCVOID)` — `NULL` validates the whole heap
+/// (always fine); otherwise the pointer must be a live heap block.
+pub unsafe extern "win64" fn HeapValidate(h: usize, _flags: u32, p: *const c_void) -> i32 {
+    if h != PROCESS_HEAP {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if p.is_null() {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    if heap_sizes().lock().unwrap().contains_key(&(p as usize)) {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+fn module_path_for(h: usize) -> Option<String> {
+    if h == 0 {
+        if let Some(m) = crate::modules::main_module() {
+            return Some(m.path.to_string_lossy().into_owned());
+        }
+        return crate::state::boot().map(|b| b.exe_path.to_string_lossy().into_owned());
+    }
+    if let Some(m) = crate::modules::main_module() {
+        if m.base == h {
+            return Some(m.path.to_string_lossy().into_owned());
+        }
+    }
+    if let Some(m) = crate::modules::find_mapped_by_base(h) {
+        return Some(m.path.to_string_lossy().into_owned());
+    }
+    crate::modules::hle_name_by_handle(h).map(|n| format!("C:\\Windows\\System32\\{n}"))
+}
+
+/// `DWORD GetModuleFileNameW(HMODULE, LPWSTR, DWORD)` — the mapped image path for XCL
+/// images (or a `C:\Windows\System32\…` stand-in for HLE pseudo-handles); `0` for
+/// unknown handles. Truncation reports `ERROR_INSUFFICIENT_BUFFER`, as on Windows.
+pub unsafe extern "win64" fn GetModuleFileNameW(h: usize, buf: *mut u16, size: u32) -> u32 {
+    let Some(p) = module_path_for(h) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if buf.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = crate::util::write_wide_out(&p, buf, size);
+    if n == size {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    n
+}
+
+/// `DWORD GetModuleFileNameA(HMODULE, LPSTR, DWORD)` — ANSI (UTF-8 on Linux) form.
+pub unsafe extern "win64" fn GetModuleFileNameA(h: usize, buf: *mut u8, size: u32) -> u32 {
+    let Some(p) = module_path_for(h) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if buf.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = crate::util::write_ansi_out(&p, buf, size);
+    if n == size {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------------------
 // Export table
 // ---------------------------------------------------------------------------------------
 
@@ -3209,6 +3563,19 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("AcquireSRWLockExclusive", AcquireSRWLockExclusive as usize),
         ("ReleaseSRWLockExclusive", ReleaseSRWLockExclusive as usize),
         ("TryAcquireSRWLockExclusive", TryAcquireSRWLockExclusive as usize),
+        // Step-11b startup: command line, process heap, module file names.
+        ("GetCommandLineW", GetCommandLineW as usize),
+        ("GetCommandLineA", GetCommandLineA as usize),
+        ("GetProcessHeap", GetProcessHeap as usize),
+        ("HeapCreate", HeapCreate as usize),
+        ("HeapDestroy", HeapDestroy as usize),
+        ("HeapAlloc", HeapAlloc as usize),
+        ("HeapReAlloc", HeapReAlloc as usize),
+        ("HeapFree", HeapFree as usize),
+        ("HeapSize", HeapSize as usize),
+        ("HeapValidate", HeapValidate as usize),
+        ("GetModuleFileNameW", GetModuleFileNameW as usize),
+        ("GetModuleFileNameA", GetModuleFileNameA as usize),
         // Step-10c file APIs through the linked-in Linux VFS (kernel-family fallbacks).
         ("CreateFileW", CreateFileW as usize),
         ("CreateFileA", CreateFileA as usize),
@@ -3253,6 +3620,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::Barrier;
+
+    /// Serializes the two command-line tests: they share the process-global
+    /// `GAME_ARGS`, and the suite runs tests on multiple threads.
+    static CMDLINE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn perms_at(addr: usize) -> Option<String> {
         let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
@@ -3866,5 +4237,121 @@ mod tests {
         );
         assert_eq!(tree_hash(global_game), global_before);
         let _ = data;
+    }
+
+    #[test]
+    fn command_line_is_a_parseable_wide_string() {
+        let _serial = CMDLINE_TEST_SERIAL.lock().unwrap();
+        let prev = game_args();
+        set_game_args(&[]);
+        unsafe {
+            let w = GetCommandLineW();
+            assert!(!w.is_null());
+            let n = crate::util::wcslen(w);
+            assert!(n > 0, "command line must not be empty");
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(w, n));
+            // The exe (or the "xcl" fallback when no image is mapped) is always argv[0].
+            assert!(!s.is_empty());
+            let a = GetCommandLineA();
+            assert!(!a.is_null());
+            let an = crate::util::wcslen(w);
+            assert_eq!(an, n);
+            let sa = crate::util::from_cstr_ptr(a).expect("ansi command line");
+            assert_eq!(sa, s, "W and A forms must agree");
+            // Same source keeps the same pointer (Windows stability).
+            assert_eq!(GetCommandLineW(), w);
+            assert_eq!(GetCommandLineA(), a);
+        }
+        set_game_args(&prev);
+    }
+
+    #[test]
+    fn command_line_quoting_matches_the_launcher() {
+        assert_eq!(quote_cmd_arg("game.exe"), "game.exe");
+        assert_eq!(quote_cmd_arg(""), "\"\"");
+        assert_eq!(quote_cmd_arg("a b"), "\"a b\"");
+        assert_eq!(quote_cmd_arg("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn command_line_carries_the_game_args() {
+        let _serial = CMDLINE_TEST_SERIAL.lock().unwrap();
+        let prev = game_args();
+        set_game_args(&["--level".to_string(), "a b".to_string()]);
+        unsafe {
+            let w = GetCommandLineW();
+            let n = crate::util::wcslen(w);
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(w, n));
+            assert!(s.contains("--level"), "{s}");
+            assert!(s.contains("\"a b\""), "{s}");
+        }
+        set_game_args(&prev);
+    }
+
+    #[test]
+    fn process_heap_allocs_frees_and_resizes() {
+        unsafe {
+            assert_eq!(GetProcessHeap(), PROCESS_HEAP);
+            assert_ne!(HeapCreate(0, 0, 0), 0);
+            // Zero bytes still yields a freeable block.
+            let p = HeapAlloc(GetProcessHeap(), 0, 0);
+            assert!(!p.is_null());
+            assert!(HeapSize(GetProcessHeap(), 0, p) >= 1);
+            assert_eq!(HeapFree(GetProcessHeap(), 0, p), 1);
+            // NULL free is a no-op success; double free fails cleanly (no host abort).
+            assert_eq!(HeapFree(GetProcessHeap(), 0, std::ptr::null_mut()), 1);
+            assert_eq!(HeapFree(GetProcessHeap(), 0, p), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // Wrong heap fails cleanly.
+            assert!(HeapAlloc(0x1234, 0, 16).is_null());
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // Zeroed alloc reads as zeros.
+            let z = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 32) as *mut u8;
+            assert!(!z.is_null());
+            assert!(std::slice::from_raw_parts(z, 32).iter().all(|&b| b == 0));
+            // Realloc grows, keeps content, zeroes the tail under HEAP_ZERO_MEMORY.
+            std::ptr::write_bytes(z, 0xAB, 32);
+            let q = HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, z as *mut c_void, 64) as *mut u8;
+            assert!(!q.is_null());
+            assert!(std::slice::from_raw_parts(q, 32).iter().all(|&b| b == 0xAB));
+            assert!(std::slice::from_raw_parts(q.add(32), 32).iter().all(|&b| b == 0));
+            assert_eq!(HeapSize(GetProcessHeap(), 0, q as *const c_void), 64);
+            // Realloc to 0 frees and returns NULL.
+            assert!(HeapReAlloc(GetProcessHeap(), 0, q as *mut c_void, 0).is_null());
+            // NULL realloc behaves as alloc.
+            let r = HeapReAlloc(GetProcessHeap(), 0, std::ptr::null_mut(), 16);
+            assert!(!r.is_null());
+            assert_eq!(HeapFree(GetProcessHeap(), 0, r), 1);
+            assert_eq!(HeapValidate(GetProcessHeap(), 0, std::ptr::null()), 1);
+            assert_eq!(HeapDestroy(GetProcessHeap()), 1);
+            assert_eq!(HeapDestroy(0x1234), 0);
+        }
+    }
+
+    #[test]
+    fn module_file_name_answers_mapped_and_hle_images() {
+        unsafe {
+            // HLE pseudo-handles report a System32 stand-in.
+            let h = crate::modules::hle_handle("kernelx_unit_probe.dll");
+            let mut wbuf = [0u16; 260];
+            let n = GetModuleFileNameW(h, wbuf.as_mut_ptr(), 260);
+            assert!(n > 0);
+            let s = String::from_utf16_lossy(&wbuf[..n as usize]);
+            assert!(s.ends_with("kernelx_unit_probe.dll"), "{s}");
+            let mut abuf = [0u8; 260];
+            let m = GetModuleFileNameA(h, abuf.as_mut_ptr(), 260);
+            assert!(m > 0);
+            // Unknown handles fail cleanly.
+            assert_eq!(GetModuleFileNameW(0xDEAD_BEEF_1234, wbuf.as_mut_ptr(), 260), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // Truncation reports ERROR_INSUFFICIENT_BUFFER with `size` chars, as on Windows.
+            let mut tiny = [0u16; 4];
+            let t = GetModuleFileNameW(h, tiny.as_mut_ptr(), 4);
+            assert_eq!(t, 4);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            // Null buffer/size fails cleanly.
+            assert_eq!(GetModuleFileNameW(h, std::ptr::null_mut(), 260), 0);
+            assert_eq!(GetModuleFileNameW(h, wbuf.as_mut_ptr(), 0), 0);
+        }
     }
 }

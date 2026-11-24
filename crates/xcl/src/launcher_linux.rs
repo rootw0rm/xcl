@@ -250,7 +250,7 @@ pub fn format_missing_cpu_message(missing: &[&str]) -> String {
     )
 }
 
-pub fn run(target: &Path, _args: &[String]) -> i32 {
+pub fn run(target: &Path, args: &[String]) -> i32 {
     let (root, explicit_exe, title) = match resolve_location(target) {
         Ok(x) => x,
         Err(e) => {
@@ -336,6 +336,10 @@ pub fn run(target: &Path, _args: &[String]) -> i32 {
             return 2;
         }
     }
+
+    // The game reads its exe + args through GetCommandLineW (mingw __getmainargs
+    // parses it into argc/argv); remember what the user passed before entering the host.
+    crate::hle::kernelx_linux::set_game_args(args);
 
     let code = crate::host::run_boot(&boot);
     summarize(&boot, code);
