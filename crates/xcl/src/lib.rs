@@ -51,6 +51,9 @@ pub mod state;
 pub mod stubs;
 #[cfg(windows)]
 pub mod tls;
+#[cfg(not(windows))]
+#[path = "tls_linux.rs"]
+pub mod tls;
 pub mod util;
 #[cfg(windows)]
 pub mod vfs;

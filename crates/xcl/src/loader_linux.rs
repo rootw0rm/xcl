@@ -211,10 +211,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         );
     }
 
-    // 5. static TLS: keep the directory's callbacks in order. The per-thread block and the
-    // callbacks themselves are step 7.
+    // 5. static TLS: keep the directory's callbacks in order, then (for the main image)
+    // install the per-thread blocks. DLL TLS install follows the game-DLL load path —
+    // LINUX-TODO: Phase C step-10.
     let mut tls_callbacks = Vec::new();
-    let mut tls_note = None;
+    let mut tls_dir = None;
     match pe.tls() {
         Ok(Some(t)) => {
             if t.address_of_callbacks != 0 {
@@ -242,13 +243,54 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                     at += 8;
                 }
             }
-            tls_note = Some((t.template_len(), u64::from(t.size_of_zero_fill)));
+            tls_dir = Some(t);
         }
         Ok(None) => {}
         Err(e) => return Err(format!("{name}: TLS directory: {e}")),
     }
 
     let tls_count = tls_callbacks.len();
+    if let Some(t) = tls_dir {
+        let template_len = t.template_len() as usize;
+        let template = if template_len == 0 {
+            0
+        } else {
+            let rva = checked_rva(&pe, t.start_raw, template_len, "TLS template")?;
+            base + rva as usize
+        };
+        let index_ptr = if t.address_of_index == 0 {
+            0
+        } else {
+            let rva = checked_rva(&pe, t.address_of_index, 4, "TLS index")?;
+            base + rva as usize
+        };
+        crate::xlog_info!(
+            "{name}: TLS directory: template {template_len} B, zero-fill {} B, {tls_count} callbacks",
+            t.size_of_zero_fill
+        );
+        if is_main {
+            unsafe {
+                crate::tls::install(crate::tls::ImageSpec {
+                    name: name.clone(),
+                    template,
+                    template_len,
+                    total_len: t.total_len(),
+                    index_ptr,
+                    hinst: base,
+                    callbacks: tls_callbacks.clone(),
+                    main: true,
+                })
+            }
+            .map_err(|e| format!("{name}: static TLS: {e}"))?;
+        } else {
+            // LINUX-TODO: Phase C step-10 — the game-DLL load path (DllMain/init_dll) does
+            // not exist yet; install the DLL's blocks there, before running its code.
+            crate::xlog_info!(
+                "{name}: non-main image: static TLS installs on the game-DLL load path (Phase C step-10)"
+            );
+        }
+    }
+
     let module = Arc::new(MappedModule {
         name: name.clone(),
         path: path.to_path_buf(),
@@ -271,13 +313,6 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         "loaded {name} @ {base:#x} (size {size:#x}, preferred {:#x})",
         pe.image_base
     );
-    if let Some((template, zerofill)) = tls_note {
-        // LINUX-TODO: Phase C step-07 — install the static TLS block per thread and run the
-        // callbacks; the directory (and these addresses) are already at their link VAs.
-        crate::xlog_info!(
-            "{name}: TLS directory: template {template} B, zero-fill {zerofill} B, {tls_count} callbacks; install is Phase C step-07"
-        );
-    }
 
     // 6. page protections (headers read-only, sections from their characteristics) and
     // transparent huge pages for large sections.
@@ -401,17 +436,18 @@ mod tests {
         f[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
 
-    /// A PE32+ DLL with one section (.text at RVA 0x1000, 0x200 raw bytes at file 0x200,
-    /// execute+read), entry point at RVA 0x1000, preferred at `image_base`, one empty base
-    /// relocation block at RVA 0x1100. `import_dir`: (RVA, size) if an import directory is
-    /// wanted.
+    /// A PE32+ DLL with two sections: .text at RVA 0x1000 (0x200 raw bytes at file 0x200,
+    /// execute+read; entry point there) and .data at RVA 0x2000 (0x200 raw bytes at file
+    /// 0x400, read+write; the TLS directory lives there). Preferred base `image_base`, one
+    /// empty base relocation block at RVA 0x1100. `import_dir`: (RVA, size) if an import
+    /// directory is wanted.
     fn tiny_dll(image_base: u64, code: &[u8], import_dir: Option<(u32, u32)>) -> Vec<u8> {
-        let mut f = vec![0u8; 0x400];
+        let mut f = vec![0u8; 0x600];
         f[0..2].copy_from_slice(b"MZ");
         p32(&mut f, 0x3C, 0x40);
         f[0x40..0x44].copy_from_slice(b"PE\0\0");
         p16(&mut f, 0x44, 0x8664);
-        p16(&mut f, 0x46, 1);
+        p16(&mut f, 0x46, 2);
         p16(&mut f, 0x54, 0xF0);
         p16(&mut f, 0x56, 0x2022);
         let o = 0x58;
@@ -423,7 +459,7 @@ mod tests {
         p32(&mut f, o + 0x24, 0x200); // file alignment
         p16(&mut f, o + 0x28, 6);
         p16(&mut f, o + 0x30, 6);
-        p32(&mut f, o + 0x38, 0x2000); // size of image
+        p32(&mut f, o + 0x38, 0x3000); // size of image
         p32(&mut f, o + 0x3C, 0x200); // size of headers
         p16(&mut f, o + 0x44, 3); // console subsystem
         f[o + 0x48..o + 0x50].copy_from_slice(&0x10_0000u64.to_le_bytes());
@@ -447,6 +483,14 @@ mod tests {
         p32(&mut f, s + 16, 0x200);
         p32(&mut f, s + 20, 0x200);
         p32(&mut f, s + 36, 0x6000_0020);
+        // .data: RVA 0x2000, file 0x400
+        let d = s + 0x28;
+        f[d..d + 5].copy_from_slice(b".data");
+        p32(&mut f, d + 8, 0x200);
+        p32(&mut f, d + 12, 0x2000);
+        p32(&mut f, d + 16, 0x200);
+        p32(&mut f, d + 20, 0x400);
+        p32(&mut f, d + 36, 0xC000_0040);
         f[0x200..0x200 + code.len()].copy_from_slice(code);
         f
     }
@@ -463,22 +507,28 @@ mod tests {
         p32(f, o + 0x70 + 5 * 8 + 4, block as u32);
     }
 
-    /// TLS directory at RVA 0x1120, callback list at RVA 0x1160, template at 0x11A0.
-    fn set_tls(f: &mut [u8], image_base: u64) {
+    /// TLS directory at RVA 0x2000 (.data), callback list at 0x2040, 8-byte template at
+    /// 0x2080 (first byte `template`, already-relocated zeros after it) and the image's
+    /// `_tls_index` at 0x2088. The callbacks are two distinct `ret`s in .text, so a thread
+    /// that attaches later can run them for real. The index starts at a poison value: an
+    /// install must overwrite it.
+    fn set_tls(f: &mut [u8], image_base: u64, template: u8) {
         let o = 0x58;
-        let callbacks = image_base + 0x1160;
-        let template = image_base + 0x11A0;
-        p32(f, o + 0x70 + 9 * 8, 0x1120);
+        let callbacks = image_base + 0x2040;
+        let template_va = image_base + 0x2080;
+        p32(f, o + 0x70 + 9 * 8, 0x2000);
         p32(f, o + 0x70 + 9 * 8 + 4, 40);
-        let d = 0x320; // RVA 0x1120
-        f[d..d + 8].copy_from_slice(&template.to_le_bytes());
-        f[d + 8..d + 16].copy_from_slice(&(template + 8).to_le_bytes());
-        f[d + 16..d + 24].copy_from_slice(&(image_base + 0x11B0).to_le_bytes());
+        let d = 0x400; // RVA 0x2000
+        f[d..d + 8].copy_from_slice(&template_va.to_le_bytes());
+        f[d + 8..d + 16].copy_from_slice(&(template_va + 8).to_le_bytes());
+        f[d + 16..d + 24].copy_from_slice(&(image_base + 0x2088).to_le_bytes());
         f[d + 24..d + 32].copy_from_slice(&callbacks.to_le_bytes());
-        // callbacks: two entries and the null terminator
-        let c = 0x360; // RVA 0x1160
+        // callbacks: two distinct entries and the null terminator
+        let c = 0x440; // RVA 0x2040
         f[c..c + 8].copy_from_slice(&(image_base + 0x1000).to_le_bytes());
-        f[c + 8..c + 16].copy_from_slice(&(image_base + 0x1000).to_le_bytes());
+        f[c + 8..c + 16].copy_from_slice(&(image_base + 0x1001).to_le_bytes());
+        f[0x480] = template; // RVA 0x2080
+        p32(f, 0x488, 0xDEAD_BEEF); // RVA 0x2088, poison until installed
     }
 
     fn write(name: &str, bytes: &[u8]) -> PathBuf {
@@ -515,7 +565,7 @@ mod tests {
         let p = write("xcl_map_ok.dll", &tiny_dll(base, &code, None));
         let m = map_image(&p).expect("synthetic PE maps");
         assert_eq!(m.base, base as usize);
-        assert_eq!(m.size, 0x2000);
+        assert_eq!(m.size, 0x3000);
         assert_eq!(m.entry_rva, 0x1000);
         assert!(m.is_dll);
         assert_eq!(m.name, "xcl_map_ok.dll");
@@ -586,14 +636,68 @@ mod tests {
     #[test]
     fn tls_directory_callbacks_are_preserved_in_order() {
         let base = 0x6E52_0000_0000u64;
-        let mut file = tiny_dll(base, &[0xC3], None);
-        set_tls(&mut file, base);
+        let mut file = tiny_dll(base, &[0xC3, 0xC3], None);
+        set_tls(&mut file, base, 7);
         let p = write("xcl_tls.dll", &file);
         let m = map_image(&p).expect("synthetic TLS image maps");
         assert_eq!(
             *m.tls_callbacks.lock().unwrap(),
-            vec![base as usize + 0x1000; 2]
+            vec![base as usize + 0x1000, base as usize + 0x1001]
         );
+        // A DLL installs its blocks with the game-DLL load path (step 10), not at map.
+        assert_eq!(
+            unsafe { std::ptr::read_volatile((m.base + 0x2088) as *const u32) },
+            0xDEAD_BEEF
+        );
+    }
+
+    /// Read byte 0 of the current thread's block for `index` through the TEB pointer, as
+    /// PE `__declspec(thread)` code does.
+    unsafe fn read_tls_byte(index: u32) -> u8 {
+        let slots: *mut *mut u8;
+        core::arch::asm!(
+            "mov {}, gs:[0x58]",
+            out(reg) slots,
+            options(nostack, readonly, preserves_flags)
+        );
+        let block = *slots.add(index as usize);
+        *block
+    }
+
+    #[test]
+    fn main_image_installs_slot_zero_and_blocks_for_new_threads() {
+        let base = 0x6E55_0000_0000u64;
+        let mut file = tiny_dll(base, &[0xC3, 0xC3], None);
+        set_tls(&mut file, base, 7);
+        let p = write("xcl_tls_main.dll", &file);
+        let m = load_main(&p).expect("synthetic main image loads");
+        let index = unsafe { std::ptr::read_volatile((m.base + 0x2088) as *const u32) };
+        assert_eq!(index, 0, "the main image takes TLS slot 0");
+
+        let a = crate::tls::spawn("tls-main-a", move || unsafe {
+            let first = read_tls_byte(index);
+            *slots_for(index) = 8;
+            (first, read_tls_byte(index))
+        })
+        .expect("spawn a");
+        let b = crate::tls::spawn("tls-main-b", move || unsafe {
+            let first = read_tls_byte(index);
+            *slots_for(index) = 8;
+            (first, read_tls_byte(index))
+        })
+        .expect("spawn b");
+        assert_eq!(a.join().unwrap(), (7, 8));
+        assert_eq!(b.join().unwrap(), (7, 8));
+    }
+
+    unsafe fn slots_for(index: u32) -> *mut u8 {
+        let slots: *mut *mut u8;
+        core::arch::asm!(
+            "mov {}, gs:[0x58]",
+            out(reg) slots,
+            options(nostack, readonly, preserves_flags)
+        );
+        *slots.add(index as usize)
     }
 
     #[test]
