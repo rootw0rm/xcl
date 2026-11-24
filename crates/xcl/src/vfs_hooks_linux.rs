@@ -4,8 +4,7 @@
 //! `kernelx` file APIs call libc themselves, so the VFS sits *inside* that path — this module
 //! is where a console path is resolved and opened. Nothing is interposed process-wide.
 //!
-//! `// LINUX-TODO: Phase C step-10` — kernelx (`CreateFileW` and the CRT entry points) calls
-//! `open` once its file APIs are ported; until then this module is exercised by its tests.
+//! The step-10c `kernelx` file APIs call `open` here; the CRT entry points stay stubs.
 
 use std::ffi::CString;
 use std::fs::File;

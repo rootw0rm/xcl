@@ -361,9 +361,10 @@ mod tests {
     #[test]
     fn routed_imports_resolve_to_callable_stubs() {
         // Every import routed to an HLE module is Stub metadata (address 0) but resolves
-        // to a callable auto-stub thunk, never null.
+        // to a callable auto-stub thunk, never null. Step-10c file APIs are HLE now, so
+        // they are covered by `kernelx_core_imports_resolve_to_hle` instead.
         for (dll, sym) in [
-            ("kernel32.dll", "CreateFileW"),
+            ("kernel32.dll", "LoadLibraryW"),
             ("kernelx.dll", "XMemAlloc"),
             ("d3d12_xs.dll", "D3D12XboxCreateDevice"),
             ("xgameruntime.dll", "XGameRuntimeInitialize"),
@@ -379,7 +380,7 @@ mod tests {
 
     #[test]
     fn kernelx_core_imports_resolve_to_hle() {
-        // Step 10b: memory/thread/sync/time imports are real HLE, callable directly.
+        // Steps 10b–10c: memory/thread/sync/time/file imports are real HLE, callable directly.
         for (dll, sym) in [
             ("kernel32.dll", "VirtualAlloc"),
             ("api-ms-win-core-memory-l1-1-0.dll", "VirtualProtect"),
@@ -387,6 +388,11 @@ mod tests {
             ("api-ms-win-core-synch-l1-1-0.dll", "WaitForSingleObject"),
             ("api-ms-win-core-synch-l1-1-0.dll", "EnterCriticalSection"),
             ("api-ms-win-core-profile-l1-1-0.dll", "QueryPerformanceCounter"),
+            ("kernel32.dll", "CreateFileW"),
+            ("api-ms-win-core-file-l1-1-0.dll", "ReadFile"),
+            ("api-ms-win-core-file-l1-1-0.dll", "WriteFile"),
+            ("api-ms-win-core-file-l1-1-0.dll", "DeleteFileW"),
+            ("api-ms-win-core-file-l1-2-0.dll", "GetDiskFreeSpaceExW"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
@@ -472,7 +478,11 @@ mod tests {
 
     #[test]
     fn classify_never_claims_hle_on_linux() {
-        assert_eq!(classify("kernel32.dll", &name("CreateFileW")), Source::Stub);
+        // File APIs are HLE on Linux now (step 10c); unimplemented HLE names stay Stub.
+        assert!(matches!(
+            classify("kernel32.dll", &name("CreateFileW")),
+            Source::Hle(_) | Source::HleOther(_)
+        ));
         assert_eq!(classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice")), Source::Stub);
         assert_eq!(classify("ucrtbase.dll", &name("malloc")), Source::Stub);
     }

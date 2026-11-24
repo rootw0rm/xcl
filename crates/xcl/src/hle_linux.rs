@@ -323,8 +323,8 @@ mod tests {
     #[test]
     fn linux_exports_are_stub_metadata_except_kernelx_core() {
         let r = build(&Config::default());
-        // Unimplemented names are metadata `0`, never a callable address. Step 10b
-        // implements the kernelx memory/thread/sync/time slice, so those resolve as HLE.
+        // Unimplemented names are metadata `0`, never a callable address. Steps 10b–10c
+        // implement the kernelx memory/thread/sync/time/file slices, so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
@@ -339,7 +339,7 @@ mod tests {
             }
         }
         assert!(total > 200, "expected the Windows export-name tables, got {total}");
-        assert!(implemented > 40, "expected the step-10b kernelx core, got {implemented}");
+        assert!(implemented > 70, "expected the step-10b/10c kernelx core, got {implemented}");
         // Spot-check counts against the Windows tables (kernelx grows with the Linux
         // kernel-family fallbacks routed to it).
         let kx = r.module_by_name(KERNELX).unwrap();
@@ -357,12 +357,22 @@ mod tests {
             "QueryPerformanceCounter",
             "InitializeCriticalSection",
             "AcquireSRWLockExclusive",
+            "CreateFileW",
+            "ReadFile",
+            "WriteFile",
+            "DeleteFileW",
+            "CreateDirectoryW",
+            "MoveFileExW",
+            "FindFirstFileW",
+            "FindNextFileW",
+            "GetFileAttributesW",
+            "GetDiskFreeSpaceExW",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
-        // Steps 10c–10d stay stubs here (names present in the Windows export list).
+        // Steps 10d stay stubs here (names present in the Windows export list).
         for name in ["GetModuleHandleW", "LoadLibraryW", "XMemAlloc"] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);

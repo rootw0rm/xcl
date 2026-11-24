@@ -1,21 +1,27 @@
-//! Linux kernelx core (Phase C step 10b): memory, threads, sync, and time.
+//! Linux kernelx core (Phase C steps 10b–10c): memory, threads, sync, time, and files.
 //!
 //! The Windows `hle/kernelx.rs` stays the implementation source of truth for the full
-//! title path. This module is the Linux twin for the step-10b slice: virtual memory via
-//! `mmap`/`mprotect`, game threads via [`crate::tls::spawn`] (so static TLS attach and
-//! `DLL_THREAD_ATTACH`/`DETACH` callbacks run), synchronization primitives with inline
-//! Windows layout semantics, and monotonic time. Xbox thread priorities degrade
-//! gracefully: the requested value is remembered and returned, while the host scheduler
-//! change is best-effort (no abort without `CAP_SYS_NICE`).
+//! title path. This module is the Linux twin for the step-10b slice (virtual memory via
+//! `mmap`/`mprotect`, game threads via [`crate::tls::spawn`], synchronization primitives
+//! with inline Windows layout semantics, and monotonic time) plus the step-10c slice
+//! (title-facing file operations through the linked-in Linux VFS path in
+//! `vfs_hooks_linux`, with libc-backed kernel-family fallbacks). Xbox thread priorities
+//! degrade gracefully: the requested value is remembered and returned, while the host
+//! scheduler change is best-effort (no abort without `CAP_SYS_NICE`).
 //!
 //! Calling convention: the game is a Windows PE, so every export is
 //! `unsafe extern "win64"`, matching the stub thunks and the TLS callbacks.
 //!
-//! Unrelated exports (file APIs, module loading, physical pages, XAudio/GPU paths) stay
-//! `Stub` in `hle_linux` until steps 10c–10d and Phase D/E land.
+//! Unrelated exports (module loading, physical pages, XAudio/GPU paths) stay
+//! `Stub` in `hle_linux` until steps 10d and Phase D/E land.
 //!
-//! Handle model: events and threads are monotonic ids in process-wide tables. `GetCurrentProcess`
-//! returns `-1` and `GetCurrentThread` returns `-2`, as on Windows.
+//! Handle model: events, threads, files, and finds are monotonic ids in process-wide
+//! tables. `GetCurrentProcess` returns `-1` and `GetCurrentThread` returns `-2`, as on
+//! Windows. File handles hold `std::fs::File` opened through the VFS, so reads see the
+//! read-only game layer and writes land in the copy-on-write overlay; `S:`/`T:` use the
+//! title data dir.
+
+#![allow(non_snake_case)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
@@ -1165,6 +1171,14 @@ pub unsafe extern "win64" fn CloseHandle(handle: usize) -> i32 {
         set_error(ERROR_SUCCESS);
         return 1;
     }
+    if close_file_handle(handle) {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    if close_find_handle(handle) {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
     if threads().lock().unwrap().contains_key(&handle) {
         // A running game thread cannot be force-closed; detach the record and let it run.
         // A finished thread's join is dropped here.
@@ -1576,6 +1590,1537 @@ pub unsafe extern "win64" fn XMemVirtualQuery(
 }
 
 // ---------------------------------------------------------------------------------------
+// Files (Phase C step 10c): title-facing operations through the linked-in Linux VFS.
+// ---------------------------------------------------------------------------------------
+//
+// The Windows build hooks KERNELBASE so the CRT (`fopen` → `CreateFileW`) and every
+// system DLL go through the VFS. Linux has no KERNELBASE: these HLE `kernelx` file APIs
+// call the VFS directly on the host call path (`vfs_hooks_linux::open` for data files,
+// `Vfs::{delete_file,create_dir,remove_dir,stage_write,commit_write}` for metadata).
+// Nothing is interposed process-wide (`LD_PRELOAD` is not used).
+//
+// Reads see the read-only game layer, writes land in the copy-on-write overlay, and
+// `S:`/`T:` use the title data dir. An unmapped drive or a traversal/symlink escape is
+// a clean Win32 error, never a host file. `CloseHandle` below also closes file and find
+// handles.
+
+const INVALID_HANDLE_VALUE: usize = usize::MAX;
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+
+// Win32 creation dispositions used here (match `vfs`).
+const CREATE_ALWAYS: u32 = 2;
+const OPEN_ALWAYS: u32 = 4;
+
+// Move/Copy flags.
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+const MOVEFILE_COPY_ALLOWED: u32 = 0x2;
+const COPY_FILE_FAIL_IF_EXISTS: u32 = 0x1;
+
+// File attributes.
+const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+
+// Seek origins.
+const FILE_BEGIN: u32 = 0;
+const FILE_CURRENT: u32 = 1;
+const FILE_END: u32 = 2;
+
+/// Windows `WIN32_FIND_DATAW` (592 bytes on x86-64). The game reads this layout
+/// directly, so it must match the Windows definition field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FindDataW {
+    pub attrs: u32,
+    pub creation_low: u32,
+    pub creation_high: u32,
+    pub access_low: u32,
+    pub access_high: u32,
+    pub write_low: u32,
+    pub write_high: u32,
+    pub size_high: u32,
+    pub size_low: u32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub name: [u16; 260],
+    pub alt_name: [u16; 14],
+}
+
+struct FindState {
+    items: Vec<FindDataW>,
+    pos: usize,
+}
+
+static FILES: OnceLock<Mutex<HashMap<usize, std::sync::Arc<Mutex<std::fs::File>>>>> =
+    OnceLock::new();
+static FINDS: OnceLock<Mutex<HashMap<usize, FindState>>> = OnceLock::new();
+
+fn files() -> &'static Mutex<HashMap<usize, std::sync::Arc<Mutex<std::fs::File>>>> {
+    FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn finds() -> &'static Mutex<HashMap<usize, FindState>> {
+    FINDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_file(f: std::fs::File) -> usize {
+    let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    files()
+        .lock()
+        .unwrap()
+        .insert(h, std::sync::Arc::new(Mutex::new(f)));
+    h
+}
+
+fn with_file<T>(h: usize, f: impl FnOnce(&std::fs::File) -> T) -> Option<T> {
+    let arc = files().lock().unwrap().get(&h).cloned()?;
+    let g = arc.lock().unwrap();
+    Some(f(&g))
+}
+
+fn with_file_mut<T>(h: usize, f: impl FnOnce(&mut std::fs::File) -> T) -> Option<T> {
+    let arc = files().lock().unwrap().get(&h).cloned()?;
+    let mut g = arc.lock().unwrap();
+    Some(f(&mut g))
+}
+
+fn close_file_handle(h: usize) -> bool {
+    files().lock().unwrap().remove(&h).is_some()
+}
+
+fn close_find_handle(h: usize) -> bool {
+    finds().lock().unwrap().remove(&h).is_some()
+}
+
+/// Case-insensitive `*`/`?` match for Find patterns (Windows semantics, ASCII only).
+fn pattern_matches(pat: &str, name: &str) -> bool {
+    let (p, n) = (pat.as_bytes(), name.as_bytes());
+    // Lowercase ASCII copies for case-insensitive compare.
+    let lower = |b: &[u8]| b.iter().map(|c| c.to_ascii_lowercase()).collect::<Vec<u8>>();
+    let p = lower(p);
+    let n = lower(n);
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if star.is_some() {
+            pi = star.unwrap() + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn filetime_from_system(t: std::time::SystemTime) -> (u32, u32) {
+    // Windows FILETIME: 100ns ticks since 1601-01-01.
+    let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let ticks = dur.as_secs() * 10_000_000 + dur.subsec_nanos() as u64 / 100 + 11_644_473_600 * 10_000_000;
+    (ticks as u32, (ticks >> 32) as u32)
+}
+
+fn find_data_for(name: &str, meta: &std::fs::Metadata) -> FindDataW {
+    let mut wname = [0u16; 260];
+    let enc: Vec<u16> = name.encode_utf16().take(259).collect();
+    wname[..enc.len()].copy_from_slice(&enc);
+    let is_dir = meta.is_dir();
+    let mut attrs = if is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_ARCHIVE
+    };
+    if meta.permissions().readonly() {
+        attrs |= FILE_ATTRIBUTE_READONLY;
+    }
+    let len = meta.len();
+    let (cw_l, cw_h) = meta
+        .created()
+        .map(filetime_from_system)
+        .unwrap_or((0, 0));
+    let (ca_l, ca_h) = meta
+        .accessed()
+        .map(filetime_from_system)
+        .unwrap_or((cw_l, cw_h));
+    let (ww_l, ww_h) = meta
+        .modified()
+        .map(filetime_from_system)
+        .unwrap_or((cw_l, cw_h));
+    FindDataW {
+        attrs,
+        creation_low: cw_l,
+        creation_high: cw_h,
+        access_low: ca_l,
+        access_high: ca_h,
+        write_low: ww_l,
+        write_high: ww_h,
+        size_high: (len >> 32) as u32,
+        size_low: len as u32,
+        reserved0: 0,
+        reserved1: 0,
+        name: wname,
+        alt_name: [0u16; 14],
+    }
+}
+
+fn list_host_dir(path: &str, pattern: &str) -> Vec<FindDataW> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n == ".xcl_whiteouts" {
+            continue;
+        }
+        if !pattern_matches(pattern, &n) {
+            continue;
+        }
+        let Ok(m) = e.metadata() else { continue };
+        out.push(find_data_for(&n, &m));
+    }
+    out.sort_by(|a, b| {
+        let an = a.name.iter().position(|&c| c == 0).unwrap_or(a.name.len());
+        let bn = b.name.iter().position(|&c| c == 0).unwrap_or(b.name.len());
+        String::from_utf16_lossy(&a.name[..an]).cmp(&String::from_utf16_lossy(&b.name[..bn]))
+    });
+    out
+}
+
+fn game_dir_entries(v: &crate::vfs::Vfs, dir_rel: &str, pattern: &str) -> Result<Vec<FindDataW>, u32> {
+    use crate::vfs::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    if !dir_rel.is_empty() && !v.is_dir(dir_rel) {
+        return Err(ERROR_PATH_NOT_FOUND);
+    }
+    let wildcard = pattern.contains('*') || pattern.contains('?');
+    if !wildcard {
+        // Exact name: single entry when visible.
+        let child = if dir_rel.is_empty() {
+            pattern.to_string()
+        } else {
+            format!("{dir_rel}\\{pattern}")
+        };
+        if v.is_whiteout(&child) {
+            return Err(ERROR_FILE_NOT_FOUND);
+        }
+        if v.visible_in_overlay(&child) || v.visible_in_original(&child) {
+            let host = v.read_path_rel(&child).ok_or(ERROR_FILE_NOT_FOUND)?;
+            let meta = std::fs::metadata(&host).map_err(|_| ERROR_FILE_NOT_FOUND)?;
+            return Ok(vec![find_data_for(pattern, &meta)]);
+        }
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let overlay_dir = v.overlay_path(dir_rel);
+    if v.needs_merge(dir_rel) || std::path::Path::new(&overlay_dir).is_dir() {
+        for d in list_host_dir(&overlay_dir, pattern) {
+            let n = {
+                let len = d.name.iter().position(|&c| c == 0).unwrap_or(d.name.len());
+                String::from_utf16_lossy(&d.name[..len])
+            };
+            if seen.insert(n.to_lowercase()) {
+                items.push(d);
+            }
+        }
+    }
+    if dir_rel.is_empty() || !v.is_whiteout(dir_rel) {
+        let orig_dir = v.original_path(dir_rel);
+        for d in list_host_dir(&orig_dir, pattern) {
+            let n = {
+                let len = d.name.iter().position(|&c| c == 0).unwrap_or(d.name.len());
+                String::from_utf16_lossy(&d.name[..len])
+            };
+            if n == "." || n == ".." {
+                continue;
+            }
+            let child = if dir_rel.is_empty() {
+                n.clone()
+            } else {
+                format!("{dir_rel}\\{n}")
+            };
+            if v.is_whiteout(&child) {
+                continue;
+            }
+            if seen.insert(n.to_lowercase()) {
+                items.push(d);
+            }
+        }
+    }
+    if items.is_empty() {
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
+    Ok(items)
+}
+
+/// Split `G:\dir\pat*` into (`dir_rel`, `pattern`) for game paths. `dir_rel` uses `\`.
+fn split_find_rel(rel: &str) -> (String, String) {
+    match rel.rsplit_once('\\') {
+        Some((d, p)) => (d.to_string(), p.to_string()),
+        None => (String::new(), rel.to_string()),
+    }
+}
+
+fn find_first_impl(path: &str, out: *mut FindDataW) -> Result<usize, u32> {
+    use crate::vfs::Target;
+    let v = crate::vfs::get();
+    let Some(v) = v else {
+        // No VFS yet: plain host listing.
+        let (dir, pat) = match path.rsplit_once(['/', '\\']) {
+            Some((d, p)) => (d.to_string(), p.to_string()),
+            None => (".".to_string(), path.to_string()),
+        };
+        let items = list_host_dir(&dir, &pat);
+        if items.is_empty() {
+            return Err(crate::vfs::ERROR_FILE_NOT_FOUND);
+        }
+        unsafe {
+            *out = items[0];
+        }
+        let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        finds().lock().unwrap().insert(
+            h,
+            FindState {
+                items,
+                pos: 1,
+            },
+        );
+        return Ok(h);
+    };
+    match v.classify(path) {
+        Target::Pass => {
+            let (dir, pat) = match path.rsplit_once(['/', '\\']) {
+                Some((d, p)) => (d.to_string(), p.to_string()),
+                None => (".".to_string(), path.to_string()),
+            };
+            let items = list_host_dir(&dir, &pat);
+            if items.is_empty() {
+                return Err(crate::vfs::ERROR_FILE_NOT_FOUND);
+            }
+            unsafe {
+                *out = items[0];
+            }
+            let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+            finds().lock().unwrap().insert(
+                h,
+                FindState {
+                    items,
+                    pos: 1,
+                },
+            );
+            Ok(h)
+        }
+        Target::Translated(p) => {
+            let (dir, pat) = match p.rsplit_once('/') {
+                Some((d, q)) => (d.to_string(), q.to_string()),
+                None => (p.clone(), "*".to_string()),
+            };
+            // A pattern without a directory (bare `*`) lists the translated dir itself.
+            let (dir, pat) = if dir.is_empty() { (p.clone(), pat) } else { (dir, pat) };
+            let items = list_host_dir(&dir, &pat);
+            if items.is_empty() {
+                return Err(crate::vfs::ERROR_FILE_NOT_FOUND);
+            }
+            unsafe {
+                *out = items[0];
+            }
+            let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+            finds().lock().unwrap().insert(
+                h,
+                FindState {
+                    items,
+                    pos: 1,
+                },
+            );
+            Ok(h)
+        }
+        Target::Game { rel } => {
+            let (dir_rel, pat) = split_find_rel(&rel);
+            let items = game_dir_entries(v, &dir_rel, &pat)?;
+            unsafe {
+                *out = items[0];
+            }
+            let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+            finds().lock().unwrap().insert(
+                h,
+                FindState {
+                    items,
+                    pos: 1,
+                },
+            );
+            Ok(h)
+        }
+        #[cfg(not(windows))]
+        Target::Reject(e) => Err(e),
+    }
+}
+
+fn host_statvfs(path: &str, out: &mut libc::statvfs) -> bool {
+    use std::ffi::CString;
+    let Ok(c) = CString::new(path) else { return false };
+    unsafe { libc::statvfs(c.as_ptr(), out) == 0 }
+}
+
+fn disk_space_for(path: &str) -> Option<(u64, u64)> {
+    // Returns (available_bytes, total_bytes) for the volume behind `path`.
+    let v = crate::vfs::get();
+    let host: String = if let Some(v) = v {
+        use crate::vfs::Target;
+        match v.classify(path) {
+            Target::Pass => path.to_string(),
+            Target::Translated(p) => p,
+            Target::Game { rel } => {
+                if rel.is_empty() {
+                    v.game_root().to_string()
+                } else {
+                    v.read_path_rel(&rel)?
+                }
+            }
+            #[cfg(not(windows))]
+            Target::Reject(_) => return None,
+        }
+    } else {
+        path.to_string()
+    };
+    // `statvfs` needs an existing path: walk up to the nearest existing ancestor.
+    let mut probe = std::path::PathBuf::from(&host);
+    loop {
+        if probe.exists() {
+            break;
+        }
+        if !probe.pop() {
+            return None;
+        }
+    }
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if !host_statvfs(&probe.to_string_lossy(), &mut st) {
+        return None;
+    }
+    let bsize = st.f_bsize as u64;
+    Some((st.f_bavail as u64 * bsize, st.f_blocks as u64 * bsize))
+}
+
+fn create_file_impl(path: &str, access: u32, disposition: u32, flags: u32) -> Result<usize, u32> {
+    let opened = crate::vfs_hooks::open(path, access, disposition, flags)?;
+    // `CREATE_ALWAYS`/`OPEN_ALWAYS` report pre-existence via the last error while
+    // still succeeding, as on Windows.
+    if opened.already_existed && (disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS) {
+        set_error(crate::vfs::ERROR_ALREADY_EXISTS);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    // Directories opened with backup semantics hold an O_PATH descriptor that Rust
+    // `File` cannot read; the VFS `open` already validated containment, and directory
+    // reads go through Find, not ReadFile.
+    Ok(register_file(opened.file))
+}
+
+unsafe fn wide_str(p: *const u16) -> Option<String> {
+    from_wide_ptr(p)
+}
+
+unsafe fn ansi_str(p: *const u8) -> Option<String> {
+    from_ansi_ptr(p)
+}
+
+pub unsafe extern "win64" fn CreateFileW(
+    name: *const u16,
+    access: u32,
+    _share: u32,
+    _attrs: *const c_void,
+    disposition: u32,
+    flags: u32,
+    _template: usize,
+) -> usize {
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    };
+    match create_file_impl(&path, access, disposition, flags) {
+        Ok(h) => h,
+        Err(e) => {
+            set_error(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn CreateFileA(
+    name: *const u8,
+    access: u32,
+    _share: u32,
+    _attrs: *const c_void,
+    disposition: u32,
+    flags: u32,
+    _template: usize,
+) -> usize {
+    let Some(path) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    };
+    match create_file_impl(&path, access, disposition, flags) {
+        Ok(h) => h,
+        Err(e) => {
+            set_error(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn CreateFile2(
+    name: *const u16,
+    access: u32,
+    _share: u32,
+    disposition: u32,
+    params: *const c_void,
+) -> usize {
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    };
+    // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }.
+    let flags = if params.is_null() {
+        0
+    } else {
+        unsafe { *((params as *const u8).add(8) as *const u32) }
+    };
+    match create_file_impl(&path, access, disposition, flags) {
+        Ok(h) => h,
+        Err(e) => {
+            set_error(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn ReadFile(
+    handle: usize,
+    buf: *mut c_void,
+    n: u32,
+    done: *mut u32,
+    _ov: *mut c_void,
+) -> i32 {
+    if buf.is_null() && n != 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let arc = files().lock().unwrap().get(&handle).cloned();
+    let Some(arc) = arc else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, n as usize) };
+    let mut g = arc.lock().unwrap();
+    match std::io::Read::read(&mut *g, slice) {
+        Ok(k) => {
+            if !done.is_null() {
+                *done = k as u32;
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        Err(e) => {
+            set_error(e.raw_os_error().unwrap_or(5) as u32);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn WriteFile(
+    handle: usize,
+    buf: *const c_void,
+    n: u32,
+    done: *mut u32,
+    _ov: *mut c_void,
+) -> i32 {
+    if buf.is_null() && n != 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let arc = files().lock().unwrap().get(&handle).cloned();
+    let Some(arc) = arc else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) };
+    let mut g = arc.lock().unwrap();
+    match std::io::Write::write(&mut *g, slice) {
+        Ok(k) => {
+            if !done.is_null() {
+                *done = k as u32;
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        Err(e) => {
+            set_error(e.raw_os_error().unwrap_or(5) as u32);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn FlushFileBuffers(handle: usize) -> i32 {
+    let ok = with_file(handle, |f| std::io::Write::flush(&mut &*f).is_ok()).unwrap_or(false);
+    // `File::sync_all` is the durable flush; a shared read handle flushes trivially.
+    if ok {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        // Try a metadata-only handle (O_PATH): nothing to flush, still success when known.
+        if files().lock().unwrap().contains_key(&handle) {
+            set_error(ERROR_SUCCESS);
+            return 1;
+        }
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+pub unsafe extern "win64" fn GetFileSizeEx(handle: usize, out: *mut u64) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let len = with_file(handle, |f| f.metadata().map(|m| m.len()).unwrap_or(u64::MAX));
+    match len {
+        Some(n) if n != u64::MAX => {
+            *out = n;
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        _ => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn SetFilePointerEx(
+    handle: usize,
+    dist: i64,
+    new_pos: *mut u64,
+    origin: u32,
+) -> i32 {
+    use std::io::SeekFrom;
+    let from = match origin {
+        FILE_BEGIN => SeekFrom::Start(dist as u64),
+        FILE_CURRENT => SeekFrom::Current(dist),
+        FILE_END => SeekFrom::End(dist),
+        _ => {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    };
+    let pos = with_file_mut(handle, |f| {
+        use std::io::Seek;
+        f.seek(from).map(|p| p)
+    });
+    match pos {
+        Some(Ok(p)) => {
+            if !new_pos.is_null() {
+                *new_pos = p;
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        _ => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn SetEndOfFile(handle: usize) -> i32 {
+    let ok = with_file_mut(handle, |f| {
+        use std::io::Seek;
+        let pos = f.seek(std::io::SeekFrom::Current(0)).ok()?;
+        f.set_len(pos).ok()
+    })
+    .unwrap_or(None)
+    .is_some();
+    if ok {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+pub unsafe extern "win64" fn DeleteFileW(name: *const u16) -> i32 {
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    delete_file_impl(&path)
+}
+
+pub unsafe extern "win64" fn DeleteFileA(name: *const u8) -> i32 {
+    let Some(path) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    delete_file_impl(&path)
+}
+
+fn delete_file_impl(path: &str) -> i32 {
+    let Some(v) = crate::vfs::get() else {
+        return match std::fs::remove_file(path) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(2) as u32);
+                0
+            }
+        };
+    };
+    use crate::vfs::Target;
+    match v.classify(path) {
+        Target::Pass => match std::fs::remove_file(path) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(2) as u32);
+                0
+            }
+        },
+        Target::Translated(p) => match std::fs::remove_file(&p) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(2) as u32);
+                0
+            }
+        },
+        Target::Game { rel } => match v.delete_file(&rel) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e);
+                0
+            }
+        },
+        #[cfg(not(windows))]
+        Target::Reject(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn CreateDirectoryW(name: *const u16, _sa: *const c_void) -> i32 {
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    create_dir_impl(&path)
+}
+
+pub unsafe extern "win64" fn CreateDirectoryA(name: *const u8, _sa: *const c_void) -> i32 {
+    let Some(path) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    create_dir_impl(&path)
+}
+
+fn create_dir_impl(path: &str) -> i32 {
+    let Some(v) = crate::vfs::get() else {
+        return match std::fs::create_dir(path) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                0
+            }
+        };
+    };
+    use crate::vfs::Target;
+    match v.classify(path) {
+        Target::Pass => match std::fs::create_dir(path) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                0
+            }
+        },
+        Target::Translated(p) => match std::fs::create_dir(&p) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                0
+            }
+        },
+        Target::Game { rel } => match v.create_dir(&rel) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e);
+                0
+            }
+        },
+        #[cfg(not(windows))]
+        Target::Reject(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn RemoveDirectoryW(name: *const u16) -> i32 {
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    remove_dir_impl(&path)
+}
+
+pub unsafe extern "win64" fn RemoveDirectoryA(name: *const u8) -> i32 {
+    let Some(path) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    remove_dir_impl(&path)
+}
+
+fn remove_dir_impl(path: &str) -> i32 {
+    let Some(v) = crate::vfs::get() else {
+        return match std::fs::remove_dir(path) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                0
+            }
+        };
+    };
+    use crate::vfs::Target;
+    match v.classify(path) {
+        Target::Pass => match std::fs::remove_dir(path) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                0
+            }
+        },
+        Target::Translated(p) => match std::fs::remove_dir(&p) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                0
+            }
+        },
+        Target::Game { rel } => match v.remove_dir(&rel) {
+            Ok(()) => {
+                set_error(ERROR_SUCCESS);
+                1
+            }
+            Err(e) => {
+                set_error(e);
+                0
+            }
+        },
+        #[cfg(not(windows))]
+        Target::Reject(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+fn move_impl(src: &str, dst: &str, replace: bool) -> Result<(), u32> {
+    use crate::vfs::{Target, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND};
+    let Some(v) = crate::vfs::get() else {
+        if !replace && std::path::Path::new(dst).exists() {
+            return Err(ERROR_ALREADY_EXISTS);
+        }
+        return std::fs::rename(src, dst).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                std::fs::copy(src, dst)
+                    .map(|_| ())
+                    .and_then(|_| std::fs::remove_file(src))
+                    .map_err(|e| e.raw_os_error().unwrap_or(5) as u32)
+            } else {
+                Err(e.raw_os_error().unwrap_or(2) as u32)
+            }
+        });
+    };
+    let s_target = v.classify(src);
+    let d_target = v.classify(dst);
+    #[cfg(not(windows))]
+    {
+        if let Target::Reject(e) = &s_target {
+            return Err(*e);
+        }
+        if let Target::Reject(e) = &d_target {
+            return Err(*e);
+        }
+    }
+    let s_game = matches!(s_target, Target::Game { .. });
+    let d_game = matches!(d_target, Target::Game { .. });
+    if !s_game && !d_game {
+        // Both host-side: resolve translated paths when present.
+        let rs = match &s_target {
+            Target::Translated(p) => p.clone(),
+            _ => src.to_string(),
+        };
+        let rd = match &d_target {
+            Target::Translated(p) => p.clone(),
+            _ => dst.to_string(),
+        };
+        if let Some(parent) = std::path::Path::new(&rd).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !replace && std::path::Path::new(&rd).exists() {
+            return Err(ERROR_ALREADY_EXISTS);
+        }
+        return std::fs::rename(&rs, &rd).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                std::fs::copy(&rs, &rd)
+                    .map(|_| ())
+                    .and_then(|_| std::fs::remove_file(&rs))
+                    .map_err(|e| e.raw_os_error().unwrap_or(5) as u32)
+            } else {
+                Err(e.raw_os_error().unwrap_or(2) as u32)
+            }
+        });
+    }
+    // At least one side is a game path: resolve through the VFS with overlay staging.
+    let (rs, srel) = match &s_target {
+        Target::Pass => (src.to_string(), None),
+        Target::Translated(p) => (p.clone(), None),
+        Target::Game { rel } => (
+            v.read_path_rel(rel).ok_or(ERROR_FILE_NOT_FOUND)?,
+            Some(rel.clone()),
+        ),
+        #[cfg(not(windows))]
+        Target::Reject(e) => return Err(*e),
+    };
+    if !std::path::Path::new(&rs).exists() {
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
+    if std::path::Path::new(&rs).is_dir() {
+        return Err(crate::vfs::ERROR_ACCESS_DENIED);
+    }
+    // Destination bookkeeping first (without publishing), then the host move.
+    let (rd, drel) = match &d_target {
+        Target::Pass => (dst.to_string(), None),
+        Target::Translated(p) => {
+            if let Some(parent) = std::path::Path::new(p).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            (p.clone(), None)
+        }
+        Target::Game { rel } => {
+            if v.is_dir(rel) {
+                return Err(crate::vfs::ERROR_ACCESS_DENIED);
+            }
+            if !replace && v.exists(rel) {
+                return Err(ERROR_ALREADY_EXISTS);
+            }
+            // Case-only rename inside the game folder over the original: copy overlay.
+            if let Some(sr) = &srel {
+                if sr.to_lowercase() == rel.to_lowercase() && sr != rel {
+                    let staged = v.stage_write(rel)?;
+                    std::fs::copy(&rs, &staged).map_err(|_| crate::vfs::ERROR_ACCESS_DENIED)?;
+                    v.commit_write(rel);
+                    return Ok(());
+                }
+            }
+            (v.stage_write(rel)?, Some(rel.clone()))
+        }
+        #[cfg(not(windows))]
+        Target::Reject(e) => return Err(*e),
+    };
+    // Same-volume rename when the source already lives in the overlay.
+    if let (Some(sr), Some(dr)) = (&srel, &drel) {
+        let in_overlay = rs == v.overlay_path(sr);
+        if in_overlay {
+            if std::fs::rename(&rs, &rd).is_ok() {
+                v.commit_write(dr);
+                let _ = v.delete_file(sr);
+                return Ok(());
+            }
+        }
+    }
+    // General path: copy the bytes, publish the destination, hide the source.
+    std::fs::copy(&rs, &rd).map_err(|_| crate::vfs::ERROR_ACCESS_DENIED)?;
+    if let Some(dr) = &drel {
+        v.commit_write(dr);
+    }
+    if let Some(sr) = &srel {
+        let _ = v.delete_file(sr);
+    } else if matches!(s_target, Target::Translated(_)) {
+        let _ = std::fs::remove_file(&rs);
+    }
+    Ok(())
+}
+
+pub unsafe extern "win64" fn MoveFileExW(src: *const u16, dst: *const u16, flags: u32) -> i32 {
+    let (Some(s), Some(d)) = (wide_str(src), wide_str(dst)) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    match move_impl(&s, &d, flags & MOVEFILE_REPLACE_EXISTING != 0) {
+        Ok(()) => {
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn MoveFileWithProgressW(
+    src: *const u16,
+    dst: *const u16,
+    _prog: *const c_void,
+    _data: *const c_void,
+    flags: u32,
+) -> i32 {
+    MoveFileExW(src, dst, flags)
+}
+
+pub unsafe extern "win64" fn MoveFileW(src: *const u16, dst: *const u16) -> i32 {
+    MoveFileExW(src, dst, MOVEFILE_COPY_ALLOWED)
+}
+
+pub unsafe extern "win64" fn MoveFileExA(src: *const u8, dst: *const u8, flags: u32) -> i32 {
+    let (Some(s), Some(d)) = (ansi_str(src), ansi_str(dst)) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    match move_impl(&s, &d, flags & MOVEFILE_REPLACE_EXISTING != 0) {
+        Ok(()) => {
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn MoveFileWithProgressA(
+    src: *const u8,
+    dst: *const u8,
+    _prog: *const c_void,
+    _data: *const c_void,
+    flags: u32,
+) -> i32 {
+    MoveFileExA(src, dst, flags)
+}
+
+fn copy_impl(src: &str, dst: &str, fail_if_exists: bool) -> Result<(), u32> {
+    use crate::vfs::{Target, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND};
+    let Some(v) = crate::vfs::get() else {
+        if fail_if_exists && std::path::Path::new(dst).exists() {
+            return Err(ERROR_FILE_EXISTS);
+        }
+        return std::fs::copy(src, dst)
+            .map(|_| ())
+            .map_err(|e| e.raw_os_error().unwrap_or(2) as u32);
+    };
+    let s_target = v.classify(src);
+    let d_target = v.classify(dst);
+    #[cfg(not(windows))]
+    {
+        if let Target::Reject(e) = &s_target {
+            return Err(*e);
+        }
+        if let Target::Reject(e) = &d_target {
+            return Err(*e);
+        }
+    }
+    let (rs, _) = match &s_target {
+        Target::Pass => (src.to_string(), None),
+        Target::Translated(p) => (p.clone(), None),
+        Target::Game { rel } => (
+            v.read_path_rel(rel).ok_or(ERROR_FILE_NOT_FOUND)?,
+            Some(rel.clone()),
+        ),
+        #[cfg(not(windows))]
+        Target::Reject(e) => return Err(*e),
+    };
+    if !std::path::Path::new(&rs).exists() {
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
+    let (rd, drel) = match &d_target {
+        Target::Pass => (dst.to_string(), None),
+        Target::Translated(p) => {
+            if let Some(parent) = std::path::Path::new(p).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if fail_if_exists && std::path::Path::new(p).exists() {
+                return Err(ERROR_FILE_EXISTS);
+            }
+            (p.clone(), None)
+        }
+        Target::Game { rel } => {
+            if v.is_dir(rel) {
+                return Err(crate::vfs::ERROR_ACCESS_DENIED);
+            }
+            if fail_if_exists && v.exists(rel) {
+                return Err(ERROR_FILE_EXISTS);
+            }
+            (v.stage_write(rel)?, Some(rel.clone()))
+        }
+        #[cfg(not(windows))]
+        Target::Reject(e) => return Err(*e),
+    };
+    std::fs::copy(&rs, &rd).map_err(|_| crate::vfs::ERROR_ACCESS_DENIED)?;
+    if let Some(dr) = drel {
+        v.commit_write(&dr);
+    }
+    Ok(())
+}
+
+pub unsafe extern "win64" fn CopyFileW(src: *const u16, dst: *const u16, fail: i32) -> i32 {
+    let (Some(s), Some(d)) = (wide_str(src), wide_str(dst)) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    match copy_impl(&s, &d, fail != 0) {
+        Ok(()) => {
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn CopyFileExW(
+    src: *const u16,
+    dst: *const u16,
+    _prog: *const c_void,
+    _data: *const c_void,
+    _cancel: *mut i32,
+    flags: u32,
+) -> i32 {
+    let (Some(s), Some(d)) = (wide_str(src), wide_str(dst)) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    match copy_impl(&s, &d, flags & COPY_FILE_FAIL_IF_EXISTS != 0) {
+        Ok(()) => {
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn FindFirstFileExW(
+    name: *const u16,
+    level: i32,
+    data: *mut c_void,
+    _op: i32,
+    _filter: *const c_void,
+    _flags: u32,
+) -> usize {
+    if level > 1 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    };
+    match find_first_impl(&path, data as *mut FindDataW) {
+        Ok(h) => {
+            set_error(ERROR_SUCCESS);
+            h
+        }
+        Err(e) => {
+            set_error(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn FindFirstFileW(name: *const u16, data: *mut FindDataW) -> usize {
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    };
+    match find_first_impl(&path, data) {
+        Ok(h) => {
+            set_error(ERROR_SUCCESS);
+            h
+        }
+        Err(e) => {
+            set_error(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn FindFirstFileA(name: *const u8, data: *mut FindDataW) -> usize {
+    // ANSI callers read the wide layout through the same struct; the name bytes are
+    // UTF-8 on Linux, converted here, and the wide name is filled as usual.
+    let Some(path) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    };
+    // Reuse the wide path: encode back is unnecessary, call the impl directly.
+    let mut w = std::mem::zeroed::<FindDataW>();
+    match find_first_impl(&path, &mut w) {
+        Ok(h) => {
+            if !data.is_null() {
+                *data = w;
+            }
+            set_error(ERROR_SUCCESS);
+            h
+        }
+        Err(e) => {
+            set_error(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn FindNextFileW(handle: usize, data: *mut FindDataW) -> i32 {
+    if data.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut g = finds().lock().unwrap();
+    let Some(st) = g.get_mut(&handle) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    match st.items.get(st.pos).copied() {
+        Some(d) => {
+            unsafe { *data = d };
+            st.pos += 1;
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        None => {
+            set_error(18); // ERROR_NO_MORE_FILES
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn FindNextFileA(handle: usize, data: *mut FindDataW) -> i32 {
+    FindNextFileW(handle, data)
+}
+
+pub unsafe extern "win64" fn FindClose(handle: usize) -> i32 {
+    if close_find_handle(handle) {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+fn attrs_for(path: &str) -> Result<u32, u32> {
+    let Some(v) = crate::vfs::get() else {
+        let m = std::fs::metadata(path).map_err(|e| e.raw_os_error().unwrap_or(2) as u32)?;
+        return Ok(if m.is_dir() {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_ARCHIVE
+        });
+    };
+    use crate::vfs::Target;
+    match v.classify(path) {
+        Target::Pass => {
+            let m = std::fs::metadata(path).map_err(|e| e.raw_os_error().unwrap_or(2) as u32)?;
+            Ok(if m.is_dir() {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_ARCHIVE
+            })
+        }
+        Target::Translated(p) => {
+            let m = std::fs::metadata(&p).map_err(|e| e.raw_os_error().unwrap_or(2) as u32)?;
+            Ok(if m.is_dir() {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_ARCHIVE
+            })
+        }
+        Target::Game { rel } => {
+            if v.is_whiteout(&rel) && !v.visible_in_overlay(&rel) {
+                return Err(crate::vfs::ERROR_FILE_NOT_FOUND);
+            }
+            if v.visible_in_overlay(&rel) || v.visible_in_original(&rel) {
+                if v.is_dir(&rel) {
+                    return Ok(FILE_ATTRIBUTE_DIRECTORY);
+                }
+                return Ok(FILE_ATTRIBUTE_ARCHIVE);
+            }
+            Err(crate::vfs::ERROR_FILE_NOT_FOUND)
+        }
+        #[cfg(not(windows))]
+        Target::Reject(e) => Err(e),
+    }
+}
+
+pub unsafe extern "win64" fn GetFileAttributesW(name: *const u16) -> u32 {
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_FILE_ATTRIBUTES;
+    };
+    match attrs_for(&path) {
+        Ok(a) => {
+            set_error(ERROR_SUCCESS);
+            a
+        }
+        Err(e) => {
+            set_error(e);
+            INVALID_FILE_ATTRIBUTES
+        }
+    }
+}
+
+pub unsafe extern "win64" fn GetFileAttributesA(name: *const u8) -> u32 {
+    let Some(path) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_FILE_ATTRIBUTES;
+    };
+    match attrs_for(&path) {
+        Ok(a) => {
+            set_error(ERROR_SUCCESS);
+            a
+        }
+        Err(e) => {
+            set_error(e);
+            INVALID_FILE_ATTRIBUTES
+        }
+    }
+}
+
+/// `WIN32_FILE_ATTRIBUTE_DATA` (36 bytes): attributes + 3 FILETIMEs + size high/low.
+pub unsafe extern "win64" fn GetFileAttributesExW(name: *const u16, level: i32, out: *mut u8) -> i32 {
+    if level != 0 || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(path) = wide_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let attrs = match attrs_for(&path) {
+        Ok(a) => a,
+        Err(e) => {
+            set_error(e);
+            return 0;
+        }
+    };
+    // Resolve the host path for times/sizes.
+    let host: Option<String> = (|| {
+        let v = crate::vfs::get()?;
+        use crate::vfs::Target;
+        match v.classify(&path) {
+            Target::Pass => Some(path.clone()),
+            Target::Translated(p) => Some(p),
+            Target::Game { rel } => v.read_path_rel(&rel),
+            #[cfg(not(windows))]
+            Target::Reject(_) => None,
+        }
+    })();
+    let host = host.unwrap_or(path);
+    let meta = std::fs::metadata(&host).ok();
+    let (c_l, c_h) = meta
+        .as_ref()
+        .and_then(|m| m.created().ok())
+        .map(filetime_from_system)
+        .unwrap_or((0, 0));
+    let (a_l, a_h) = meta
+        .as_ref()
+        .and_then(|m| m.accessed().ok())
+        .map(filetime_from_system)
+        .unwrap_or((c_l, c_h));
+    let (w_l, w_h) = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(filetime_from_system)
+        .unwrap_or((c_l, c_h));
+    let len = meta.map(|m| m.len()).unwrap_or(0);
+    unsafe {
+        (out as *mut u32).write_unaligned(attrs);
+        (out.add(4) as *mut u32).write_unaligned(c_l);
+        (out.add(8) as *mut u32).write_unaligned(c_h);
+        (out.add(12) as *mut u32).write_unaligned(a_l);
+        (out.add(16) as *mut u32).write_unaligned(a_h);
+        (out.add(20) as *mut u32).write_unaligned(w_l);
+        (out.add(24) as *mut u32).write_unaligned(w_h);
+        (out.add(28) as *mut u32).write_unaligned((len >> 32) as u32);
+        (out.add(32) as *mut u32).write_unaligned(len as u32);
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+pub unsafe extern "win64" fn GetDiskFreeSpaceExW(
+    dir: *const u16,
+    avail: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+) -> i32 {
+    let Some(path) = wide_str(dir) else {
+        // NULL means the current directory's volume: report the host cwd volume.
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".to_string());
+        return disk_free_answer(&cwd, avail, total, free);
+    };
+    disk_free_answer(&path, avail, total, free)
+}
+
+pub unsafe extern "win64" fn GetDiskFreeSpaceExA(
+    dir: *const u8,
+    avail: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+) -> i32 {
+    let Some(path) = ansi_str(dir) else {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".to_string());
+        return disk_free_answer(&cwd, avail, total, free);
+    };
+    disk_free_answer(&path, avail, total, free)
+}
+
+fn disk_free_answer(path: &str, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
+    match disk_space_for(path) {
+        Some((a, t)) => {
+            unsafe {
+                if !avail.is_null() {
+                    *avail = a;
+                }
+                if !total.is_null() {
+                    *total = t;
+                }
+                if !free.is_null() {
+                    *free = a;
+                }
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        None => {
+            set_error(crate::vfs::ERROR_PATH_NOT_FOUND);
+            0
+        }
+    }
+}
+
+pub unsafe extern "win64" fn GetDiskFreeSpaceW(
+    root: *const u16,
+    spc: *mut u32,
+    bps: *mut u32,
+    free_cl: *mut u32,
+    total_cl: *mut u32,
+) -> i32 {
+    let Some(path) = wide_str(root) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    disk_clusters_answer(&path, spc, bps, free_cl, total_cl)
+}
+
+pub unsafe extern "win64" fn GetDiskFreeSpaceA(
+    root: *const u8,
+    spc: *mut u32,
+    bps: *mut u32,
+    free_cl: *mut u32,
+    total_cl: *mut u32,
+) -> i32 {
+    let Some(path) = ansi_str(root) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    disk_clusters_answer(&path, spc, bps, free_cl, total_cl)
+}
+
+fn disk_clusters_answer(
+    path: &str,
+    spc: *mut u32,
+    bps: *mut u32,
+    free_cl: *mut u32,
+    total_cl: *mut u32,
+) -> i32 {
+    match disk_space_for(path) {
+        Some((avail, total)) => {
+            // Fixed 4 KiB clusters: titles only check relative magnitudes.
+            const CLUSTER: u64 = 4096;
+            unsafe {
+                if !spc.is_null() {
+                    *spc = 1;
+                }
+                if !bps.is_null() {
+                    *bps = CLUSTER as u32;
+                }
+                if !free_cl.is_null() {
+                    *free_cl = (avail / CLUSTER).min(u32::MAX as u64) as u32;
+                }
+                if !total_cl.is_null() {
+                    *total_cl = (total / CLUSTER).min(u32::MAX as u64) as u32;
+                }
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        None => {
+            set_error(crate::vfs::ERROR_PATH_NOT_FOUND);
+            0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Export table
 // ---------------------------------------------------------------------------------------
 
@@ -1664,6 +3209,42 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("AcquireSRWLockExclusive", AcquireSRWLockExclusive as usize),
         ("ReleaseSRWLockExclusive", ReleaseSRWLockExclusive as usize),
         ("TryAcquireSRWLockExclusive", TryAcquireSRWLockExclusive as usize),
+        // Step-10c file APIs through the linked-in Linux VFS (kernel-family fallbacks).
+        ("CreateFileW", CreateFileW as usize),
+        ("CreateFileA", CreateFileA as usize),
+        ("CreateFile2", CreateFile2 as usize),
+        ("ReadFile", ReadFile as usize),
+        ("WriteFile", WriteFile as usize),
+        ("FlushFileBuffers", FlushFileBuffers as usize),
+        ("GetFileSizeEx", GetFileSizeEx as usize),
+        ("SetFilePointerEx", SetFilePointerEx as usize),
+        ("SetEndOfFile", SetEndOfFile as usize),
+        ("DeleteFileW", DeleteFileW as usize),
+        ("DeleteFileA", DeleteFileA as usize),
+        ("CreateDirectoryW", CreateDirectoryW as usize),
+        ("CreateDirectoryA", CreateDirectoryA as usize),
+        ("RemoveDirectoryW", RemoveDirectoryW as usize),
+        ("RemoveDirectoryA", RemoveDirectoryA as usize),
+        ("MoveFileExW", MoveFileExW as usize),
+        ("MoveFileWithProgressW", MoveFileWithProgressW as usize),
+        ("MoveFileW", MoveFileW as usize),
+        ("MoveFileExA", MoveFileExA as usize),
+        ("MoveFileWithProgressA", MoveFileWithProgressA as usize),
+        ("CopyFileW", CopyFileW as usize),
+        ("CopyFileExW", CopyFileExW as usize),
+        ("FindFirstFileExW", FindFirstFileExW as usize),
+        ("FindFirstFileW", FindFirstFileW as usize),
+        ("FindFirstFileA", FindFirstFileA as usize),
+        ("FindNextFileW", FindNextFileW as usize),
+        ("FindNextFileA", FindNextFileA as usize),
+        ("FindClose", FindClose as usize),
+        ("GetFileAttributesW", GetFileAttributesW as usize),
+        ("GetFileAttributesA", GetFileAttributesA as usize),
+        ("GetFileAttributesExW", GetFileAttributesExW as usize),
+        ("GetDiskFreeSpaceExW", GetDiskFreeSpaceExW as usize),
+        ("GetDiskFreeSpaceExA", GetDiskFreeSpaceExA as usize),
+        ("GetDiskFreeSpaceW", GetDiskFreeSpaceW as usize),
+        ("GetDiskFreeSpaceA", GetDiskFreeSpaceA as usize),
     ]
 }
 
@@ -1997,5 +3578,293 @@ mod tests {
             QueryProcessorSchedulingStatistics(&mut out);
             assert!(out[2] >= out[0] && out[2] >= out[1]);
         }
+    }
+
+    fn test_vfs_root(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("xcl_kernelx_files_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        let data = dir.join("xcldata");
+        std::fs::create_dir_all(game.join("data")).unwrap();
+        std::fs::write(game.join("data").join("hello.txt"), b"original").unwrap();
+        std::fs::write(game.join("data").join("gone.txt"), b"bye").unwrap();
+        (game, data)
+    }
+
+    fn ensure_test_vfs() -> (std::path::PathBuf, std::path::PathBuf) {
+        use crate::vfs::Vfs;
+        if crate::vfs::get().is_some() {
+            // Already initialised by this test (single comprehensive test below).
+            // Return placeholder paths; the test uses its own captured roots.
+            return (std::path::PathBuf::new(), std::path::PathBuf::new());
+        }
+        let (game, data) = test_vfs_root("global");
+        let mounts = vec![
+            ("G:".to_string(), game.to_string_lossy().to_string()),
+            ("GAME:".to_string(), game.to_string_lossy().to_string()),
+            ("D:".to_string(), game.to_string_lossy().to_string()),
+            (
+                "T:".to_string(),
+                data.join("temp").to_string_lossy().to_string(),
+            ),
+            (
+                "S:".to_string(),
+                data.join("pls").to_string_lossy().to_string(),
+            ),
+        ];
+        let v = Vfs::new(&game, &data, mounts);
+        crate::vfs::init(v);
+        (game, data)
+    }
+
+    fn tree_hash(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                let ft = entry.file_type().unwrap();
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if ft.is_dir() {
+                    stack.push(p);
+                } else if ft.is_symlink() {
+                    out.insert(
+                        rel,
+                        std::fs::read_link(&p)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                            .into_bytes(),
+                    );
+                } else {
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    unsafe fn open_w(path: &str, access: u32, disp: u32) -> usize {
+        let w = crate::util::wide(path);
+        let h = CreateFileW(
+            w.as_ptr(),
+            access,
+            0,
+            std::ptr::null(),
+            disp,
+            0,
+            0,
+        );
+        assert_ne!(h, INVALID_HANDLE_VALUE, "open {path} failed err {}", GetLastError());
+        h
+    }
+
+    unsafe fn read_all(h: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let mut done = 0u32;
+            let r = ReadFile(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut done, std::ptr::null_mut());
+            assert_eq!(r, 1);
+            if done == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..done as usize]);
+            if done < buf.len() as u32 {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn kernelx_files_go_through_vfs_overlay() {
+        use crate::vfs::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+        let (game, data) = test_vfs_root("files");
+        let mounts = vec![
+            ("G:".to_string(), game.to_string_lossy().to_string()),
+            ("GAME:".to_string(), game.to_string_lossy().to_string()),
+            ("D:".to_string(), game.to_string_lossy().to_string()),
+            (
+                "T:".to_string(),
+                data.join("temp").to_string_lossy().to_string(),
+            ),
+            (
+                "S:".to_string(),
+                data.join("pls").to_string_lossy().to_string(),
+            ),
+        ];
+        // Isolated VFS for direct API checks (global VFS is exercised through the
+        // exported CreateFileW path after `ensure_test_vfs` below).
+        let v = crate::vfs::Vfs::new(&game, &data, mounts.clone());
+        let before = tree_hash(&game);
+        // Direct VFS read sees the game layer.
+        let p = v.read_path_rel("data\\hello.txt").expect("game read path");
+        assert_eq!(std::fs::read(&p).unwrap(), b"original");
+
+        // Global path: the exported shims must use the same VFS. Initialise once per
+        // process; a second test run in the same process reuses it.
+        let _ = ensure_test_vfs();
+        let gv = crate::vfs::get().expect("global VFS initialised");
+        // Seed the global game root with the same fixture content when this is the
+        // first initialisation in the process.
+        let global_game = std::path::Path::new(gv.game_root());
+        if !global_game.join("data").join("hello.txt").exists() {
+            std::fs::create_dir_all(global_game.join("data")).ok();
+            std::fs::write(global_game.join("data").join("hello.txt"), b"original").ok();
+            std::fs::write(global_game.join("data").join("gone.txt"), b"bye").ok();
+        }
+        let global_before = tree_hash(global_game);
+
+        unsafe {
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const OPEN_EXISTING: u32 = 3;
+            const CREATE_ALWAYS: u32 = 2;
+            // Read through the shim.
+            let h = open_w("G:\\data\\hello.txt", GENERIC_READ, OPEN_EXISTING);
+            assert_eq!(read_all(h), b"original");
+            assert_eq!(CloseHandle(h), 1);
+
+            // Overlay write is visible; game folder unchanged.
+            let h = open_w("G:\\data\\hello.txt", GENERIC_WRITE, OPEN_EXISTING);
+            let mut done = 0u32;
+            let bytes = b"modified";
+            assert_eq!(
+                WriteFile(
+                    h,
+                    bytes.as_ptr() as *const c_void,
+                    bytes.len() as u32,
+                    &mut done,
+                    std::ptr::null_mut()
+                ),
+                1
+            );
+            assert_eq!(done as usize, bytes.len());
+            assert_eq!(CloseHandle(h), 1);
+            let h = open_w("G:\\data\\hello.txt", GENERIC_READ, OPEN_EXISTING);
+            assert_eq!(read_all(h), b"modified");
+            assert_eq!(CloseHandle(h), 1);
+
+            // New file + rename + delete hide without touching the original.
+            let h = open_w("G:\\data\\new_save.bin", GENERIC_WRITE, CREATE_ALWAYS);
+            let mut done = 0u32;
+            let payload = b"save-data";
+            assert_eq!(
+                WriteFile(
+                    h,
+                    payload.as_ptr() as *const c_void,
+                    payload.len() as u32,
+                    &mut done,
+                    std::ptr::null_mut()
+                ),
+                1
+            );
+            assert_eq!(CloseHandle(h), 1);
+            let s = crate::util::wide("G:\\data\\new_save.bin");
+            let d = crate::util::wide("G:\\data\\renamed.bin");
+            assert_eq!(MoveFileExW(s.as_ptr(), d.as_ptr(), 0), 1);
+            let h = open_w("G:\\data\\renamed.bin", GENERIC_READ, OPEN_EXISTING);
+            assert_eq!(read_all(h), b"save-data");
+            assert_eq!(CloseHandle(h), 1);
+
+            let del = crate::util::wide("G:\\data\\gone.txt");
+            assert_eq!(DeleteFileW(del.as_ptr()), 1);
+            let gone = crate::util::wide("G:\\data\\gone.txt");
+            assert_eq!(
+                CreateFileW(
+                    gone.as_ptr(),
+                    GENERIC_READ,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+
+            // Adversarial paths never open host files.
+            for bad in ["Z:\\Windows\\notepad.exe", "G:\\..\\outside.txt"] {
+                let w = crate::util::wide(bad);
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                );
+                assert_eq!(h, INVALID_HANDLE_VALUE, "{bad}");
+                let e = GetLastError();
+                assert!(
+                    e == ERROR_PATH_NOT_FOUND || e == ERROR_ACCESS_DENIED,
+                    "{bad} err {e}"
+                );
+            }
+
+            // T: lands under title data, free space reports the host volume.
+            let h = open_w("T:\\scratch.bin", GENERIC_WRITE, CREATE_ALWAYS);
+            let mut done = 0u32;
+            assert_eq!(
+                WriteFile(
+                    h,
+                    b"tmp".as_ptr() as *const c_void,
+                    3,
+                    &mut done,
+                    std::ptr::null_mut()
+                ),
+                1
+            );
+            assert_eq!(CloseHandle(h), 1);
+            let t = crate::util::wide("T:\\");
+            let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+            assert_eq!(
+                GetDiskFreeSpaceExW(t.as_ptr(), &mut avail, &mut total, &mut free),
+                1
+            );
+            assert!(total > 0 && avail <= total);
+
+            // Directory listing merges overlay and hides the whiteout.
+            let pat = crate::util::wide("G:\\data\\*");
+            let mut data: FindDataW = std::mem::zeroed();
+            let fh = FindFirstFileW(pat.as_ptr(), &mut data);
+            assert_ne!(fh, INVALID_HANDLE_VALUE);
+            let mut names = Vec::new();
+            let wname = |d: &FindDataW| {
+                let n = d.name.iter().position(|&c| c == 0).unwrap_or(d.name.len());
+                String::from_utf16_lossy(&d.name[..n])
+            };
+            names.push(wname(&data));
+            loop {
+                let mut next: FindDataW = std::mem::zeroed();
+                if FindNextFileW(fh, &mut next) == 0 {
+                    break;
+                }
+                names.push(wname(&next));
+            }
+            assert_eq!(FindClose(fh), 1);
+            for want in ["hello.txt", "renamed.bin"] {
+                assert!(names.iter().any(|n| n == want), "missing {want} in {names:?}");
+            }
+            assert!(!names.iter().any(|n| n == "gone.txt"), "stale {names:?}");
+        }
+
+        // Recursive game-tree hash unchanged on the isolated fixture.
+        assert_eq!(tree_hash(&game)["data/hello.txt"], b"original");
+        assert_eq!(tree_hash(&game), before);
+        // Global game root: only overlay writes happened, originals intact.
+        assert_eq!(
+            std::fs::read(global_game.join("data").join("hello.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(tree_hash(global_game), global_before);
+        let _ = data;
     }
 }
