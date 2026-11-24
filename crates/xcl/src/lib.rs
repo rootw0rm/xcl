@@ -31,7 +31,9 @@ pub mod inspect;
 pub mod launcher;
 #[cfg(windows)]
 pub mod loader;
-#[cfg(windows)]
+#[cfg(not(windows))]
+#[path = "loader_linux.rs"]
+pub mod loader;
 pub mod modules;
 pub mod pe;
 pub mod platform;

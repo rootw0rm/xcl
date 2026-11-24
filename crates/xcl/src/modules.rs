@@ -109,14 +109,29 @@ static HLE_HANDLES: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
 /// Stable fake HMODULE for an HLE module: a committed page starting with "MZ".
 pub fn hle_handle(module_name: &str) -> usize {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
     let key = crate::util::dll_key(module_name);
     let mut g = HLE_HANDLES.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
     if let Some(&h) = map.get(&key) {
         return h;
     }
-    let p = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as *mut u8;
+    #[cfg(windows)]
+    let p = unsafe {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        VirtualAlloc(std::ptr::null(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    } as *mut u8;
+    #[cfg(not(windows))]
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            0x1000,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        ) as *mut u8
+    };
+    assert!(p as isize > 0, "allocating a page for an HLE pseudo handle failed");
     unsafe {
         *p = b'M';
         *p.add(1) = b'Z';
@@ -141,6 +156,7 @@ pub fn hle_name_by_handle(h: usize) -> Option<String> {
 /// The addresses `describe_address` gets include raw stack words, which can be anything. Wine
 /// may report a module for one with a handle above the address: the subtraction must not panic
 /// there, or a crash report turns into a panic in the crash handler.
+#[cfg_attr(not(windows), allow(dead_code))] // used by the Windows fallback and its test
 fn module_offset(name: &str, base: usize, addr: usize) -> String {
     match addr.checked_sub(base) {
         Some(offset) => format!("{name}+{offset:#x}"),
@@ -158,6 +174,7 @@ pub fn describe_address(addr: usize) -> String {
         }
         return format!("{b:#x}+{:#x}", addr - b);
     }
+    #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::LibraryLoader::{
             GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -177,6 +194,7 @@ pub fn describe_address(addr: usize) -> String {
             return module_offset(&name, h as usize, addr);
         }
     }
+    // Linux: only images XCL itself mapped are named; there is no system loader lookup.
     format!("{addr:#x}")
 }
 
