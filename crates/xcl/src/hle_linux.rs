@@ -405,6 +405,14 @@ mod tests {
             "GetConsoleOutputCP",
             "SetThreadStackGuarantee",
             "NtWriteFile",
+            // Step-11e timer/synch: Rust sleep + parking.
+            "CreateWaitableTimerExW",
+            "CreateWaitableTimerW",
+            "SetWaitableTimer",
+            "CancelWaitableTimer",
+            "WaitOnAddress",
+            "WakeByAddressSingle",
+            "WakeByAddressAll",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);

@@ -71,6 +71,8 @@ pub const WAIT_TIMEOUT: u32 = 258;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 
+const ERROR_TIMEOUT: u32 = 1460;
+
 // Memory types.
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -1058,6 +1060,13 @@ pub unsafe extern "win64" fn WaitForSingleObject(handle: usize, timeout_ms: u32)
             WAIT_TIMEOUT
         };
     }
+    if let Some(t) = is_timer(handle) {
+        return if wait_timer(&t, timeout_ms) {
+            WAIT_OBJECT_0
+        } else {
+            WAIT_TIMEOUT
+        };
+    }
     if joins().lock().unwrap().contains_key(&handle) {
         if let Some(code) = join_if_finished(handle) {
             let _ = code;
@@ -1112,6 +1121,11 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         all = false;
                         break;
                     }
+                } else if let Some(t) = is_timer(h) {
+                    if !*t.signaled.lock().unwrap() {
+                        all = false;
+                        break;
+                    }
                 } else if joins().lock().unwrap().contains_key(&h) {
                     if join_if_finished(h).is_none() {
                         // `join_if_finished` consumes a finished join; re-check below.
@@ -1135,6 +1149,10 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         if !ev.manual {
                             *ev.signaled.lock().unwrap() = false;
                         }
+                    } else if let Some(t) = is_timer(h) {
+                        if !t.manual {
+                            *t.signaled.lock().unwrap() = false;
+                        }
                     }
                 }
                 return WAIT_OBJECT_0;
@@ -1145,6 +1163,14 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                     let mut g = ev.signaled.lock().unwrap();
                     if *g {
                         if !ev.manual {
+                            *g = false;
+                        }
+                        return WAIT_OBJECT_0 + i as u32;
+                    }
+                } else if let Some(t) = is_timer(h) {
+                    let mut g = t.signaled.lock().unwrap();
+                    if *g {
+                        if !t.manual {
                             *g = false;
                         }
                         return WAIT_OBJECT_0 + i as u32;
@@ -1169,8 +1195,391 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Waitable timers + WaitOnAddress family (Phase C step 11e)
+// ---------------------------------------------------------------------------------------
+//
+// Rust `std` on Windows parks threads with `WaitOnAddress`/`WakeByAddress*` and
+// implements `thread::sleep` with a one-shot waitable timer (`CreateWaitableTimerExW`
+// + `SetWaitableTimer` + `WaitForSingleObject`). The auto-stubs returned NULL for the
+// timer, so the first sleep-capable check panicked. These are real host shims:
+//
+// * Timers live in their own handle table (closed through `CloseHandle`) and are
+//   waitable through `WaitForSingleObject`/`WaitForMultipleObjects` above. A sync
+//   (auto-reset) timer consumes its signal on wake; a manual-reset timer stays
+//   signaled. `SetWaitableTimer` disarms first (bumping the generation so a pending
+//   sleeper is cancelled), then arms a detached host thread that fires after the
+//   due time and every period when periodic.
+// * `WaitOnAddress` is a futex emulation keyed by guest address: waiters register a
+//   private condvar, re-check the comparison after registering (so a write+wake that
+//   raced the registration is not missed), then block with the timeout. `WakeBy*`
+//   signal one/all waiters on that address. APC/completion routines are logged and
+//   ignored (no APC delivery on Linux); `fResume` is accepted and ignored.
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+const CREATE_WAITABLE_TIMER_MANUAL_RESET: u32 = 0x1;
+
+struct TimerState {
+    manual: bool,
+    signaled: Mutex<bool>,
+    cvar: Condvar,
+    generation: Mutex<u64>,
+}
+
+static TIMERS: OnceLock<Mutex<HashMap<usize, std::sync::Arc<TimerState>>>> = OnceLock::new();
+
+fn timers() -> &'static Mutex<HashMap<usize, std::sync::Arc<TimerState>>> {
+    TIMERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_timer(handle: usize) -> Option<std::sync::Arc<TimerState>> {
+    timers().lock().unwrap().get(&handle).cloned()
+}
+
+fn close_timer_handle(h: usize) -> bool {
+    if let Some(t) = timers().lock().unwrap().remove(&h) {
+        // Disarm: pending sleepers see a stale generation and never fire.
+        let next = t.generation.lock().unwrap().wrapping_add(1);
+        *t.generation.lock().unwrap() = next;
+        t.cvar.notify_all();
+        true
+    } else {
+        false
+    }
+}
+
+fn wait_timer(t: &std::sync::Arc<TimerState>, timeout_ms: u32) -> bool {
+    let mut g = t.signaled.lock().unwrap();
+    if *g {
+        if !t.manual {
+            *g = false;
+        }
+        return true;
+    }
+    if timeout_ms == 0 {
+        return false;
+    }
+    if timeout_ms == INFINITE {
+        while !*g {
+            g = t.cvar.wait(g).unwrap();
+        }
+        if !t.manual {
+            *g = false;
+        }
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    while !*g {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let (guard, timeout) = t.cvar.wait_timeout(g, deadline - now).unwrap();
+        g = guard;
+        if *g {
+            break;
+        }
+        if timeout.timed_out() {
+            return false;
+        }
+    }
+    if !t.manual {
+        *g = false;
+    }
+    true
+}
+
+fn filetime_now_100ns() -> i64 {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    (ts.tv_sec as i64 + 11_644_473_600) * 10_000_000 + ts.tv_nsec as i64 / 100
+}
+
+fn new_timer(manual: bool) -> usize {
+    let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    timers().lock().unwrap().insert(
+        h,
+        std::sync::Arc::new(TimerState {
+            manual,
+            signaled: Mutex::new(false),
+            cvar: Condvar::new(),
+            generation: Mutex::new(0),
+        }),
+    );
+    set_error(ERROR_SUCCESS);
+    h
+}
+
+/// `HANDLE CreateWaitableTimerExW(SECURITY_ATTRIBUTES*, LPCWSTR, DWORD flags, DWORD access)` —
+/// `flags & MANUAL_RESET` selects a manual-reset timer, otherwise a synchronization
+/// (auto-reset) timer. Name/security/access are accepted and ignored.
+pub unsafe extern "win64" fn CreateWaitableTimerExW(
+    _attrs: *const c_void,
+    _name: *const u16,
+    flags: u32,
+    _access: u32,
+) -> usize {
+    new_timer(flags & CREATE_WAITABLE_TIMER_MANUAL_RESET != 0)
+}
+
+/// `HANDLE CreateWaitableTimerW(SECURITY_ATTRIBUTES*, BOOL manual, LPCWSTR)` —
+/// legacy spelling of the same timer; `manual != 0` selects manual-reset.
+pub unsafe extern "win64" fn CreateWaitableTimerW(
+    _attrs: *const c_void,
+    manual: i32,
+    _name: *const u16,
+) -> usize {
+    new_timer(manual != 0)
+}
+
+fn arm_timer(handle: usize, due: i64, period_ms: u32) {
+    let t = is_timer(handle).expect("arm_timer: known handle");
+    // Disarm first: drop any pending signal and cancel the pending sleeper.
+    *t.signaled.lock().unwrap() = false;
+    let gen = {
+        let mut g = t.generation.lock().unwrap();
+        *g = g.wrapping_add(1);
+        *g
+    };
+    // Resolve the due time to a host delay.
+    let delay = if due == 0 {
+        Duration::ZERO
+    } else if due > 0 {
+        let delta_100ns = due.saturating_sub(filetime_now_100ns()).max(0) as u64;
+        Duration::from_nanos(delta_100ns * 100)
+    } else {
+        Duration::from_nanos(due.unsigned_abs() * 100)
+    };
+    let period = if period_ms == 0 { None } else { Some(Duration::from_millis(period_ms as u64)) };
+    let tt = t.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        loop {
+            // Stale generation (Cancel/Close/Set superseded us): never fire.
+            if *tt.generation.lock().unwrap() != gen {
+                return;
+            }
+            *tt.signaled.lock().unwrap() = true;
+            tt.cvar.notify_all();
+            match period {
+                None => return,
+                Some(p) => {
+                    std::thread::sleep(p);
+                    // Periodic timers re-fire while armed; manual ones stay signaled.
+                    if *tt.generation.lock().unwrap() != gen {
+                        return;
+                    }
+                    if !tt.manual {
+                        // Re-arm the next period: clear so each period is observable.
+                        // A waiter that consumed the signal still sees the next fire.
+                        *tt.signaled.lock().unwrap() = true;
+                        tt.cvar.notify_all();
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// `BOOL SetWaitableTimer(HANDLE, LARGE_INTEGER* due, LONG period_ms, PTIMERAPCROUTINE,
+/// LPVOID, BOOL resume)` — one-shot when `period_ms == 0`, periodic otherwise.
+/// A NULL due fails; APC/resume are accepted and ignored (logged once).
+pub unsafe extern "win64" fn SetWaitableTimer(
+    handle: usize,
+    due: *const i64,
+    period_ms: i32,
+    _apc: usize,
+    _apc_ctx: *mut c_void,
+    _resume: i32,
+) -> i32 {
+    if due.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if is_timer(handle).is_none() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if period_ms < 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let d = *due;
+    if _apc != 0 {
+        static WARNED: AtomicU32 = AtomicU32::new(0);
+        if WARNED.swap(1, Ordering::Relaxed) == 0 {
+            crate::xlog_debug!("SetWaitableTimer: APC completion routines are ignored on Linux");
+        }
+    }
+    arm_timer(handle, d, period_ms as u32);
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `BOOL CancelWaitableTimer(HANDLE)` — disarms the timer; waiters keep waiting.
+pub unsafe extern "win64" fn CancelWaitableTimer(handle: usize) -> i32 {
+    let Some(t) = is_timer(handle) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let next = t.generation.lock().unwrap().wrapping_add(1);
+    *t.generation.lock().unwrap() = next;
+    *t.signaled.lock().unwrap() = false;
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+// --- WaitOnAddress family: futex emulation keyed by guest address ---
+
+struct AddrWaiter {
+    signaled: Mutex<bool>,
+    cvar: Condvar,
+}
+
+static WAIT_ADDR: OnceLock<Mutex<HashMap<usize, Vec<std::sync::Arc<AddrWaiter>>>>> = OnceLock::new();
+
+fn wait_addrs() -> &'static Mutex<HashMap<usize, Vec<std::sync::Arc<AddrWaiter>>>> {
+    WAIT_ADDR.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn addr_bytes(addr: *const c_void, size: usize) -> Option<Vec<u8>> {
+    if addr.is_null() || size == 0 || size > 64 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(addr as *const u8, size).to_vec() })
+}
+
+/// `BOOL WaitOnAddress(VOID* addr, PVOID cmp, SIZE_T size, DWORD ms)` — waits while
+/// `*addr == *cmp` (compared over `size` bytes). Returns 1 on wake, 0 on timeout
+/// (`ERROR_TIMEOUT`) or on an already-differing value. Unknown sizes/NULLs fail
+/// with `ERROR_INVALID_PARAMETER`.
+pub unsafe extern "win64" fn WaitOnAddress(
+    addr: *const c_void,
+    cmp: *const c_void,
+    size: usize,
+    timeout_ms: u32,
+) -> i32 {
+    let (Some(cur), Some(want)) = (addr_bytes(addr, size), addr_bytes(cmp, size)) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if cur != want {
+        // Already changed: return immediately, as on Windows.
+        set_error(ERROR_SUCCESS);
+        return 0;
+    }
+    let me = std::sync::Arc::new(AddrWaiter {
+        signaled: Mutex::new(false),
+        cvar: Condvar::new(),
+    });
+    let key = addr as usize;
+    wait_addrs().lock().unwrap().entry(key).or_default().push(me.clone());
+    // A write+wake that raced the registration must not be missed: re-check after
+    // registering; a change now counts as a wake.
+    if addr_bytes(addr, size).as_ref() != Some(&want) {
+        unpark_addr_waiter(key, &me, true);
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    let mut g = me.signaled.lock().unwrap();
+    if timeout_ms == INFINITE {
+        while !*g {
+            g = me.cvar.wait(g).unwrap();
+        }
+        set_error(ERROR_SUCCESS);
+        1
+    } else if timeout_ms == 0 {
+        let woken = *g;
+        drop(g);
+        unpark_addr_waiter(key, &me, false);
+        if woken {
+            set_error(ERROR_SUCCESS);
+            1
+        } else {
+            set_error(ERROR_TIMEOUT);
+            0
+        }
+    } else {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        while !*g {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (guard, timeout) = me.cvar.wait_timeout(g, deadline - now).unwrap();
+            g = guard;
+            if *g {
+                break;
+            }
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        let woken = *g;
+        drop(g);
+        unpark_addr_waiter(key, &me, false);
+        if woken {
+            set_error(ERROR_SUCCESS);
+            1
+        } else {
+            // Re-check: a write that landed just before the timeout still counts.
+            if addr_bytes(addr, size).as_ref() != Some(&want) {
+                set_error(ERROR_SUCCESS);
+                1
+            } else {
+                set_error(ERROR_TIMEOUT);
+                0
+            }
+        }
+    }
+}
+
+fn unpark_addr_waiter(key: usize, me: &std::sync::Arc<AddrWaiter>, signal: bool) {
+    if signal {
+        *me.signaled.lock().unwrap() = true;
+        me.cvar.notify_one();
+    }
+    let mut g = wait_addrs().lock().unwrap();
+    if let Some(v) = g.get_mut(&key) {
+        v.retain(|w| !std::sync::Arc::ptr_eq(w, me));
+        if v.is_empty() {
+            g.remove(&key);
+        }
+    }
+}
+
+/// `VOID WakeByAddressSingle(PVOID)` — wakes one waiter on the address, if any.
+pub unsafe extern "win64" fn WakeByAddressSingle(addr: *const c_void) {
+    if addr.is_null() {
+        return;
+    }
+    let key = addr as usize;
+    let one = wait_addrs().lock().unwrap().get(&key).and_then(|v| v.first().cloned());
+    if let Some(w) = one {
+        unpark_addr_waiter(key, &w, true);
+    }
+}
+
+/// `VOID WakeByAddressAll(PVOID)` — wakes every waiter on the address, if any.
+pub unsafe extern "win64" fn WakeByAddressAll(addr: *const c_void) {
+    if addr.is_null() {
+        return;
+    }
+    let key = addr as usize;
+    let all = wait_addrs().lock().unwrap().remove(&key).unwrap_or_default();
+    for w in all {
+        *w.signaled.lock().unwrap() = true;
+        w.cvar.notify_one();
+    }
+}
+
 pub unsafe extern "win64" fn CloseHandle(handle: usize) -> i32 {
     if events().lock().unwrap().remove(&handle).is_some() {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    if close_timer_handle(handle) {
         set_error(ERROR_SUCCESS);
         return 1;
     }
@@ -4342,6 +4751,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetConsoleOutputCP", GetConsoleOutputCP as usize),
         ("SetThreadStackGuarantee", SetThreadStackGuarantee as usize),
         ("NtWriteFile", NtWriteFile as usize),
+        // Step-11e timer/synch shims for Rust thread sleep + parking.
+        ("CreateWaitableTimerExW", CreateWaitableTimerExW as usize),
+        ("CreateWaitableTimerW", CreateWaitableTimerW as usize),
+        ("SetWaitableTimer", SetWaitableTimer as usize),
+        ("CancelWaitableTimer", CancelWaitableTimer as usize),
+        ("WaitOnAddress", WaitOnAddress as usize),
+        ("WakeByAddressSingle", WakeByAddressSingle as usize),
+        ("WakeByAddressAll", WakeByAddressAll as usize),
         // Step-10c file APIs through the linked-in Linux VFS (kernel-family fallbacks).
         ("CreateFileW", CreateFileW as usize),
         ("CreateFileA", CreateFileA as usize),
@@ -5419,6 +5836,113 @@ mod tests {
                 std::ptr::null_mut(),
             );
             assert_eq!(st, STATUS_INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn waitable_timers_fire_and_close() {
+        unsafe {
+            // Auto-reset (sync) timer: one-shot fires once, then disarms.
+            let t = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, 0);
+            assert_ne!(t, 0);
+            // Null due fails cleanly.
+            assert_eq!(SetWaitableTimer(t, std::ptr::null(), 0, 0, std::ptr::null_mut(), 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // Unknown handles fail cleanly too.
+            assert_eq!(SetWaitableTimer(0xDEAD_BEEF, &0i64, 0, 0, std::ptr::null_mut(), 0), 0);
+            assert_eq!(CancelWaitableTimer(0xDEAD_BEEF), 0);
+            // 20 ms relative due: negative 100ns units.
+            let due: i64 = -(20 * 10_000);
+            assert_eq!(SetWaitableTimer(t, &due, 0, 0, std::ptr::null_mut(), 0), 1);
+            assert_eq!(WaitForSingleObject(t, 5000), WAIT_OBJECT_0);
+            // Auto-reset consumed the signal.
+            assert_eq!(WaitForSingleObject(t, 0), WAIT_TIMEOUT);
+            // Zero due fires immediately.
+            let zero: i64 = 0;
+            assert_eq!(SetWaitableTimer(t, &zero, 0, 0, std::ptr::null_mut(), 0), 1);
+            assert_eq!(WaitForSingleObject(t, 1000), WAIT_OBJECT_0);
+            // Cancel disarms: a 200 ms timer cancelled now never fires.
+            let far: i64 = -(200 * 10_000);
+            assert_eq!(SetWaitableTimer(t, &far, 0, 0, std::ptr::null_mut(), 0), 1);
+            assert_eq!(CancelWaitableTimer(t), 1);
+            assert_eq!(WaitForSingleObject(t, 50), WAIT_TIMEOUT);
+            // Periodic timer fires repeatedly (manual-reset stays signaled).
+            let m = CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_MANUAL_RESET,
+                0,
+            );
+            assert_ne!(m, 0);
+            let soon: i64 = -(10 * 10_000);
+            assert_eq!(SetWaitableTimer(m, &soon, 10, 0, std::ptr::null_mut(), 0), 1);
+            assert_eq!(WaitForSingleObject(m, 2000), WAIT_OBJECT_0);
+            // Manual-reset stays signaled across waits.
+            assert_eq!(WaitForSingleObject(m, 0), WAIT_OBJECT_0);
+            // Legacy W spelling agrees.
+            let w = CreateWaitableTimerW(std::ptr::null(), 0, std::ptr::null());
+            assert_ne!(w, 0);
+            assert_eq!(SetWaitableTimer(w, &zero, 0, 0, std::ptr::null_mut(), 0), 1);
+            assert_eq!(WaitForSingleObject(w, 1000), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(t), 1);
+            assert_eq!(CloseHandle(m), 1);
+            assert_eq!(CloseHandle(w), 1);
+            // Closed timers are gone from every wait path.
+            assert_eq!(WaitForSingleObject(t, 0), WAIT_FAILED);
+            assert_eq!(CancelWaitableTimer(t), 0);
+        }
+    }
+
+    #[test]
+    fn wait_on_address_wakes_and_times_out() {
+        unsafe {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicU32, Ordering};
+            // Shared cells: the address (usize) is Send; waiters read the bytes there.
+            let cell = Arc::new(AtomicU32::new(0));
+            let cell_addr = &*cell as *const AtomicU32 as usize;
+            static WANT: u32 = 0;
+            let want_addr = &WANT as *const u32 as usize;
+            let want_ptr = want_addr as *const c_void;
+            // Mismatched values return immediately without waiting.
+            cell.store(1, Ordering::SeqCst);
+            assert_eq!(WaitOnAddress(cell_addr as *const c_void, want_ptr, 4, 1000), 0);
+            cell.store(0, Ordering::SeqCst);
+            // A waker thread changes the value and wakes the waiter.
+            let cell2 = cell.clone();
+            let waker = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                cell2.store(7, Ordering::SeqCst);
+                WakeByAddressAll(cell_addr as *const c_void);
+            });
+            assert_eq!(WaitOnAddress(cell_addr as *const c_void, want_ptr, 4, 5000), 1);
+            waker.join().unwrap();
+            // No change + short timeout: FALSE with ERROR_TIMEOUT.
+            cell.store(0, Ordering::SeqCst);
+            assert_eq!(WaitOnAddress(cell_addr as *const c_void, want_ptr, 4, 20), 0);
+            assert_eq!(GetLastError(), ERROR_TIMEOUT);
+            // WakeSingle wakes exactly one waiter.
+            cell.store(0, Ordering::SeqCst);
+            let h1 = std::thread::spawn(move || {
+                WaitOnAddress(cell_addr as *const c_void, want_addr as *const c_void, 4, 5000)
+            });
+            // Second waiter on its own cell so the two waits do not share an address.
+            let cell_b = Arc::new(AtomicU32::new(0));
+            let cell_b_addr = &*cell_b as *const AtomicU32 as usize;
+            let h2 = std::thread::spawn(move || {
+                WaitOnAddress(cell_b_addr as *const c_void, want_addr as *const c_void, 4, 200)
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            WakeByAddressSingle(cell_addr as *const c_void);
+            assert_eq!(h1.join().unwrap(), 1);
+            // The waiter on the other address was not woken: it times out.
+            assert_eq!(h2.join().unwrap(), 0);
+            // Bad sizes/NULLs fail cleanly.
+            assert_eq!(WaitOnAddress(std::ptr::null(), want_ptr, 4, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(WaitOnAddress(cell_addr as *const c_void, want_ptr, 0, 0), 0);
+            WakeByAddressSingle(std::ptr::null());
+            WakeByAddressAll(std::ptr::null());
         }
     }
 }

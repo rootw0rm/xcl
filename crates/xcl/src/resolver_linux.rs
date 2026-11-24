@@ -428,6 +428,10 @@ mod tests {
             ("kernel32.dll", "GetConsoleOutputCP"),
             ("kernel32.dll", "SetThreadStackGuarantee"),
             ("ntdll.dll", "NtWriteFile"),
+            // Step 11e timer/synch: Rust sleep + parking.
+            ("kernel32.dll", "CreateWaitableTimerExW"),
+            ("kernel32.dll", "SetWaitableTimer"),
+            ("api-ms-win-core-synch-l1-2-0.dll", "WaitOnAddress"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
