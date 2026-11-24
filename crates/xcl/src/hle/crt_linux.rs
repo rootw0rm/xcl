@@ -425,6 +425,41 @@ pub unsafe extern "win64" fn wcsnlen(s: *const u16, max: usize) -> usize {
     n
 }
 
+/// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
+pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(key) = crate::util::from_cstr_ptr(name) else {
+        return std::ptr::null_mut();
+    };
+    match std::env::var(&key) {
+        Ok(v) => immortal_cstr(&v),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+fn immortal_cstr(s: &str) -> *mut u8 {
+    unsafe {
+        let p = libc::malloc(s.len() + 1) as *mut u8;
+        assert!(!p.is_null(), "crt: out of memory");
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
+        *p.add(s.len()) = 0;
+        p
+    }
+}
+
+/// `int setvbuf(FILE*, char*, int, size_t)` — stdio is unbacked (see
+/// `__acrt_iob_func`), so buffering requests are accepted and ignored (`0`).
+pub unsafe extern "win64" fn setvbuf(
+    _stream: *mut u8,
+    _buf: *mut u8,
+    _mode: i32,
+    _size: usize,
+) -> i32 {
+    0
+}
+
 /// Export table: name → real code address (never `0`/stub metadata).
 pub fn exports() -> Vec<(&'static str, usize)> {
     vec![
@@ -470,6 +505,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("strnlen", strnlen as usize),
         ("wcslen", wcslen as usize),
         ("wcsnlen", wcsnlen as usize),
+        ("getenv", getenv as usize),
+        ("setvbuf", setvbuf as usize),
     ]
 }
 
@@ -617,6 +654,31 @@ mod tests {
             free(p as *mut c_void);
             free(r as *mut c_void);
             free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn getenv_reads_the_process_environment() {
+        unsafe {
+            std::env::set_var("XCL_CRT_PROBE_VAR", "crt-probe-value");
+            let name = c"XCL_CRT_PROBE_VAR";
+            let p = getenv(name.as_ptr() as *const u8);
+            assert!(!p.is_null());
+            assert_eq!(crate::util::from_cstr_ptr(p).as_deref(), Some("crt-probe-value"));
+            // Same key keeps working after the host removes it? No: missing reads NULL.
+            std::env::remove_var("XCL_CRT_PROBE_VAR");
+            assert!(getenv(name.as_ptr() as *const u8).is_null());
+            // Null names never fault.
+            assert!(getenv(std::ptr::null()).is_null());
+        }
+    }
+
+    #[test]
+    fn setvbuf_reports_success_without_backing() {
+        unsafe {
+            assert_eq!(setvbuf(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0), 0);
+            assert_eq!(__acrt_iob_func(2).is_null(), false);
+            assert_eq!(setvbuf(__acrt_iob_func(2), std::ptr::null_mut(), 2, 4096), 0);
         }
     }
 }

@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::pe::ImportName;
 use crate::util::{from_ansi_ptr, from_wide_ptr};
 
 // ---------------------------------------------------------------------------------------
@@ -3561,6 +3562,8 @@ pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
 pub const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
 const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 fn std_handle_value(which: u32) -> usize {
     // Windows HANDLEs for the std streams are the sign-extended constants themselves.
@@ -3955,6 +3958,260 @@ pub unsafe extern "win64" fn DeleteFiber(_fiber: usize) {}
 pub unsafe extern "win64" fn SwitchToFiber(_fiber: usize) {}
 
 // ---------------------------------------------------------------------------------------
+// Exception / console shims (Phase C step 11d)
+// ---------------------------------------------------------------------------------------
+//
+// The cross-built title's Rust runtime takes its panic-report path through these:
+// `lang_start_internal` registers a stack-overflow vectored handler and sets the
+// thread stack guarantee, `std::sys::stdio::windows::write` probes `GetConsoleMode`
+// (redirected stderr fails, as on Windows) and then writes through `NtWriteFile`,
+// and `SetThreadDescription::load` probes `GetProcAddress` (a miss is a benign
+// fallback, as on Windows). The auto-stubs returned 0 for all of them: `NtWriteFile`
+// reported success without filling the `IO_STATUS_BLOCK`, so the write looked like
+// zero bytes and the panic message was lost on the way to the `int 29` fastfail.
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+/// Process-wide vectored-exception-handler table: handle → (first, handler).
+/// Full dispatch (running these on a fault) is later Phase C work; recording them
+/// unblocks `lang_start_internal`, which ignores the return otherwise.
+static VEH: OnceLock<Mutex<HashMap<usize, (u32, usize)>>> = OnceLock::new();
+
+fn veh() -> &'static Mutex<HashMap<usize, (u32, usize)>> {
+    VEH.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `PVOID AddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER)` —
+/// a non-zero handle, or 0 on a null handler.
+pub unsafe extern "win64" fn AddVectoredExceptionHandler(first: u32, handler: usize) -> usize {
+    if handler == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    veh().lock().unwrap().insert(h, (first, handler));
+    set_error(ERROR_SUCCESS);
+    crate::xlog_debug!("AddVectoredExceptionHandler(first={first}): handle {h:#x}");
+    h
+}
+
+/// `ULONG RemoveVectoredExceptionHandler(PVOID)` — 1 when the handle was registered.
+pub unsafe extern "win64" fn RemoveVectoredExceptionHandler(handle: usize) -> u32 {
+    if veh().lock().unwrap().remove(&handle).is_some() {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+/// `VOID RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR*)` — logged, then
+/// returns (dispatching the VEH chain / C++ unwinding is later Phase C work, when
+/// `.pdata` translation lands; cf. `eh_linux`).
+pub unsafe extern "win64" fn RaiseException(code: u32, flags: u32, nargs: u32, args: *const usize) {
+    let first = if nargs > 0 && !args.is_null() { *args } else { 0 };
+    crate::xlog_warn!("RaiseException(code={code:#x}, flags={flags:#x}, args={nargs}, first={first:#x})");
+}
+
+/// `FARPROC GetProcAddress(HMODULE, LPCSTR)` — HLE/mapped lookups through the
+/// Linux resolver (never a stub thunk, so optional-API probing keeps working);
+/// a miss is NULL with `ERROR_PROC_NOT_FOUND`, as on Windows.
+pub unsafe extern "win64" fn GetProcAddress(h: usize, name: *const u8) -> usize {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // Ordinals arrive as small integers, names as pointers (mirrors the Windows twin).
+    let what = if (name as usize) < 0x1_0000 {
+        ImportName::Ordinal(name as usize as u16)
+    } else {
+        match from_ansi_ptr(name) {
+            Some(n) => ImportName::Name { hint: 0, name: n },
+            None => {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+        }
+    };
+    let h = if h == 0 { main_or_zero_base() } else { h };
+    match crate::resolver::get_proc_address(h, &what) {
+        Some(a) => {
+            set_error(ERROR_SUCCESS);
+            a
+        }
+        None => {
+            set_error(ERROR_PROC_NOT_FOUND);
+            0
+        }
+    }
+}
+
+/// `BOOL GetConsoleMode(HANDLE, LPDWORD)` — succeeds only for the std pseudo
+/// handles when the backing fd is a tty (a redirected stderr fails with
+/// `ERROR_INVALID_HANDLE`, steering Rust's `write` onto the `NtWriteFile` path,
+/// as on Windows). Console output defaults to `ENABLE_PROCESSED_OUTPUT |
+/// ENABLE_WRAP_AT_EOL_OUTPUT`; input to the usual cooked set.
+pub unsafe extern "win64" fn GetConsoleMode(h: usize, mode: *mut u32) -> i32 {
+    if mode.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let fd = if h == std_handle_value(STD_INPUT_HANDLE) {
+        0
+    } else if h == std_handle_value(STD_OUTPUT_HANDLE) {
+        1
+    } else if h == std_handle_value(STD_ERROR_HANDLE) {
+        2
+    } else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if unsafe { libc::isatty(fd) } != 1 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    *mode = if fd == 0 { 0x1F7 } else { 0x7 };
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `BOOL SetConsoleMode(HANDLE, DWORD)` — accepted for the std pseudo handles
+/// when the backing fd is a tty; anything else fails, as on Windows.
+pub unsafe extern "win64" fn SetConsoleMode(h: usize, _mode: u32) -> i32 {
+    let fd = if h == std_handle_value(STD_INPUT_HANDLE) {
+        0
+    } else if h == std_handle_value(STD_OUTPUT_HANDLE) {
+        1
+    } else if h == std_handle_value(STD_ERROR_HANDLE) {
+        2
+    } else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if unsafe { libc::isatty(fd) } != 1 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `UINT GetConsoleOutputCP(void)` — `CP_UTF8` (65001), so Rust's console write
+/// takes the UTF-8 `NtWriteFile` path instead of the `WriteConsoleW` path.
+pub unsafe extern "win64" fn GetConsoleOutputCP() -> u32 {
+    65001
+}
+
+/// `BOOL SetThreadStackGuarantee(PULONG)` — host stacks grow on demand, so the
+/// guarantee is trivially satisfied; the value is left in place, as on Windows.
+pub unsafe extern "win64" fn SetThreadStackGuarantee(size: *mut u32) -> i32 {
+    if size.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+// `NTSTATUS NtWriteFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
+// PVOID, ULONG, PLARGE_INTEGER, PULONG)`: the console path Rust's
+// `synchronous_write` takes. Forwards to the host fd (std pseudos) or the VFS
+// file table, fills the `IO_STATUS_BLOCK` (`Status`, `Information =
+// bytes-written`) and returns `STATUS_SUCCESS`. Event/APC/offset/key are
+// synchronous no-ops here.
+
+/// Windows `IO_STATUS_BLOCK` (16 bytes on x86-64): status + bytes-transferred.
+#[repr(C)]
+pub struct IoStatusBlock {
+    pub status: u32,
+    pub _pad: u32,
+    pub info: usize,
+}
+
+const STATUS_SUCCESS: u32 = 0;
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+
+fn iosb_write(out: *mut IoStatusBlock, status: u32, info: usize) -> u32 {
+    if !out.is_null() {
+        unsafe {
+            (*out).status = status;
+            (*out)._pad = 0;
+            (*out).info = info;
+        }
+    }
+    status
+}
+
+fn fd_write_all(fd: i32, data: &[u8]) -> Result<usize, u32> {
+    let mut written = 0usize;
+    while written < data.len() {
+        let r = unsafe {
+            libc::write(
+                fd,
+                data.as_ptr().add(written) as *const c_void,
+                data.len() - written,
+            )
+        };
+        if r < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(5);
+            if e == libc::EINTR {
+                continue;
+            }
+            return Err(e as u32);
+        }
+        // A zero return cannot happen for these sizes; guard against a spin anyway.
+        if r == 0 {
+            break;
+        }
+        written += r as usize;
+        break; // pipes/ttys accept the write in one go for these sizes.
+    }
+    Ok(written)
+}
+
+pub unsafe extern "win64" fn NtWriteFile(
+    handle: usize,
+    _event: usize,
+    _apc: usize,
+    _apc_ctx: usize,
+    iosb: *mut IoStatusBlock,
+    buf: *const u8,
+    len: u32,
+    _byte_offset: *const i64,
+    _key: *mut u32,
+) -> u32 {
+    if len == 0 {
+        return iosb_write(iosb, STATUS_SUCCESS, 0);
+    }
+    if buf.is_null() {
+        return iosb_write(iosb, STATUS_INVALID_HANDLE, 0);
+    }
+    let data = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+    // Console pseudos land on the host fds, as in `WriteFile`.
+    if handle == std_handle_value(STD_OUTPUT_HANDLE) || handle == std_handle_value(STD_ERROR_HANDLE) {
+        let fd = if handle == std_handle_value(STD_OUTPUT_HANDLE) { 1 } else { 2 };
+        return match fd_write_all(fd, data) {
+            Ok(k) => iosb_write(iosb, STATUS_SUCCESS, k),
+            Err(_) => iosb_write(iosb, STATUS_UNSUCCESSFUL, 0),
+        };
+    }
+    if handle == std_handle_value(STD_INPUT_HANDLE) {
+        return iosb_write(iosb, STATUS_INVALID_HANDLE, 0);
+    }
+    let arc = files().lock().unwrap().get(&handle).cloned();
+    let Some(arc) = arc else {
+        return iosb_write(iosb, STATUS_INVALID_HANDLE, 0);
+    };
+    let mut g = arc.lock().unwrap();
+    match std::io::Write::write(&mut *g, data) {
+        Ok(k) => iosb_write(iosb, STATUS_SUCCESS, k),
+        Err(_) => iosb_write(iosb, STATUS_UNSUCCESSFUL, 0),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Export table
 // ---------------------------------------------------------------------------------------
 
@@ -4075,6 +4332,16 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetModuleHandleExA", GetModuleHandleExA as usize),
         ("GetEnvironmentVariableW", GetEnvironmentVariableW as usize),
         ("GetEnvironmentVariableA", GetEnvironmentVariableA as usize),
+        // Step-11d exception/console shims for the Rust panic-report path.
+        ("AddVectoredExceptionHandler", AddVectoredExceptionHandler as usize),
+        ("RemoveVectoredExceptionHandler", RemoveVectoredExceptionHandler as usize),
+        ("RaiseException", RaiseException as usize),
+        ("GetProcAddress", GetProcAddress as usize),
+        ("GetConsoleMode", GetConsoleMode as usize),
+        ("SetConsoleMode", SetConsoleMode as usize),
+        ("GetConsoleOutputCP", GetConsoleOutputCP as usize),
+        ("SetThreadStackGuarantee", SetThreadStackGuarantee as usize),
+        ("NtWriteFile", NtWriteFile as usize),
         // Step-10c file APIs through the linked-in Linux VFS (kernel-family fallbacks).
         ("CreateFileW", CreateFileW as usize),
         ("CreateFileA", CreateFileA as usize),
@@ -5006,6 +5273,152 @@ mod tests {
             let m = GetEnvironmentVariableA(aname.as_ptr() as *const u8, abuf.as_mut_ptr(), 64);
             assert_eq!(m, "hello-fls".len() as u32);
             std::env::remove_var("XCL_FLS_PROBE_VAR");
+        }
+    }
+
+    #[test]
+    fn vectored_handlers_register_and_remove() {
+        unsafe {
+            // Null handlers fail cleanly, never hand out handle 0.
+            assert_eq!(AddVectoredExceptionHandler(1, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            let a = AddVectoredExceptionHandler(1, 0x1234);
+            let b = AddVectoredExceptionHandler(0, 0x5678);
+            assert_ne!(a, 0);
+            assert_ne!(b, 0);
+            assert_ne!(a, b);
+            assert_eq!(RemoveVectoredExceptionHandler(a), 1);
+            // Double remove and unknown handles fail cleanly.
+            assert_eq!(RemoveVectoredExceptionHandler(a), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(RemoveVectoredExceptionHandler(0xDEAD_BEEF), 0);
+            assert_eq!(RemoveVectoredExceptionHandler(b), 1);
+            // Raising logs and returns (dispatch is later Phase C work).
+            RaiseException(0xE06D_7363, 0, 0, std::ptr::null());
+        }
+    }
+
+    #[test]
+    fn get_proc_address_probes_hle_without_stubs() {
+        unsafe {
+            // Null names fail cleanly.
+            assert_eq!(GetProcAddress(0x1234_5000, std::ptr::null()), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // HLE pseudo handles resolve real HLE bodies, never stub thunks.
+            let kx = crate::modules::hle_handle("kernelx.dll");
+            let va = GetProcAddress(kx, c"VirtualAlloc".as_ptr() as *const u8);
+            assert_ne!(va, 0);
+            assert!(crate::stubs::info_of_stub(va).is_none());
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+            // Unknown names miss with ERROR_PROC_NOT_FOUND so probing works.
+            let miss = GetProcAddress(kx, c"XclDefinitelyMissingApi123".as_ptr() as *const u8);
+            assert_eq!(miss, 0);
+            assert_eq!(GetLastError(), ERROR_PROC_NOT_FOUND);
+            // Unknown handles miss too.
+            assert_eq!(
+                GetProcAddress(0xDEAD_5000, c"VirtualAlloc".as_ptr() as *const u8),
+                0
+            );
+            // Ordinal 0 (no ordinal exports here) misses cleanly.
+            assert_eq!(GetProcAddress(kx, 0 as *const u8), 0);
+        }
+    }
+
+    #[test]
+    fn console_mode_follows_the_tty_and_stack_guarantee_holds() {
+        unsafe {
+            // Null mode buffers fail cleanly; unknown handles are not consoles.
+            let mut mode = 0u32;
+            assert_eq!(
+                GetConsoleMode(std_handle_value(STD_ERROR_HANDLE), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetConsoleMode(0x1234, &mut mode), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            // Redirected std handles (this test's stderr is a pipe/file under cargo)
+            // fail like Windows; on a real tty they succeed with a plausible mode.
+            let r = GetConsoleMode(std_handle_value(STD_ERROR_HANDLE), &mut mode);
+            if libc::isatty(2) == 1 {
+                assert_eq!(r, 1);
+                assert_ne!(mode, 0);
+                assert_eq!(SetConsoleMode(std_handle_value(STD_ERROR_HANDLE), mode), 1);
+            } else {
+                assert_eq!(r, 0);
+                assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+                assert_eq!(SetConsoleMode(std_handle_value(STD_ERROR_HANDLE), 7), 0);
+            }
+            assert_eq!(SetConsoleMode(0x1234, 7), 0);
+            // UTF-8 so Rust takes the NtWriteFile path, not WriteConsoleW.
+            assert_eq!(GetConsoleOutputCP(), 65001);
+            // The guarantee call Rust's lang_start makes always succeeds.
+            let mut size = 0x5000u32;
+            assert_eq!(SetThreadStackGuarantee(&mut size), 1);
+            assert_eq!(size, 0x5000);
+            assert_eq!(SetThreadStackGuarantee(std::ptr::null_mut()), 0);
+        }
+    }
+
+    #[test]
+    fn nt_write_file_fills_the_io_status_block() {
+        unsafe {
+            let msg = b"xcl-ntwrite-probe";
+            let mut iosb = IoStatusBlock { status: 0xDEAD, _pad: 0xBEEF, info: 0xCAFE };
+            // Console stderr lands on host fd 2.
+            let st = NtWriteFile(
+                std_handle_value(STD_ERROR_HANDLE),
+                0,
+                0,
+                0,
+                &mut iosb,
+                msg.as_ptr(),
+                msg.len() as u32,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(st, STATUS_SUCCESS);
+            assert_eq!(iosb.status, STATUS_SUCCESS);
+            assert_eq!(iosb.info, msg.len());
+            // Zero-length writes succeed with zero information.
+            let st = NtWriteFile(
+                std_handle_value(STD_OUTPUT_HANDLE),
+                0,
+                0,
+                0,
+                &mut iosb,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(st, STATUS_SUCCESS);
+            assert_eq!(iosb.info, 0);
+            // Stdin and unknown handles are STATUS_INVALID_HANDLE, still filling the block.
+            let st = NtWriteFile(
+                std_handle_value(STD_INPUT_HANDLE),
+                0,
+                0,
+                0,
+                &mut iosb,
+                msg.as_ptr(),
+                msg.len() as u32,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(st, STATUS_INVALID_HANDLE);
+            assert_eq!(iosb.status, STATUS_INVALID_HANDLE);
+            assert_eq!(iosb.info, 0);
+            let st = NtWriteFile(
+                0xDEAD_BEEF,
+                0,
+                0,
+                0,
+                &mut iosb,
+                msg.as_ptr(),
+                msg.len() as u32,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(st, STATUS_INVALID_HANDLE);
         }
     }
 }

@@ -418,6 +418,16 @@ mod tests {
             ("kernel32.dll", "GetModuleHandleA"),
             ("kernel32.dll", "GetModuleHandleExW"),
             ("kernel32.dll", "GetEnvironmentVariableW"),
+            // Step 11d panic-report path: exception, console, loader probes.
+            ("kernel32.dll", "AddVectoredExceptionHandler"),
+            ("kernel32.dll", "RemoveVectoredExceptionHandler"),
+            ("kernel32.dll", "RaiseException"),
+            ("kernel32.dll", "GetProcAddress"),
+            ("kernel32.dll", "GetConsoleMode"),
+            ("kernel32.dll", "SetConsoleMode"),
+            ("kernel32.dll", "GetConsoleOutputCP"),
+            ("kernel32.dll", "SetThreadStackGuarantee"),
+            ("ntdll.dll", "NtWriteFile"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
@@ -454,6 +464,8 @@ mod tests {
             ("api-ms-win-crt-runtime-l1-1-0.dll", "_errno"),
             ("api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func"),
             ("api-ms-win-crt-heap-l1-1-0.dll", "malloc"),
+            ("api-ms-win-crt-environment-l1-1-0.dll", "getenv"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "setvbuf"),
             ("ucrtbase.dll", "memcpy"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
@@ -525,6 +537,9 @@ mod tests {
         assert!(modules::hle_name_by_handle(h).is_some());
         // HLE exports are Stub metadata: GetProcAddress returns None (no stub synthesis).
         assert_eq!(get_proc_address(h, &name("XMemAlloc")), None);
+        // Implemented HLE bodies resolve to callable addresses through the same path.
+        let va = get_proc_address(h, &name("VirtualAlloc")).expect("VirtualAlloc HLE");
+        assert!(stubs::info_of_stub(va).is_none());
         // Unknown handles have no lookup.
         assert_eq!(get_proc_address(0x1234_5000, &name("XMemAlloc")), None);
         // Stub routes still hand out a pseudo handle.
@@ -549,7 +564,15 @@ mod tests {
             classify("api-ms-win-crt-stdio-l1-1-0.dll", &name("__p__fmode")),
             Source::HleOther(_)
         ));
-        assert_eq!(classify("ucrtbase.dll", &name("getenv")), Source::Stub);
+        assert!(matches!(
+            classify("ucrtbase.dll", &name("getenv")),
+            Source::HleOther(_)
+        ));
+        assert!(matches!(
+            classify("ntdll.dll", &name("NtWriteFile")),
+            Source::HleOther(_)
+        ));
+        assert_eq!(classify("ucrtbase.dll", &name("LinuxProbeMissingCrt")), Source::Stub);
     }
 
     #[test]

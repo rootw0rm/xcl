@@ -395,6 +395,16 @@ mod tests {
             "GetModuleHandleA",
             "GetModuleHandleExW",
             "GetEnvironmentVariableW",
+            // Step-11d panic-report path: exception, console, loader probes.
+            "AddVectoredExceptionHandler",
+            "RemoveVectoredExceptionHandler",
+            "RaiseException",
+            "GetProcAddress",
+            "GetConsoleMode",
+            "SetConsoleMode",
+            "GetConsoleOutputCP",
+            "SetThreadStackGuarantee",
+            "NtWriteFile",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);
@@ -423,6 +433,8 @@ mod tests {
             "memcpy",
             "memset",
             "strlen",
+            "getenv",
+            "setvbuf",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, UCRT);

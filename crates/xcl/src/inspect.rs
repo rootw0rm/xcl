@@ -220,7 +220,7 @@ mod tests {
             classify("api-ms-win-crt-stdio-l1-1-0.dll", &name("__p__fmode"), None),
             "HLE (ucrtbase.dll, other module)"
         );
-        assert_eq!(classify("ucrtbase.dll", &name("getenv"), None), "STUB");
+        assert_eq!(classify("ucrtbase.dll", &name("getenv"), None), "HLE (ucrtbase.dll, other module)");
     }
 
     #[test]
