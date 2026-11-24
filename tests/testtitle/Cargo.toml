@@ -11,11 +11,14 @@ name = "xcl_testtitle"
 path = "src/main.rs"
 
 [dependencies]
-# zlib for the synthetic retail-format console shader (XBCH)
+
+# zlib for the synthetic retail-format console shader (XBCH) in the Windows PE build
+[target.'cfg(windows)'.dependencies]
 miniz_oxide = "0.9"
 
 # D3D12 types/interfaces only – the device itself comes from d3d12_xs.dll (XCL).
-[dependencies.windows]
+# The title is a Windows PE binary; on a Linux host the crate is not built (see src/main.rs).
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
     "Win32_Foundation",

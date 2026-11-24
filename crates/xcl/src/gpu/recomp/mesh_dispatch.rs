@@ -256,6 +256,7 @@ mod tests {
         assert_ne!(&fixed.0[..64], &fixed.0[64..]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn validation_shader_has_only_unconditional_rendezvous() {
         let hlsl = validation_hlsl();
@@ -294,6 +295,7 @@ mod tests {
         assert!(!translated.hlsl.contains("DeviceMemoryBarrierWithGroupSync"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn gpu_dispatch_matches_native_wave64_reference() {
         if let Err(reason) = super::super::runner::adapter() {

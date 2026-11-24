@@ -4,10 +4,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
 use crate::gpu::pack;
@@ -84,10 +86,22 @@ fn atomic_write_with(
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "output appeared during extraction"));
     }
     before_commit(&temporary.0)?;
-    let from: Vec<u16> = temporary.0.as_os_str().encode_wide().chain([0]).collect();
-    let to: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-        return Err(io::Error::last_os_error());
+    #[cfg(windows)]
+    {
+        let from: Vec<u16> = temporary.0.as_os_str().encode_wide().chain([0]).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // `rename(2)` would replace an existing file; `link(2)` publishes the finished temp file
+    // atomically and fails with `AlreadyExists` instead (the same no-clobber contract as
+    // `MoveFileExW` without REPLACE_EXISTING). The temp file lives beside the destination, so
+    // the link stays on one filesystem.
+    #[cfg(not(windows))]
+    {
+        std::fs::hard_link(&temporary.0, path)?;
+        std::fs::remove_file(&temporary.0)?;
     }
     Ok(())
 }

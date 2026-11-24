@@ -4,7 +4,9 @@
 //! a cache keyed by the raw words …) can use them. Field positions as in AMD's GFX10
 //! register docs, cross-checked with AnyPS5 (GPL-2.0); format numbers = GFX10 IMG_FORMAT.
 
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D12::*;
+#[cfg(windows)]
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 /// GFX10 image TYPE (T# word 3 [31:28]).
@@ -76,6 +78,7 @@ pub fn image(w: &[u32; 8]) -> Option<Image> {
 
 /// DXGI format of a GFX10 IMG_FORMAT and where GFX components x, y, z, w live among the
 /// DXGI channels R, G, B, A (the B-first packed formats store x in the blue bits).
+#[cfg(windows)]
 pub fn dxgi_format(f: u32) -> Option<(DXGI_FORMAT, [u32; 4])> {
     const RGBA: [u32; 4] = [0, 1, 2, 3];
     const BGRA: [u32; 4] = [2, 1, 0, 3];
@@ -147,6 +150,7 @@ pub fn dxgi_format(f: u32) -> Option<(DXGI_FORMAT, [u32; 4])> {
 }
 
 /// D3D12 component mapping for a T#'s DST_SEL on a DXGI format with the given channel order.
+#[cfg(windows)]
 pub fn component_mapping(dst_sel: [u32; 4], order: [u32; 4]) -> u32 {
     let src = |sel: u32| match sel {
         0 => D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0.0 as u32,
@@ -166,6 +170,7 @@ pub fn valid_cube_view(t: &Image) -> bool {
     t.depth.checked_sub(t.base_array).is_some_and(|faces| faces != 0 && faces % 6 == 0)
 }
 
+#[cfg(windows)]
 pub fn valid_image_shape(t: &Image) -> bool {
     if t.width == 0 || (!matches!(t.ty, ImageType::D1 | ImageType::D1Array) && t.height == 0) {
         return false;
@@ -209,6 +214,7 @@ pub fn valid_image_shape(t: &Image) -> bool {
     t.base_level <= t.last_level && t.last_level <= t.max_mip && t.max_mip <= highest
 }
 
+#[cfg(windows)]
 pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
     if !valid_cube_view(t) || !valid_image_shape(t) {
         return None;
@@ -277,6 +283,7 @@ pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOU
 
 /// D3D12 sampler from an S#. Border colours from the console's table (type 3) become
 /// transparent black. `comparison` selects the comparison variant (image_*_c).
+#[cfg(windows)]
 pub fn sampler_d3d12(w: &[u32; 4], comparison: bool) -> D3D12_SAMPLER_DESC {
     let address = |c: u32| match c {
         0 => D3D12_TEXTURE_ADDRESS_MODE_WRAP,
@@ -376,6 +383,7 @@ mod tests {
     }
 
     /// T# of a 2D BGRA-swizzled RGBA8 texture, 256×128, 8 mips, view of mips 1..3.
+    #[cfg(windows)]
     fn tsharp() -> [u32; 8] {
         let (w, h) = (256u32 - 1, 128u32 - 1);
         [
@@ -390,6 +398,7 @@ mod tests {
         ]
     }
 
+    #[cfg(windows)]
     #[test]
     fn decodes_tsharp() {
         let t = image(&tsharp()).unwrap();
@@ -406,6 +415,7 @@ mod tests {
         assert!(image(&[0; 8]).is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn packed_formats_reorder_channels() {
         // 5_6_5: x lives in the blue bits of DXGI B5G6R5; identity DST_SEL → r ← B channel
@@ -415,6 +425,7 @@ mod tests {
         assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
     }
 
+    #[cfg(windows)]
     #[test]
     fn non_array_resources_ignore_tsharp_depth() {
         let mut t = image(&tsharp()).unwrap();
@@ -435,6 +446,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn cube_views_require_a_nonempty_whole_number_of_faces() {
         let mut t = image(&tsharp()).unwrap();
@@ -455,6 +467,7 @@ mod tests {
         assert!(image_d3d12(&t).is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn image_mips_and_array_views_stay_within_resource_dimensions() {
         let mut t = image(&tsharp()).unwrap();
@@ -490,6 +503,7 @@ mod tests {
         assert!(!valid_image_shape(&t));
     }
 
+    #[cfg(windows)]
     #[test]
     fn resource_depth_is_rejected_instead_of_silently_clamped() {
         let mut t = image(&tsharp()).unwrap();
@@ -506,6 +520,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn resource_dimensions_respect_d3d12_texture_limits() {
         let mut t = image(&tsharp()).unwrap();
@@ -575,6 +590,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn decodes_ssharp() {
         // clamp/wrap/border, aniso 8, compare LESS, bias -1.5, mag/min linear, mip linear, lod 0..13
@@ -598,6 +614,7 @@ mod tests {
 }
 
 /// GFX10 IMG_FORMAT of a DXGI format (the inverse of `dxgi_format`; typeless → None).
+#[cfg(windows)]
 pub fn gfx10_format(f: DXGI_FORMAT) -> Option<u32> {
     (0..=182).find(|&g| dxgi_format(g).map(|(d, _)| d) == Some(f))
 }
@@ -628,6 +645,7 @@ pub fn xcl_image_for_view(srv_heap_index: u32, format: u32, ty: ImageType, width
     t
 }
 
+#[cfg(windows)]
 #[cfg(test)]
 mod view_tests {
     use super::*;

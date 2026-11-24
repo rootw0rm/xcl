@@ -69,12 +69,24 @@ pub fn enabled(level: Level) -> bool {
     level as u8 <= LEVEL.load(Ordering::Relaxed)
 }
 
+#[cfg(windows)]
+fn thread_id() -> u32 {
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// Linux: std exposes no numeric TID, and `ThreadId` is stable and distinct per thread.
+// LINUX-TODO: Phase E — use the kernel tid once the kernelx thread shim owns thread creation.
+#[cfg(not(windows))]
+fn thread_id() -> String {
+    format!("{:?}", std::thread::current().id())
+}
+
 pub fn write(level: Level, args: std::fmt::Arguments<'_>) {
     if !enabled(level) {
         return;
     }
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
-    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let tid = thread_id();
     let line = format!("[{t:9.3}][{tid:5}][{}] {args}\n", level.tag());
     if let Ok(mut g) = FILE.try_lock().or_else(|_| FILE.lock()) {
         if let Some(f) = g.as_mut() {

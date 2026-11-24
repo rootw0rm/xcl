@@ -1,18 +1,22 @@
 //! xcl.exe – command line front-end and (in host mode) the process the game runs in.
 
+#[cfg(windows)]
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::sync::atomic::Ordering;
 
 /// Our own TLS callback: ntdll calls it for every thread start/exit in the process.
 /// In host mode it initialises the game's static TLS for the new thread and forwards
 /// the notification to the game's TLS callbacks / DllMains.
+#[cfg(windows)]
 unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mut c_void) {
     if xcl::host::HOST_MODE.load(Ordering::Acquire) {
         xcl::loader::on_tls_event(reason);
     }
 }
 
+#[cfg(windows)]
 #[used]
 #[link_section = ".CRT$XLY"]
 static XCL_TLS_CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
@@ -43,8 +47,12 @@ Usage:
 
 fn main() {
     // keep the TLS callback from being discarded by the linker
-    unsafe { std::ptr::read_volatile(&XCL_TLS_CALLBACK) };
+    #[cfg(windows)]
+    unsafe {
+        std::ptr::read_volatile(&XCL_TLS_CALLBACK)
+    };
 
+    #[cfg(windows)]
     if let Some(boot) = std::env::var_os("XCL_HOST") {
         std::env::remove_var("XCL_HOST");
         std::process::exit(xcl::host::host_main(&PathBuf::from(boot)));
@@ -57,12 +65,9 @@ fn main() {
                 Some(i) => args[i + 1..].to_vec(),
                 None => args[2..].to_vec(),
             };
-            xcl::launcher::run(&PathBuf::from(&args[1]), &rest)
+            run_command(Path::new(&args[1]), &rest)
         }
-        Some("inspect") if args.len() >= 2 => {
-            let json = args.iter().any(|a| a == "--json");
-            xcl::inspect::run(&PathBuf::from(&args[1]), json)
-        }
+        Some("inspect") if args.len() >= 2 => inspect_command(Path::new(&args[1]), &args[2..]),
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
@@ -70,20 +75,63 @@ fn main() {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        None if started_by_double_click() => run_picked_game(),
-        _ => {
-            print!("{HELP}");
-            if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-                0
-            } else {
-                2
-            }
-        }
+        None => match no_args() {
+            Some(code) => code,
+            None => help(&args),
+        },
+        _ => help(&args),
     };
     std::process::exit(code);
 }
 
+fn help(args: &[String]) -> i32 {
+    print!("{HELP}");
+    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+        0
+    } else {
+        2
+    }
+}
+
+#[cfg(windows)]
+fn run_command(target: &Path, rest: &[String]) -> i32 {
+    xcl::launcher::run(target, rest)
+}
+
+/// The host runtime (launcher, loader, HLE) is Windows-only until Phase C.
+// LINUX-TODO: Phase C — call the Linux launcher.
+#[cfg(not(windows))]
+fn run_command(_target: &Path, _rest: &[String]) -> i32 {
+    eprintln!("xcl run: not supported on Linux yet (Phase C)");
+    2
+}
+
+#[cfg(windows)]
+fn inspect_command(target: &Path, args: &[String]) -> i32 {
+    xcl::inspect::run(target, args.iter().any(|a| a == "--json"))
+}
+
+// LINUX-TODO: Phase B — inspect already parses PE; the HLE classification needs the route table.
+#[cfg(not(windows))]
+fn inspect_command(_target: &Path, _args: &[String]) -> i32 {
+    eprintln!("xcl inspect: not supported on Linux yet (Phase B)");
+    2
+}
+
+/// xcl.exe opened from Explorer with no arguments: run the picked game.
+#[cfg(windows)]
+fn no_args() -> Option<i32> {
+    started_by_double_click().then(run_picked_game)
+}
+
+/// No Explorer menu on Linux: a bare invocation prints the help.
+#[cfg(not(windows))]
+fn no_args() -> Option<i32> {
+    None
+}
+
 /// xcl.exe opened from Explorer: the console is its own (from a terminal, the shell shares it).
+#[cfg(windows)]
 fn started_by_double_click() -> bool {
     let mut ids = [0u32; 4];
     unsafe { windows_sys::Win32::System::Console::GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
@@ -91,6 +139,7 @@ fn started_by_double_click() -> bool {
 
 /// No command line: a small menu (choose a game / run the last one again), then the game runs
 /// in this console. On an error the console stays open until Enter, so the message can be read.
+#[cfg(windows)]
 fn run_picked_game() -> i32 {
     let last_file = xcl::launcher::data_root().join("last-game.txt");
     let last = std::fs::read_to_string(&last_file).ok().map(|s| PathBuf::from(s.trim())).filter(|p| p.exists());
@@ -119,12 +168,14 @@ fn run_picked_game() -> i32 {
     code
 }
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// `name` of system DLL `dll`, looked up when the menu needs it: xcl.exe does not import the
 /// dialog libraries (the game runs in this executable, and must not get them).
+#[cfg(windows)]
 unsafe fn system_proc(dll: &str, name: &str) -> Option<usize> {
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     let lib = LoadLibraryW(wide(dll).as_ptr());
@@ -137,10 +188,12 @@ unsafe fn system_proc(dll: &str, name: &str) -> Option<usize> {
 /// While the menu is open: COM for the file dialog, and the common controls 6 (the task
 /// dialog, the current look) through an activation context of its own – not a manifest of
 /// xcl.exe, which would apply to the game too.
+#[cfg(windows)]
 struct Ui {
     actctx: Option<(windows_sys::Win32::Foundation::HANDLE, usize)>,
 }
 
+#[cfg(windows)]
 impl Ui {
     fn enter() -> Ui {
         use windows_sys::Win32::System::ApplicationInstallationAndServicing::{ActivateActCtx, CreateActCtxW, ACTCTXW};
@@ -171,6 +224,7 @@ impl Ui {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Ui {
     fn drop(&mut self) {
         use windows_sys::Win32::System::ApplicationInstallationAndServicing::{DeactivateActCtx, ReleaseActCtx};
@@ -184,6 +238,7 @@ impl Drop for Ui {
     }
 }
 
+#[cfg(windows)]
 enum Choice {
     Choose,
     Again,
@@ -193,6 +248,7 @@ enum Choice {
 }
 
 /// The menu: a task dialog with "Choose a game…" and, after a first run, "Run again".
+#[cfg(windows)]
 fn menu(last: Option<&std::path::Path>) -> Choice {
     use windows_sys::Win32::UI::Controls::*;
     const CHOOSE: i32 = 100;
@@ -231,6 +287,7 @@ fn menu(last: Option<&std::path::Path>) -> Choice {
 }
 
 /// The standard Windows open dialog (None: cancelled).
+#[cfg(windows)]
 fn pick_game_file() -> Option<PathBuf> {
     use windows_sys::Win32::UI::Controls::Dialogs::*;
     type GetOpenFileName = unsafe extern "system" fn(*mut OPENFILENAMEW) -> i32;

@@ -739,6 +739,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn parses_kernel32_exports_and_imports() {
         let data = system_file("kernel32.dll");
@@ -758,6 +759,7 @@ mod tests {
 
     /// Malformed directories are errors, not panics or runaway loops (#106): a relocation block
     /// claiming more than the directory holds, import descriptors at the end of the address space.
+    #[cfg(windows)]
     #[test]
     fn malformed_relocations_and_imports_are_errors() {
         let mut data = system_file("kernel32.dll");
@@ -789,6 +791,7 @@ mod tests {
         assert!(pe.imports().is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn parses_own_test_binary_tls() {
         // The test harness itself is an x64 Rust binary with static TLS.

@@ -29,11 +29,14 @@ fn add(h: &mut u64, bytes: &[u8]) {
 
 fn main() {
     // xcl.exe without high-entropy ASLR: the title's memory then lies under 2^40, which a
-    // retail title's BVH builder requires of its GPU addresses (#585, PR #631)
-    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
-        Ok("msvc") => println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO"),
-        Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
-        _ => {}
+    // retail title's BVH builder requires of its GPU addresses (#585, PR #631). The flags are
+    // Windows PE linker options; on a Linux host the ELF binary must not get them.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO"),
+            Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
+            _ => {}
+        }
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut h = 0xcbf2_9ce4_8422_2325u64;

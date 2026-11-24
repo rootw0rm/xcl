@@ -744,6 +744,7 @@ mod tests {
         assert_eq!(l.offset(1, 16, 32), 2 * 256 + 1); // second block row of a 2-block-wide surface
     }
 
+    #[cfg(windows)]
     #[test]
     fn t_sharp_bc7_layout() {
         let t = crate::gpu::desc::Image {

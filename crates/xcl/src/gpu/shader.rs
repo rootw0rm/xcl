@@ -203,6 +203,7 @@ fn dump_dir() -> PathBuf {
 
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
+#[cfg(windows)]
 pub fn readable(p: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     if p == 0 || len == 0 || len > 256 << 20 {
@@ -230,13 +231,22 @@ pub fn readable(p: usize, len: usize) -> bool {
     true
 }
 
+/// Linux: no `/proc/self/maps` walk yet, so refuse (never dereference) any game pointer.
+// LINUX-TODO: Phase C — answer from the loader's mapped ranges once it exists.
+#[cfg(not(windows))]
+pub fn readable(p: usize, len: usize) -> bool {
+    let _ = (p, len);
+    false
+}
+
 /// Whether each page of `[p, end)` (up to 16 pages) is in the working set with a readable
 /// protection, asked of the kernel for all the pages in one call that touches none of them.
 /// `readable` asks this first because `VirtualQuery` sizes the whole region around an address by
 /// walking it: in a title's 2 GB block of committed memory that took 20–25 ms a call, and a retail game's
-/// streaming thread, which has the page arrays of its DirectStorage requests checked, spent most
-/// of the world load there. `false` for a page that is not resident (never touched, paged out,
+/// streaming thread, which has the page arrays of its DirectStorage requests checked, spent
+/// most of the world load there. `false` for a page that is not resident (never touched, paged out,
 /// guard, reserved, no access): the `VirtualQuery` walk answers for those.
+#[cfg(windows)]
 fn resident_and_readable(p: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
@@ -395,7 +405,14 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
             let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
             let Ok(t) = recomp::translate(code, &opt) else { continue };
             let _ = std::fs::write(base.with_extension(format!("fssm{i}.p{j}.hlsl")), &t.hlsl);
+            #[cfg(windows)]
             let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
+            // DXC is Windows-only until the SPIR-V backend (Phase D); the HLSL dump is still written.
+            #[cfg(not(windows))]
+            let built: Option<Result<(Vec<u8>, bool), String>> = {
+                let _ = (dxc, profile);
+                None
+            };
             if let Some(Err(e)) = &built {
                 crate::xlog_warn!("[SHADER] DXC rejected the translation {}: {}", base.display(), e.lines().next().unwrap_or(""));
             }
@@ -481,6 +498,7 @@ mod tests {
         assert!(l.contains("FSSM #0 [PS]") && l.contains("v_add_f32"), "{l}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn readable_rejects_garbage() {
         assert!(!readable(0, 10));
@@ -489,6 +507,7 @@ mod tests {
         assert!(readable(v.as_ptr() as usize, 100));
     }
 
+    #[cfg(windows)]
     #[test]
     fn readable_answers_from_the_working_set_without_touching_pages() {
         use windows_sys::Win32::System::Memory::*;

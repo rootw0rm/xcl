@@ -86,10 +86,19 @@ pub unsafe fn from_cstr_ptr(p: *const u8) -> Option<String> {
 }
 
 /// ANSI (current code page) → String. Falls back to lossy UTF-8.
+#[cfg(windows)]
 pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
     from_code_page_ptr(p, windows_sys::Win32::Globalization::CP_ACP)
 }
 
+/// Linux has no ANSI code page: game strings are UTF-8 (lossy for invalid bytes).
+// LINUX-TODO: Phase A step 2 — the title's ANSI paths use the host locale, not UTF-8 blindly.
+#[cfg(not(windows))]
+pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
+    from_cstr_ptr(p)
+}
+
+#[cfg(windows)]
 pub(crate) unsafe fn from_file_ansi_ptr(p: *const u8) -> Option<String> {
     use windows_sys::Win32::Globalization::{CP_ACP, CP_OEMCP};
     use windows_sys::Win32::Storage::FileSystem::AreFileApisANSI;
@@ -104,6 +113,12 @@ pub(crate) unsafe fn from_file_ansi_ptr(p: *const u8) -> Option<String> {
     from_code_page_ptr(p, code_page)
 }
 
+#[cfg(not(windows))]
+pub(crate) unsafe fn from_file_ansi_ptr(p: *const u8) -> Option<String> {
+    from_cstr_ptr(p)
+}
+
+#[cfg(windows)]
 unsafe fn from_code_page_ptr(p: *const u8, code_page: u32) -> Option<String> {
     use windows_sys::Win32::Globalization::MultiByteToWideChar;
     if p.is_null() {
@@ -123,6 +138,7 @@ unsafe fn from_code_page_ptr(p: *const u8, code_page: u32) -> Option<String> {
 }
 
 /// The process runs under Wine (its ntdll exports `wine_get_version`).
+#[cfg(windows)]
 pub fn under_wine() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -130,6 +146,12 @@ pub fn under_wine() -> bool {
     *WINE.get_or_init(|| unsafe {
         GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some()
     })
+}
+
+/// Never Wine on the native Linux host.
+#[cfg(not(windows))]
+pub fn under_wine() -> bool {
+    false
 }
 
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
@@ -175,6 +197,7 @@ pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
     std::ptr::copy_nonoverlapping(w.as_ptr(), buf, n);
     *buf.add(n) = 0;
     if w.len() >= size as usize {
+        #[cfg(windows)]
         windows_sys::Win32::Foundation::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
         size
     } else {
@@ -186,6 +209,7 @@ pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
 /// (`GetModuleFileNameA` semantics): returns bytes written (without terminator), or `size` with
 /// `ERROR_INSUFFICIENT_BUFFER` when truncated. Truncation always stops at a complete character
 /// boundary so multi-byte sequences (DBCS / UTF-8) and UTF-16 surrogate pairs are never split.
+#[cfg(windows)]
 unsafe fn write_codepage_out(src: &str, codepage: u32, buf: *mut u8, size: u32) -> u32 {
     use windows_sys::Win32::Foundation::{SetLastError, ERROR_INSUFFICIENT_BUFFER};
     use windows_sys::Win32::Globalization::WideCharToMultiByte;
@@ -296,8 +320,32 @@ unsafe fn write_codepage_out(src: &str, codepage: u32, buf: *mut u8, size: u32) 
 
 /// Win32-style "copy ANSI string" (GetModuleFileNameA semantics): converts `src` to `CP_ACP`,
 /// NUL-terminates, and returns bytes written (without terminator) or `size` when truncated.
+#[cfg(windows)]
 pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
     write_codepage_out(src, windows_sys::Win32::Globalization::CP_ACP, buf, size)
+}
+
+/// Win32-style "copy ANSI string" on Linux: there is no ANSI code page, so the bytes are
+/// UTF-8. Same return/truncation contract as the Windows version; never splits a character.
+// LINUX-TODO: Phase A step 2 — map the host locale, not UTF-8, once the platform leaf lands.
+#[cfg(not(windows))]
+pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
+    if buf.is_null() || size == 0 {
+        return 0;
+    }
+    let cap = size as usize - 1;
+    let bytes = src.as_bytes();
+    let mut n = bytes.len().min(cap);
+    while n > 0 && !src.is_char_boundary(n) {
+        n -= 1;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+    *buf.add(n) = 0;
+    if bytes.len() > cap {
+        size
+    } else {
+        n as u32
+    }
 }
 
 /// Wrapper to keep raw pointers in statics.
@@ -347,6 +395,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn ansi_out_encodes_codepage_and_truncates_on_char_boundaries() {
         use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_INSUFFICIENT_BUFFER};

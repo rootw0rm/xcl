@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{Boot, Config};
+use crate::manifest::{decode_game_config, xml_attrs};
 use crate::util::wide;
 
 /// Data root: `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`.
@@ -15,113 +16,8 @@ pub fn data_root() -> PathBuf {
     PathBuf::from(base).join("XCL")
 }
 
-/// Values of `attr` on every `<tag …>` element (so "<Executable" != "<ExecutableList").
-pub(crate) fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
-    let open = format!("<{tag}");
-    let key = format!("{attr}=\"");
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(i) = xml[from..].find(&open).map(|i| from + i) {
-        from = i + open.len();
-        let Some(next) = xml[from..].chars().next() else { break };
-        if !(next.is_whitespace() || next == '/' || next == '>') {
-            continue;
-        }
-        let Some(end) = xml[from..].find('>') else { break };
-        let t = &xml[from..from + end];
-        // attribute must start at a whitespace boundary ("Name=" but not "DisplayName=")
-        let mut pos = 0;
-        while let Some(k) = t[pos..].find(&key).map(|k| pos + k) {
-            if k == 0 || t[..k].ends_with(char::is_whitespace) {
-                let a = k + key.len();
-                if let Some(b) = t[a..].find('"') {
-                    out.push(xml_unescape(&t[a..a + b]));
-                }
-                break;
-            }
-            pos = k + key.len();
-        }
-    }
-    out
-}
-
-/// An attribute value with XML's character references replaced: the five named ones
-/// ("Ratchet &amp; Clank") and numeric ones (`&#39;`, `&#x27;`). Anything else stays as written.
-fn xml_unescape(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    let mut rest = v;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let decoded = rest.find(';').and_then(|end| {
-            let c = match &rest[1..end] {
-                "amp" => '&',
-                "lt" => '<',
-                "gt" => '>',
-                "quot" => '"',
-                "apos" => '\'',
-                r => {
-                    let n = r.strip_prefix("#x").map(|h| u32::from_str_radix(h, 16)).or_else(|| r.strip_prefix('#').map(|d| d.parse()))?;
-                    char::from_u32(n.ok()?)?
-                }
-            };
-            Some((c, end + 1))
-        });
-        match decoded {
-            Some((c, len)) => {
-                out.push(c);
-                rest = &rest[len..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     xml_attrs(xml, tag, attr).into_iter().next()
-}
-
-/// MicrosoftGame.config as text, without its comments: a commented-out `<Executable>` or
-/// `<Identity>` is not the game's.
-pub(crate) fn decode_game_config(raw: &[u8]) -> Option<String> {
-    decode_text(raw).map(|xml| without_comments(&xml))
-}
-
-fn without_comments(xml: &str) -> String {
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some(i) = rest.find("<!--") {
-        out.push_str(&rest[..i]);
-        match rest[i + 4..].find("-->") {
-            Some(j) => rest = &rest[i + 4 + j + 3..],
-            None => return out, // unterminated: the rest is comment
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn decode_text(raw: &[u8]) -> Option<String> {
-    let (body, little_endian) = if let Some(body) = raw.strip_prefix(&[0xFF, 0xFE]) {
-        (body, true)
-    } else if let Some(body) = raw.strip_prefix(&[0xFE, 0xFF]) {
-        (body, false)
-    } else {
-        return String::from_utf8(raw.to_vec()).ok();
-    };
-    if body.len() % 2 != 0 {
-        return None;
-    }
-    let units: Vec<u16> = body
-        .chunks_exact(2)
-        .map(|b| if little_endian { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) })
-        .collect();
-    String::from_utf16(&units).ok()
 }
 
 /// (executables, title) from MicrosoftGame.config if present.
@@ -520,6 +416,7 @@ fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{without_comments, xml_unescape};
 
     #[test]
     fn microsoft_game_config_parsing() {

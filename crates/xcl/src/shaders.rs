@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(windows)]
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
@@ -737,6 +738,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// ABI root signature with its static samplers): the driver keeps what it compiled in its own
 /// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
 /// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
+#[cfg(windows)]
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
@@ -749,8 +751,10 @@ struct Pipelines {
 }
 
 // D3D12 devices and root signatures are free-threaded
+#[cfg(windows)]
 unsafe impl Sync for Pipelines {}
 
+#[cfg(windows)]
 impl Pipelines {
     fn new() -> Result<Pipelines, String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -811,6 +815,7 @@ impl Pipelines {
     }
 }
 
+#[cfg(windows)]
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
@@ -941,7 +946,16 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     0
 }
 
+/// `--precompile` compiles into the DXC cache, which is Windows-only until the SPIR-V backend.
+// LINUX-TODO: Phase D — fill the cache from the SPIR-V backend.
+#[cfg(not(windows))]
+fn precompile(_input: &Input, _limit: usize, _windows: u32, _split: Option<bool>, _only: Option<&str>, _pipelines: bool, _t0: std::time::Instant) -> i32 {
+    eprintln!("xcl shaders --precompile: DXC is Windows-only; not supported on Linux yet (Phase D)");
+    2
+}
+
 /// Compile the kept HLSL samples with DXC on all cores: (ok, failures with the first error line).
+#[cfg(windows)]
 fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<String>) {
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
@@ -992,10 +1006,24 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
     (ok, parts.into_iter().flat_map(|p| p.1).collect())
 }
 
+#[cfg(windows)]
+fn compile_samples_maybe(samples: &[(String, String, &'static str)]) -> Option<(usize, Vec<String>)> {
+    Some(compile_samples(samples))
+}
+
+/// `--compile N` compiles the kept samples with DXC, which is Windows-only until Phase D.
+// LINUX-TODO: Phase D — compile through the in-process SPIR-V backend instead.
+#[cfg(not(windows))]
+fn compile_samples_maybe(_samples: &[(String, String, &'static str)]) -> Option<(usize, Vec<String>)> {
+    eprintln!("xcl shaders --compile: DXC is Windows-only; not supported on Linux yet (Phase D)");
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::time::Instant, compile: usize) -> i32 {
     let rc = &agg.rc;
-    let compiled = if compile > 0 && !rc.samples.is_empty() { Some(compile_samples(&rc.samples)) } else { None };
+    // `--compile N` needs DXC; on Linux the translations are still counted (Phase D replaces it).
+    let compiled = if compile > 0 && !rc.samples.is_empty() { compile_samples_maybe(&rc.samples) } else { None };
     let mut missing: Vec<(&String, &(usize, usize))> = rc.missing.iter().collect();
     missing.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| a.0.cmp(b.0)));
     let ranked = agg.insts.sorted();
@@ -1207,10 +1235,14 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:
 {x}");
+            #[cfg(windows)]
             match recomp::dxc::compile(hlsl, "main", profile, &[]) {
                 Ok(b) => println!("DXC ({profile}): OK, {} B DXIL", b.len()),
                 Err(e) => println!("DXC ({profile}): {}", e.split("--- HLSL ---").next().unwrap_or("").trim()),
             }
+            // LINUX-TODO: Phase D — compile through the in-process SPIR-V backend instead.
+            #[cfg(not(windows))]
+            println!("DXC ({profile}): not supported on Linux yet (Phase D)");
             if let Ok(path) = std::env::var("XCL_EXAMPLE_HLSL") {
                 let _ = std::fs::write(&path, hlsl);
                 println!("HLSL saved: {path}");

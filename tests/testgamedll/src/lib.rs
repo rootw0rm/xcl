@@ -1,5 +1,9 @@
 //! Fake middleware DLL shipped "with the game". It is loaded by XCL's own loader, not by
 //! Windows: it imports a console DLL (kernelx.dll), has static TLS and a DllMain.
+//!
+//! It is a Windows PE (raw-dylib imports); on a Linux host the crate is empty.
+
+#![cfg(windows)]
 
 use std::cell::Cell;
 use std::ffi::c_void;
