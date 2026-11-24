@@ -553,6 +553,38 @@ mod tests {
     }
 
     #[test]
+    fn minuserx_window_imports_resolve_to_hle() {
+        // Step 11m: headless console window. `minuserx.dll` + ntuser API sets are
+        // routed HLE; `user32.dll`/`dwmapi.dll` stay routeless and resolve via
+        // the cross-HLE name lookup.
+        for (dll, sym) in [
+            ("minuserx.dll", "CreateWindowExA"),
+            ("minuserx.dll", "CreateWindowExW"),
+            (
+                "ext-ms-win-rtcore-ntuser-window-l1-1-0.dll",
+                "CreateWindowExW",
+            ),
+            ("user32.dll", "RegisterClassW"),
+            ("user32.dll", "GetWindowLongW"),
+            ("user32.dll", "GetClientRect"),
+            ("user32.dll", "DefWindowProcW"),
+            ("user32.dll", "DestroyWindow"),
+            ("dwmapi.dll", "DwmGetWindowAttribute"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+    }
+
+    #[test]
     fn stub_thunk_calls_log_and_return() {
         let (addr, src) = resolve_inner("kernelx.dll", &name("LinuxProbeThunk"), 0);
         assert_eq!(src, Source::Stub);

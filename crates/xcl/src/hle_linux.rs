@@ -19,6 +19,8 @@ pub mod kernelx_linux;
 pub mod crt_linux;
 #[path = "hle/xgameruntime_linux.rs"]
 pub mod xgameruntime_linux;
+#[path = "hle/minuserx_linux.rs"]
+pub mod minuserx_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -208,7 +210,17 @@ fn dxcompiler_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn minuserx_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![CreateWindowExA, RegisterClassExA, CreateWindowExW]
+    let mut v = crate::hle_exports![CreateWindowExA, RegisterClassExA, CreateWindowExW];
+    // Step-11m window slice carries real Linux addresses; `user32.dll`/`dwmapi.dll`
+    // have no route and resolve through the cross-HLE `find_any` name lookup.
+    for (name, addr) in minuserx_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn xcrdapi_exports() -> Vec<(&'static str, usize)> {
@@ -351,15 +363,17 @@ mod tests {
         let r = build(&Config::default());
         // Unimplemented names are metadata `0`, never a callable address. Steps 10b–10c
         // implement the kernelx memory/thread/sync/time/file slices, step 11 the CRT
-        // startup slice and step 11i the xgameruntime identity slice, so those resolve
-        // as HLE.
+        // startup slice, step 11i the xgameruntime identity slice and step 11m the
+        // minuserx window slice, so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
             assert!(!m.exports.is_empty(), "{} has no exports", m.name);
             for (&name, &addr) in &m.exports {
                 total += 1;
-                if (m.name == KERNELX || m.name == UCRT || m.name == XGAMERUNTIME) && addr != 0 {
+                if (m.name == KERNELX || m.name == UCRT || m.name == XGAMERUNTIME || m.name == MINUSERX)
+                    && addr != 0
+                {
                     implemented += 1;
                     continue;
                 }
@@ -514,6 +528,23 @@ mod tests {
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, XGAMERUNTIME);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-11m minuserx window slice: headless console screen, not stub metadata.
+        // `user32.dll`/`dwmapi.dll` stay routeless and resolve via `find_any`.
+        for name in [
+            "CreateWindowExA",
+            "CreateWindowExW",
+            "RegisterClassW",
+            "RegisterClassExW",
+            "GetWindowLongW",
+            "GetClientRect",
+            "DefWindowProcW",
+            "DestroyWindow",
+            "DwmGetWindowAttribute",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, MINUSERX);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
     }
