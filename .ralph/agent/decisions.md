@@ -1,0 +1,280 @@
+# Decision Journal
+
+Template for each entry:
+
+- **Decision:** what was decided
+- **Chosen Option:** the option taken
+- **Confidence:** 0-100
+- **Alternatives Considered:** what else was on the table
+- **Reasoning:** why
+- **Reversibility:** how hard to undo
+- **Timestamp:** UTC ISO 8601
+
+---
+
+## DEC-001 — Phase-A gating strategy
+
+- **Decision:** How to make the crate compile on Linux without porting behavior yet.
+- **Chosen Option:** `#[cfg(windows)]` whole Windows-only modules in `lib.rs` plus small Linux
+  stub modules that return clean errors with `// LINUX-TODO: Phase X`. Split a file into
+  `_windows`/`_linux` only when a phase actually needs it on Linux.
+- **Confidence:** 88
+- **Alternatives Considered:** (a) per-function `cfg` across 80 files; (b) a second `xcl_linux`
+  crate; (c) feature flags per platform.
+- **Reasoning:** (a) is a huge, unreviewable diff and keeps the crate tangled with Win32; (b)
+  duplicates the CLI and build plumbing; (c) features are additive and easy to get wrong.
+  Whole-module gating is the smallest reversible step and preserves the Windows build.
+- **Reversibility:** high — moving a module back under Linux is a localized change.
+- **Timestamp:** 2026-11-24T10:40:00Z
+
+## DEC-002 — Linux HLE export-name preservation
+
+- **Decision:** How Linux gets HLE routing and export names without a second hand-maintained list.
+- **Chosen Option:** make `hle_exports!` cfg-dependent: Windows keeps `$name as usize`; Linux
+  keeps `stringify!($name)` with address `0`. Resolver treats `0` as an auto-stub, so inspect
+  reports STUB until a function is really ported. Move Windows implementation bodies to
+  `_windows.rs` files as modules are ported, kernelx first.
+- **Confidence:** 85
+- **Alternatives Considered:** (a) duplicate name lists in a Linux table; (b) rewrite each HLE
+  module's functions with Linux bodies immediately; (c) generate the table from the Windows
+  source at build time.
+- **Reasoning:** (a) drifts and doubles maintenance; (b) is weeks of unverified work before
+  anything runs; (c) adds build-script fragility. The macro split keeps one source of names and
+  makes stub-vs-implemented explicit in the resolver.
+- **Reversibility:** high — the macro and resolver are localized; a real implementation simply
+  replaces `0` with a function address.
+- **Timestamp:** 2026-11-24T10:41:00Z
+
+## DEC-003 — Phase-B inspect classification
+
+- **Decision:** How `xcl inspect` runs before the HLE modules are ported.
+- **Chosen Option:** extract the route table (module names + DLL patterns) from
+  `hle::build` so inspect can use it without calling the implementation export tables. It
+  classifies console imports as HLE-module names and unimplemented functions as STUB. No fake
+  registry, no `LoadLibrary`.
+- **Confidence:** 90
+- **Alternatives Considered:** (a) gate inspect until Phase C; (b) a Linux-only hard-coded
+  console-DLL list; (c) build the full registry with stubbed implementations early.
+- **Reasoning:** (a) delays a high-value offline tool; (b) creates a second source of truth;
+  (c) pulls Phase-C work into Phase B. Extracting routes is a small refactor that the HLE port
+  reuses.
+- **Reversibility:** high.
+- **Timestamp:** 2026-11-24T10:42:00Z
+
+## DEC-004 — Test PE cross-build target
+
+- **Decision:** Which Windows target to use for `tests/testtitle` + `tests/testgamedll` on this
+  Linux host (deferred to step 11, recorded here as the preference).
+- **Chosen Option:** prefer `x86_64-pc-windows-gnullvm` (rust-lld, no MSVC tools); fall back to
+  `x86_64-pc-windows-gnu` if a mingw toolchain is available. Evidence required either way; a
+  synthetic PE test is the fallback only if neither target can link.
+- **Confidence:** 55
+- **Alternatives Considered:** use the retail exe as the only Phase-C target; commit a
+  prebuilt synthetic PE.
+- **Reasoning:** the test title is the intended e2e; the exact target depends on installed
+  linkers/libs, unknown until step 11. Committing a prebuilt PE is acceptable only as
+  synthetic test data, never a game artifact.
+- **Reversibility:** high.
+- **Timestamp:** 2026-11-24T10:43:00Z
+
+## DEC-005 — Linux loader placement, libc, and deferred loader legs
+
+- **Decision:** Where the Linux PE mapper lives and how it compiles before the TLS/HLE/EH
+  steps exist.
+- **Chosen Option:** a new `crates/xcl/src/loader_linux.rs` exposed as `crate::loader` on
+  non-Windows via `#[path]`; `loader.rs` stays the untouched Windows implementation. Add
+  `libc` only for `cfg(target_os = "linux")`. Map with `mmap(MAP_FIXED_NOREPLACE)` at
+  `ImageBase`, keep the relocation path but make an occupied base a hard error, parse
+  imports/TLS/delay tables, and leave IAT resolution (step 10), TLS install (step 7) and
+  `.pdata` (step 9) as explicit `LINUX-TODO`s.
+- **Confidence:** 85
+- **Alternatives Considered:** (a) split `loader.rs` into `loader_windows.rs` + dispatcher;
+  (b) compile `loader.rs` on Linux with scattered `cfg(windows)`; (c) port resolver/TLS/EH
+  early so imports resolve during step 6.
+- **Reasoning:** (a) moves 525 unchanged Windows lines for no behavior; (b) mixes two ABIs
+  and Windows-only calls into the mapping code; (c) pulls three later steps into this one and
+  would fake HLE addresses. The `#[path]` swap keeps one module name for later host code while
+  preserving the Windows build, and the deferred legs are named instead of silently stubbed.
+  `libc` is MIT OR Apache-2.0 (MIT grant), musl-friendly, and needed by the upcoming
+  `sigaction`/pthread work anyway.
+- **Reversibility:** high — renaming the file and swapping the `#[path]` line is local; the
+  deferred legs are additive.
+- **Timestamp:** 2026-11-24T11:20:00Z
+
+## DEC-006 — Linux static TLS via a fake GS TEB
+
+- **Decision:** How PE `__declspec(thread)` accesses work for manually mapped images on
+  Linux, and when the loader installs them.
+- **Chosen Option:** `crates/xcl/src/tls_linux.rs` (exposed as `crate::tls` on non-Windows)
+  sets `GS` per attached thread via `arch_prctl(ARCH_SET_GS)` to a fake TEB with
+  `ThreadLocalStoragePointer` at `0x58` and a slot array. Blocks are 16-aligned copies of
+  the relocated template; the main image takes slot 0, DLLs allocate from 1, and the image's
+  `_tls_index` is written by the installer. Threads enter through `tls::spawn` (kernelx
+  wrapper), which attaches, runs `f`, and detaches (also on panic). `load_main` installs the
+  main image only; DLL TLS install is deferred to the step-10 game-DLL load path.
+- **Confidence:** 90
+- **Alternatives Considered:** (a) `LD_PRELOAD`/pthread interposition; (b) translate every
+  PE TLS access to a host TLS variable; (c) install every mapped image at `map_image`.
+- **Reasoning:** PE code hard-codes `gs:[0x58]`, so only a GS-based TEB keeps the index and
+  pointer semantics identical; Linux does not use GS in userspace, and xcl's own TLS is in
+  FS, which frees slot 0 for the main image (no Windows-style exchange). The task forbids
+  pthread interposition, and kernelx owns all game threads. Installing at `map_image` would
+  run retail TLS callbacks from unrelated test threads before HLE exists; the DLL load path
+  is the point where blocks and callbacks belong.
+- **Reversibility:** high — the module boundary is `install`/`attach`/`detach`/`spawn`; the
+  loader can install DLLs at step 10 without changing the mechanism.
+- **Timestamp:** 2026-11-24T12:10:00Z
+
+## DEC-007 — Split Phase-C HLE/host bring-up into reviewable slices
+
+- **Decision:** Whether to keep registry/resolver, kernelx, file APIs, and DLL/host entry in
+  one Phase-C task.
+- **Chosen Option:** split the former step 10 into 10a registry/resolver, 10b kernelx core,
+  10c kernelx file APIs through VFS, and 10d DLL loading plus host-entry/TLS lifecycle.
+- **Confidence:** 90
+- **Alternatives Considered:** keep one large kernelx/host task; defer TLS lifecycle fixes
+  until retail smoke triage.
+- **Reasoning:** each slice now has an independently testable user-facing outcome and a
+  reviewable diff. The split also makes the known TLS obligations explicit: attach the main
+  thread before entry, filter detach callbacks by images present at thread attach, preallocate
+  the slot array, and serialize late DLL loads.
+- **Reversibility:** high — tasks can be re-chained or recombined after earlier slices land.
+- **Timestamp:** 2026-11-24T11:36:00Z
+
+## DEC-008 — Execute an import-free PE before HLE bring-up
+
+- **Decision:** Whether Phase C should implement HLE before proving that mapped PE code runs.
+- **Chosen Option:** add step 9b immediately after EH/report: `load_main`, attach the current
+  thread, run process TLS callbacks, call the entry point, then detach.
+- **Confidence:** 92
+- **Alternatives Considered:** keep the original registry/kernelx-first order; use only the
+  retail EXE as the first execution target.
+- **Reasoning:** a tiny import-free synthetic PE isolates loader/TLS/entry execution from HLE,
+  graphics, and retail noise, and gives the Builder a real runnable slice to review.
+- **Reversibility:** high — the harness remains useful as a regression test after HLE lands.
+- **Timestamp:** 2026-11-24T11:45:00Z
+
+## DEC-009 — Linux stub metadata versus runtime import thunks
+
+- **Decision:** How unresolved Linux imports should be represented and invoked.
+- **Chosen Option:** keep address `0` as inspect/registry metadata meaning `Stub`, but have the
+  runtime resolver allocate safe executable auto-stub thunks and write those addresses into
+  the IAT. A thunk logs the called stub and returns without a null call or panic.
+- **Confidence:** 90
+- **Alternatives Considered:** write zero into the IAT; duplicate a Linux export-name table;
+  implement every kernel-family fallback before any image can start.
+- **Reasoning:** zero is useful classification data but is not callable. Thunks preserve
+  forward progress and `called_stubs` reporting while kernelx/file fallbacks land in later
+  slices.
+- **Reversibility:** high — a real implementation replaces the thunk address in the registry.
+- **Timestamp:** 2026-11-24T11:46:00Z
+
+## DEC-010 — Keep strict fixed-address mapping during initial DLL bring-up
+
+- **Decision:** Whether Linux game DLLs should relocate when their preferred base is occupied.
+- **Chosen Option:** retain the prompt's strict `MAP_FIXED_NOREPLACE` policy for this phase;
+  an occupied main or DLL base is a hard error naming the address. Revisit only if a real
+  title demonstrates a collision that blocks progress.
+- **Confidence:** 70
+- **Alternatives Considered:** allocate game DLLs at a fallback base and apply PE relocations,
+  matching the Windows loader's usual behavior.
+- **Reasoning:** the current objective explicitly bans silent base fallback, and the test
+  title can prove DLL loading without speculative relocation policy. A future revision can
+  narrow the rule to DLLs with evidence.
+- **Reversibility:** medium — relocation support already exists in the PE path, but choosing a
+  base and updating pointers is additional loader policy.
+- **Timestamp:** 2026-11-24T11:47:00Z
+
+## DEC-011 — Linux VFS rejection and containment policy
+
+- **Decision:** How Linux console paths that escape a mount are represented and checked.
+- **Chosen Option:** add a Linux-only `Target::Reject(u32)`; normalize mount tails, require
+  lexical containment, then compare the nearest existing canonical ancestors of the mount
+  root and target. Apply the same checks to game/overlay relative paths, forbid a symlinked
+  overlay root, and keep title-data mounts inside the canonical data root. Reject dangling
+  final symlinks and return `ERROR_PATH_NOT_FOUND` for untranslated console drives. Keep the
+  Windows `Target` variants and mount parser semantics unchanged.
+- **Confidence:** 88
+- **Alternatives Considered:** (a) return `Target::Pass` and rely on the host open to fail;
+  (b) clamp escaping paths to the mount root; (c) reject every `..` component; (d) use
+  `openat2(RESOLVE_BENEATH)` for every host open.
+- **Reasoning:** pass-through can turn `Z:/...` into a relative host path, clamping silently
+  changes title-visible semantics, and rejecting all `..` needlessly breaks valid in-mount
+  paths. Canonical-ancestor checks also cover existing symlink parents and missing files
+  below them without introducing a new dependency. `openat2` remains a possible later
+  hardening step for race-free opens when kernelx file APIs land.
+- **Reversibility:** high — the rejection variant and helpers are Linux-only and localized to
+  `vfs.rs`; runtime open hardening can be added in `vfs_hooks_linux.rs` later.
+- **Timestamp:** 2026-11-24T12:01:08Z
+
+## DEC-012 — Keep Linux fatal-signal reporting outside the handler
+
+- **Decision:** How to write `report.json` after a fatal signal without making the signal
+  handler allocate, take Rust locks, or perform file I/O.
+- **Chosen Option:** the `SA_SIGINFO` handler stores signal/PC/address in atomics, writes one
+  byte to a `pipe2`, and pauses; a pre-started watchdog thread formats the crash description,
+  writes a crash-only portable report, and re-raises the original signal with the default
+  action.
+- **Confidence:** 90
+- **Alternatives Considered:** (a) call the existing report builder directly from the handler;
+  (b) hand-format JSON with only async-signal-safe libc calls in the handler; (c) install an
+  alternate signal stack and accept the non-async-safe report path.
+- **Reasoning:** (a) can deadlock in allocator/log/report locks and is not async-signal-safe;
+  (b) would duplicate serialization and still complicate mapped-module naming; (c) only fixes
+  stack exhaustion and not lock safety. The watchdog keeps the handler small while preserving
+  normal Rust reporting and exact termination status.
+- **Reversibility:** high — the pipe/watchdog is contained in `eh_linux.rs`; a future
+  `openat2`/preformatted-report design can replace the watchdog without changing the report
+  schema.
+- **Timestamp:** 2026-11-24T12:41:21Z
+
+## DEC-013 — Use the explicit Windows x64 ABI for Linux PE calls
+
+- **Decision:** How Linux calls manually mapped PE entry points and TLS callbacks.
+- **Chosen Option:** type them as `unsafe extern "win64" fn(...)` on Linux, including
+  `tls_linux::TlsCallback` and `loader_linux::ExeEntry`.
+- **Confidence:** 96
+- **Alternatives Considered:** (a) `extern "system"` (the host C ABI on Linux); (b) naked
+  assembly bridges; (c) make synthetic PE callbacks use the host ABI.
+- **Reasoning:** PE code expects RCX/RDX/R8 and the Windows shadow-space/alignment rules.
+  `extern "system"` is SysV on Linux and would pass arguments in RDI/ESI/RDX. Rust supports
+  the `win64` ABI on x86_64, so the compiler can emit the correct call sequence without
+  hand-maintained assembly; the synthetic callback reads its reason from EDX and proves the
+  ABI at runtime.
+- **Reversibility:** high — only Linux function-pointer types change.
+- **Timestamp:** 2026-11-24T13:05:05Z
+
+## DEC-014 — Linux kernelx core lives in hle/kernelx_linux.rs with handle tables
+
+- **Decision:** How step 10b implements kernelx memory/threads/sync/time on Linux.
+- **Chosen Option:** new `hle/kernelx_linux.rs` wired into `hle_linux` (real addresses for the
+  10b slice, `0` stubs otherwise) with per-process handle tables: `mmap`/`mprotect` + tracked
+  reservations for `Virtual*`, game threads via explicit `tls::attach/detach` (same callbacks as
+  `tls::spawn`), reentrant critical sections and auto/manual events in Rust, SRW-exclusive as an
+  inline atomic, monotonic `clock_gettime` time, best-effort priority/affinity (never abort), and a
+  thread-local last error. File/module/physical-page exports stay stubs for steps 10c–10d.
+- **Confidence:** 85
+- **Alternatives Considered:** (a) port the whole Windows `kernelx.rs` at once; (b) separate OS
+  dispatcher per function family; (c) `pthread_mutex_t` mapped onto the game's CRITICAL_SECTION bytes.
+- **Reasoning:** (a) drags UMA/GPU/file paths into this slice; (b) adds layers the module does not
+  need; (c) couples the layout to libc internals. The single Linux file keeps the diff reviewable
+  and leaves Windows behavior untouched.
+- **Reversibility:** high — the slice is additive behind the existing registry/resolver seam.
+- **Timestamp:** 2026-11-24T13:40:00Z
+
+## DEC-015 — Linux kernelx files call the VFS directly, no hooks
+
+- **Decision:** How step 10c implements title file I/O on Linux.
+- **Chosen Option:** new file section in `hle/kernelx_linux.rs` whose `CreateFileW/A/2`
+  call `vfs_hooks_linux::open` and return `File`-holding HANDLEs; metadata/mutation go
+  through `Vfs::{delete_file,create_dir,remove_dir,stage_write,commit_write}` with
+  `std::fs` host ops; `FindFirst/Next` merge overlay+original in-process with `*`/`?`
+  matching; disk space via `statvfs`; `CloseHandle` also closes file/find handles.
+  Kernel-family fallbacks are these same exports (resolved as HLE/HleOther); CRT stays stubs.
+- **Confidence:** 80
+- **Alternatives Considered:** (a) LD_PRELOAD interception; (b) porting the Windows hook
+  table with trampolines; (c) implementing CRT fopen/fread in this slice.
+- **Reasoning:** (a) contradicts the in-process host model; (b) has no KERNELBASE on Linux
+  to hook; (c) is not needed for the VFS acceptance and stays deferred to the e2e slice.
+- **Reversibility:** high — additive exports behind the registry/resolver seam.
+- **Timestamp:** 2026-11-24T14:20:00Z
