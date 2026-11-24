@@ -413,6 +413,14 @@ mod tests {
             "WaitOnAddress",
             "WakeByAddressSingle",
             "WakeByAddressAll",
+            // Step-11f SEH search: `.pdata` reader plus Rtl* shims.
+            "RtlPcToFileHeader",
+            "RtlLookupFunctionEntry",
+            "RtlVirtualUnwind",
+            "RtlAddFunctionTable",
+            "RtlCaptureContext",
+            "RtlUnwindEx",
+            "RtlRestoreContext",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);

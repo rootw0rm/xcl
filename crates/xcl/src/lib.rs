@@ -47,6 +47,7 @@ pub mod loader;
 #[path = "loader_linux.rs"]
 pub mod loader;
 pub mod modules;
+pub mod pdata;
 pub mod pe;
 pub mod platform;
 #[cfg(windows)]

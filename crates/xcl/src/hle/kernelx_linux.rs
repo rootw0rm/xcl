@@ -4621,6 +4621,395 @@ pub unsafe extern "win64" fn NtWriteFile(
 }
 
 // ---------------------------------------------------------------------------------------
+// Step-11f SEH search: `.pdata` reader plus Rtl* HLEs.
+//
+// The Linux host has no `RtlAddFunctionTable`: the mapped image already holds the
+// Windows unwind tables, so lookup/virtual-unwind read them in place through
+// `crate::pdata`. Only fixed frames (`PUSH_NONVOL`, `ALLOC_SMALL`, `ALLOC_LARGE`
+// with `OpInfo==0`, `SET_FPREG`; `SAVE_XMM128` ignored) unwind here — anything
+// else (`SAVE_NONVOL`, chained info, machine frames, 32-bit large allocs) fails
+// closed with a warn log so a future slice can extend the op coverage without
+// changing the call sites. `RtlCaptureContext` / `RtlUnwindEx` /
+// `RtlRestoreContext` stay logged stubs until the dispatch slice lands; they are
+// HLEs (non-zero) so the imports resolve instead of auto-stubbing.
+// ---------------------------------------------------------------------------------------
+
+const CTX_RAX: usize = 0x78;
+const CTX_RCX: usize = 0x80;
+const CTX_RDX: usize = 0x88;
+const CTX_RBX: usize = 0x90;
+const CTX_RSP: usize = 0x98;
+const CTX_RBP: usize = 0xA0;
+const CTX_RSI: usize = 0xA8;
+const CTX_RDI: usize = 0xB0;
+const CTX_R8: usize = 0xB8;
+const CTX_R9: usize = 0xC0;
+const CTX_R10: usize = 0xC8;
+const CTX_R11: usize = 0xD0;
+const CTX_R12: usize = 0xD8;
+const CTX_R13: usize = 0xE0;
+const CTX_R14: usize = 0xE8;
+const CTX_R15: usize = 0xF0;
+const CTX_RIP: usize = 0xF8;
+
+unsafe fn ctx_u64(ctx: *const u8, off: usize) -> Option<u64> {
+    if ctx.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ptr::read_unaligned(ctx.add(off) as *const u64) })
+}
+
+unsafe fn ctx_set_u64(ctx: *mut u8, off: usize, val: u64) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    unsafe {
+        std::ptr::write_unaligned(ctx.add(off) as *mut u64, val);
+    }
+    true
+}
+
+fn ctx_to_regs(ctx: *const u8) -> Option<crate::pdata::IntRegs> {
+    unsafe {
+        Some(crate::pdata::IntRegs {
+            rax: ctx_u64(ctx, CTX_RAX)?,
+            rcx: ctx_u64(ctx, CTX_RCX)?,
+            rdx: ctx_u64(ctx, CTX_RDX)?,
+            rbx: ctx_u64(ctx, CTX_RBX)?,
+            rsp: ctx_u64(ctx, CTX_RSP)?,
+            rbp: ctx_u64(ctx, CTX_RBP)?,
+            rsi: ctx_u64(ctx, CTX_RSI)?,
+            rdi: ctx_u64(ctx, CTX_RDI)?,
+            r8: ctx_u64(ctx, CTX_R8)?,
+            r9: ctx_u64(ctx, CTX_R9)?,
+            r10: ctx_u64(ctx, CTX_R10)?,
+            r11: ctx_u64(ctx, CTX_R11)?,
+            r12: ctx_u64(ctx, CTX_R12)?,
+            r13: ctx_u64(ctx, CTX_R13)?,
+            r14: ctx_u64(ctx, CTX_R14)?,
+            r15: ctx_u64(ctx, CTX_R15)?,
+            rip: ctx_u64(ctx, CTX_RIP)?,
+        })
+    }
+}
+
+fn regs_to_ctx(regs: &crate::pdata::IntRegs, ctx: *mut u8) {
+    let pairs = [
+        (CTX_RAX, regs.rax),
+        (CTX_RCX, regs.rcx),
+        (CTX_RDX, regs.rdx),
+        (CTX_RBX, regs.rbx),
+        (CTX_RSP, regs.rsp),
+        (CTX_RBP, regs.rbp),
+        (CTX_RSI, regs.rsi),
+        (CTX_RDI, regs.rdi),
+        (CTX_R8, regs.r8),
+        (CTX_R9, regs.r9),
+        (CTX_R10, regs.r10),
+        (CTX_R11, regs.r11),
+        (CTX_R12, regs.r12),
+        (CTX_R13, regs.r13),
+        (CTX_R14, regs.r14),
+        (CTX_R15, regs.r15),
+        (CTX_RIP, regs.rip),
+    ];
+    for (off, val) in pairs {
+        unsafe {
+            ctx_set_u64(ctx, off, val);
+        }
+    }
+}
+
+/// Fault-free 8-byte load from the game's stack (the game runs on host stacks,
+/// so a wrong `RSP` guess must fail closed instead of `SIGSEGV`-ing the host).
+fn safe_read_u64(addr: u64) -> Option<u64> {
+    if addr == 0 || addr.checked_add(8).is_none() {
+        return None;
+    }
+    let mut out = 0u64;
+    let local = libc::iovec {
+        iov_base: &mut out as *mut _ as *mut c_void,
+        iov_len: 8,
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut c_void,
+        iov_len: 8,
+    };
+    let n = unsafe {
+        libc::process_vm_readv(
+            std::process::id() as i32,
+            &local as *const _,
+            1,
+            &remote as *const _,
+            1,
+            0,
+        )
+    };
+    if n == 8 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn exception_dir_of(base: usize, size: usize) -> Option<(u32, u32)> {
+    if base == 0 || size == 0 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
+    let pe = crate::pe::Pe::parse(bytes, crate::pe::Layout::Mapped).ok()?;
+    let dir = pe.dir(crate::pe::DIR_EXCEPTION);
+    if dir.rva == 0 || dir.size == 0 {
+        return None;
+    }
+    Some((dir.rva, dir.size))
+}
+
+/// `PVOID RtlPcToFileHeader(PVOID Pc, PVOID *Base)` — image base for a PC, via
+/// the loader registry (the Windows hook this replaces only knew modules on the
+/// Windows loader list).
+pub unsafe extern "win64" fn RtlPcToFileHeader(pc: usize, base_out: *mut usize) -> usize {
+    match crate::modules::image_base_for_addr(pc) {
+        Some(base) => {
+            if !base_out.is_null() {
+                unsafe {
+                    *base_out = base;
+                }
+            }
+            set_error(ERROR_SUCCESS);
+            base
+        }
+        None => {
+            if !base_out.is_null() {
+                unsafe {
+                    *base_out = 0;
+                }
+            }
+            0
+        }
+    }
+}
+
+/// `PRUNTIME_FUNCTION RtlLookupFunctionEntry(DWORD64 Pc, PDWORD64 Base,
+/// PUNWIND_HISTORY_TABLE History)` — pointer into the mapped `.pdata`, or
+/// NULL when the PC is not in a mapped image with exception data. `History`
+/// is ignored (no caching in this slice).
+pub unsafe extern "win64" fn RtlLookupFunctionEntry(
+    control_pc: usize,
+    image_base_out: *mut usize,
+    _history: *mut u8,
+) -> usize {
+    let Some(m) = crate::modules::find_mapped_by_addr(control_pc) else {
+        return 0;
+    };
+    let Some((pdata_rva, pdata_size)) = exception_dir_of(m.base, m.size) else {
+        return 0;
+    };
+    let table_bytes = match crate::pdata::guest_bytes(m.base, m.size, pdata_rva, pdata_size as usize) {
+        Some(b) => b,
+        None => return 0,
+    };
+    let table = match crate::pdata::parse_runtime_functions(&table_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::xlog_warn!("RtlLookupFunctionEntry: .pdata parse failed: {e}");
+            return 0;
+        }
+    };
+    let control_rva = match u32::try_from(control_pc.wrapping_sub(m.base)) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let Some(entry) = crate::pdata::lookup(&table, control_rva) else {
+        return 0;
+    };
+    let index = (entry as *const _ as usize - table.as_ptr() as usize) / 12;
+    if !image_base_out.is_null() {
+        unsafe {
+            *image_base_out = m.base;
+        }
+    }
+    m.base.wrapping_add(pdata_rva as usize).wrapping_add(index * 12)
+}
+
+/// `BOOLEAN RtlAddFunctionTable(PRUNTIME_FUNCTION Table, DWORD Count,
+/// DWORD64 Base)` — no OS registration on Linux; validate the table sits in a
+/// mapped image and report success so the title's startup path proceeds. The
+/// unwinder reads `.pdata` in place on every lookup.
+pub unsafe extern "win64" fn RtlAddFunctionTable(table: usize, count: u32, base: usize) -> i32 {
+    if table == 0 || count == 0 || base == 0 {
+        return 0;
+    }
+    let len = (count as usize).checked_mul(12);
+    let Some(len) = len else {
+        return 0;
+    };
+    if crate::modules::find_mapped_by_addr(table).is_none()
+        && crate::modules::find_mapped_by_addr(table.wrapping_add(len).wrapping_sub(1)).is_none()
+    {
+        crate::xlog_warn!("RtlAddFunctionTable({table:#x}, {count}, {base:#x}): outside mapped images");
+        return 0;
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `PEXCEPTION_ROUTINE RtlVirtualUnwind(DWORD HandlerType, DWORD64 ImageBase,
+/// DWORD64 ControlPc, PRUNTIME_FUNCTION Entry, PCONTEXT Ctx, PVOID *Data,
+/// PDWORD64 Establisher, PKNONVOLATILE_CONTEXT_POINTERS Ptrs)` — unwind one
+/// frame for the SEH search. Returns the language-specific handler or NULL.
+/// Unsupported ops fail closed (NULL) with a warn log; `Ptrs` is ignored.
+pub unsafe extern "win64" fn RtlVirtualUnwind(
+    _handler_type: u32,
+    image_base: usize,
+    control_pc: usize,
+    function_entry: usize,
+    context: *mut u8,
+    handler_data_out: *mut usize,
+    establisher_out: *mut usize,
+    _context_pointers: *mut u8,
+) -> usize {
+    if context.is_null() {
+        return 0;
+    }
+    let Some(m) = crate::modules::find_mapped_by_addr(control_pc) else {
+        return 0;
+    };
+    let base = if image_base != 0 { image_base } else { m.base };
+    // Function entry: use the caller's pointer when given, else look it up.
+    let (begin_rva, end_rva, unwind_rva) = if function_entry != 0 {
+        let r = |off: usize| unsafe { std::ptr::read_unaligned((function_entry + off) as *const u32) };
+        // The pointer must live in a mapped image (or the HLE pseudo-table area);
+        // a garbage pointer fails closed instead of faulting the host.
+        if crate::modules::find_mapped_by_addr(function_entry).is_none() {
+            // Still allow HLE-allocated tables? No — only mapped images in this slice.
+            crate::xlog_warn!("RtlVirtualUnwind: FunctionEntry {function_entry:#x} outside mapped images");
+            return 0;
+        }
+        (r(0), r(4), r(8))
+    } else {
+        let Some((pdata_rva, pdata_size)) = exception_dir_of(m.base, m.size) else {
+            return 0;
+        };
+        let Some(bytes) = crate::pdata::guest_bytes(m.base, m.size, pdata_rva, pdata_size as usize) else {
+            return 0;
+        };
+        let Ok(table) = crate::pdata::parse_runtime_functions(&bytes) else {
+            return 0;
+        };
+        let Ok(rva) = u32::try_from(control_pc.wrapping_sub(m.base)) else {
+            return 0;
+        };
+        let Some(f) = crate::pdata::lookup(&table, rva) else {
+            return 0;
+        };
+        (f.begin_rva, f.end_rva, f.unwind_rva)
+    };
+    // Unwind bytes: header + codes + handler. 1 KiB covers the largest test-title
+    // entry (514 + handler); entries past the image end fail closed.
+    let Some(raw) = crate::pdata::guest_bytes(base, m.size, unwind_rva, 1024) else {
+        // The unwind RVA may sit past the 1 KiB window check but inside the image:
+        // fall back to a tight read of just the header to learn the real length.
+        let Some(hdr) = crate::pdata::guest_bytes(base, m.size, unwind_rva, 4) else {
+            return 0;
+        };
+        let count = hdr[2] as usize;
+        let need = 4 + count * 2 + 8;
+        let Some(full) = crate::pdata::guest_bytes(base, m.size, unwind_rva, need) else {
+            return 0;
+        };
+        let Ok(info) = crate::pdata::parse_unwind_info(&full) else {
+            return 0;
+        };
+        return virtual_unwind_with_info(base, &crate::pdata::RuntimeFunction { begin_rva: begin_rva, end_rva: end_rva, unwind_rva }, &info, context, handler_data_out, establisher_out);
+    };
+    let Ok(info) = crate::pdata::parse_unwind_info(&raw) else {
+        crate::xlog_warn!("RtlVirtualUnwind: UNWIND_INFO parse failed at {unwind_rva:#x}");
+        return 0;
+    };
+    virtual_unwind_with_info(
+        base,
+        &crate::pdata::RuntimeFunction { begin_rva: begin_rva, end_rva: end_rva, unwind_rva },
+        &info,
+        context,
+        handler_data_out,
+        establisher_out,
+    )
+}
+
+fn virtual_unwind_with_info(
+    image_base: usize,
+    func: &crate::pdata::RuntimeFunction,
+    info: &crate::pdata::UnwindInfo,
+    context: *mut u8,
+    handler_data_out: *mut usize,
+    establisher_out: *mut usize,
+) -> usize {
+    let Some(mut regs) = ctx_to_regs(context as *const u8) else {
+        return 0;
+    };
+    let read = |addr: u64| safe_read_u64(addr);
+    match crate::pdata::unwind_frame(&mut regs, &read, image_base as u64, func, info) {
+        Ok(out) => {
+            regs_to_ctx(&regs, context);
+            if !establisher_out.is_null() {
+                unsafe {
+                    *establisher_out = out.establisher as usize;
+                }
+            }
+            if !handler_data_out.is_null() {
+                // Language-specific data follows the handler RVA (cf. MSDN
+                // GetLanguageSpecificDataPtr). Only valid when a handler exists.
+                let data = info.handler_rva.map(|_| {
+                    let count = info.codes.len();
+                    // Recompute the handler-data RVA: header + padded codes + handler.
+                    // The parser consumed `count` slots; data starts after padding.
+                    let _ = count;
+                    // The exact RVA needs the raw count, not the op count: reuse the
+                    // unwind RVA plus the parsed length. For this slice the handler
+                    // only needs a non-null pointer for personality matching; the
+                    // full scope-table walk is the next slice's work.
+                    image_base.wrapping_add(func.unwind_rva as usize)
+                });
+                unsafe {
+                    *handler_data_out = data.unwrap_or(0);
+                }
+            }
+            out.handler.map(|h| h as usize).unwrap_or(0)
+        }
+        Err(e) => {
+            crate::xlog_warn!("RtlVirtualUnwind: {e}");
+            0
+        }
+    }
+}
+
+/// `VOID RtlCaptureContext(PCONTEXT)` — logged stub until the asm slice lands
+/// (capturing the caller's `RIP`/`RSP` needs a naked shim; a Rust body would
+/// only see its own frame).
+pub unsafe extern "win64" fn RtlCaptureContext(_ctx: *mut u8) {
+    crate::xlog_warn!("RtlCaptureContext: not implemented on Linux (later Phase C work)");
+}
+
+/// `VOID RtlUnwindEx(...)` — logged stub until the dispatch slice lands.
+pub unsafe extern "win64" fn RtlUnwindEx(
+    _base: usize,
+    _pc: usize,
+    _entry: usize,
+    _e: usize,
+    _ctx: *mut u8,
+    _history: usize,
+) {
+    crate::xlog_warn!("RtlUnwindEx: not implemented on Linux (later Phase C work)");
+}
+
+/// `VOID RtlRestoreContext(PCONTEXT, PEXCEPTION_RECORD)` — logged stub until the
+/// asm slice lands (restoring means jumping to a new `RIP`/`RSP`).
+pub unsafe extern "win64" fn RtlRestoreContext(_ctx: *mut u8, _e: usize) {
+    crate::xlog_warn!("RtlRestoreContext: not implemented on Linux (later Phase C work)");
+}
+
+// ---------------------------------------------------------------------------------------
 // Export table
 // ---------------------------------------------------------------------------------------
 
@@ -4759,6 +5148,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("WaitOnAddress", WaitOnAddress as usize),
         ("WakeByAddressSingle", WakeByAddressSingle as usize),
         ("WakeByAddressAll", WakeByAddressAll as usize),
+        // Step-11f SEH search: `.pdata` reader plus Rtl* shims.
+        ("RtlPcToFileHeader", RtlPcToFileHeader as usize),
+        ("RtlLookupFunctionEntry", RtlLookupFunctionEntry as usize),
+        ("RtlVirtualUnwind", RtlVirtualUnwind as usize),
+        ("RtlAddFunctionTable", RtlAddFunctionTable as usize),
+        ("RtlCaptureContext", RtlCaptureContext as usize),
+        ("RtlUnwindEx", RtlUnwindEx as usize),
+        ("RtlRestoreContext", RtlRestoreContext as usize),
         // Step-10c file APIs through the linked-in Linux VFS (kernel-family fallbacks).
         ("CreateFileW", CreateFileW as usize),
         ("CreateFileA", CreateFileA as usize),

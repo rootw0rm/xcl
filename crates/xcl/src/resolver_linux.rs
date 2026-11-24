@@ -432,6 +432,14 @@ mod tests {
             ("kernel32.dll", "CreateWaitableTimerExW"),
             ("kernel32.dll", "SetWaitableTimer"),
             ("api-ms-win-core-synch-l1-2-0.dll", "WaitOnAddress"),
+            // Step 11f SEH search: `.pdata` reader plus Rtl* shims.
+            ("kernel32.dll", "RtlPcToFileHeader"),
+            ("kernel32.dll", "RtlLookupFunctionEntry"),
+            ("kernel32.dll", "RtlVirtualUnwind"),
+            ("kernel32.dll", "RtlAddFunctionTable"),
+            ("kernel32.dll", "RtlCaptureContext"),
+            ("kernel32.dll", "RtlUnwindEx"),
+            ("kernel32.dll", "RtlRestoreContext"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
