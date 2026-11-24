@@ -27,6 +27,8 @@ pub mod gameinput_linux;
 pub mod xtaskqueue_linux;
 #[path = "hle/xuser_linux.rs"]
 pub mod xuser_linux;
+#[path = "hle/xaudio2_linux.rs"]
+pub mod xaudio2_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -219,7 +221,16 @@ fn d3d12x_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn xaudio2_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![XAudio2Create, XAudio2CreateWithVersionInfo]
+    let mut v = crate::hle_exports![XAudio2Create, XAudio2CreateWithVersionInfo];
+    // Step-11q headless engine: real code, not stub metadata.
+    for (name, addr) in xaudio2_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn mfplat_exports() -> Vec<(&'static str, usize)> {
@@ -406,7 +417,8 @@ mod tests {
                     || m.name == UCRT
                     || m.name == XGAMERUNTIME
                     || m.name == MINUSERX
-                    || m.name == GAMEINPUT)
+                    || m.name == GAMEINPUT
+                    || m.name == XAUDIO2)
                     && addr != 0
                 {
                     implemented += 1;
@@ -586,6 +598,12 @@ mod tests {
         for name in ["GameInputCreate"] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, GAMEINPUT);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-11q headless XAudio2 slice: engine + voices, not stub metadata.
+        for name in ["XAudio2Create", "XAudio2CreateWithVersionInfo"] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, XAUDIO2);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
         // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.

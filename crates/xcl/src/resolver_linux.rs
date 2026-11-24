@@ -374,7 +374,6 @@ mod tests {
         // they are covered by `kernelx_core_imports_resolve_to_hle` instead.
         for (dll, sym) in [
             ("d3d12_xs.dll", "D3D12XboxCreateDevice"),
-            ("xaudio2_9.dll", "XAudio2Create"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert_eq!(src, Source::Stub, "{dll}!{sym}");
@@ -719,6 +718,52 @@ mod tests {
             let mut b = [0u8; 48];
             assert_eq!(add(1, b.as_mut_ptr()), 0);
             assert_eq!(status(b.as_mut_ptr(), true), 0);
+        }
+    }
+
+    #[test]
+    fn xaudio2_imports_resolve_to_hle() {
+        // Step 11q: headless XAudio2 engine. `xaudio2_9.dll` is routed HLE.
+        for (dll, sym) in [
+            ("xaudio2_9.dll", "XAudio2Create"),
+            ("xaudio2_9.dll", "XAudio2CreateWithVersionInfo"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // Direct ABI: engine hands out a mastering voice.
+        let (addr, _) = resolve_inner(&dll_key("xaudio2_9.dll"), &name("XAudio2Create"), 0);
+        let create: unsafe extern "win64" fn(*mut *mut std::ffi::c_void, u32, u32) -> i32 =
+            unsafe { std::mem::transmute(addr) };
+        unsafe {
+            let mut eng: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(create(&mut eng, 0x41, 0x3c), 0);
+            assert!(!eng.is_null());
+            let vt = *(eng as *const *const usize);
+            let create_master: unsafe extern "win64" fn(
+                *mut std::ffi::c_void,
+                *mut *mut std::ffi::c_void,
+                u32,
+                u32,
+                u32,
+                *const u16,
+                *const std::ffi::c_void,
+                u32,
+            ) -> i32 = std::mem::transmute(*vt.add(7));
+            let mut master: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(
+                create_master(eng, &mut master, 2, 48_000, 0x4, std::ptr::null(), std::ptr::null(), 6),
+                0
+            );
+            assert!(!master.is_null());
         }
     }
 
