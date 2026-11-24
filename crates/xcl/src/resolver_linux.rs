@@ -373,7 +373,6 @@ mod tests {
         // to a callable auto-stub thunk, never null. Step-10c file APIs are HLE now, so
         // they are covered by `kernelx_core_imports_resolve_to_hle` instead.
         for (dll, sym) in [
-            ("kernel32.dll", "LoadLibraryW"),
             ("d3d12_xs.dll", "D3D12XboxCreateDevice"),
             ("xaudio2_9.dll", "XAudio2Create"),
         ] {
@@ -440,6 +439,14 @@ mod tests {
             ("kernel32.dll", "RtlCaptureContext"),
             ("kernel32.dll", "RtlUnwindEx"),
             ("kernel32.dll", "RtlRestoreContext"),
+            // Step 11k module loading: dynamic LoadLibrary family.
+            ("kernel32.dll", "LoadLibraryW"),
+            ("kernel32.dll", "LoadLibraryA"),
+            ("kernel32.dll", "LoadLibraryExW"),
+            ("kernel32.dll", "LoadLibraryExA"),
+            ("kernel32.dll", "LoadPackagedLibrary"),
+            ("kernel32.dll", "FreeLibrary"),
+            ("kernel32.dll", "DisableThreadLibraryCalls"),
             // Step 11j XMem: heap, graphics UMA pool and physical pages.
             ("kernelx.dll", "XMemAlloc"),
             ("kernelx.dll", "XMemAllocDefault"),
@@ -585,8 +592,9 @@ mod tests {
     fn load_library_and_get_proc_address_contract() {
         let h = load_library("kernelx.dll").expect("HLE pseudo handle");
         assert!(modules::hle_name_by_handle(h).is_some());
-        // HLE exports that stay Stub metadata: GetProcAddress returns None (no stub synthesis).
-        assert_eq!(get_proc_address(h, &name("LoadLibraryW")), None);
+        // Step-11k: LoadLibraryW is now implemented HLE, directly callable.
+        let ll = get_proc_address(h, &name("LoadLibraryW")).expect("LoadLibraryW HLE");
+        assert!(stubs::info_of_stub(ll).is_none());
         // Implemented HLE bodies resolve to callable addresses through the same path.
         let va = get_proc_address(h, &name("VirtualAlloc")).expect("VirtualAlloc HLE");
         assert!(stubs::info_of_stub(va).is_none());

@@ -444,16 +444,25 @@ mod tests {
             "RtlCaptureContext",
             "RtlUnwindEx",
             "RtlRestoreContext",
+            // Step-11k module loading: dynamic LoadLibrary family.
+            "LoadLibraryW",
+            "LoadLibraryA",
+            "LoadLibraryExW",
+            "LoadLibraryExA",
+            "LoadPackagedLibrary",
+            "FreeLibrary",
+            "DisableThreadLibraryCalls",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
-        // Steps 10d stay stubs here (names present in the Windows export list).
-        for name in ["LoadLibraryW"] {
+        // Step-11k leaves FreeLibraryWhenCallbackReturns as a no-op void shim
+        // (still a real address, not stub metadata).
+        for name in ["FreeLibraryWhenCallbackReturns"] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);
-            assert_eq!(addr, 0, "{name} stays Stub until its slice lands");
+            assert_ne!(addr, 0, "{name} must be implemented");
         }
         // Step-11 CRT spot checks: real code, reachable from any api-ms-win-crt-*
         // contract through the cross-HLE lookup (no per-contract routes).

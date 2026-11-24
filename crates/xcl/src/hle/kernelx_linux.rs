@@ -5246,6 +5246,102 @@ pub unsafe extern "win64" fn GetProcAddress(h: usize, name: *const u8) -> usize 
     }
 }
 
+/// `HMODULE LoadLibraryW(LPCWSTR)` — HLE pseudo-handles, mapped bases and the
+/// game-DLL load path through `resolver::load_library`; NULL names fail with
+/// `ERROR_INVALID_PARAMETER`, misses with `ERROR_MOD_NOT_FOUND`, as on Windows.
+pub unsafe extern "win64" fn LoadLibraryW(name: *const u16) -> usize {
+    load_library_impl(from_wide_ptr(name))
+}
+
+/// `HMODULE LoadLibraryA(LPCSTR)` — ANSI (UTF-8 on Linux) form.
+pub unsafe extern "win64" fn LoadLibraryA(name: *const u8) -> usize {
+    load_library_impl(from_ansi_ptr(name))
+}
+
+fn load_library_impl(name: Option<String>) -> usize {
+    let Some(n) = name else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    match crate::resolver::load_library(&n) {
+        Some(h) => {
+            crate::xlog_debug!("LoadLibrary({n}) → {h:#x}");
+            set_error(ERROR_SUCCESS);
+            h
+        }
+        None => {
+            crate::xlog_warn!("LoadLibrary({n}) → NULL (not found)");
+            set_error(ERROR_MOD_NOT_FOUND);
+            0
+        }
+    }
+}
+
+/// `HMODULE LoadLibraryExW(LPCWSTR, HANDLE, DWORD)` — data-file flags have no
+/// separate mapping on Linux (no resource-only view), so every flag combination
+/// takes the same `load_library` path; a NULL name still fails clean.
+pub unsafe extern "win64" fn LoadLibraryExW(name: *const u16, _file: usize, _flags: u32) -> usize {
+    load_library_impl(from_wide_ptr(name))
+}
+
+/// `HMODULE LoadLibraryExA(LPCSTR, HANDLE, DWORD)` — ANSI form, same as above.
+pub unsafe extern "win64" fn LoadLibraryExA(name: *const u8, _file: usize, _flags: u32) -> usize {
+    load_library_impl(from_ansi_ptr(name))
+}
+
+/// `HMODULE LoadPackagedLibrary(LPCWSTR, DWORD)` — packaged titles resolve like
+/// `LoadLibraryW` on Linux; reserved must be 0.
+pub unsafe extern "win64" fn LoadPackagedLibrary(name: *const u16, _reserved: u32) -> usize {
+    load_library_impl(from_wide_ptr(name))
+}
+
+fn free_library_known(h: usize) -> bool {
+    if h == 0 {
+        return false;
+    }
+    if h == main_or_zero_base() {
+        return true;
+    }
+    if crate::modules::hle_name_by_handle(h).is_some() {
+        return true;
+    }
+    crate::modules::find_mapped_by_base(h).is_some()
+}
+
+/// `BOOL FreeLibrary(HMODULE)` — XCL never unloads: known HLE/mapped/main
+/// handles succeed without unloading; unknown handles fail, as on Windows.
+pub unsafe extern "win64" fn FreeLibrary(h: usize) -> i32 {
+    if free_library_known(h) {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+/// `void FreeLibraryWhenCallbackReturns(PVOID, HMODULE)` — no unload on Linux,
+/// so known handles are a no-op (mirrors the Windows twin's early return for
+/// XCL-mapped modules).
+pub unsafe extern "win64" fn FreeLibraryWhenCallbackReturns(_instance: usize, _h: usize) {}
+
+/// `BOOL DisableThreadLibraryCalls(HMODULE)` — records the opt-out on mapped
+/// game DLLs; HLE/main handles trivially succeed.
+pub unsafe extern "win64" fn DisableThreadLibraryCalls(h: usize) -> i32 {
+    if let Some(m) = crate::modules::find_mapped_by_base(h) {
+        m.no_thread_calls.store(true, std::sync::atomic::Ordering::Relaxed);
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    if free_library_known(h) {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
 /// `BOOL GetConsoleMode(HANDLE, LPDWORD)` — succeeds only for the std pseudo
 /// handles when the backing fd is a tty (a redirected stderr fails with
 /// `ERROR_INVALID_HANDLE`, steering Rust's `write` onto the `NtWriteFile` path,
@@ -6667,6 +6763,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetModuleHandleA", GetModuleHandleA as usize),
         ("GetModuleHandleExW", GetModuleHandleExW as usize),
         ("GetModuleHandleExA", GetModuleHandleExA as usize),
+        ("LoadLibraryW", LoadLibraryW as usize),
+        ("LoadLibraryA", LoadLibraryA as usize),
+        ("LoadLibraryExW", LoadLibraryExW as usize),
+        ("LoadLibraryExA", LoadLibraryExA as usize),
+        ("LoadPackagedLibrary", LoadPackagedLibrary as usize),
+        ("FreeLibrary", FreeLibrary as usize),
+        ("FreeLibraryWhenCallbackReturns", FreeLibraryWhenCallbackReturns as usize),
+        ("DisableThreadLibraryCalls", DisableThreadLibraryCalls as usize),
         ("GetEnvironmentVariableW", GetEnvironmentVariableW as usize),
         ("GetEnvironmentVariableA", GetEnvironmentVariableA as usize),
         // Step-11d exception/console shims for the Rust panic-report path.
@@ -7674,6 +7778,44 @@ mod tests {
             );
             // Ordinal 0 (no ordinal exports here) misses cleanly.
             assert_eq!(GetProcAddress(kx, 0 as *const u8), 0);
+        }
+    }
+
+    #[test]
+    fn load_library_family_hands_out_known_handles() {
+        unsafe {
+            // HLE routes hand out the stable pseudo handle; A/W agree.
+            let w = LoadLibraryW(crate::util::wide("kernelx.dll").as_ptr());
+            assert_ne!(w, 0);
+            assert_eq!(w, crate::modules::hle_handle("kernelx.dll"));
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+            let a = LoadLibraryA(c"kernelx.dll".as_ptr() as *const u8);
+            assert_eq!(a, w);
+            // Ex + packaged take the same path; flags are accepted, not rejected.
+            assert_eq!(LoadLibraryExW(crate::util::wide("kernelx.dll").as_ptr(), 0, 0x22), w);
+            assert_eq!(LoadLibraryExA(c"kernelx.dll".as_ptr() as *const u8, 0, 0), w);
+            assert_eq!(LoadPackagedLibrary(crate::util::wide("kernelx.dll").as_ptr(), 0), w);
+            // GetProcAddress through the loaded handle resolves HLE bodies.
+            let va = GetProcAddress(w, c"VirtualAlloc".as_ptr() as *const u8);
+            assert_ne!(va, 0);
+            assert!(crate::stubs::info_of_stub(va).is_none());
+            // NULL names fail cleanly; unknown DLLs miss with MOD_NOT_FOUND.
+            assert_eq!(LoadLibraryW(std::ptr::null()), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(LoadLibraryExW(std::ptr::null(), 0, 0), 0);
+            assert_eq!(
+                LoadLibraryW(crate::util::wide("xcl_definitely_missing_xyz.dll").as_ptr()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_MOD_NOT_FOUND);
+            // FreeLibrary never unloads: known handles succeed, unknown fail.
+            assert_eq!(FreeLibrary(w), 1);
+            assert_eq!(FreeLibrary(0xDEAD_BEEF), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            FreeLibraryWhenCallbackReturns(0, w);
+            // DisableThreadLibraryCalls records the opt-out on known handles.
+            assert_eq!(DisableThreadLibraryCalls(w), 1);
+            assert_eq!(DisableThreadLibraryCalls(0xDEAD_BEEF), 0);
         }
     }
 
