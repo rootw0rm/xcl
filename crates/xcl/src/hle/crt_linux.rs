@@ -747,6 +747,171 @@ pub unsafe extern "win64" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
     std::ptr::null_mut()
 }
 
+// ---------------------------------------------------------------------------------------
+// String copy/concat (Phase C step-12a): DllMain/facet init `strcpy`/`strcat` family.
+// Same NULL-stub fault class as memcpy/compare: a logging stub returning NULL would
+// fault on the first write/read, so these return `dst` (or `dst` + NUL handling)
+// exactly like UCRT. Narrow ops are byte loops, wide ops are UTF-16 unit loops.
+// `strncpy` pads with NUL to `n`; `strncat`/`wcsncat` append at most `n` units then
+// NUL-terminate. `wmemcpy`/`wmemmove` copy `n` wide units (`wmemmove` is
+// overlap-safe); zero lengths touch nothing but still return `dst`.
+// ---------------------------------------------------------------------------------------
+
+/// `char* strcpy(dst, src)` — copy `src` (incl. NUL), return `dst`.
+pub unsafe extern "win64" fn strcpy(dst: *mut u8, src: *const u8) -> *mut u8 {
+    let mut i = 0;
+    loop {
+        let b = *src.add(i);
+        *dst.add(i) = b;
+        if b == 0 {
+            break;
+        }
+        i += 1;
+    }
+    dst
+}
+
+/// `char* strncpy(dst, src, n)` — copy at most `n` bytes, NUL-pad to `n`, return `dst`.
+/// Truncation (src longer than `n`) leaves `dst[..n]` unterminated, as on Windows.
+pub unsafe extern "win64" fn strncpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        let b = *src.add(i);
+        *dst.add(i) = b;
+        i += 1;
+        if b == 0 {
+            break;
+        }
+    }
+    while i < n {
+        *dst.add(i) = 0;
+        i += 1;
+    }
+    dst
+}
+
+/// `char* strcat(dst, src)` — append `src` (incl. NUL) after `dst`'s NUL, return `dst`.
+pub unsafe extern "win64" fn strcat(dst: *mut u8, src: *const u8) -> *mut u8 {
+    let mut d = 0;
+    while *dst.add(d) != 0 {
+        d += 1;
+    }
+    let mut i = 0;
+    loop {
+        let b = *src.add(i);
+        *dst.add(d + i) = b;
+        if b == 0 {
+            break;
+        }
+        i += 1;
+    }
+    dst
+}
+
+/// `char* strncat(dst, src, n)` — append at most `n` bytes of `src` plus NUL.
+pub unsafe extern "win64" fn strncat(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut d = 0;
+    while *dst.add(d) != 0 {
+        d += 1;
+    }
+    let mut i = 0;
+    while i < n {
+        let b = *src.add(i);
+        if b == 0 {
+            break;
+        }
+        *dst.add(d + i) = b;
+        i += 1;
+    }
+    *dst.add(d + i) = 0;
+    dst
+}
+
+/// `wchar_t* wcscpy(dst, src)` — copy wide `src` (incl. NUL), return `dst`.
+pub unsafe extern "win64" fn wcscpy(dst: *mut u16, src: *const u16) -> *mut u16 {
+    let mut i = 0;
+    loop {
+        let w = *src.add(i);
+        *dst.add(i) = w;
+        if w == 0 {
+            break;
+        }
+        i += 1;
+    }
+    dst
+}
+
+/// `wchar_t* wcsncpy(dst, src, n)` — copy at most `n` wide units, NUL-pad to `n`.
+pub unsafe extern "win64" fn wcsncpy(dst: *mut u16, src: *const u16, n: usize) -> *mut u16 {
+    let mut i = 0;
+    while i < n {
+        let w = *src.add(i);
+        *dst.add(i) = w;
+        i += 1;
+        if w == 0 {
+            break;
+        }
+    }
+    while i < n {
+        *dst.add(i) = 0;
+        i += 1;
+    }
+    dst
+}
+
+/// `wchar_t* wcscat(dst, src)` — append wide `src` (incl. NUL), return `dst`.
+pub unsafe extern "win64" fn wcscat(dst: *mut u16, src: *const u16) -> *mut u16 {
+    let mut d = 0;
+    while *dst.add(d) != 0 {
+        d += 1;
+    }
+    let mut i = 0;
+    loop {
+        let w = *src.add(i);
+        *dst.add(d + i) = w;
+        if w == 0 {
+            break;
+        }
+        i += 1;
+    }
+    dst
+}
+
+/// `wchar_t* wcsncat(dst, src, n)` — append at most `n` wide units plus NUL.
+pub unsafe extern "win64" fn wcsncat(dst: *mut u16, src: *const u16, n: usize) -> *mut u16 {
+    let mut d = 0;
+    while *dst.add(d) != 0 {
+        d += 1;
+    }
+    let mut i = 0;
+    while i < n {
+        let w = *src.add(i);
+        if w == 0 {
+            break;
+        }
+        *dst.add(d + i) = w;
+        i += 1;
+    }
+    *dst.add(d + i) = 0;
+    dst
+}
+
+/// `wchar_t* wmemcpy(dst, src, n)` — copy `n` wide units (no overlap), return `dst`.
+pub unsafe extern "win64" fn wmemcpy(dst: *mut u16, src: *const u16, n: usize) -> *mut u16 {
+    if n != 0 {
+        std::ptr::copy_nonoverlapping(src, dst, n);
+    }
+    dst
+}
+
+/// `wchar_t* wmemmove(dst, src, n)` — overlap-safe copy of `n` wide units.
+pub unsafe extern "win64" fn wmemmove(dst: *mut u16, src: *const u16, n: usize) -> *mut u16 {
+    if n != 0 {
+        std::ptr::copy(src, dst, n);
+    }
+    dst
+}
+
 /// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
 pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
@@ -1079,12 +1244,22 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("strnlen", strnlen as usize),
         ("strcmp", strcmp as usize),
         ("strncmp", strncmp as usize),
+        ("strcpy", strcpy as usize),
+        ("strncpy", strncpy as usize),
+        ("strcat", strcat as usize),
+        ("strncat", strncat as usize),
         ("strchr", strchr as usize),
         ("memchr", memchr as usize),
         ("wcslen", wcslen as usize),
         ("wcsnlen", wcsnlen as usize),
         ("wcscmp", wcscmp as usize),
         ("wcsncmp", wcsncmp as usize),
+        ("wcscpy", wcscpy as usize),
+        ("wcsncpy", wcsncpy as usize),
+        ("wcscat", wcscat as usize),
+        ("wcsncat", wcsncat as usize),
+        ("wmemcpy", wmemcpy as usize),
+        ("wmemmove", wmemmove as usize),
         ("getenv", getenv as usize),
         ("setvbuf", setvbuf as usize),
         ("fopen", fopen as usize),
@@ -1369,6 +1544,83 @@ mod tests {
             assert_eq!(memchr(s.as_ptr(), b'l' as i32, 5), s.as_ptr().add(2) as *mut u8);
             assert!(memchr(s.as_ptr(), b'l' as i32, 2).is_null());
             assert!(memchr(s.as_ptr(), b'z' as i32, 5).is_null());
+        }
+    }
+
+    #[test]
+    fn string_copy_and_concat_match_libc() {
+        unsafe {
+            // strcpy returns dst and copies the NUL (never the NULL stub).
+            let mut dst = [0u8; 8];
+            let src = b"hi\0";
+            assert_eq!(strcpy(dst.as_mut_ptr(), src.as_ptr()), dst.as_mut_ptr());
+            assert_eq!(&dst[..3], b"hi\0");
+            // strncpy pads with NUL; truncation leaves no NUL (UCRT semantics).
+            let mut pad = [0x7Fu8; 6];
+            assert_eq!(
+                strncpy(pad.as_mut_ptr(), b"ab\0".as_ptr(), 5),
+                pad.as_mut_ptr()
+            );
+            assert_eq!(&pad[..5], b"ab\0\0\0");
+            let mut trunc = [0u8; 3];
+            strncpy(trunc.as_mut_ptr(), b"abcd\0".as_ptr(), 3);
+            assert_eq!(&trunc, b"abc");
+            // Zero length touches nothing but still returns dst.
+            let mut zero = [0x41u8; 2];
+            assert_eq!(
+                strncpy(zero.as_mut_ptr(), b"zzz\0".as_ptr(), 0),
+                zero.as_mut_ptr()
+            );
+            assert_eq!(&zero, b"AA");
+            // strcat/strncat append after the dst NUL and NUL-terminate.
+            let mut cat = [0u8; 12];
+            strcpy(cat.as_mut_ptr(), b"foo\0".as_ptr());
+            assert_eq!(strcat(cat.as_mut_ptr(), b"bar\0".as_ptr()), cat.as_mut_ptr());
+            assert_eq!(&cat[..7], b"foobar\0");
+            let mut ncat = [0u8; 12];
+            strcpy(ncat.as_mut_ptr(), b"foo\0".as_ptr());
+            assert_eq!(
+                strncat(ncat.as_mut_ptr(), b"barbaz\0".as_ptr(), 3),
+                ncat.as_mut_ptr()
+            );
+            assert_eq!(&ncat[..7], b"foobar\0");
+            // strncat with n == 0 only re-terminates.
+            strncat(ncat.as_mut_ptr(), b"ZZZ\0".as_ptr(), 0);
+            assert_eq!(&ncat[..7], b"foobar\0");
+            // Wide copy/concat mirror the narrow semantics in UTF-16 units.
+            let mut wdst = [0u16; 8];
+            let wsrc: [u16; 3] = [0x48, 0x69, 0];
+            assert_eq!(wcscpy(wdst.as_mut_ptr(), wsrc.as_ptr()), wdst.as_mut_ptr());
+            assert_eq!(&wdst[..3], &[0x48, 0x69, 0]);
+            let mut wpad = [0x7Fu16; 6];
+            wcsncpy(wpad.as_mut_ptr(), [0x41, 0].as_ptr(), 4);
+            assert_eq!(&wpad[..4], &[0x41, 0, 0, 0]);
+            let mut wtrunc = [0u16; 2];
+            wcsncpy(wtrunc.as_mut_ptr(), [0x41, 0x42, 0x43, 0].as_ptr(), 2);
+            assert_eq!(&wtrunc, &[0x41, 0x42]);
+            let mut wcat = [0u16; 12];
+            wcscpy(wcat.as_mut_ptr(), [0x66, 0x6F, 0x6F, 0].as_ptr());
+            wcscat(wcat.as_mut_ptr(), [0x62, 0x61, 0x72, 0].as_ptr());
+            assert_eq!(&wcat[..7], &[0x66, 0x6F, 0x6F, 0x62, 0x61, 0x72, 0]);
+            let mut wncat = [0u16; 12];
+            wcscpy(wncat.as_mut_ptr(), [0x66, 0x6F, 0x6F, 0].as_ptr());
+            wcsncat(wncat.as_mut_ptr(), [0x62, 0x61, 0x72, 0x62, 0x61, 0x7A, 0].as_ptr(), 3);
+            assert_eq!(&wncat[..7], &[0x66, 0x6F, 0x6F, 0x62, 0x61, 0x72, 0]);
+            // wmemcpy copies units; wmemmove is overlap-safe; zero length is a no-op.
+            let wsrc2: [u16; 4] = [1, 2, 3, 4];
+            let mut wmem = [0u16; 4];
+            assert_eq!(
+                wmemcpy(wmem.as_mut_ptr(), wsrc2.as_ptr(), 4),
+                wmem.as_mut_ptr()
+            );
+            assert_eq!(&wmem, &wsrc2);
+            let mut wov = [1u16, 2, 3, 4, 0, 0];
+            wmemmove(wov.as_mut_ptr().add(1), wov.as_ptr(), 4);
+            assert_eq!(&wov[..5], &[1, 1, 2, 3, 4]);
+            let mut wzero = [9u16, 9];
+            wmemcpy(wzero.as_mut_ptr(), wsrc2.as_ptr(), 0);
+            wmemmove(wzero.as_mut_ptr(), wsrc2.as_ptr(), 0);
+            assert_eq!(&wzero, &[9, 9]);
         }
     }
 

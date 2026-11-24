@@ -691,3 +691,24 @@ entry stack, or C++/`.pdata` unwinding. Those remain in steps 10a/10d and later 
 - HEAD is `f3bee90` (PROMPT snapshot on top of `141768c`; code identical to `ed0fd32` + upstream `20cf130` sync). Prior refresh lines referencing `ed0fd32` updated to `f3bee90`; no phase flip.
 - Queue: 40 closed, 11 open. `task-1795560125-71aa` (`linux:crt-copy`, plan.md step 12a) is `in_progress` since 23:38Z — the Builder owns it. `code-assist:linux-port:step-12:retail-smoke` is the only `ready --all` item but is SKIPPED here (`/run/media/...` absent); steps 13–21 stay chained behind step-12. Phase D stays blocked until the synthetic title runs to `ExitProcess`.
 - No code changes in this planner pass. Next: Builder continues `linux:crt-copy` (NUL-safe `strcpy`/`strncpy`/`strcat`/`wcs*`/`wmemcpy`/`wmemmove` via ucrtbase HLE, one commit, synthetic verification only).
+
+## Planner refresh (2026-11-25, `linux` @ `8153a44`, build.start, no game files on host)
+
+- Queue verified: 1 in_progress (`linux:crt-copy` task-1795560125-71aa, Builder owns it — uncommitted work in `crt_linux.rs`/`hle_linux.rs`/`resolver_linux.rs` left untouched), 10 open (step-12 retail-smoke + steps 13–21 chained behind it). No missing tasks, no broken chains (step-12's `blocked_by` points at a pruned closed task and it correctly shows as the only formal ready item).
+- No replan: docs (`context.md`/`plan.md` step 12a) already describe the crt-copy slice; further CRT families stay provisional until crt-copy lands and triage names the next one. Phase D/E/F remain blocked per PROMPT §4.7. Step-12 stays open but SKIPPED here (`/run/media/...` absent) — never stall on it.
+- No code changes in this planner pass. Next: Builder continues `linux:crt-copy` to a one-commit landing with synthetic verification (focused `crt` tests + full lib suite + workspace check + cross-built title e2e regression gate).
+
+## Verification Notes — step-12a crt-copy (Builder, 2026-11-25, `linux`)
+
+Task `task-1795560125-71aa` / plan.md step 12a (`linux:crt-copy`).
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/hle/crt_linux.rs`: NUL-safe win64 `strcpy`/`strncpy`/`strcat`/`strncat` + `wcscpy`/`wcsncpy`/`wcscat`/`wcsncat` + `wmemcpy`/`wmemmove` (overlap-safe `copy` vs `copy_nonoverlapping`, zero-length no-op returning `dst`), wired into `exports()`, plus `string_copy_and_concat_match_libc` unit test (pad/truncate/zero-length/overlap).
+- `crates/xcl/src/hle_linux.rs`: 10 new names in the HLE spot list.
+- `crates/xcl/src/resolver_linux.rs`: `api-ms-win-crt-string-l1-1-0` contract checks + bundled-DLL (`msvcp140`/`vcruntime140`) forwarding checks, plus direct win64 `strcpy`/`wmemmove` callable checks (return `dst`, overlap-safe).
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib crt -- --test-threads=4` → 18 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 371 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → Finished, 6 pre-existing warnings, 0 errors.
+- Cross-built synthetic title (prebuilt `target/debug/xcl_testtitle.exe` + `testgame_mw.dll`, fresh temp game+data dirs): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 16`, `ExitProcess(0x10)`. Baseline without this slice on a fresh dir is also 16 (same GPU/null-device + first-run overlay quirks: real-GPU triangle/Present, sparse VRAM, DirectStorage, MFPlat, XG texture pools). No CRT regression; title reaches `ExitProcess`. A rerun on a reused dir drops to 14 (overlay already populated), so fresh-dir counts are the comparator.

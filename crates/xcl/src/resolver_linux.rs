@@ -509,6 +509,16 @@ mod tests {
             ("api-ms-win-crt-stdio-l1-1-0.dll", "fflush"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strcmp"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strncmp"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strcpy"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strncpy"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strcat"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strncat"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wcscpy"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wcsncpy"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wcscat"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wcsncat"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wmemcpy"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wmemmove"),
             ("api-ms-win-crt-string-l1-1-0.dll", "wcscmp"),
             ("api-ms-win-crt-string-l1-1-0.dll", "wcsncmp"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strchr"),
@@ -570,6 +580,14 @@ mod tests {
             ("vccorlib140.dll", "free"),
             ("msvcp140.dll", "strcmp"),
             ("vcruntime140.dll", "strncmp"),
+            ("msvcp140.dll", "strcpy"),
+            ("vcruntime140.dll", "strncpy"),
+            ("msvcp140.dll", "strcat"),
+            ("vcruntime140.dll", "strncat"),
+            ("msvcp140.dll", "wcscpy"),
+            ("vcruntime140.dll", "wcscat"),
+            ("msvcp140.dll", "wmemcpy"),
+            ("vcruntime140.dll", "wmemmove"),
             ("msvcp140.dll", "wcscmp"),
             ("vcruntime140.dll", "strchr"),
             ("concrt140.dll", "memchr"),
@@ -618,6 +636,22 @@ mod tests {
             let src = *b"ABCDEFGH";
             assert_eq!(memcpy(dst.as_mut_ptr(), src.as_ptr(), 8), dst.as_mut_ptr());
             assert_eq!(&dst, &src);
+        }
+        // The routed strcpy/strcat are directly callable with the Windows x64 ABI
+        // (return `dst`, never the NULL stub).
+        let (addr, _) = resolve_inner(&dll_key("msvcp140.dll"), &name("strcpy"), 0);
+        let strcpy: unsafe extern "win64" fn(*mut u8, *const u8) -> *mut u8 =
+            unsafe { std::mem::transmute(addr) };
+        let (addr, _) = resolve_inner(&dll_key("vcruntime140.dll"), &name("wmemmove"), 0);
+        let wmemmove: unsafe extern "win64" fn(*mut u16, *const u16, usize) -> *mut u16 =
+            unsafe { std::mem::transmute(addr) };
+        unsafe {
+            let mut dst = [0u8; 8];
+            assert_eq!(strcpy(dst.as_mut_ptr(), b"hi\0".as_ptr()), dst.as_mut_ptr());
+            assert_eq!(&dst[..3], b"hi\0");
+            let mut w = [1u16, 2, 3, 4, 0, 0];
+            assert_eq!(wmemmove(w.as_mut_ptr().add(1), w.as_ptr(), 4), w.as_mut_ptr().add(1));
+            assert_eq!(&w[..5], &[1, 1, 2, 3, 4]);
         }
         // The routed operator new/delete is directly callable with the Windows x64 ABI.
         let (addr, _) = resolve_inner(&dll_key("msvcp140.dll"), &name("??2@YAPEAX_K@Z"), 0);
