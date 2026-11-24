@@ -10,9 +10,9 @@
 //!
 //! Not ported yet (explicit Phase C/C steps, no silent stubs):
 //! * import resolution/HLE/auto-stubs — step 10; the IAT stays empty for now,
-//! * static TLS block installation and callbacks — step 7; the directory is parsed here,
-//! * `.pdata` registration / signal handling — step 9,
-//! * running DllMain/entry (Win64 ABI) — needs the Phase C host.
+//! * game-DLL DllMain/TLS installation — step 10; the main image's static TLS runs here,
+//! * `.pdata` translation / C++ unwinding — later Phase C work,
+//! * the title PEB, argv and dedicated entry-thread stack — step 10d.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -123,6 +123,72 @@ pub fn load_main(path: &Path) -> Result<Arc<MappedModule>, String> {
     map_image_ex(path, true)
 }
 
+type ExeEntry = unsafe extern "win64" fn(*mut c_void) -> u32;
+
+unsafe fn run_tls_callbacks(m: &MappedModule, reason: u32) {
+    let callbacks = m
+        .tls_callbacks
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    for callback in callbacks {
+        let f: crate::tls::TlsCallback = std::mem::transmute(callback);
+        f(m.base as *mut c_void, reason, std::ptr::null_mut());
+    }
+}
+
+/// Run an import-free main image on the calling thread with the Windows x64 ABI.
+///
+/// The calling thread first receives its TLS blocks and `DLL_THREAD_ATTACH` callbacks, then
+/// the image's process-attach callbacks and entry point run. After the entry returns, process
+/// detach runs while the blocks are still alive, followed by thread detach and restoration of
+/// the host's previous `GS`.
+pub fn run_main(m: &Arc<MappedModule>) -> u32 {
+    const ENTRY_START_FAILED: u32 = 0xC000_0001;
+    if m.is_dll {
+        crate::xlog_error!("{}: run_main requires an executable", m.name);
+        return ENTRY_START_FAILED;
+    }
+    if m.entry_rva == 0 || m.entry_rva as usize >= m.size {
+        crate::xlog_error!(
+            "{}: entry RVA {:#x} is outside the image",
+            m.name,
+            m.entry_rva
+        );
+        return ENTRY_START_FAILED;
+    }
+    if !modules::main_module().is_some_and(|main| Arc::ptr_eq(&main, m)) {
+        crate::xlog_error!(
+            "{}: run_main requires the image registered by load_main",
+            m.name
+        );
+        return ENTRY_START_FAILED;
+    }
+    if let Err(e) = crate::tls::attach_current_thread() {
+        crate::xlog_error!("{}: attaching the main thread: {e}", m.name);
+        return ENTRY_START_FAILED;
+    }
+
+    unsafe {
+        run_tls_callbacks(m, crate::tls::DLL_PROCESS_ATTACH);
+        let entry: ExeEntry = std::mem::transmute(m.base + m.entry_rva as usize);
+        crate::xlog_info!(
+            "start {}: entry point {}",
+            m.name,
+            modules::describe_address(m.base + m.entry_rva as usize)
+        );
+        crate::log::flush();
+        // LINUX-TODO: Phase C step-10d — supply the title PEB/argv and dedicated stack. The
+        // import-free synthetic entry does not read its Windows PEB argument.
+        let code = entry(std::ptr::null_mut());
+        // Process detach must see the thread's blocks; free them only afterwards.
+        run_tls_callbacks(m, crate::tls::DLL_PROCESS_DETACH);
+        crate::tls::detach_current_thread();
+        crate::xlog_info!("{}: entry point returned code {code:#x}", m.name);
+        code
+    }
+}
+
 fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String> {
     let file = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let pe = Pe::parse(&file, Layout::File).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -200,6 +266,14 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     let import_entries: usize = imports.iter().map(|d| d.entries.len()).sum();
     let delay_entries: usize = delay.iter().map(|d| d.entries.len()).sum();
     if !imports.is_empty() || !delay.is_empty() {
+        if is_main {
+            // This slice can execute only self-contained images. Do not leave callable IAT
+            // slots at zero and then let run_main jump into an unresolved import.
+            // LINUX-TODO: Phase C step-10 — remove this guard once the resolver fills the IAT.
+            return Err(format!(
+                "{name}: import resolution is unavailable on Linux until Phase C step-10"
+            ));
+        }
         // LINUX-TODO: Phase C step-10 — resolve imports through the HLE registry/game DLLs
         // and write the IAT slots; keep name/ordinal/delay ordering identical.
         crate::xlog_info!(
@@ -435,6 +509,9 @@ mod tests {
     fn p32(f: &mut [u8], at: usize, v: u32) {
         f[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
+    fn p64(f: &mut [u8], at: usize, v: u64) {
+        f[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
 
     /// A PE32+ DLL with two sections: .text at RVA 0x1000 (0x200 raw bytes at file 0x200,
     /// execute+read; entry point there) and .data at RVA 0x2000 (0x200 raw bytes at file
@@ -664,15 +741,153 @@ mod tests {
         *block
     }
 
+    unsafe fn gs_base() -> u64 {
+        let mut base = 0u64;
+        let rc = libc::syscall(libc::SYS_arch_prctl, 0x1004, &mut base as *mut u64);
+        assert_eq!(rc, 0, "ARCH_GET_GS");
+        base
+    }
+
+    /// Entry code: read TLS byte 0 through the TEB, require the template value 7, append an
+    /// entry event, change this thread's copy to 8, and return the Windows exit code 0x2a.
+    fn lifecycle_entry_code(index_ptr: u64, trace_count: u64) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&[0x49, 0xBA]); // mov r10, index_ptr
+        c.extend_from_slice(&index_ptr.to_le_bytes());
+        c.extend_from_slice(&[0x45, 0x8B, 0x1A]); // mov r11d, [r10]
+        c.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // mov rax, gs:[0x58]
+        c.extend_from_slice(&[0x4E, 0x8B, 0x0C, 0xD8]); // mov r9, [rax+r11*8]
+        c.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x01]); // movzx eax, byte [r9]
+        c.extend_from_slice(&[0x3C, 0x07]); // cmp al, 7
+        let jne = c.len();
+        c.extend_from_slice(&[0x75, 0]); // jne failure
+        c.extend_from_slice(&[0x49, 0xBB]); // mov r11, trace_count
+        c.extend_from_slice(&trace_count.to_le_bytes());
+        c.extend_from_slice(&[0x45, 0x8B, 0x13]); // mov r10d, [r11]
+        c.extend_from_slice(&[0xC1, 0xE0, 0x10]); // shl eax, 16
+        c.extend_from_slice(&[0x83, 0xC8, 0x45]); // or eax, EVENT_ENTRY
+        c.extend_from_slice(&[0x43, 0x89, 0x44, 0x93, 0x04]); // mov [r11+r10*4+4], eax
+        c.extend_from_slice(&[0x41, 0xFF, 0x03]); // inc dword [r11]
+        c.extend_from_slice(&[0x41, 0xC6, 0x01, 0x08]); // mov byte [r9], 8
+        c.extend_from_slice(&[0xB8, 0x2A, 0, 0, 0, 0xC3]); // mov eax, 0x2a; ret
+        let failure = c.len();
+        c[jne + 1] = (failure - (jne + 2)) as u8;
+        c.extend_from_slice(&[0xB8, 0x99, 0, 0, 0, 0xC3]); // mov eax, 0x99; ret
+        c
+    }
+
+    /// TLS callback code: append `(id | reason << 8 | tls_byte << 16)` to the image's trace.
+    /// It only uses volatile registers and keeps the Windows x64 stack alignment untouched.
+    fn lifecycle_callback_code(index_ptr: u64, trace_count: u64, id: u8) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&[0x49, 0xBA]); // mov r10, index_ptr
+        c.extend_from_slice(&index_ptr.to_le_bytes());
+        c.extend_from_slice(&[0x45, 0x8B, 0x1A]); // mov r11d, [r10]
+        c.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // mov rax, gs:[0x58]
+        c.extend_from_slice(&[0x4E, 0x8B, 0x0C, 0xD8]); // mov r9, [rax+r11*8]
+        c.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x01]); // movzx eax, byte [r9]
+        c.extend_from_slice(&[0xC1, 0xE0, 0x10]); // shl eax, 16
+        c.extend_from_slice(&[0x44, 0x0F, 0xB6, 0xD2]); // movzx r10d, dl (reason)
+        c.extend_from_slice(&[0x41, 0xC1, 0xE2, 0x08]); // shl r10d, 8
+        c.extend_from_slice(&[0x44, 0x09, 0xD0]); // or eax, r10d
+        c.extend_from_slice(&[0x83, 0xC8, id]); // or eax, callback id
+        c.extend_from_slice(&[0x49, 0xBB]); // mov r11, trace_count
+        c.extend_from_slice(&trace_count.to_le_bytes());
+        c.extend_from_slice(&[0x45, 0x8B, 0x13]); // mov r10d, [r11]
+        c.extend_from_slice(&[0x43, 0x89, 0x44, 0x93, 0x04]); // mov [r11+r10*4+4], eax
+        c.extend_from_slice(&[0x41, 0xFF, 0x03]); // inc dword [r11]
+        c.push(0xC3);
+        c
+    }
+
     #[test]
-    fn main_image_installs_slot_zero_and_blocks_for_new_threads() {
-        let base = 0x6E55_0000_0000u64;
-        let mut file = tiny_dll(base, &[0xC3, 0xC3], None);
-        set_tls(&mut file, base, 7);
-        let p = write("xcl_tls_main.dll", &file);
-        let m = load_main(&p).expect("synthetic main image loads");
+    fn runs_an_import_free_main_through_tls_and_entry() {
+        const CHILD: &str = "XCL_LOADER_LIFECYCLE_CHILD";
+        const PE_PATH: &str = "XCL_LOADER_LIFECYCLE_PE";
+        if std::env::var_os(CHILD).is_none() {
+            let base = 0x6E56_0000_0000u64;
+            let index_ptr = base + 0x2088;
+            let trace_count = base + 0x20C0;
+            let entry = lifecycle_entry_code(index_ptr, trace_count);
+            let callback_a = lifecycle_callback_code(index_ptr, trace_count, 1);
+            let callback_b = lifecycle_callback_code(index_ptr, trace_count, 2);
+            let mut code = vec![0xCC; 0x100];
+            code[..entry.len()].copy_from_slice(&entry);
+            code[0x60..0x60 + callback_a.len()].copy_from_slice(&callback_a);
+            code[0xB0..0xB0 + callback_b.len()].copy_from_slice(&callback_b);
+            let mut file = tiny_dll(base, &code, None);
+            p16(&mut file, 0x56, 0x0022); // executable + large-address-aware, not a DLL
+            set_tls(&mut file, base, 7);
+            p64(&mut file, 0x440, base + 0x1060);
+            p64(&mut file, 0x448, base + 0x10B0);
+            let path = write("xcl_run_main.exe", &file);
+
+            // TLS slot 0, GS, and the module registry are process-wide. Run the lifecycle in a
+            // fresh test process so parallel TLS tests cannot install another main image or
+            // interleave their thread callbacks with this image's event trace.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("loader::tests::runs_an_import_free_main_through_tls_and_entry")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env(PE_PATH, &path)
+                .output()
+                .expect("run synthetic-main child");
+            assert!(
+                output.status.success(),
+                "synthetic-main child failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("synthetic main lifecycle: ok")
+            );
+            return;
+        }
+
+        let path = PathBuf::from(std::env::var(PE_PATH).unwrap());
+        let previous_gs = unsafe { gs_base() };
+        let m = load_main(&path).expect("synthetic main image loads");
+        assert!(!m.is_dll, "the fixture is an executable");
         let index = unsafe { std::ptr::read_volatile((m.base + 0x2088) as *const u32) };
         assert_eq!(index, 0, "the main image takes TLS slot 0");
+
+        assert_eq!(run_main(&m), 0x2a, "the PE entry point's return value");
+        assert_eq!(unsafe { gs_base() }, previous_gs, "run_main restores GS");
+        let count = unsafe { std::ptr::read_volatile((m.base + 0x20C0) as *const u32) };
+        assert_eq!(
+            count, 9,
+            "thread/process attach, entry, process/thread detach"
+        );
+        let events =
+            unsafe { std::slice::from_raw_parts((m.base + 0x20C4) as *const u32, count as usize) };
+        assert_eq!(
+            events,
+            &[
+                0x0702_01,   // callback 1, DLL_THREAD_ATTACH, template byte 7
+                0x0702_02,   // callback 2, DLL_THREAD_ATTACH, template byte 7
+                0x0701_01,   // callback 1, DLL_PROCESS_ATTACH
+                0x0701_02,   // callback 2, DLL_PROCESS_ATTACH
+                0x0007_0045, // entry, template byte 7
+                0x0800_01,   // callback 1, DLL_PROCESS_DETACH, byte changed by entry
+                0x0800_02,   // callback 2, DLL_PROCESS_DETACH
+                0x0803_01,   // callback 1, DLL_THREAD_DETACH
+                0x0803_02,   // callback 2, DLL_THREAD_DETACH
+            ],
+            "thread attach → process attach → entry → process detach → thread detach"
+        );
+
+        // A fresh attach must allocate the template again, proving detach freed the old block.
+        crate::tls::attach_current_thread().expect("fresh attach after run_main");
+        let fresh = unsafe { read_tls_byte(index) };
+        crate::tls::detach_current_thread();
+        assert_eq!(fresh, 7, "fresh per-thread template after cleanup");
+        assert_eq!(
+            unsafe { gs_base() },
+            previous_gs,
+            "fresh detach restores GS"
+        );
 
         let a = crate::tls::spawn("tls-main-a", move || unsafe {
             let first = read_tls_byte(index);
@@ -688,6 +903,7 @@ mod tests {
         .expect("spawn b");
         assert_eq!(a.join().unwrap(), (7, 8));
         assert_eq!(b.join().unwrap(), (7, 8));
+        println!("synthetic main lifecycle: ok");
     }
 
     unsafe fn slots_for(index: u32) -> *mut u8 {
@@ -707,6 +923,33 @@ mod tests {
         let m = map_image(&p).unwrap();
         assert_eq!(perms_at(m.base).as_deref(), Some("r--p"), ".headers");
         assert_eq!(perms_at(m.base + 0x1000).as_deref(), Some("r-xp"), ".text");
+    }
+
+    #[test]
+    fn main_image_with_imports_is_rejected_before_execution() {
+        let base = 0x6E57_0000_0000u64;
+        let mut code = vec![0x31, 0xC0, 0xC3];
+        code.resize(0x80, 0xCC);
+        // One valid IMAGE_IMPORT_DESCRIPTOR at RVA 0x1010, followed by its null terminator.
+        for (i, v) in [0x1040u32, 0, 0, 0x1050, 0x1060].into_iter().enumerate() {
+            p32(&mut code, 0x10 + i * 4, v);
+        }
+        code[0x24..0x38].fill(0); // null IMAGE_IMPORT_DESCRIPTOR
+        p64(&mut code, 0x40, base + 0x1070); // OriginalFirstThunk
+        p64(&mut code, 0x48, 0);
+        code[0x50..0x50 + b"kernel32.dll\0".len()].copy_from_slice(b"kernel32.dll\0");
+        p64(&mut code, 0x60, base + 0x1070); // FirstThunk
+        p64(&mut code, 0x68, 0);
+        code[0x72..0x72 + b"ExitProcess\0".len()].copy_from_slice(b"ExitProcess\0");
+        let mut file = tiny_dll(base, &code, Some((0x1010, 40)));
+        p16(&mut file, 0x56, 0x0022);
+        let path = write("xcl_import_main.exe", &file);
+
+        let error = load_main(&path)
+            .err()
+            .expect("unresolved imports must not run");
+        assert!(error.contains("import resolution"), "{error}");
+        assert!(modules::find_mapped_by_base(base as usize).is_none());
     }
 
     #[test]

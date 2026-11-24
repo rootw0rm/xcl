@@ -40,8 +40,10 @@ use std::thread::JoinHandle;
 pub const NO_INDEX: u32 = u32::MAX;
 
 /// `PIMAGE_TLS_CALLBACK` on x64: `void (*)(PVOID hinst, DWORD reason, PVOID reserved)`.
-pub type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
+/// PE code uses the Windows x64 ABI even when the host is Linux.
+pub type TlsCallback = unsafe extern "win64" fn(*mut c_void, u32, *mut c_void);
 
+pub const DLL_PROCESS_DETACH: u32 = 0;
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 pub const DLL_THREAD_ATTACH: u32 = 2;
 pub const DLL_THREAD_DETACH: u32 = 3;
@@ -238,8 +240,9 @@ fn lock_install() -> Result<std::sync::MutexGuard<'static, ()>, String> {
 
 /// Register an image and allocate its block in every thread that is already attached.
 ///
-/// `// LINUX-TODO: Phase C step-10` — process-attach callbacks (`reason == 1`) and DllMain
-/// are the loader's `run_main`/`init_dll` work, when those are ported.
+/// `// LINUX-TODO: Phase C step-10` — game-DLL process-attach callbacks (`reason == 1`) and
+/// DllMain are the loader's `init_dll` work. The main executable's process callbacks run in
+/// `loader_linux::run_main` after the current thread has attached.
 ///
 /// # Safety
 /// `template` must point at `template_len` readable bytes in a live mapping, and
@@ -456,7 +459,7 @@ mod tests {
         Box::into_raw(Box::new(NO_INDEX)) as usize
     }
 
-    unsafe extern "system" fn record_callback(
+    unsafe extern "win64" fn record_callback(
         hinst: *mut c_void,
         reason: u32,
         _reserved: *mut c_void,
