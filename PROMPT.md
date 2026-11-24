@@ -9,15 +9,22 @@ full work plan.
 
 ## Status snapshot (2026-11-24 — refresh this when a phase flips)
 
-- `linux` @ `ed0fd32` (6 commits ahead of `origin/linux` @ `038c41a`,
-  in sync with upstream `main` @ `1d027e5`).
+- `linux` @ `141768c` (merge `7393c0e` of upstream `main` @ `20cf130`
+  plus a Linux gate fix; `origin/linux` trails — push when asked).
   Verify with `git log --oneline -3; git status -sb`.
+  Upstream brought the direct-DXIL follow-up (`TRANSLATOR_VERSION` 6→7:
+  MSAA `textureLoad`-before-dimensions fix, geometry records, rounding
+  lowers) — cache invalidation rides the version bump in `pso.rs`, no
+  `build.rs` change needed. Its 4 new GPU test modules
+  (`fuzz/msaa/round/geometry_tests`) are `cfg(all(test, windows))` on
+  Linux, same as `core_tests` (`141768c`).
   NOTE: this machine has **no game files** — `/run/media/...` does not
   exist here. Retail-dependent steps are SKIPPED on this host (see §4.7);
   never block the loop on them.
 - **Phase A done.** `cargo check -p xcl --tests` and `cargo check --workspace`
   are green (0 errors) on `x86_64-unknown-linux-gnu`; `cargo test -p xcl --lib`
-  passes (369 passed, 0 failed at last check). `target/debug/xcl` builds.
+  passes (369 passed, 0 failed, re-verified after the `20cf130` sync).
+  `target/debug/xcl` builds.
 - **Phase B done** (where game files exist). Offline tools run on the real
   paths, e.g. `xcl inspect .../game_scarlett_master.exe` reports 587 imports /
   247 stubs; `xcl rpf`, `xcl shaders`, `xcl disasm` work on the game folder and
