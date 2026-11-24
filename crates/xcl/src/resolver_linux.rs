@@ -513,6 +513,13 @@ mod tests {
             ("api-ms-win-crt-string-l1-1-0.dll", "wcsncmp"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strchr"),
             ("api-ms-win-crt-string-l1-1-0.dll", "memchr"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_purecall"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_get_purecall_handler"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_invoke_watson"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "terminate"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_get_terminate"),
+            ("api-ms-win-crt-heap-l1-1-0.dll", "_get_invalid_parameter_handler"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__CxxFrameHandler3"),
             ("ucrtbase.dll", "memcpy"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
@@ -578,6 +585,21 @@ mod tests {
             ("msvcp140.dll", "_callnewh"),
             ("vcruntime140.dll", "_set_new_handler"),
             ("concrt140.dll", "_query_new_handler"),
+            ("vcruntime140.dll", "_purecall"),
+            ("msvcp140.dll", "_set_purecall_handler"),
+            ("concrt140.dll", "_get_purecall_handler"),
+            ("vcruntime140.dll", "_invoke_watson"),
+            ("msvcp140.dll", "_invalid_parameter"),
+            ("vcruntime140.dll", "_invalid_parameter_noinfo"),
+            ("concrt140.dll", "_get_invalid_parameter_handler"),
+            ("msvcp140.dll", "terminate"),
+            ("vcruntime140.dll", "_set_terminate"),
+            ("concrt140.dll", "_get_terminate"),
+            ("vcomp140.dll", "_set_unexpected"),
+            ("vccorlib140.dll", "_get_unexpected"),
+            ("msvcp140.dll", "_CxxThrowException"),
+            ("vcruntime140.dll", "__CxxFrameHandler3"),
+            ("msvcp140.dll", "__CxxFrameHandler4"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
@@ -610,6 +632,10 @@ mod tests {
             op_del(p);
             op_del(std::ptr::null_mut());
         }
+        // The routed frame personality is directly callable and declines (1).
+        let (addr, _) = resolve_inner(&dll_key("vcruntime140.dll"), &name("__CxxFrameHandler3"), 0);
+        let fh: unsafe extern "win64" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+        assert_eq!(unsafe { fh() }, 1);
         // Even when a bundled file exists on disk, the HLE route wins over GameDll.
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

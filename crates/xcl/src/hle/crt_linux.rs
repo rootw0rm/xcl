@@ -197,9 +197,22 @@ pub unsafe extern "win64" fn _set_app_type(_t: i32) -> i32 {
     0
 }
 
-/// `__acrt_thread_parameter* _set_invalid_parameter_handler(...)` — was NULL.
-pub unsafe extern "win64" fn _set_invalid_parameter_handler(_h: usize) -> usize {
-    0
+static PURECALL_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static TERMINATE_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static UNEXPECTED_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static INVALID_PARAM_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+/// `__acrt_thread_parameter* _set_invalid_parameter_handler(...)` — store the
+/// handler, return the previous one (`0` = none). `msvcp140` `DllMain` installs
+/// one during facet init; without storage a later `_invalid_parameter` call
+/// would have nowhere to dispatch.
+pub unsafe extern "win64" fn _set_invalid_parameter_handler(h: usize) -> usize {
+    INVALID_PARAM_HANDLER.swap(h, Ordering::Relaxed)
+}
+
+/// `... _get_invalid_parameter_handler(void)` — current handler or `0`.
+pub unsafe extern "win64" fn _get_invalid_parameter_handler() -> usize {
+    INVALID_PARAM_HANDLER.load(Ordering::Relaxed)
 }
 
 /// `int _crt_atexit(void (__cdecl* f)(void))` — `0` = registered.
@@ -308,6 +321,140 @@ pub unsafe extern "win64" fn _exit(code: i32) -> ! {
 /// `void _cexit(void)` — run C terminators, then terminate with code `0`.
 pub unsafe extern "win64" fn _cexit() -> ! {
     libc::_exit(0);
+}
+
+// ---------------------------------------------------------------------------------------
+// C++ termination / EH plumbing (purecall, Watson, terminate/unexpected, throw).
+// Same NULL-stub fault class as memcpy/new: `msvcp140`/`vcruntime` `DllMain` and
+// static initializers link these, and a logging stub that returns would resume into
+// garbage. C++ semantics demand abort; the shims below log through `xlog` and abort
+// via libc (or dispatch a stored handler first), never return a bogus code.
+// ---------------------------------------------------------------------------------------
+
+type VoidFn = unsafe extern "win64" fn();
+type InvalidParamFn =
+    unsafe extern "win64" fn(*const u16, *const u16, *const u16, u32, usize);
+
+/// `void _purecall(void)` — pure-virtual call: run the installed handler if any,
+/// else abnormal termination. Never returns.
+pub unsafe extern "win64" fn _purecall() -> ! {
+    let h = PURECALL_HANDLER.load(Ordering::Relaxed);
+    if h != 0 {
+        (std::mem::transmute::<usize, VoidFn>(h))();
+    } else {
+        crate::xlog_warn!("crt: _purecall with no handler — aborting");
+    }
+    libc::abort();
+}
+
+/// `_purecall_handler _set_purecall_handler(...)` — store, return previous.
+pub unsafe extern "win64" fn _set_purecall_handler(h: usize) -> usize {
+    PURECALL_HANDLER.swap(h, Ordering::Relaxed)
+}
+
+/// `_purecall_handler _get_purecall_handler(void)` — current handler or `0`.
+pub unsafe extern "win64" fn _get_purecall_handler() -> usize {
+    PURECALL_HANDLER.load(Ordering::Relaxed)
+}
+
+/// `void _invoke_watson(...)` — fatal CRT error: log and abort. Never returns.
+pub unsafe extern "win64" fn _invoke_watson(
+    _expr: *const u16,
+    _func: *const u16,
+    _file: *const u16,
+    _line: u32,
+    _reserved: usize,
+) -> ! {
+    crate::xlog_warn!("crt: _invoke_watson — aborting");
+    libc::abort();
+}
+
+/// `void _invalid_parameter(...)` — call the installed handler if any, else no-op.
+/// Returns `()` so facet init survives when no handler is installed.
+pub unsafe extern "win64" fn _invalid_parameter(
+    expr: *const u16,
+    func: *const u16,
+    file: *const u16,
+    line: u32,
+    reserved: usize,
+) {
+    let h = INVALID_PARAM_HANDLER.load(Ordering::Relaxed);
+    if h != 0 {
+        (std::mem::transmute::<usize, InvalidParamFn>(h))(expr, func, file, line, reserved);
+    }
+}
+
+/// `void _invalid_parameter_noinfo(void)` — same handler, null source info.
+pub unsafe extern "win64" fn _invalid_parameter_noinfo() {
+    let h = INVALID_PARAM_HANDLER.load(Ordering::Relaxed);
+    if h != 0 {
+        (std::mem::transmute::<usize, InvalidParamFn>(h))(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            0,
+        );
+    }
+}
+
+/// `void terminate(void)` — run the installed handler if any, then abort.
+pub unsafe extern "win64" fn terminate() -> ! {
+    let h = TERMINATE_HANDLER.load(Ordering::Relaxed);
+    if h != 0 {
+        (std::mem::transmute::<usize, VoidFn>(h))();
+    } else {
+        crate::xlog_warn!("crt: terminate with no handler — aborting");
+    }
+    libc::abort();
+}
+
+/// `terminate_function _set_terminate(...)` — store, return previous.
+pub unsafe extern "win64" fn _set_terminate(h: usize) -> usize {
+    TERMINATE_HANDLER.swap(h, Ordering::Relaxed)
+}
+
+/// `terminate_function _get_terminate(void)` — current handler or `0`.
+pub unsafe extern "win64" fn _get_terminate() -> usize {
+    TERMINATE_HANDLER.load(Ordering::Relaxed)
+}
+
+/// `void unexpected(void)` — run the installed handler if any, then terminate.
+pub unsafe extern "win64" fn unexpected() -> ! {
+    let h = UNEXPECTED_HANDLER.load(Ordering::Relaxed);
+    if h != 0 {
+        (std::mem::transmute::<usize, VoidFn>(h))();
+    }
+    terminate();
+}
+
+/// `unexpected_function _set_unexpected(...)` — store, return previous.
+pub unsafe extern "win64" fn _set_unexpected(h: usize) -> usize {
+    UNEXPECTED_HANDLER.swap(h, Ordering::Relaxed)
+}
+
+/// `unexpected_function _get_unexpected(void)` — current handler or `0`.
+pub unsafe extern "win64" fn _get_unexpected() -> usize {
+    UNEXPECTED_HANDLER.load(Ordering::Relaxed)
+}
+
+/// `void _CxxThrowException(void*, _ThrowInfo*)` — real unwinding is a later
+/// slice (`.pdata` translation); the honest short-term behavior is log-and-abort,
+/// since returning would resume the throw site with no exception in flight.
+pub unsafe extern "win64" fn _CxxThrowException(_obj: usize, _info: usize) -> ! {
+    crate::xlog_warn!("crt: _CxxThrowException — C++ unwinding unimplemented, aborting");
+    libc::abort();
+}
+
+/// `__CxxFrameHandler3` personality: no unwinding yet, so decline to handle
+/// (`ExceptionContinueSearch` = 1) and let the search continue.
+pub unsafe extern "win64" fn __CxxFrameHandler3() -> i32 {
+    1
+}
+
+/// `__CxxFrameHandler4` personality: same as `_3` until unwinding lands.
+pub unsafe extern "win64" fn __CxxFrameHandler4() -> i32 {
+    1
 }
 
 /// `char* strerror(int)` — static generic message (per-code text is a later slice).
@@ -872,6 +1019,22 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("__acrt_iob_func", __acrt_iob_func as usize),
         ("_set_app_type", _set_app_type as usize),
         ("_set_invalid_parameter_handler", _set_invalid_parameter_handler as usize),
+        ("_get_invalid_parameter_handler", _get_invalid_parameter_handler as usize),
+        ("_invalid_parameter", _invalid_parameter as usize),
+        ("_invalid_parameter_noinfo", _invalid_parameter_noinfo as usize),
+        ("_invoke_watson", _invoke_watson as usize),
+        ("_purecall", _purecall as usize),
+        ("_set_purecall_handler", _set_purecall_handler as usize),
+        ("_get_purecall_handler", _get_purecall_handler as usize),
+        ("terminate", terminate as usize),
+        ("_set_terminate", _set_terminate as usize),
+        ("_get_terminate", _get_terminate as usize),
+        ("unexpected", unexpected as usize),
+        ("_set_unexpected", _set_unexpected as usize),
+        ("_get_unexpected", _get_unexpected as usize),
+        ("_CxxThrowException", _CxxThrowException as usize),
+        ("__CxxFrameHandler3", __CxxFrameHandler3 as usize),
+        ("__CxxFrameHandler4", __CxxFrameHandler4 as usize),
         ("_crt_atexit", _crt_atexit as usize),
         ("_register_onexit_function", _register_onexit_function as usize),
         ("_initialize_onexit_table", _initialize_onexit_table as usize),
@@ -1003,7 +1166,10 @@ mod tests {
     fn narrow_init_helpers_report_success() {
         unsafe {
             assert_eq!(_set_app_type(1), 0);
-            assert_eq!(_set_invalid_parameter_handler(0), 0);
+            // Handler storage is global; save/restore so parallel tests don't flake.
+            let prev_ip = _set_invalid_parameter_handler(0);
+            assert_eq!(_get_invalid_parameter_handler(), 0);
+            _set_invalid_parameter_handler(prev_ip);
             assert_eq!(_crt_atexit(0), 0);
             assert_eq!(_register_onexit_function(0, 0), 0);
             assert_eq!(_initialize_onexit_table(0), 0);
@@ -1121,6 +1287,63 @@ mod tests {
             assert_eq!(_callnewh(64), 1);
             assert_eq!(_set_new_handler(0), probe as usize);
             assert_eq!(_query_new_handler(), 0);
+        }
+    }
+
+    #[test]
+    fn terminate_handlers_store_and_dispatch() {
+        unsafe {
+            // Frame personalities decline (ContinueSearch) without aborting.
+            assert_eq!(__CxxFrameHandler3(), 1);
+            assert_eq!(__CxxFrameHandler4(), 1);
+            // Purecall / terminate / unexpected handler slots round-trip.
+            unsafe extern "win64" fn pure_probe() {}
+            unsafe extern "win64" fn term_probe() {}
+            unsafe extern "win64" fn unex_probe() {}
+            let prev_pure = _set_purecall_handler(pure_probe as usize);
+            assert_eq!(_get_purecall_handler(), pure_probe as usize);
+            _set_purecall_handler(prev_pure);
+            let prev_term = _set_terminate(term_probe as usize);
+            assert_eq!(_get_terminate(), term_probe as usize);
+            _set_terminate(prev_term);
+            let prev_unex = _set_unexpected(unex_probe as usize);
+            assert_eq!(_get_unexpected(), unex_probe as usize);
+            _set_unexpected(prev_unex);
+            // Invalid-parameter dispatch calls the installed handler, no-ops without.
+            static HIT: AtomicUsize = AtomicUsize::new(0);
+            unsafe extern "win64" fn ip_probe(
+                _e: *const u16,
+                _f: *const u16,
+                _d: *const u16,
+                _l: u32,
+                _r: usize,
+            ) {
+                HIT.fetch_add(1, Ordering::SeqCst);
+            }
+            let prev_ip = _set_invalid_parameter_handler(ip_probe as usize);
+            assert_eq!(_get_invalid_parameter_handler(), ip_probe as usize);
+            HIT.store(0, Ordering::SeqCst);
+            _invalid_parameter(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+            );
+            assert_eq!(HIT.load(Ordering::SeqCst), 1);
+            HIT.store(0, Ordering::SeqCst);
+            _invalid_parameter_noinfo();
+            assert_eq!(HIT.load(Ordering::SeqCst), 1);
+            _set_invalid_parameter_handler(0);
+            _invalid_parameter(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+            );
+            _invalid_parameter_noinfo();
+            _set_invalid_parameter_handler(prev_ip);
         }
     }
 
