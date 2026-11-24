@@ -21,7 +21,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::util::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, S_FALSE, S_OK};
+use crate::util::{E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, S_FALSE, S_OK};
 
 const VTBL_SLOTS: usize = 256;
 const DLL: &str = "d3d12_xs.dll";
@@ -35,6 +35,9 @@ pub enum Kind {
     Fence,
     DescriptorHeap,
     Resource,
+    /// A console `CreatePlacedResourceX` resource: its GPU VA is the title's own
+    /// memory (host-accessible), not a fake bump-allocator address.
+    PlacedResource,
     Heap,
     PipelineState,
     RootSignature,
@@ -54,7 +57,7 @@ impl Kind {
             Kind::CommandList => "ID3D12GraphicsCommandList",
             Kind::Fence => "ID3D12Fence",
             Kind::DescriptorHeap => "ID3D12DescriptorHeap",
-            Kind::Resource => "ID3D12Resource",
+            Kind::Resource | Kind::PlacedResource => "ID3D12Resource",
             Kind::Heap => "ID3D12Heap",
             Kind::PipelineState => "ID3D12PipelineState",
             Kind::RootSignature => "ID3D12RootSignature",
@@ -139,14 +142,22 @@ fn vtable(kind: Kind) -> *const usize {
             v[40] = Ret_S_OK as usize; // SetStablePowerState
             v[41] = Device_CreateCommandSignature as usize;
             v[43] = Device_GetAdapterLuid as usize;
-            v[44] = Device_CreatePipelineLibrary as usize;
+            v[44] = Device_CreatePlacedResourceX as usize; // console placed title memory
             v[45] = Device_SetEventOnMultipleFenceCompletion as usize;
             v[46] = Ret_S_OK as usize; // SetResidencyPriority
-            v[47] = Device_CreatePipelineStateStream as usize; // CreatePipelineState (Device2)
+            v[47] = Ret_S_OK as usize; // console extension #47 (unmodelled, S_OK)
+            v[48] = Device_CreateCommandQueueX as usize; // console queue (DMA)
             v[51] = Device_CreateCommandList1 as usize;
+            v[52] = Ret_S_OK as usize; // console SetDebugFlagsX
             v[53] = Device_CreateCommittedResource1 as usize;
             v[54] = Device_CreateHeap1 as usize;
+            v[55] = Device_CreateDerivedPipelineStateX as usize; // console derived PSO
+            v[56] = Device_SerializePipelineStateX as usize; // E_ACCESSDENIED like the console
+            v[60] = Device_CreateGraphicsPipelineStateX as usize; // console PSO
             v[62] = Device_CreatePipelineState4 as usize; // CreateStateObject (Device5)
+            v[73] = Device_CreateCommandListX as usize; // console list (DMA)
+            v[74] = Device_RegisterPagePoolX as usize;
+            v[75] = Device_UnregisterPagePoolX as usize;
         }
         Kind::CommandQueue => {
             v[10] = Ret_Void as usize; // ExecuteCommandLists
@@ -161,6 +172,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
             v[9] = Ret_S_OK as usize; // Close
             v[10] = Ret_S_OK as usize; // Reset
+            v[11] = Dma_CopyBufferRegion as usize; // console DMA CopyBufferRegion
         }
         Kind::Fence => {
             v[8] = Fence_GetCompletedValue as usize;
@@ -172,7 +184,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[9] = Heap_GetHandleStart as usize; // CPU
             v[10] = Heap_GetHandleStart as usize; // GPU
         }
-        Kind::Resource => {
+        Kind::Resource | Kind::PlacedResource => {
             v[8] = Resource_Map as usize;
             v[9] = Ret_Void as usize; // Unmap
             v[10] = Resource_GetDesc as usize;
@@ -391,10 +403,6 @@ unsafe extern "win64" fn Device_CreateComputePipelineState(_t: *mut NullObj, d: 
     capture_compute_desc(d);
     out_obj(ppv, Kind::PipelineState)
 }
-unsafe extern "win64" fn Device_CreatePipelineStateStream(_t: *mut NullObj, d: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    capture_stream_desc(d);
-    out_obj(ppv, Kind::PipelineState)
-}
 unsafe extern "win64" fn Device_CreateCommandList(_t: *mut NullObj, _m: u32, _ty: u32, _a: *mut c_void, _p: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     out_obj(ppv, Kind::CommandList)
 }
@@ -563,14 +571,182 @@ unsafe extern "win64" fn Device_GetAdapterLuid(_t: *mut NullObj, ret: *mut u64) 
     }
     ret
 }
-unsafe extern "win64" fn Device_CreatePipelineLibrary(_t: *mut NullObj, _b: *const c_void, _l: usize, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    out_obj(ppv, Kind::PipelineLibrary)
-}
 unsafe extern "win64" fn Device_SetEventOnMultipleFenceCompletion(_t: *mut NullObj, _f: *const c_void, _v: *const u64, _n: u32, _flags: u32, ev: *mut c_void) -> HRESULT {
     if !ev.is_null() {
         crate::hle::kernelx_linux::SetEvent(ev as usize);
     }
     S_OK
+}
+
+// ---------------------------------------------------------------------------------------
+// console device extensions (Phase C step 11s): the title's own memory, DMA queue/list,
+// derived/console PSOs, page pools. Slots collide with PC Device1/2 methods the null
+// device never served the title (no PipelineLibrary/stream use); the title is console.
+// ---------------------------------------------------------------------------------------
+
+/// `CreatePlacedResourceX(va, desc, state, clear, riid, out)`: the resource IS the
+/// title's memory at `va` – record the desc and report `va` back, no host backing.
+unsafe extern "win64" fn Device_CreatePlacedResourceX(
+    _t: *mut NullObj,
+    va: u64,
+    desc: *const u8,
+    _state: u32,
+    _clear: *const c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() || va == 0 {
+        return E_INVALIDARG;
+    }
+    let o = new_obj(Kind::PlacedResource);
+    if !desc.is_null() {
+        std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 56);
+    }
+    (*o).value.store(va, Ordering::Relaxed);
+    *ppv = o as *mut c_void;
+    S_OK
+}
+
+/// `CreateCommandQueueX(desc[4], riid, out)`: `desc[0]` is the queue type (0x10 DMA).
+unsafe extern "win64" fn Device_CreateCommandQueueX(
+    _t: *mut NullObj,
+    _desc: *const u32,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    out_obj(ppv, Kind::CommandQueue)
+}
+
+/// `CreateCommandListX(desc[4], allocator, state, riid, out)`.
+unsafe extern "win64" fn Device_CreateCommandListX(
+    _t: *mut NullObj,
+    _desc: *const u32,
+    _alloc: *mut c_void,
+    _state: *mut c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    out_obj(ppv, Kind::CommandList)
+}
+
+/// `CreateGraphicsPipelineStateX(desc, flags, cache, riid, out)`: capture and accept.
+unsafe extern "win64" fn Device_CreateGraphicsPipelineStateX(
+    _t: *mut NullObj,
+    d: *const u8,
+    _flags: u32,
+    _cache: *const c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    capture_graphics_desc(d);
+    out_obj(ppv, Kind::PipelineState)
+}
+
+/// `CreateDerivedPipelineStateX(base, count, patch, riid, out)`: `patch[0]` selects the
+/// derivation (2 = blend state). Unknown derivations fail like the console.
+unsafe extern "win64" fn Device_CreateDerivedPipelineStateX(
+    _t: *mut NullObj,
+    _base: *mut c_void,
+    _count: u32,
+    patch: *const u8,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if patch.is_null() {
+        return E_INVALIDARG;
+    }
+    match *patch {
+        2 => out_obj(ppv, Kind::PipelineState),
+        _ => E_INVALIDARG,
+    }
+}
+
+/// `SerializePipelineStateX(what)`: the console refuses with `E_ACCESSDENIED`.
+unsafe extern "win64" fn Device_SerializePipelineStateX(
+    _t: *mut NullObj,
+    _what: *mut c_void,
+) -> HRESULT {
+    0x8007_0005u32 as i32 // E_ACCESSDENIED
+}
+
+static PAGE_POOL_NEXT: AtomicU32 = AtomicU32::new(1);
+static PAGE_POOLS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// `RegisterPagePoolX(base, count, out)`: hand a monotonic pool id.
+unsafe extern "win64" fn Device_RegisterPagePoolX(
+    _t: *mut NullObj,
+    _base: u64,
+    _count: u32,
+    out: *mut u32,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let id = PAGE_POOL_NEXT.fetch_add(1, Ordering::Relaxed);
+    PAGE_POOLS.lock().unwrap().push(id);
+    *out = id;
+    S_OK
+}
+
+/// `UnregisterPagePoolX(pool)`: `S_OK` once, `E_FAIL` when the pool is unknown.
+unsafe extern "win64" fn Device_UnregisterPagePoolX(_t: *mut NullObj, pool: u64) -> HRESULT {
+    let mut g = PAGE_POOLS.lock().unwrap();
+    match g.iter().position(|&p| p as u64 == pool) {
+        Some(i) => {
+            g.remove(i);
+            S_OK
+        }
+        None => E_FAIL,
+    }
+}
+
+/// Ensure a resource has host backing and hand its pointer plus size.
+unsafe fn resource_backing(o: *mut NullObj) -> (*mut u8, usize) {
+    let mut g = (*o).mem.lock().unwrap();
+    if g.0 == 0 {
+        let n = g.1.max(1);
+        let p = libc::malloc(n) as usize;
+        if p != 0 {
+            std::ptr::write_bytes(p as *mut u8, 0, n);
+        }
+        g.0 = p;
+    }
+    (g.0 as *mut u8, g.1)
+}
+
+/// Console DMA `CopyBufferRegion(dst, dst_off, src, src_off, bytes)`: an immediate host
+/// `memcpy`. Placed resources read from the title's memory (their VA); committed ones
+/// from their Map backing. Enough for the title's DMA round-trip check; the queue's
+/// `ExecuteCommandLists` stays a no-op because the copy already happened.
+unsafe extern "win64" fn Dma_CopyBufferRegion(
+    _t: *mut NullObj,
+    dst: *mut NullObj,
+    dst_off: u64,
+    src: *mut NullObj,
+    src_off: u64,
+    bytes: u64,
+) {
+    if dst.is_null() || src.is_null() || bytes == 0 {
+        return;
+    }
+    let n = bytes as usize;
+    let (dp, dn) = resource_backing(dst);
+    if dp.is_null() || dst_off as usize + n > dn {
+        return;
+    }
+    if (*src).kind == Kind::PlacedResource {
+        let va = (*src).value.load(Ordering::Relaxed);
+        if va == 0 {
+            return;
+        }
+        std::ptr::copy_nonoverlapping((va + src_off) as *const u8, dp.add(dst_off as usize), n);
+    } else {
+        let (sp, sn) = resource_backing(src);
+        if sp.is_null() || src_off as usize + n > sn {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(sp.add(src_off as usize), dp.add(dst_off as usize), n);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -678,7 +854,7 @@ unsafe extern "win64" fn Blob_GetBufferSize(this: *mut NullObj) -> usize {
     (*this).mem.lock().unwrap().1
 }
 
-unsafe fn new_blob(size: usize, out: *mut *mut c_void) -> HRESULT {
+pub(crate) unsafe fn new_blob(size: usize, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -686,6 +862,20 @@ unsafe fn new_blob(size: usize, out: *mut *mut c_void) -> HRESULT {
     let buf = vec![0u8; size.max(1)].leak();
     *(*o).mem.lock().unwrap() = (buf.as_mut_ptr() as usize, size);
     *out = o as *mut c_void;
+    S_OK
+}
+
+/// A blob pre-filled with `len` bytes from `src` (the headless `D3DCompile` echo).
+pub(crate) unsafe fn new_blob_from(src: *const u8, len: usize, out: *mut *mut c_void) -> HRESULT {
+    let hr = new_blob(len, out);
+    if hr != S_OK {
+        return hr;
+    }
+    let back = (*(*out as *mut NullObj)).mem.lock().unwrap().0 as *mut u8;
+    if back.is_null() {
+        return E_FAIL;
+    }
+    std::ptr::copy_nonoverlapping(src, back, len);
     S_OK
 }
 
@@ -882,6 +1072,73 @@ mod tests {
                     assert_eq!(start(h), base, "slot {i}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn console_placed_dma_and_pools_roundtrip() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            // title memory the placed resource aliases
+            let mut title = vec![0u32; 64];
+            for (i, v) in title.iter_mut().enumerate() {
+                *v = 0xC0DE_0000 | i as u32;
+            }
+            let mut desc = [0u8; 56];
+            desc[0] = 1; // BUFFER
+            desc[16..24].copy_from_slice(&256u64.to_le_bytes());
+            type PlacedX = unsafe extern "win64" fn(*mut c_void, u64, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let placed: PlacedX = std::mem::transmute(slot(dev, 44));
+            let mut raw = std::ptr::null_mut();
+            assert_eq!(placed(dev, title.as_ptr() as u64, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut raw), S_OK);
+            assert!(!raw.is_null());
+            let va: unsafe extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(slot(raw, 11));
+            assert_eq!(va(raw), title.as_ptr() as u64);
+            // readback + DMA copy through the DMA queue/list slots
+            type QueueX = unsafe extern "win64" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let queue_x: QueueX = std::mem::transmute(slot(dev, 48));
+            let mut q = std::ptr::null_mut();
+            assert_eq!(queue_x(dev, [0x10u32, 0, 0, 0].as_ptr(), std::ptr::null(), &mut q), S_OK);
+            type ListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let list_x: ListX = std::mem::transmute(slot(dev, 73));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            let create_rb: unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 27));
+            let mut rb = std::ptr::null_mut();
+            assert_eq!(create_rb(dev, std::ptr::null(), 0, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+            type Copy = unsafe extern "win64" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+            let copy: Copy = std::mem::transmute(slot(l, 11));
+            copy(l, rb, 0, raw, 0, 256);
+            let map: unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(slot(rb, 8));
+            let mut p = std::ptr::null_mut();
+            assert_eq!(map(rb, 0, std::ptr::null(), &mut p), S_OK);
+            assert_eq!(std::slice::from_raw_parts(p as *const u32, 64), &title[..]);
+            // console PSO + derived PSO blend accept, unknown derivation fails
+            type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
+            let mut pso = std::ptr::null_mut();
+            assert_eq!(pso_x(dev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut pso), S_OK);
+            assert!(!pso.is_null());
+            type DerivedX = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, *const u8, *const c_void, *mut *mut c_void) -> HRESULT;
+            let derive: DerivedX = std::mem::transmute(slot(dev, 55));
+            let mut d2 = std::ptr::null_mut();
+            assert_eq!(derive(dev, pso, 1, [2u8].as_ptr(), std::ptr::null(), &mut d2), S_OK);
+            assert!(!d2.is_null());
+            assert!(derive(dev, pso, 1, [4u8].as_ptr(), std::ptr::null(), &mut d2) < 0);
+            // serialize refuses, extension #47 stays S_OK, pools register once
+            let ser: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(slot(dev, 56));
+            assert_eq!(ser(dev, std::ptr::null_mut()), 0x8007_0005u32 as i32);
+            let ext: unsafe extern "win64" fn(*mut c_void, usize, usize, usize) -> HRESULT = std::mem::transmute(slot(dev, 47));
+            assert_eq!(ext(dev, 0, 0, 0), S_OK);
+            let reg: unsafe extern "win64" fn(*mut c_void, u64, u32, *mut u32) -> HRESULT = std::mem::transmute(slot(dev, 74));
+            let unreg: unsafe extern "win64" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(slot(dev, 75));
+            let mut pool = u32::MAX;
+            assert_eq!(reg(dev, 0x2_0000_0000, 16, &mut pool), S_OK);
+            assert_ne!(pool, u32::MAX);
+            assert_eq!(unreg(dev, pool as u64), S_OK);
+            assert!(unreg(dev, pool as u64) < 0);
         }
     }
 

@@ -15,6 +15,22 @@ pub struct PipeConfig {
     pub pkrs_log2: u32,
 }
 
+/// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
+/// From the console's own layout library: every texel of every mode matches with 32 pipes /
+/// 8 packers by default (Series X), 8 pipes / 4 packers with its hardware version 4 (taken
+/// to be Series S).
+pub const CONSOLE_PIPES: PipeConfig = PipeConfig { pipes_log2: 5, pkrs_log2: 3 };
+pub const SERIES_S_PIPES: PipeConfig = PipeConfig { pipes_log2: 3, pkrs_log2: 2 };
+
+/// The pipe configuration of the console XCL reports to the title (`XSystemGetDeviceType`).
+pub fn console_pipes() -> PipeConfig {
+    if crate::state::config().is_series_s() {
+        SERIES_S_PIPES
+    } else {
+        CONSOLE_PIPES
+    }
+}
+
 impl PipeConfig {
     /// row group in the RB+ tables (addrlib Gfx10Lib::HwlInitGlobalParams, m_colorBaseIndex)
     fn group(self) -> usize {

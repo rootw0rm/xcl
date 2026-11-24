@@ -831,6 +831,65 @@ mod tests {
     }
 
     #[test]
+    fn xg_d3dcompile_imports_resolve_to_hle() {
+        // Step 11s: XG texture computer (routed HLE) + headless D3DCompile
+        // (routeless `d3dcompiler_47.dll`, resolved via the cross-HLE lookup).
+        for (dll, sym) in [
+            ("xg_xs.dll", "XGCreateTextureComputer"),
+            ("xg_xs.dll", "XGSuggestSwizzleMode"),
+            ("d3dcompiler_47.dll", "D3DCompile"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // The fake compiler echoes its source into a blob.
+        let (addr, _) = resolve_inner(&dll_key("d3dcompiler_47.dll"), &name("D3DCompile"), 0);
+        type Compile = unsafe extern "win64" fn(
+            *const u8,
+            usize,
+            *const u8,
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *const u8,
+            *const u8,
+            u32,
+            u32,
+            *mut *mut std::ffi::c_void,
+            *mut *mut std::ffi::c_void,
+        ) -> i32;
+        let compile: Compile = unsafe { std::mem::transmute(addr) };
+        unsafe {
+            let src = b"float4 main() : SV_Target { return 1; }";
+            let mut code = std::ptr::null_mut();
+            assert_eq!(
+                compile(
+                    src.as_ptr(),
+                    src.len(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    b"main\0".as_ptr(),
+                    b"ps_5_0\0".as_ptr(),
+                    0,
+                    0,
+                    &mut code,
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            assert!(!code.is_null());
+        }
+    }
+
+    #[test]
     fn stub_thunk_calls_log_and_return() {
         let (addr, src) = resolve_inner("kernelx.dll", &name("LinuxProbeThunk"), 0);
         assert_eq!(src, Source::Stub);

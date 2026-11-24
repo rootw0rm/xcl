@@ -215,6 +215,8 @@ mod tests {
     fn linux_classification_never_claims_hle() {
         assert_eq!(classify("kernel32.dll", &name("CreateFileW"), None), "HLE (kernelx.dll)");
         assert_eq!(classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice"), None), "HLE (d3d12_xs.dll)");
+        assert_eq!(classify("xg_xs.dll", &name("XGCreateTextureComputer"), None), "HLE (xg_xs.dll)");
+        assert_eq!(classify("d3dcompiler_47.dll", &name("D3DCompile"), None), "HLE (d3dcompiler_47.dll, other module)");
         assert_eq!(classify("ucrtbase.dll", &name("malloc"), None), "HLE (ucrtbase.dll, other module)");
         assert_eq!(
             classify("api-ms-win-crt-stdio-l1-1-0.dll", &name("__p__fmode"), None),

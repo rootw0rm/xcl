@@ -31,6 +31,10 @@ pub mod xuser_linux;
 pub mod xaudio2_linux;
 #[path = "hle/d3d12x_linux.rs"]
 pub mod d3d12x_linux;
+#[path = "hle/d3dcompiler_linux.rs"]
+pub mod d3dcompiler_linux;
+#[path = "hle/xg_linux.rs"]
+pub mod xg_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -48,6 +52,11 @@ pub use crate::hle_routes::{
 /// cross-HLE `find_any` name lookup, so every CRT contract variant works without
 /// route-table churn. `inspect` reports these as `HLE (ucrtbase.dll)`.
 pub const UCRT: &str = "ucrtbase.dll";
+
+/// Canonical name of the Linux headless shader-compiler module. Like `UCRT` it has no
+/// route: `d3dcompiler_47.dll!D3DCompile` resolves through `find_any`, so the static
+/// import and any dynamic `GetProcAddress` probe both land on the fake compiler.
+pub const D3DCOMPILER47: &str = "d3dcompiler_47.dll";
 
 /// Linux form: keep the name, store `0` as `Stub` metadata. The Windows form keeps
 /// `$name as usize`. Only one of the two is compiled (see `lib.rs` `#[path]`).
@@ -265,12 +274,27 @@ fn minuserx_exports() -> Vec<(&'static str, usize)> {
     v
 }
 
+/// Step-11s headless shader compiler: the fake `D3DCompile` blob echo. Like `UCRT`
+/// it carries no route and resolves through the cross-HLE `find_any` name lookup.
+fn d3dcompiler47_exports() -> Vec<(&'static str, usize)> {
+    d3dcompiler_linux::exports()
+}
+
 fn xcrdapi_exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![DStorageGetFactory]
 }
 
 fn xg_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![XGCreateTextureComputer, XGSuggestSwizzleMode]
+    let mut v = crate::hle_exports![XGCreateTextureComputer, XGSuggestSwizzleMode];
+    // Step-11s texture computer: real Linux addresses over the stub metadata.
+    for (name, addr) in xg_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn acphal_exports() -> Vec<(&'static str, usize)> {
@@ -313,6 +337,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(MINUSERX, minuserx_exports(), &["user32.dll"]),
         HleModule::new(XCRDAPI, xcrdapi_exports(), &[]),
         HleModule::new(XG, xg_exports(), &[]),
+        HleModule::new(D3DCOMPILER47, d3dcompiler47_exports(), &[]),
         HleModule::new(ACPHAL, acphal_exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput_exports(), &[]),
         HleModule::new(UCRT, crt_exports(), &[]),
@@ -416,8 +441,9 @@ mod tests {
         // implement the kernelx memory/thread/sync/time/file slices, step 11 the CRT
         // startup slice, step 11i the xgameruntime identity slice, step 11m the
         // minuserx window slice, step 11n the headless GameInput slice, step 11o
-        // the XTaskQueue + networking slice, step 11q the XAudio2 slice and
-        // step 11r the D3D12.X null device, so those resolve as HLE.
+        // the XTaskQueue + networking slice, step 11q the XAudio2 slice,
+        // step 11r the D3D12.X null device and step 11s the XG texture
+        // computer + headless D3DCompile, so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
@@ -430,7 +456,9 @@ mod tests {
                     || m.name == MINUSERX
                     || m.name == GAMEINPUT
                     || m.name == D3D12X
-                    || m.name == XAUDIO2)
+                    || m.name == XAUDIO2
+                    || m.name == XG
+                    || m.name == D3DCOMPILER47)
                     && addr != 0
                 {
                     implemented += 1;
@@ -448,8 +476,12 @@ mod tests {
         assert_eq!(r.module_by_name(XGAMERUNTIME).unwrap().exports.len(), 127);
         assert_eq!(r.module_by_name(D3D12X).unwrap().exports.len(), 13);
         assert_eq!(r.module_by_name(UCRT).unwrap().exports.len(), crt_linux::exports().len());
+        assert_eq!(r.module_by_name(XG).unwrap().exports.len(), 2);
+        assert_eq!(r.module_by_name(D3DCOMPILER47).unwrap().exports.len(), 1);
         assert!(r.find_any("XMemAlloc").is_some());
         assert!(r.find_any("D3D12XboxCreateDevice").is_some());
+        assert!(r.find_any("XGCreateTextureComputer").is_some());
+        assert!(r.find_any("D3DCompile").is_some());
         // Step-10b spot checks: real code, not stub metadata.
         for name in [
             "VirtualAlloc",
@@ -631,6 +663,19 @@ mod tests {
             assert_eq!(m.name, D3D12X);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
+        // Step-11s XG texture computer + headless D3DCompile: real code, not stub
+        // metadata. `d3dcompiler_47.dll` stays routeless and resolves via `find_any`.
+        for name in ["XGCreateTextureComputer", "XGSuggestSwizzleMode"] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, XG);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        for name in ["D3DCompile"] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, D3DCOMPILER47);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        assert_eq!(r.hle_for("d3dcompiler_47.dll").map(|m| m.name), None);
         // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.
         // Step-11p XUser/XAsync/save/PLS slice: sign-in + storage are real.
         for name in [
