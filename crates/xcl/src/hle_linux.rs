@@ -29,6 +29,8 @@ pub mod xtaskqueue_linux;
 pub mod xuser_linux;
 #[path = "hle/xaudio2_linux.rs"]
 pub mod xaudio2_linux;
+#[path = "hle/d3d12x_linux.rs"]
+pub mod d3d12x_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -217,6 +219,14 @@ fn d3d12x_exports() -> Vec<(&'static str, usize)> {
     ];
     // Data export on Windows (`&IID_ID3D12Device`); metadata `0` on Linux.
     v.push(("IID_ID3D12Device", 0));
+    // Step-11r null device: real code, not stub metadata.
+    for (name, addr) in d3d12x_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
     v
 }
 
@@ -405,8 +415,9 @@ mod tests {
         // Unimplemented names are metadata `0`, never a callable address. Steps 10b–10c
         // implement the kernelx memory/thread/sync/time/file slices, step 11 the CRT
         // startup slice, step 11i the xgameruntime identity slice, step 11m the
-        // minuserx window slice, step 11n the headless GameInput slice and step 11o
-        // the XTaskQueue + networking slice, so those resolve as HLE.
+        // minuserx window slice, step 11n the headless GameInput slice, step 11o
+        // the XTaskQueue + networking slice, step 11q the XAudio2 slice and
+        // step 11r the D3D12.X null device, so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
@@ -418,6 +429,7 @@ mod tests {
                     || m.name == XGAMERUNTIME
                     || m.name == MINUSERX
                     || m.name == GAMEINPUT
+                    || m.name == D3D12X
                     || m.name == XAUDIO2)
                     && addr != 0
                 {
@@ -604,6 +616,19 @@ mod tests {
         for name in ["XAudio2Create", "XAudio2CreateWithVersionInfo"] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, XAUDIO2);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-11r D3D12.X null device: queue + fence, not stub metadata.
+        for name in [
+            "D3D12CreateDevice",
+            "D3D12XboxCreateDevice",
+            "D3D12SerializeRootSignature",
+            "D3D12SerializeVersionedRootSignature",
+            "D3D10CreateBlob",
+            "D3D12ConfigureVirtualMemoryX",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, D3D12X);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
         // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.

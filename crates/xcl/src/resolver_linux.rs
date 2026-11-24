@@ -372,8 +372,9 @@ mod tests {
         // Every import routed to an HLE module is Stub metadata (address 0) but resolves
         // to a callable auto-stub thunk, never null. Step-10c file APIs are HLE now, so
         // they are covered by `kernelx_core_imports_resolve_to_hle` instead.
+        // Step-11r made d3d12_xs HLE, so the stub probe uses xcrdapi (still Stub).
         for (dll, sym) in [
-            ("d3d12_xs.dll", "D3D12XboxCreateDevice"),
+            ("xcrdapi.dll", "DStorageGetFactory"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert_eq!(src, Source::Stub, "{dll}!{sym}");
@@ -768,6 +769,68 @@ mod tests {
     }
 
     #[test]
+    fn d3d12x_imports_resolve_to_hle() {
+        // Step 11r: headless D3D12.X null device. `d3d12_xs.dll` is routed HLE.
+        for (dll, sym) in [
+            ("d3d12_xs.dll", "D3D12CreateDevice"),
+            ("d3d12_xs.dll", "D3D12XboxCreateDevice"),
+            ("d3d12_xs.dll", "D3D12SerializeRootSignature"),
+            ("d3d12_xs.dll", "D3D10CreateBlob"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // Direct ABI: device hands out queue + fence, signal completes instantly.
+        let (addr, _) = resolve_inner(&dll_key("d3d12_xs.dll"), &name("D3D12CreateDevice"), 0);
+        let create: unsafe extern "win64" fn(
+            *mut std::ffi::c_void,
+            u32,
+            *const std::ffi::c_void,
+            *mut *mut std::ffi::c_void,
+        ) -> i32 = unsafe { std::mem::transmute(addr) };
+        unsafe {
+            let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(create(std::ptr::null_mut(), 0xC000, std::ptr::null(), &mut dev), 0);
+            assert!(!dev.is_null());
+            let vt = *(dev as *const *const usize);
+            let create_queue: unsafe extern "win64" fn(
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+                *const std::ffi::c_void,
+                *mut *mut std::ffi::c_void,
+            ) -> i32 = std::mem::transmute(*vt.add(8));
+            let create_fence: unsafe extern "win64" fn(
+                *mut std::ffi::c_void,
+                u64,
+                u32,
+                *const std::ffi::c_void,
+                *mut *mut std::ffi::c_void,
+            ) -> i32 = std::mem::transmute(*vt.add(36));
+            let mut q: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut f: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(create_queue(dev, std::ptr::null(), std::ptr::null(), &mut q), 0);
+            assert_eq!(create_fence(dev, 5, 0, std::ptr::null(), &mut f), 0);
+            assert!(!q.is_null() && !f.is_null());
+            let qvt = *(q as *const *const usize);
+            let signal: unsafe extern "win64" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u64) -> i32 =
+                std::mem::transmute(*qvt.add(14));
+            assert_eq!(signal(q, f, 9), 0);
+            let fvt = *(f as *const *const usize);
+            let completed: unsafe extern "win64" fn(*mut std::ffi::c_void) -> u64 =
+                std::mem::transmute(*fvt.add(8));
+            assert_eq!(completed(f), 9);
+        }
+    }
+
+    #[test]
     fn stub_thunk_calls_log_and_return() {
         let (addr, src) = resolve_inner("kernelx.dll", &name("LinuxProbeThunk"), 0);
         assert_eq!(src, Source::Stub);
@@ -841,7 +904,10 @@ mod tests {
             classify("kernel32.dll", &name("CreateFileW")),
             Source::Hle(_) | Source::HleOther(_)
         ));
-        assert_eq!(classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice")), Source::Stub);
+        assert!(matches!(
+            classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice")),
+            Source::Hle(_) | Source::HleOther(_)
+        ));
         assert!(matches!(
             classify("ucrtbase.dll", &name("malloc")),
             Source::HleOther(_)
