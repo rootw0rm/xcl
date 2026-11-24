@@ -376,7 +376,6 @@ mod tests {
             ("kernel32.dll", "LoadLibraryW"),
             ("kernelx.dll", "XMemAlloc"),
             ("d3d12_xs.dll", "D3D12XboxCreateDevice"),
-            ("xgameruntime.dll", "XGameRuntimeInitialize"),
             ("xaudio2_9.dll", "XAudio2Create"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
@@ -496,6 +495,35 @@ mod tests {
         let p_fmode: unsafe extern "win64" fn() -> *mut i32 = unsafe { std::mem::transmute(addr) };
         let p = unsafe { p_fmode() };
         assert!(!p.is_null());
+    }
+
+    #[test]
+    fn xgr_identity_imports_resolve_to_hle() {
+        // Step 11i: console identity + package imports are real HLE, callable directly.
+        for (dll, sym) in [
+            ("xgameruntime.dll", "XGameRuntimeInitialize"),
+            ("xgameruntime.dll", "XSystemGetDeviceType"),
+            (
+                "xgameruntime.dll",
+                "XPackageGetCurrentProcessPackageIdentifier",
+            ),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // The device-type query is directly callable with the Windows x64 ABI.
+        let (addr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XSystemGetDeviceType"), 0);
+        let f: unsafe extern "win64" fn() -> u32 = unsafe { std::mem::transmute(addr) };
+        let got = unsafe { f() };
+        assert!(got == 6 || got == 7, "device type {got}");
     }
 
     #[test]

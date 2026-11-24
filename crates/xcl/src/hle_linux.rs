@@ -17,6 +17,8 @@
 pub mod kernelx_linux;
 #[path = "hle/crt_linux.rs"]
 pub mod crt_linux;
+#[path = "hle/xgameruntime_linux.rs"]
+pub mod xgameruntime_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -115,7 +117,7 @@ fn kernelx_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn xgameruntime_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![
+    let mut v = crate::hle_exports![
         InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, UninitializeApiImpl,
         QueryApiImpl, XErrorReport, XGameRuntimeInitialize, XGameRuntimeInitializeWithOptions,
         XGameRuntimeUninitialize, XGameRuntimeIsFeatureAvailable, XTaskQueueCreate,
@@ -168,7 +170,16 @@ fn xgameruntime_exports() -> Vec<(&'static str, usize)> {
         XUserFindControllerForUserWithUiResult, XClosedCaptionGetProperties,
         XClosedCaptionSetEnabled, XHighContrastGetMode, XStoreCreateContext,
         XStoreCloseContextHandle,
-    ]
+    ];
+    // Step-11i identity slice carries real Linux addresses; the rest stays Stub (0).
+    for (name, addr) in xgameruntime_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn d3d12x_exports() -> Vec<(&'static str, usize)> {
@@ -339,15 +350,16 @@ mod tests {
     fn linux_exports_are_stub_metadata_except_kernelx_core() {
         let r = build(&Config::default());
         // Unimplemented names are metadata `0`, never a callable address. Steps 10b–10c
-        // implement the kernelx memory/thread/sync/time/file slices and step 11 the CRT
-        // startup slice, so those resolve as HLE.
+        // implement the kernelx memory/thread/sync/time/file slices, step 11 the CRT
+        // startup slice and step 11i the xgameruntime identity slice, so those resolve
+        // as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
             assert!(!m.exports.is_empty(), "{} has no exports", m.name);
             for (&name, &addr) in &m.exports {
                 total += 1;
-                if (m.name == KERNELX || m.name == UCRT) && addr != 0 {
+                if (m.name == KERNELX || m.name == UCRT || m.name == XGAMERUNTIME) && addr != 0 {
                     implemented += 1;
                     continue;
                 }
@@ -462,6 +474,19 @@ mod tests {
         // CRT names stay routeless: contracts resolve via the name lookup above.
         assert_eq!(r.hle_for("ucrtbase.dll").map(|m| m.name), None);
         assert_eq!(r.hle_for("api-ms-win-crt-runtime-l1-1-0.dll").map(|m| m.name), None);
+        // Step-11i xgameruntime identity slice: real code, not stub metadata.
+        for name in [
+            "XGameRuntimeInitialize",
+            "XGameRuntimeInitializeWithOptions",
+            "XSystemGetDeviceType",
+            "XPackageIsPackagedProcess",
+            "XPackageGetCurrentProcessPackageIdentifier",
+            "XPackageGetIdentifier",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, XGAMERUNTIME);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
     }
 
     /// Windows `hle_exports![...]` names in `hle/kernelx.rs` (59). Kernel-family fallback
