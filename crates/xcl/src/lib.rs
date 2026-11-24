@@ -55,7 +55,11 @@ pub mod tls;
 #[path = "tls_linux.rs"]
 pub mod tls;
 pub mod util;
-#[cfg(windows)]
 pub mod vfs;
 #[cfg(windows)]
 pub mod vfs_hooks;
+#[cfg(not(windows))]
+#[path = "vfs_hooks_linux.rs"]
+pub mod vfs_hooks_linux;
+#[cfg(not(windows))]
+pub use vfs_hooks_linux as vfs_hooks;

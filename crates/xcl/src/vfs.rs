@@ -19,6 +19,9 @@ pub enum Target {
     Translated(String),
     /// Inside the (read-only) game folder; `rel` has no leading separator ("" = root).
     Game { rel: String },
+    /// A console mount was unsafe (for example, traversal escaped its host root).
+    #[cfg(not(windows))]
+    Reject(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,17 +47,30 @@ pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
 pub const ERROR_DIRECTORY: u32 = 267;
 
-const CREATE_NEW: u32 = 1;
-const CREATE_ALWAYS: u32 = 2;
-const OPEN_EXISTING: u32 = 3;
-const OPEN_ALWAYS: u32 = 4;
-const TRUNCATE_EXISTING: u32 = 5;
+/// State to restore when a Linux host open fails after the VFS staged a game write.
+#[cfg(not(windows))]
+pub(crate) struct FailedWriteRollback {
+    rel: String,
+    whiteouts: Vec<String>,
+    was_recorded: bool,
+}
 
-const GENERIC_WRITE: u32 = 0x4000_0000;
+pub(crate) const CREATE_NEW: u32 = 1;
+pub(crate) const CREATE_ALWAYS: u32 = 2;
+pub(crate) const OPEN_EXISTING: u32 = 3;
+pub(crate) const OPEN_ALWAYS: u32 = 4;
+pub(crate) const TRUNCATE_EXISTING: u32 = 5;
+
+#[cfg(not(windows))]
+pub(crate) const GENERIC_READ: u32 = 0x8000_0000;
+const FILE_READ_DATA: u32 = 0x0000_0001;
+const FILE_WRITE_DATA: u32 = 0x0000_0002;
+const FILE_APPEND_DATA: u32 = 0x0000_0004;
+pub(crate) const GENERIC_WRITE: u32 = 0x4000_0000;
 const WRITE_ACCESS: u32 = GENERIC_WRITE
     | 0x1000_0000 // GENERIC_ALL
-    | 0x0000_0002 // FILE_WRITE_DATA / ADD_FILE
-    | 0x0000_0004 // FILE_APPEND_DATA / ADD_SUBDIRECTORY
+    | FILE_WRITE_DATA // FILE_WRITE_DATA / ADD_FILE
+    | FILE_APPEND_DATA // FILE_APPEND_DATA / ADD_SUBDIRECTORY
     | 0x0000_0010 // FILE_WRITE_EA
     | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
     | 0x0001_0000 // DELETE
@@ -68,8 +84,12 @@ pub struct Vfs {
     game_root: String,
     game_root_lc: String,
     /// XCL's data folder for the title, absolute and lower-case.
+    #[cfg_attr(not(windows), allow(dead_code))]
     data_root_lc: String,
+    // The Linux PLS quota path is used by the kernelx file APIs (phase C step-10).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pls_root: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pls_root_lc: String,
     /// Other folders XCL itself reads and writes (`own_folder`), absolute and lower-case.
     own_roots_lc: Vec<String>,
@@ -77,9 +97,13 @@ pub struct Vfs {
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
     whiteout_file: PathBuf,
+    #[cfg(windows)]
     existing_drives: u32,
     unmapped: Mutex<BTreeSet<String>>,
     writes: Mutex<BTreeSet<String>>,
+    /// Serializes write bookkeeping across a staged host open, so rollback cannot replace
+    /// whiteout changes made by another VFS operation while that open was in flight.
+    write_lock: Mutex<()>,
 }
 
 static VFS: OnceLock<Vfs> = OnceLock::new();
@@ -93,12 +117,142 @@ pub fn get() -> Option<&'static Vfs> {
     VFS.get()
 }
 
+/// Host path separators: Windows paths are backslash-separated, Linux ones slash-separated.
+/// Console paths from the title are always backslash-separated and go through `logical`.
+#[cfg(windows)]
 fn norm(s: &str) -> String {
     s.replace('/', "\\")
 }
 
+#[cfg(not(windows))]
+fn norm(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+/// A console path (`G:\dir/file`) in the one form the mount and whiteout tables use.
+fn logical(s: &str) -> String {
+    s.replace('/', "\\")
+}
+
 fn trim_sep(s: &str) -> String {
-    s.trim_end_matches('\\').to_string()
+    s.trim_end_matches(['\\', '/']).to_string()
+}
+
+/// Join a root folder and a VFS-relative path (`\` separated).
+fn join_rel(root: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        return root.to_string();
+    }
+    #[cfg(windows)]
+    {
+        format!("{root}\\{rel}")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{root}/{}", rel.replace('\\', "/"))
+    }
+}
+
+/// The `rel` part of a `Target::Game` (no leading separator, `\` separated).
+fn rel_from_host(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        s.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        s.replace('/', "\\")
+    }
+}
+
+/// A host folder path (game/data/overlay/mount target) in platform form.
+#[cfg(windows)]
+fn host_path_string(s: &str) -> String {
+    norm(s)
+}
+
+#[cfg(not(windows))]
+fn host_path_string(s: &str) -> String {
+    let s = strip_verbatim(&s.replace('\\', "/"));
+    let path = Path::new(&s);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return s,
+        }
+    };
+    normalize_host(&abs)
+}
+
+/// Absolutise and lexically normalise a host path (like `GetFullPathNameW`, no file access).
+#[cfg(not(windows))]
+fn normalize_host(path: &Path) -> String {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    let s = out.to_string_lossy().into_owned();
+    if s.is_empty() {
+        "/".to_string()
+    } else {
+        s
+    }
+}
+
+#[cfg(not(windows))]
+fn canonical_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling final symlink would be followed by O_CREAT. Reject it instead of
+                // treating it as a missing regular file whose parent is safe.
+                if std::fs::symlink_metadata(&current)
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    return Err(error);
+                }
+                if !current.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Keep a translated path inside its mount even when an existing component is a symlink.
+/// Missing files are checked through their nearest existing ancestor, so a symlinked parent
+/// cannot redirect a later create outside the mount either.
+#[cfg(not(windows))]
+fn ensure_mount_contained(root: &Path, path: &Path) -> Result<(), u32> {
+    if !path.starts_with(root) {
+        return Err(ERROR_ACCESS_DENIED);
+    }
+    let root = canonical_existing_ancestor(root).map_err(|_| ERROR_ACCESS_DENIED)?;
+    let path = canonical_existing_ancestor(path).map_err(|_| ERROR_ACCESS_DENIED)?;
+    if !path.starts_with(root) {
+        return Err(ERROR_ACCESS_DENIED);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn checked_mount_path(root: &str, tail: &str) -> Result<String, u32> {
+    let path = normalize_host(Path::new(&join_rel(root, tail)));
+    ensure_mount_contained(Path::new(root), Path::new(&path))?;
+    Ok(path)
 }
 
 fn strip_verbatim(p: &str) -> String {
@@ -134,7 +288,8 @@ fn is_device(p: &str) -> bool {
         || (base.len() == 4 && (base.starts_with("com") || base.starts_with("lpt")) && base.as_bytes()[3].is_ascii_digit())
 }
 
-/// Full path via GetFullPathNameW (no file system access).
+/// Full path (no file system access).
+#[cfg(windows)]
 pub fn full_path(p: &str) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
     let w = crate::util::wide(p);
@@ -151,13 +306,28 @@ pub fn full_path(p: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..n]))
 }
 
+/// The host has no Windows drive letters; a console path that a mount does not translate is
+/// reported as unmapped instead of being looked up on a host drive.
+#[cfg(not(windows))]
+pub fn full_path(p: &str) -> Option<String> {
+    let p = strip_verbatim(p);
+    let path = Path::new(&p);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(normalize_host(&abs))
+}
+
+#[cfg(windows)]
 fn logical_drives() -> u32 {
     unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() }
 }
 
 impl Vfs {
     pub fn new(game_root: &Path, data_dir: &Path, mounts: Vec<(String, String)>) -> Vfs {
-        let game_root = trim_sep(&norm(&game_root.to_string_lossy()));
+        let game_root = trim_sep(&host_path_string(&game_root.to_string_lossy()));
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
@@ -165,7 +335,14 @@ impl Vfs {
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
-            .map(|(p, t)| (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), trim_sep(&norm(&t))))
+            .map(|(p, t)| {
+                (
+                    p.to_ascii_lowercase()
+                        .trim_end_matches(['\\', '/'])
+                        .to_string(),
+                    trim_sep(&host_path_string(&t)),
+                )
+            })
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -184,9 +361,11 @@ impl Vfs {
             mounts,
             whiteouts: Mutex::new(whiteouts),
             whiteout_file,
+            #[cfg(windows)]
             existing_drives: logical_drives(),
             unmapped: Mutex::new(BTreeSet::new()),
             writes: Mutex::new(BTreeSet::new()),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -210,14 +389,15 @@ impl Vfs {
     }
 
     /// Find the quota root for a path already translated by this VFS.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn pls_root_for(&self, translated: &str) -> Option<&Path> {
         let path = translated.to_lowercase();
         path.strip_prefix(&self.pls_root_lc)
-            .filter(|rest| rest.is_empty() || rest.starts_with('\\'))
+            .filter(|rest| rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR))
             .map(|_| self.pls_root.as_path())
     }
 
-    fn apply_mounts(&self, p: &str) -> Option<String> {
+    fn mount_match<'a>(&'a self, p: &'a str) -> Option<(&'a str, &'a str)> {
         // to_ascii_lowercase keeps byte offsets, so slicing `p` with prefix.len() is safe
         let l = p.to_ascii_lowercase();
         // Embedded "...\GAME:\rest": some runtimes treat "GAME:\x" as a relative path and
@@ -235,8 +415,7 @@ impl Vfs {
                 let after = at + needle.len();
                 let rest = &p[after..];
                 if rest.is_empty() || rest.starts_with('\\') {
-                    let tail = rest.trim_start_matches('\\');
-                    return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
+                    return Some((target, rest.trim_start_matches('\\')));
                 }
                 from = after;
             }
@@ -251,10 +430,31 @@ impl Vfs {
             if !(prefix.ends_with(':') || rest.is_empty() || rest.starts_with('\\')) {
                 continue;
             }
-            let tail = rest.trim_start_matches('\\');
-            return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
+            return Some((target, rest.trim_start_matches('\\')));
         }
         None
+    }
+
+    #[cfg(windows)]
+    fn apply_mounts(&self, p: &str) -> Option<String> {
+        self.mount_match(p)
+            .map(|(target, tail)| join_rel(target, tail))
+    }
+
+    #[cfg(not(windows))]
+    fn apply_mounts_checked(&self, p: &str) -> Option<Result<String, u32>> {
+        self.mount_match(p).map(|(target, tail)| {
+            let path = checked_mount_path(target, tail)?;
+            // Configured title-data mounts (the default S:/T:) may not use a symlinked
+            // child root to leave the title data directory, especially not to reach the
+            // read-only game layer through a writable mount.
+            if let Some(data_root) = self.pls_root.parent() {
+                if Path::new(target).starts_with(data_root) {
+                    ensure_mount_contained(data_root, Path::new(&path))?;
+                }
+            }
+            Ok(path)
+        })
     }
 
     /// Classify a path using `full` to absolutise (injected for unit tests).
@@ -262,7 +462,11 @@ impl Vfs {
         if path.is_empty() {
             return Target::Pass;
         }
-        let p = norm(path);
+        #[cfg(not(windows))]
+        if let Some(t) = self.classify_host(path, &full) {
+            return t;
+        }
+        let p = logical(path);
         if is_device(&p) {
             return Target::Pass;
         }
@@ -270,32 +474,108 @@ impl Vfs {
         if p.starts_with("\\\\") {
             return Target::Pass; // UNC
         }
+        #[cfg(windows)]
         let (p, translated) = match self.apply_mounts(&p) {
             Some(t) if !self.in_own_folders(&p, &full) => (t, true),
             _ => (p, false),
         };
+        #[cfg(not(windows))]
+        let (p, translated) = match self.apply_mounts_checked(&p) {
+            Some(Ok(t)) => (t, true),
+            Some(Err(error)) => return Target::Reject(error),
+            None => (p, false),
+        };
         if !translated {
-            let b = p.as_bytes();
-            if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-                let bit = (b[0].to_ascii_uppercase() - b'A') as u32;
-                if self.existing_drives & (1 << bit) == 0 {
-                    let mut u = self.unmapped.lock().unwrap();
-                    if u.len() < 1000 && u.insert(p.clone()) {
-                        crate::xlog_warn!("[VFS] unmapped console path: {p}");
+            #[cfg(windows)]
+            {
+                let b = p.as_bytes();
+                if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+                    let bit = (b[0].to_ascii_uppercase() - b'A') as u32;
+                    if self.existing_drives & (1 << bit) == 0 {
+                        self.log_unmapped(&p);
+                        return Target::Pass;
                     }
-                    return Target::Pass;
                 }
             }
+            // Linux has no Windows drives: an untranslated console path is not a host file.
+            #[cfg(not(windows))]
+            {
+                let b = p.as_bytes();
+                if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+                    self.log_unmapped(&p);
+                }
+                return Target::Reject(ERROR_PATH_NOT_FOUND);
+            }
         }
-        let Some(abs) = full(&p) else { return Target::Pass };
-        let abs = trim_sep(&strip_verbatim(&norm(&abs)));
+        let Some(abs) = full(&p) else {
+            return Target::Pass;
+        };
+        self.classify_abs(&abs, translated)
+    }
+
+    fn log_unmapped(&self, p: &str) {
+        let mut u = self.unmapped.lock().unwrap();
+        if u.len() < 1000 && u.insert(p.to_string()) {
+            crate::xlog_warn!("[VFS] unmapped console path: {p}");
+        }
+    }
+
+    /// A host path (Linux: the game folder itself, or an absolute path the title passed after
+    /// a runtime absolved it). Relative paths are host-relative, as `GetFullPathNameW` treats
+    /// them on Windows. `None` when `path` is a console path (drive/UNC/device/rooted).
+    #[cfg(not(windows))]
+    fn classify_host(&self, path: &str, full: &impl Fn(&str) -> Option<String>) -> Option<Target> {
+        let stripped = strip_verbatim(path);
+        let b = stripped.as_bytes();
+        let relative = !stripped.starts_with('/')
+            && !stripped.starts_with('\\')
+            && !(b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic());
+        if !stripped.starts_with('/') && !relative {
+            return None;
+        }
+        // A runtime may prepend its current directory to "GAME:\x"; an embedded mount still
+        // wins, exactly as in the Windows parsing below.
+        if let Some(t) = self.apply_mounts_checked(&logical(&stripped)) {
+            return Some(match t {
+                Ok(t) => {
+                    let Some(abs) = full(&t) else {
+                        return Some(Target::Pass);
+                    };
+                    self.classify_abs(&abs, true)
+                }
+                Err(error) => Target::Reject(error),
+            });
+        }
+        let host = if relative {
+            stripped.replace('\\', "/")
+        } else {
+            stripped
+        };
+        let Some(abs) = full(&host) else {
+            return Some(Target::Pass);
+        };
+        Some(self.classify_abs(&abs, false))
+    }
+
+    fn classify_abs(&self, abs: &str, translated: bool) -> Target {
+        let abs = trim_sep(&strip_verbatim(&norm(abs)));
         let lc = abs.to_lowercase();
         if lc == self.game_root_lc {
+            #[cfg(not(windows))]
+            if ensure_mount_contained(Path::new(&self.game_root), Path::new(&abs)).is_err() {
+                return Target::Reject(ERROR_ACCESS_DENIED);
+            }
             return Target::Game { rel: String::new() };
         }
         if let Some(rest) = lc.strip_prefix(&self.game_root_lc) {
-            if rest.starts_with('\\') {
-                return Target::Game { rel: abs[self.game_root.len() + 1..].to_string() };
+            if rest.starts_with(std::path::MAIN_SEPARATOR) {
+                #[cfg(not(windows))]
+                if ensure_mount_contained(Path::new(&self.game_root), Path::new(&abs)).is_err() {
+                    return Target::Reject(ERROR_ACCESS_DENIED);
+                }
+                return Target::Game {
+                    rel: rel_from_host(&abs[self.game_root.len() + 1..]),
+                };
             }
         }
         if translated {
@@ -309,6 +589,7 @@ impl Vfs {
     /// title's data, `own_folder`). A console drive mount ("D:") must not translate it when the
     /// PC has its folders on that drive.
     /// Only a plain drive path counts: "<game>\GAME:\x" still names a console mount.
+    #[cfg(windows)]
     fn in_own_folders(&self, p: &str, full: impl Fn(&str) -> Option<String>) -> bool {
         let b = p.as_bytes();
         if !(b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()) || p[2..].contains(':') {
@@ -330,19 +611,49 @@ impl Vfs {
     }
 
     pub fn overlay_path(&self, rel: &str) -> String {
-        if rel.is_empty() {
-            self.overlay.clone()
-        } else {
-            format!("{}\\{rel}", self.overlay)
-        }
+        join_rel(&self.overlay, rel)
     }
 
     pub fn original_path(&self, rel: &str) -> String {
-        if rel.is_empty() {
-            self.game_root.clone()
-        } else {
-            format!("{}\\{rel}", self.game_root)
+        join_rel(&self.game_root, rel)
+    }
+
+    #[cfg(not(windows))]
+    fn checked_rel(rel: &str) -> Result<(), u32> {
+        use std::path::Component;
+        let rel = rel.replace('\\', "/");
+        let path = Path::new(&rel);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(component, Component::RootDir | Component::Prefix(_) | Component::ParentDir)
+            })
+        {
+            return Err(ERROR_ACCESS_DENIED);
         }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn checked_overlay_path(&self, rel: &str) -> Result<String, u32> {
+        Self::checked_rel(rel)?;
+        // The overlay root is owned by XCL. Unlike a configured mount root it must not be a
+        // symlink, otherwise every "contained" child would share the outside boundary.
+        if std::fs::symlink_metadata(&self.overlay)
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(ERROR_ACCESS_DENIED);
+        }
+        let path = self.overlay_path(rel);
+        ensure_mount_contained(Path::new(&self.overlay), Path::new(&path))?;
+        Ok(path)
+    }
+
+    #[cfg(not(windows))]
+    fn checked_original_path(&self, rel: &str) -> Result<String, u32> {
+        Self::checked_rel(rel)?;
+        let path = self.original_path(rel);
+        ensure_mount_contained(Path::new(&self.game_root), Path::new(&path))?;
+        Ok(path)
     }
 
     fn wkey(rel: &str) -> String {
@@ -380,6 +691,10 @@ impl Vfs {
     }
 
     fn persist_whiteouts(&self, g: &HashSet<String>) {
+        #[cfg(not(windows))]
+        if self.checked_overlay_path("").is_err() {
+            return;
+        }
         let _ = std::fs::create_dir_all(&self.overlay);
         let mut v: Vec<&String> = g.iter().collect();
         v.sort();
@@ -394,7 +709,24 @@ impl Vfs {
         }
     }
 
+    #[cfg(not(windows))]
+    pub(crate) fn restore_failed_write(&self, rollback: &FailedWriteRollback) {
+        {
+            let mut g = self.whiteouts.lock().unwrap();
+            g.clear();
+            g.extend(rollback.whiteouts.iter().cloned());
+            self.persist_whiteouts(&g);
+        }
+        if !rollback.was_recorded {
+            self.writes.lock().unwrap().remove(&rollback.rel);
+        }
+    }
+
     fn remove_whiteout(&self, rel: &str) {
+        #[cfg(not(windows))]
+        if Self::checked_rel(rel).is_err() {
+            return;
+        }
         let k = Self::wkey(rel);
         if k.is_empty() {
             return;
@@ -413,8 +745,14 @@ impl Vfs {
             };
             if g.remove(prefix) {
                 changed = true;
-                let orig = self.original_path(prefix);
-                if let Ok(entries) = std::fs::read_dir(&orig) {
+                #[cfg(windows)]
+                let entries = std::fs::read_dir(self.original_path(prefix)).ok();
+                #[cfg(not(windows))]
+                let entries = self
+                    .checked_original_path(prefix)
+                    .ok()
+                    .and_then(|path| std::fs::read_dir(path).ok());
+                if let Some(entries) = entries {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_lowercase();
                         g.insert(format!("{prefix}\\{name}"));
@@ -439,11 +777,26 @@ impl Vfs {
     }
 
     pub fn visible_in_overlay(&self, rel: &str) -> bool {
-        Path::new(&self.overlay_path(rel)).exists()
+        #[cfg(windows)]
+        let path = self.overlay_path(rel);
+        #[cfg(not(windows))]
+        let Ok(path) = self.checked_overlay_path(rel) else {
+            return false;
+        };
+        Path::new(&path).exists()
     }
 
     pub fn visible_in_original(&self, rel: &str) -> bool {
-        !self.is_whiteout(rel) && Path::new(&self.original_path(rel)).exists()
+        if self.is_whiteout(rel) {
+            return false;
+        }
+        #[cfg(windows)]
+        let path = self.original_path(rel);
+        #[cfg(not(windows))]
+        let Ok(path) = self.checked_original_path(rel) else {
+            return false;
+        };
+        Path::new(&path).exists()
     }
 
     pub fn exists(&self, rel: &str) -> bool {
@@ -451,7 +804,14 @@ impl Vfs {
     }
 
     pub fn is_dir(&self, rel: &str) -> bool {
-        if let Ok(m) = std::fs::metadata(self.overlay_path(rel)) {
+        #[cfg(windows)]
+        let overlay = self.overlay_path(rel);
+        #[cfg(not(windows))]
+        let Ok(overlay) = self.checked_overlay_path(rel) else {
+            return self.visible_in_original(rel)
+                && Path::new(&self.original_path(rel)).is_dir();
+        };
+        if let Ok(m) = std::fs::metadata(overlay) {
             return m.is_dir();
         }
         self.visible_in_original(rel) && Path::new(&self.original_path(rel)).is_dir()
@@ -463,17 +823,26 @@ impl Vfs {
             Target::Pass => Some(path.to_string()),
             Target::Translated(p) => Some(p),
             Target::Game { rel } => self.read_path_rel(&rel),
+            #[cfg(not(windows))]
+            Target::Reject(_) => None,
         }
     }
 
     pub fn read_path_rel(&self, rel: &str) -> Option<String> {
         if self.visible_in_overlay(rel) {
-            return Some(self.overlay_path(rel));
+            return self.checked_overlay_path(rel).ok();
         }
         if self.is_whiteout(rel) {
             return None;
         }
-        Some(self.original_path(rel))
+        #[cfg(windows)]
+        {
+            Some(self.original_path(rel))
+        }
+        #[cfg(not(windows))]
+        {
+            self.checked_original_path(rel).ok()
+        }
     }
 
     /// Stage the overlay path for a new/overwritten file (e.g. copy/move destination)
@@ -481,27 +850,61 @@ impl Vfs {
     /// only after the underlying file operation succeeds so a failed operation cannot
     /// resurrect a whited-out original.
     pub fn stage_write(&self, rel: &str) -> Result<String, u32> {
+        let _guard = self.write_lock.lock().unwrap();
+        self.stage_write_unlocked(rel)
+    }
+
+    fn stage_write_unlocked(&self, rel: &str) -> Result<String, u32> {
         if let Some((parent_rel, _)) = rel.rsplit_once('\\') {
             if !self.is_dir(parent_rel) {
                 return Err(ERROR_PATH_NOT_FOUND);
             }
         }
+        #[cfg(windows)]
         let ov = self.overlay_path(rel);
+        #[cfg(not(windows))]
+        let ov = self.checked_overlay_path(rel)?;
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
+        #[cfg(not(windows))]
+        self.checked_overlay_path(rel)?;
         Ok(ov)
     }
 
     /// Finalise a staged write once the underlying file operation succeeded.
     pub fn commit_write(&self, rel: &str) {
+        let _guard = self.write_lock.lock().unwrap();
+        self.commit_write_unlocked(rel)
+    }
+
+    fn commit_write_unlocked(&self, rel: &str) {
+        #[cfg(not(windows))]
+        if Self::checked_rel(rel).is_err() {
+            return;
+        }
         self.remove_whiteout(rel);
         self.record_write(rel);
     }
 
     /// Record removal of an overlay file and hide the game file it covered.
     pub fn commit_overlay_removal(&self, rel: &str) {
-        if Path::new(&self.original_path(rel)).exists() {
+        let _guard = self.write_lock.lock().unwrap();
+        self.commit_overlay_removal_unlocked(rel)
+    }
+
+    fn commit_overlay_removal_unlocked(&self, rel: &str) {
+        #[cfg(not(windows))]
+        if Self::checked_rel(rel).is_err() {
+            return;
+        }
+        #[cfg(windows)]
+        let original_exists = Path::new(&self.original_path(rel)).exists();
+        #[cfg(not(windows))]
+        let original_exists = self
+            .checked_original_path(rel)
+            .is_ok_and(|path| Path::new(&path).exists());
+        if original_exists {
             self.add_whiteout(rel);
         }
         self.record_write(rel);
@@ -510,12 +913,25 @@ impl Vfs {
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
     /// and return the overlay path.
     pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        let _guard = self.write_lock.lock().unwrap();
+        self.prepare_write_unlocked(rel, keep_content)
+    }
+
+    fn prepare_write_unlocked(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        #[cfg(windows)]
         let ov = self.overlay_path(rel);
+        #[cfg(not(windows))]
+        let ov = self.checked_overlay_path(rel)?;
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
+        #[cfg(not(windows))]
+        self.checked_overlay_path(rel)?;
         if keep_content && !Path::new(&ov).exists() && self.visible_in_original(rel) {
+            #[cfg(windows)]
             let orig = self.original_path(rel);
+            #[cfg(not(windows))]
+            let orig = self.checked_original_path(rel)?;
             if Path::new(&orig).is_dir() {
                 std::fs::create_dir_all(&ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             } else {
@@ -527,15 +943,56 @@ impl Vfs {
         Ok(ov)
     }
 
-    fn is_write(access: u32, disposition: u32, flags: u32) -> bool {
+    pub(crate) fn has_write_access(access: u32) -> bool {
         access & WRITE_ACCESS != 0
+    }
+
+    /// Rights that permit reading/writing file contents, as opposed to metadata or handle
+    /// rights that still require copy-on-write bookkeeping.
+    #[cfg(not(windows))]
+    pub(crate) fn has_data_write_access(access: u32) -> bool {
+        access & (GENERIC_WRITE | 0x1000_0000 | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0
+    }
+
+    /// Append rights do not authorize the truncation performed by CREATE_ALWAYS.
+    #[cfg(not(windows))]
+    pub(crate) fn has_overwrite_access(access: u32) -> bool {
+        access & (GENERIC_WRITE | 0x1000_0000 | FILE_WRITE_DATA) != 0
+    }
+
+    pub(crate) fn is_write(access: u32, disposition: u32, flags: u32) -> bool {
+        Self::has_write_access(access)
             || matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING)
             || flags & FILE_FLAG_DELETE_ON_CLOSE != 0
     }
 
-    pub fn open_decision_for(&self, target: Target, access: u32, disposition: u32, flags: u32) -> Decision {
+    #[cfg(not(windows))]
+    pub(crate) fn is_read(access: u32) -> bool {
+        access & (GENERIC_READ | 0x1000_0000 | FILE_READ_DATA) != 0
+    }
+
+    pub fn open_decision_for(
+        &self,
+        target: Target,
+        access: u32,
+        disposition: u32,
+        flags: u32,
+    ) -> Decision {
+        let _guard = self.write_lock.lock().unwrap();
+        self.open_decision_for_unlocked(target, access, disposition, flags)
+    }
+
+    fn open_decision_for_unlocked(
+        &self,
+        target: Target,
+        access: u32,
+        disposition: u32,
+        flags: u32,
+    ) -> Decision {
         match target {
             Target::Pass => Decision::Pass,
+            #[cfg(not(windows))]
+            Target::Reject(error) => Decision::Fail(error),
             Target::Translated(p) => {
                 if Self::is_write(access, disposition, flags) || disposition == OPEN_ALWAYS {
                     if let Some(parent) = Path::new(&p).parent() {
@@ -564,7 +1021,16 @@ impl Vfs {
                     OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return Decision::Fail(ERROR_FILE_NOT_FOUND),
                     _ => {}
                 }
-                let ov_entry = in_ov || Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
+                let ov_entry = in_ov || {
+                    #[cfg(windows)]
+                    let overlay_entry = Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
+                    #[cfg(not(windows))]
+                    let overlay_entry = match self.checked_overlay_path(&rel) {
+                        Ok(path) => Path::new(&path).symlink_metadata().is_ok(),
+                        Err(error) => return Decision::Fail(error),
+                    };
+                    overlay_entry
+                };
                 if disposition == TRUNCATE_EXISTING {
                     let check_path = if in_ov { self.overlay_path(&rel) } else { self.original_path(&rel) };
                     let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
@@ -586,7 +1052,7 @@ impl Vfs {
                     && !ov_entry
                     && in_orig
                     && Path::new(&self.original_path(&rel)).is_file();
-                match self.prepare_write(&rel, keep) {
+                match self.prepare_write_unlocked(&rel, keep) {
                     Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
                     Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
                     Ok(p) => Decision::Use(p),
@@ -600,15 +1066,73 @@ impl Vfs {
         self.open_decision_for(self.classify(path), access, disposition, flags)
     }
 
+    /// Linux host opens can fail after `prepare_write` has removed a whiteout. Return the
+    /// affected game-relative path so the shim can restore it if `open(2)` does not create
+    /// the overlay entry successfully.
+    #[cfg(not(windows))]
+    pub(crate) fn open_decision_linux(
+        &self,
+        path: &str,
+        access: u32,
+        disposition: u32,
+        flags: u32,
+    ) -> (Decision, Option<FailedWriteRollback>, std::sync::MutexGuard<'_, ()>) {
+        let guard = self.write_lock.lock().unwrap();
+        let target = self.classify(path);
+        let visible = match &target {
+            Target::Game { rel } => self.exists(rel),
+            Target::Translated(path) => Path::new(path).exists(),
+            Target::Pass => Path::new(path).exists(),
+            Target::Reject(_) => false,
+        };
+        // Append rights may create a missing file, but cannot authorize truncating an
+        // existing one through CREATE_ALWAYS.
+        if disposition == CREATE_ALWAYS
+            && !Self::has_overwrite_access(access)
+            && visible
+            && !matches!(&target, Target::Reject(_))
+        {
+            return (Decision::Fail(ERROR_ACCESS_DENIED), None, guard);
+        }
+        // OPEN_ALWAYS may open an existing file read-only, but creating a missing one needs
+        // data-write access. Reject before the VFS creates parents or changes whiteouts.
+        if disposition == OPEN_ALWAYS
+            && !Self::has_data_write_access(access)
+            && !matches!(&target, Target::Reject(_))
+            && !visible
+        {
+            return (Decision::Fail(ERROR_ACCESS_DENIED), None, guard);
+        }
+        let rollback = match &target {
+            Target::Game { rel } if self.is_whiteout(rel) && !self.visible_in_overlay(rel) => {
+                Some(FailedWriteRollback {
+                    rel: rel.clone(),
+                    whiteouts: self.whiteouts(),
+                    was_recorded: self.writes.lock().unwrap().contains(rel),
+                })
+            }
+            _ => None,
+        };
+        (
+            self.open_decision_for_unlocked(target, access, disposition, flags),
+            rollback,
+            guard,
+        )
+    }
+
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
+        let _guard = self.write_lock.lock().unwrap();
+        #[cfg(windows)]
         let ov = self.overlay_path(rel);
+        #[cfg(not(windows))]
+        let ov = self.checked_overlay_path(rel)?;
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
             if meta.is_dir() {
                 return Err(ERROR_ACCESS_DENIED);
             }
             std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
-            self.commit_overlay_removal(rel);
+            self.commit_overlay_removal_unlocked(rel);
             return Ok(());
         }
         if !self.visible_in_original(rel) {
@@ -623,27 +1147,44 @@ impl Vfs {
     }
 
     pub fn create_dir(&self, rel: &str) -> Result<(), u32> {
+        let _guard = self.write_lock.lock().unwrap();
         if self.visible_in_overlay(rel) || self.visible_in_original(rel) {
             return Err(ERROR_ALREADY_EXISTS);
         }
-        std::fs::create_dir_all(self.overlay_path(rel)).map_err(|_| ERROR_PATH_NOT_FOUND)?;
+        #[cfg(windows)]
+        let ov = self.overlay_path(rel);
+        #[cfg(not(windows))]
+        let ov = self.checked_overlay_path(rel)?;
+        std::fs::create_dir_all(&ov).map_err(|_| ERROR_PATH_NOT_FOUND)?;
+        #[cfg(not(windows))]
+        self.checked_overlay_path(rel)?;
         self.remove_whiteout(rel);
         self.record_write(rel);
         Ok(())
     }
 
     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
+        let _guard = self.write_lock.lock().unwrap();
         if rel.is_empty() {
             return Err(ERROR_ACCESS_DENIED);
         }
+        #[cfg(windows)]
         let ov = self.overlay_path(rel);
+        #[cfg(not(windows))]
+        let ov = self.checked_overlay_path(rel)?;
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
             if !meta.is_dir() {
                 return Err(ERROR_DIRECTORY);
             }
             std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
-            if Path::new(&self.original_path(rel)).exists() {
+            #[cfg(windows)]
+            let original_exists = Path::new(&self.original_path(rel)).exists();
+            #[cfg(not(windows))]
+            let original_exists = self
+                .checked_original_path(rel)
+                .is_ok_and(|path| Path::new(&path).exists());
+            if original_exists {
                 self.add_whiteout(rel);
             }
             self.record_write(rel);
@@ -662,7 +1203,13 @@ impl Vfs {
 
     /// Whether directory listings under `rel_dir` must merge overlay + original.
     pub fn needs_merge(&self, rel_dir: &str) -> bool {
-        Path::new(&self.overlay_path(rel_dir)).is_dir() || self.has_whiteouts_under(rel_dir)
+        #[cfg(windows)]
+        let overlay_is_dir = Path::new(&self.overlay_path(rel_dir)).is_dir();
+        #[cfg(not(windows))]
+        let overlay_is_dir = self
+            .checked_overlay_path(rel_dir)
+            .is_ok_and(|path| Path::new(&path).is_dir());
+        overlay_is_dir || self.has_whiteouts_under(rel_dir)
     }
 
     pub fn unmapped_paths(&self) -> Vec<String> {
@@ -701,7 +1248,9 @@ mod tests {
             let mounts = vec![
                 ("G:".to_string(), game.to_string_lossy().to_string()),
                 ("GAME:".to_string(), game.to_string_lossy().to_string()),
+                ("D:".to_string(), game.to_string_lossy().to_string()),
                 ("T:".to_string(), data.join("temp").to_string_lossy().to_string()),
+                ("S:".to_string(), data.join("pls").to_string_lossy().to_string()),
             ];
             let vfs = Vfs::new(&game, &data, mounts);
             Fixture { dir, vfs }
@@ -724,6 +1273,7 @@ mod tests {
         assert_eq!(v.classify("G:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         assert_eq!(v.classify("g:/data/hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         assert_eq!(v.classify("GAME:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
+        assert_eq!(v.classify("D:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         assert_eq!(v.classify("G:\\"), Target::Game { rel: String::new() });
         // device interfaces (XInput opens the controller by one) are never the title's files
         assert_eq!(v.classify("\\\\?\\hid#vid_045e&pid_0b12&ig_00#8&1a2b3c&0&0000#{ec87f1e3-c13b-4100-b5f7-8b84d54260cb}"), Target::Pass);
@@ -734,14 +1284,151 @@ mod tests {
         assert_eq!(v.classify("C:\\somewhere\\G:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         let real = f.game().join("data").join("hello.txt");
         assert_eq!(v.classify(&real.to_string_lossy()), Target::Game { rel: "data\\hello.txt".into() });
-        assert!(matches!(v.classify("T:\\scratch.bin"), Target::Translated(p) if p.ends_with("xcldata\\temp\\scratch.bin")));
+        #[cfg(windows)]
+        let translated_tail = "xcldata\\temp\\scratch.bin";
+        #[cfg(not(windows))]
+        let translated_tail = "xcldata/temp/scratch.bin";
+        assert!(matches!(v.classify("T:\\scratch.bin"), Target::Translated(p) if p.ends_with(translated_tail)));
+        #[cfg(not(windows))]
+        assert!(matches!(v.classify("S:\\save.dat"), Target::Translated(p) if p.ends_with("xcldata/pls/save.dat")));
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
+        #[cfg(windows)]
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
+        #[cfg(not(windows))]
+        assert_eq!(
+            v.classify("C:\\Windows\\notepad.exe"),
+            Target::Reject(ERROR_PATH_NOT_FOUND)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_mount_traversal_cannot_escape_to_a_host_file() {
+        let f = Fixture::new("traversal");
+        let outside = f.dir.join("outside.txt");
+        std::fs::write(&outside, b"host secret").unwrap();
+        let v = &f.vfs;
+
+        for path in [
+            "G:\\..\\outside.txt".to_string(),
+            "g:/../outside.txt".to_string(),
+            "GAME:\\..\\outside.txt".to_string(),
+            "C:\\somewhere\\G:\\..\\outside.txt".to_string(),
+            format!("\\\\?\\{}\\GAME:\\..\\outside.txt", f.game().display()),
+            format!("{}\\GAME:\\..\\outside.txt", f.game().display()),
+        ] {
+            assert_eq!(v.classify(&path), Target::Reject(ERROR_ACCESS_DENIED), "{path}");
+            assert_eq!(
+                v.open_decision(&path, GENERIC_WRITE, OPEN_EXISTING, 0),
+                Decision::Fail(ERROR_ACCESS_DENIED),
+                "{path}"
+            );
+            assert_eq!(v.real_path_for_read(&path), None, "{path}");
+        }
+
+        // Parent components that stay inside the mount are still normalised.
+        assert_eq!(
+            v.classify("G:\\data\\..\\data\\hello.txt"),
+            Target::Game { rel: "data\\hello.txt".into() }
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"host secret");
+        assert!(v.redirected_writes().is_empty());
+        assert_eq!(v.prepare_write("..\\outside.txt", false), Err(ERROR_ACCESS_DENIED));
+        assert_eq!(v.read_path_rel("..\\outside.txt"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_mount_symlink_cannot_escape_to_a_host_file() {
+        use std::os::unix::fs::symlink;
+
+        let f = Fixture::new("symlink_escape");
+        let outside = f.dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"host secret").unwrap();
+        symlink(&outside, f.game().join("escape")).unwrap();
+
+        assert_eq!(
+            f.vfs.classify("G:\\escape\\secret.txt"),
+            Target::Reject(ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(
+            f.vfs.open_decision("G:\\escape\\secret.txt", GENERIC_READ, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(f.vfs.real_path_for_read("G:\\escape\\secret.txt"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_data_mount_symlink_cannot_leave_the_title_data_directory() {
+        use std::os::unix::fs::symlink;
+
+        let f = Fixture::new("data_symlink_escape");
+        let outside = f.dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(f.dir.join("xcldata")).unwrap();
+        symlink(&outside, f.dir.join("xcldata").join("temp")).unwrap();
+
+        assert_eq!(
+            f.vfs.classify("T:\\secret.txt"),
+            Target::Reject(ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(
+            f.vfs.open_decision("T:\\secret.txt", GENERIC_WRITE, CREATE_ALWAYS, 0),
+            Decision::Fail(ERROR_ACCESS_DENIED)
+        );
+        assert!(!outside.join("secret.txt").exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_staged_open_serializes_concurrent_write_bookkeeping() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let f = Fixture::new("write_serialization");
+        let v = &f.vfs;
+        let (decision, rollback, guard) =
+            v.open_decision_linux("G:\\data\\hello.txt", GENERIC_READ, OPEN_EXISTING, 0);
+        assert!(matches!(decision, Decision::Use(_)));
+        assert!(rollback.is_none());
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = v.delete_file("data\\gone.txt");
+                tx.send(()).unwrap();
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(guard);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        assert!(v.is_whiteout("data\\gone.txt"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_unmapped_drive_is_rejected_without_a_host_open() {
+        let f = Fixture::new("unmapped");
+        assert_eq!(
+            f.vfs.classify("Z:\\Windows\\notepad.exe"),
+            Target::Reject(ERROR_PATH_NOT_FOUND)
+        );
+        assert_eq!(
+            f.vfs.open_decision("Z:\\Windows\\notepad.exe", GENERIC_READ, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_PATH_NOT_FOUND)
+        );
+        assert_eq!(
+            f.vfs.unmapped_paths(),
+            vec!["Z:\\Windows\\notepad.exe".to_string()]
+        );
     }
 
     /// The console's "D:" mount on a PC whose game and XCL data are on its D: drive: paths
     /// already inside those folders are the PC's, everything else on the drive is the console's.
+    #[cfg(windows)]
     #[test]
     fn a_console_drive_mount_leaves_the_pcs_own_folders_on_that_drive() {
         let dir = std::env::temp_dir().join(format!("xcl_vfs_drive_{}", std::process::id()));
@@ -770,6 +1457,7 @@ mod tests {
     /// The shader cache on the drive the console's "D:" mount names: without `own_folder` the
     /// title's process writes it into the overlay (and reads the game folder) – a cache filled
     /// outside the title, where no mount applies, is not the one it then uses.
+    #[cfg(windows)]
     #[test]
     fn a_console_drive_mount_leaves_xcls_shader_cache_on_that_drive() {
         let dir = std::env::temp_dir().join(format!("xcl_vfs_cache_{}", std::process::id()));
@@ -854,6 +1542,7 @@ mod tests {
         assert!(v.is_whiteout("data\\hello.txt"), "children of a removed dir are hidden");
     }
 
+    #[cfg(windows)]
     #[test]
     fn truncate_existing_rewrites_unoverlaid_disposition_and_opens_with_win32() {
         let f = Fixture::new("trunc");
@@ -914,6 +1603,52 @@ mod tests {
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn truncate_existing_rewrites_unoverlaid_disposition_on_host_open() {
+        use std::fs::OpenOptions;
+        let f = Fixture::new("trunc_host");
+        let v = &f.vfs;
+        let orig = f.game().join("data").join("hello.txt");
+
+        // Un-overlaid game file: the disposition is rewritten to CREATE_ALWAYS in the overlay,
+        // and the path is not published before the host open runs.
+        let Decision::UseWithDisposition(ov, disp) =
+            v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0)
+        else {
+            panic!("expected Decision::UseWithDisposition for TRUNCATE_EXISTING on un-overlaid game file");
+        };
+        assert!(ov.contains("overlay"));
+        assert_eq!(disp, CREATE_ALWAYS);
+        assert!(
+            !Path::new(&ov).exists(),
+            "no placeholder file before the host open"
+        );
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&ov)
+            .unwrap();
+        assert_eq!(std::fs::read(&ov).unwrap(), b"");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+
+        // Already overlaid: TRUNCATE_EXISTING is kept and the overlay copy is truncated.
+        std::fs::write(&ov, b"overlay-content").unwrap();
+        assert_eq!(
+            v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0),
+            Decision::Use(ov.clone())
+        );
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&ov)
+            .unwrap();
+        assert_eq!(std::fs::read(&ov).unwrap(), b"");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+    }
+
     #[test]
     fn truncate_existing_validation_errors() {
         let f = Fixture::new("trunc_err");
@@ -949,27 +1684,44 @@ mod tests {
             Decision::Fail(ERROR_FILE_NOT_FOUND)
         );
 
-        // Directory fails without creating an overlay entry, matching native Win32 CreateFileW error codes.
-        let dir_w = crate::util::wide(&f.game().join("data").to_string_lossy());
-        for (flags, expected) in [(0, ERROR_ACCESS_DENIED), (FILE_FLAG_BACKUP_SEMANTICS, ERROR_INVALID_PARAMETER)] {
-            let h = unsafe {
-                windows_sys::Win32::Storage::FileSystem::CreateFileW(
-                    dir_w.as_ptr(),
-                    GENERIC_WRITE,
-                    7,
-                    std::ptr::null(),
-                    TRUNCATE_EXISTING,
-                    flags,
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
-            // Windows' own codes are the reference; Wine answers a directory opened with
-            // FILE_FLAG_BACKUP_SEMANTICS and TRUNCATE_EXISTING with ERROR_FILE_EXISTS
-            if !crate::util::under_wine() {
-                assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+        // Directory fails without creating an overlay entry.
+        #[cfg(windows)]
+        {
+            // Windows' own CreateFileW codes are the reference; Wine answers a directory opened
+            // with FILE_FLAG_BACKUP_SEMANTICS and TRUNCATE_EXISTING with ERROR_FILE_EXISTS.
+            let dir_w = crate::util::wide(&f.game().join("data").to_string_lossy());
+            for (flags, expected) in [
+                (0, ERROR_ACCESS_DENIED),
+                (FILE_FLAG_BACKUP_SEMANTICS, ERROR_INVALID_PARAMETER),
+            ] {
+                let h = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                        dir_w.as_ptr(),
+                        GENERIC_WRITE,
+                        7,
+                        std::ptr::null(),
+                        TRUNCATE_EXISTING,
+                        flags,
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+                if !crate::util::under_wine() {
+                    assert_eq!(
+                        unsafe { windows_sys::Win32::Foundation::GetLastError() },
+                        expected
+                    );
+                }
             }
-            assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
+        }
+        for (flags, expected) in [
+            (0, ERROR_ACCESS_DENIED),
+            (FILE_FLAG_BACKUP_SEMANTICS, ERROR_INVALID_PARAMETER),
+        ] {
+            assert_eq!(
+                v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags),
+                Decision::Fail(expected)
+            );
         }
         assert!(!v.visible_in_overlay("data"));
     }
@@ -980,14 +1732,30 @@ mod tests {
         let v = &f.vfs;
 
         // Match native Win32 error codes for mismatched DeleteFileW / RemoveDirectoryW.
-        let dir_w = crate::util::wide(&f.game().join("data").to_string_lossy());
-        let file_w = crate::util::wide(&f.game().join("data").join("hello.txt").to_string_lossy());
-        // SAFETY: dir_w and file_w are NUL-terminated UTF-16 paths; native Win32 rejects them without modifying disk.
-        unsafe {
-            assert_eq!(windows_sys::Win32::Storage::FileSystem::DeleteFileW(dir_w.as_ptr()), 0);
-            assert_eq!(windows_sys::Win32::Foundation::GetLastError(), ERROR_ACCESS_DENIED);
-            assert_eq!(windows_sys::Win32::Storage::FileSystem::RemoveDirectoryW(file_w.as_ptr()), 0);
-            assert_eq!(windows_sys::Win32::Foundation::GetLastError(), ERROR_DIRECTORY);
+        #[cfg(windows)]
+        {
+            let dir_w = crate::util::wide(&f.game().join("data").to_string_lossy());
+            let file_w =
+                crate::util::wide(&f.game().join("data").join("hello.txt").to_string_lossy());
+            // SAFETY: dir_w and file_w are NUL-terminated UTF-16 paths; native Win32 rejects them without modifying disk.
+            unsafe {
+                assert_eq!(
+                    windows_sys::Win32::Storage::FileSystem::DeleteFileW(dir_w.as_ptr()),
+                    0
+                );
+                assert_eq!(
+                    windows_sys::Win32::Foundation::GetLastError(),
+                    ERROR_ACCESS_DENIED
+                );
+                assert_eq!(
+                    windows_sys::Win32::Storage::FileSystem::RemoveDirectoryW(file_w.as_ptr()),
+                    0
+                );
+                assert_eq!(
+                    windows_sys::Win32::Foundation::GetLastError(),
+                    ERROR_DIRECTORY
+                );
+            }
         }
 
         // delete_file must reject both original and overlay directories without adding whiteouts.
