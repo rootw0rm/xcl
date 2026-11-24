@@ -23,6 +23,9 @@ pub mod eh;
 pub mod gpu;
 #[cfg(windows)]
 pub mod hle;
+#[cfg(not(windows))]
+#[path = "hle_linux.rs"]
+pub mod hle;
 pub mod hle_routes;
 #[cfg(windows)]
 pub mod hooks;
@@ -45,11 +48,17 @@ pub mod preflight;
 pub mod report;
 #[cfg(windows)]
 pub mod resolver;
+#[cfg(not(windows))]
+#[path = "resolver_linux.rs"]
+pub mod resolver;
 pub mod rpf;
 mod rpf_probe;
 pub mod shaders;
 pub mod state;
 #[cfg(windows)]
+pub mod stubs;
+#[cfg(not(windows))]
+#[path = "stubs_linux.rs"]
 pub mod stubs;
 #[cfg(windows)]
 pub mod tls;

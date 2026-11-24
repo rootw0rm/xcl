@@ -6,7 +6,6 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::pe::{Layout, Pe};
-#[cfg(windows)]
 use crate::resolver::{self, Source};
 
 #[derive(Serialize)]
@@ -82,7 +81,6 @@ pub fn console_imports(path: &Path) -> Option<Vec<String>> {
 }
 
 /// Function-level classification string.
-#[cfg(windows)]
 fn status(s: &Source) -> String {
     match s {
         Source::Hle(m) => format!("HLE ({m})"),
@@ -98,35 +96,12 @@ fn classify(dll: &str, what: &crate::pe::ImportName, _search_dir: Option<&Path>)
     status(&resolver::classify(dll, what))
 }
 
-/// Phase B: no HLE module is compiled on Linux yet, so every function routed to one is a
-/// stub; the system leg has no `LoadLibrary` and is named as unavailable rather than claimed.
-// LINUX-TODO: Phase C — call resolver::classify once the HLE registry builds on Linux.
+/// Linux (Phase C step 10a): the HLE registry builds from preserved export-name tables
+/// (address `0` = Stub metadata) and the resolver allocates callable auto-stub thunks.
+/// There is no `LoadLibrary`, so unmapped non-HLE imports are `STUB`, never a null.
 #[cfg(not(windows))]
-fn classify(dll: &str, _what: &crate::pe::ImportName, search_dir: Option<&Path>) -> String {
-    let key = crate::util::dll_key(dll);
-    if crate::hle_routes::module_for(&key).is_some() {
-        return "STUB".into();
-    }
-    if search_dir.is_some_and(|dir| find_game_dll(dir, &key)) {
-        return format!("game DLL ({key})");
-    }
-    format!("Windows ({key}; unavailable on Linux)")
-}
-
-/// Case-insensitive DLL lookup in the folder being inspected (no mapping; the Windows
-/// resolver has the same rule for its dry run).
-#[cfg(not(windows))]
-fn find_game_dll(dir: &Path, key: &str) -> bool {
-    if dir.join(key).is_file() {
-        return true;
-    }
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten().any(|e| {
-                e.file_name().to_string_lossy().to_ascii_lowercase() == key && e.path().is_file()
-            })
-        })
-        .unwrap_or(false)
+fn classify(dll: &str, what: &crate::pe::ImportName, _search_dir: Option<&Path>) -> String {
+    status(&resolver::classify(dll, what))
 }
 
 pub fn run(path: &Path, json: bool) -> i32 {
@@ -148,7 +123,6 @@ pub fn run(path: &Path, json: bool) -> i32 {
         }
     };
     let search_dir = path.parent();
-    #[cfg(windows)]
     if let Some(dir) = search_dir {
         resolver::set_search_dirs(vec![dir.to_path_buf()]);
     }
@@ -233,13 +207,13 @@ mod tests {
         crate::pe::ImportName::Name { hint: 0, name: s.into() }
     }
 
-    /// No HLE module is compiled on Linux before Phase C: routed functions are stubs, and
-    /// the system leg is named unavailable instead of pretending `LoadLibrary` works.
+    /// Linux has no `LoadLibrary`: HLE-routed names are Stub metadata and every other
+    /// unmapped import resolves to a callable auto-stub, never a claimed HLE/Windows DLL.
     #[test]
     fn linux_classification_never_claims_hle() {
         assert_eq!(classify("kernel32.dll", &name("CreateFileW"), None), "STUB");
         assert_eq!(classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice"), None), "STUB");
-        assert_eq!(classify("ucrtbase.dll", &name("malloc"), None), "Windows (ucrtbase.dll; unavailable on Linux)");
+        assert_eq!(classify("ucrtbase.dll", &name("malloc"), None), "STUB");
     }
 
     #[test]
@@ -248,7 +222,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xcl-inspect-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("MyLib.DLL"), b"").unwrap();
+        resolver::set_search_dirs(vec![dir.clone()]);
         let got = classify("mylib.dll", &name("Thing"), Some(&dir));
+        resolver::set_search_dirs(vec![]);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, "game DLL (mylib.dll)");
     }
