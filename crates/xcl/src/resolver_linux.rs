@@ -507,6 +507,12 @@ mod tests {
             ("api-ms-win-crt-stdio-l1-1-0.dll", "fread"),
             ("api-ms-win-crt-stdio-l1-1-0.dll", "fclose"),
             ("api-ms-win-crt-stdio-l1-1-0.dll", "fflush"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strcmp"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strncmp"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wcscmp"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wcsncmp"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strchr"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "memchr"),
             ("ucrtbase.dll", "memcpy"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
@@ -555,6 +561,11 @@ mod tests {
             ("concrt140.dll", "malloc"),
             ("vcomp140.dll", "memset"),
             ("vccorlib140.dll", "free"),
+            ("msvcp140.dll", "strcmp"),
+            ("vcruntime140.dll", "strncmp"),
+            ("msvcp140.dll", "wcscmp"),
+            ("vcruntime140.dll", "strchr"),
+            ("concrt140.dll", "memchr"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(

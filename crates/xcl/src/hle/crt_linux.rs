@@ -425,6 +425,95 @@ pub unsafe extern "win64" fn wcsnlen(s: *const u16, max: usize) -> usize {
     n
 }
 
+/// `int strcmp(a, b)` — unsigned-byte order, `0` when equal.
+pub unsafe extern "win64" fn strcmp(a: *const u8, b: *const u8) -> i32 {
+    let mut i = 0;
+    loop {
+        let x = *a.add(i);
+        let y = *b.add(i);
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+}
+
+/// `int strncmp(a, b, n)` — bounded `strcmp`, `0` when the first `n` bytes match.
+pub unsafe extern "win64" fn strncmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    for i in 0..n {
+        let x = *a.add(i);
+        let y = *b.add(i);
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+    }
+    0
+}
+
+/// `int wcscmp(a, b)` — UTF-16 unit order, `0` when equal.
+pub unsafe extern "win64" fn wcscmp(a: *const u16, b: *const u16) -> i32 {
+    let mut i = 0;
+    loop {
+        let x = *a.add(i);
+        let y = *b.add(i);
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+}
+
+/// `int wcsncmp(a, b, n)` — bounded `wcscmp`.
+pub unsafe extern "win64" fn wcsncmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+    for i in 0..n {
+        let x = *a.add(i);
+        let y = *b.add(i);
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+    }
+    0
+}
+
+/// `char* strchr(s, c)` — first `c` (as `u8`) in `s` including the NUL; NULL when absent.
+pub unsafe extern "win64" fn strchr(s: *const u8, c: i32) -> *mut u8 {
+    let target = c as u8;
+    let mut i = 0;
+    loop {
+        let x = *s.add(i);
+        if x == target {
+            return s.add(i) as *mut u8;
+        }
+        if x == 0 {
+            return std::ptr::null_mut();
+        }
+        i += 1;
+    }
+}
+
+/// `void* memchr(s, c, n)` — first `c` in the first `n` bytes; NULL when absent.
+pub unsafe extern "win64" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
+    let target = c as u8;
+    for i in 0..n {
+        if *s.add(i) == target {
+            return s.add(i) as *mut u8;
+        }
+    }
+    std::ptr::null_mut()
+}
+
 /// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
 pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
@@ -726,8 +815,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("memset", memset as usize),
         ("strlen", strlen as usize),
         ("strnlen", strnlen as usize),
+        ("strcmp", strcmp as usize),
+        ("strncmp", strncmp as usize),
+        ("strchr", strchr as usize),
+        ("memchr", memchr as usize),
         ("wcslen", wcslen as usize),
         ("wcsnlen", wcsnlen as usize),
+        ("wcscmp", wcscmp as usize),
+        ("wcsncmp", wcsncmp as usize),
         ("getenv", getenv as usize),
         ("setvbuf", setvbuf as usize),
         ("fopen", fopen as usize),
@@ -885,6 +980,32 @@ mod tests {
             free(p as *mut c_void);
             free(r as *mut c_void);
             free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn string_compare_and_search_match_libc() {
+        unsafe {
+            assert_eq!(strcmp(b"abc\0".as_ptr(), b"abc\0".as_ptr()), 0);
+            assert!(strcmp(b"abc\0".as_ptr(), b"abd\0".as_ptr()) < 0);
+            assert!(strcmp(b"abd\0".as_ptr(), b"abc\0".as_ptr()) > 0);
+            assert_eq!(strncmp(b"abcdef\0".as_ptr(), b"abcxyz\0".as_ptr(), 3), 0);
+            assert!(strncmp(b"abcdef\0".as_ptr(), b"abcxyz\0".as_ptr(), 4) < 0);
+            assert_eq!(strncmp(b"abc\0".as_ptr(), b"abc\0".as_ptr(), 0), 0);
+            let wa: [u16; 4] = [0x41, 0x42, 0x43, 0];
+            let wb: [u16; 4] = [0x41, 0x42, 0x44, 0];
+            assert_eq!(wcscmp(wa.as_ptr(), wa.as_ptr()), 0);
+            assert!(wcscmp(wa.as_ptr(), wb.as_ptr()) < 0);
+            assert!(wcscmp(wb.as_ptr(), wa.as_ptr()) > 0);
+            assert_eq!(wcsncmp(wa.as_ptr(), wb.as_ptr(), 2), 0);
+            assert!(wcsncmp(wa.as_ptr(), wb.as_ptr(), 3) < 0);
+            let s = b"hello\0";
+            assert_eq!(strchr(s.as_ptr(), b'e' as i32), s.as_ptr().add(1) as *mut u8);
+            assert_eq!(strchr(s.as_ptr(), 0), s.as_ptr().add(5) as *mut u8);
+            assert!(strchr(s.as_ptr(), b'z' as i32).is_null());
+            assert_eq!(memchr(s.as_ptr(), b'l' as i32, 5), s.as_ptr().add(2) as *mut u8);
+            assert!(memchr(s.as_ptr(), b'l' as i32, 2).is_null());
+            assert!(memchr(s.as_ptr(), b'z' as i32, 5).is_null());
         }
     }
 
