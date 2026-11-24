@@ -82,7 +82,7 @@ pub struct Report {
     #[cfg(windows)]
     #[serde(default)]
     pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
-    /// DirectStorage: BCPack requests refused (no decoder) by mode, and bytes filled under
+    /// DirectStorage: BCPack requests unpacked and refused (no decoder) by mode, and bytes filled under
     /// `XCL_DSTORAGE_BCPACK_FILL`
     #[cfg(windows)]
     #[serde(default)]

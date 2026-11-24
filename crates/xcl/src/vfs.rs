@@ -1163,6 +1163,25 @@ impl Vfs {
         Ok(())
     }
 
+    fn check_original_dir_empty(&self, rel: &str) -> Result<(), u32> {
+        if self.is_whiteout(rel) {
+            return Ok(());
+        }
+        let entries = match std::fs::read_dir(self.original_path(rel)) {
+            Ok(entries) => entries,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(()),
+            Err(e) => return Err(e.raw_os_error().map(|c| c as u32).unwrap_or(ERROR_ACCESS_DENIED)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| e.raw_os_error().map(|c| c as u32).unwrap_or(ERROR_ACCESS_DENIED))?;
+            let child = format!("{rel}\\{}", entry.file_name().to_string_lossy());
+            if !self.is_whiteout(&child) {
+                return Err(ERROR_DIR_NOT_EMPTY);
+            }
+        }
+        Ok(())
+    }
+
     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
         let _guard = self.write_lock.lock().unwrap();
         if rel.is_empty() {
@@ -1177,6 +1196,7 @@ impl Vfs {
             if !meta.is_dir() {
                 return Err(ERROR_DIRECTORY);
             }
+            self.check_original_dir_empty(rel)?;
             std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
             #[cfg(windows)]
             let original_exists = Path::new(&self.original_path(rel)).exists();
@@ -1196,6 +1216,7 @@ impl Vfs {
         if !Path::new(&self.original_path(rel)).is_dir() {
             return Err(ERROR_DIRECTORY);
         }
+        self.check_original_dir_empty(rel)?;
         self.add_whiteout(rel);
         self.record_write(rel);
         Ok(())
@@ -1537,9 +1558,52 @@ mod tests {
         assert_eq!(v.create_dir("saves\\slot1"), Ok(()));
         assert!(!f.game().join("saves").exists());
         assert!(v.visible_in_overlay("saves\\slot1"));
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert!(!v.is_whiteout("data"));
+        assert!(v.visible_in_original("data\\hello.txt"));
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
         assert_eq!(v.remove_dir("data"), Ok(()));
-        assert!(f.game().join("data").exists());
-        assert!(v.is_whiteout("data\\hello.txt"), "children of a removed dir are hidden");
+        assert!(f.game().join("data").join("hello.txt").exists());
+        let reloaded = Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]);
+        assert!(!reloaded.exists("data"));
+        assert_eq!(v.remove_dir("saves\\slot1"), Ok(()));
+        assert!(!v.exists("saves\\slot1"));
+    }
+
+    #[test]
+    fn remove_dir_checks_both_layers_before_removing_overlay() {
+        let f = Fixture::new("remove_merged_dir");
+        let v = &f.vfs;
+        std::fs::create_dir_all(v.overlay_path("data")).unwrap();
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert!(v.visible_in_overlay("data"));
+        assert!(!v.is_whiteout("data"));
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+
+        // Overlay entries remain visible even when their original names are whited out.
+        std::fs::write(v.overlay_path("data\\hello.txt"), b"overlay").unwrap();
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert!(v.visible_in_overlay("data\\hello.txt"));
+        assert!(!v.is_whiteout("data"));
+        std::fs::remove_file(v.overlay_path("data\\hello.txt")).unwrap();
+        assert_eq!(v.remove_dir("data"), Ok(()));
+        assert!(!v.exists("data"));
+        assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn remove_dir_rejects_visible_subdirectories() {
+        let f = Fixture::new("remove_dir_child");
+        let v = &f.vfs;
+        std::fs::create_dir(f.game().join("data").join("sub")).unwrap();
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        assert_eq!(v.remove_dir("data\\sub"), Ok(()));
+        assert_eq!(v.remove_dir("data"), Ok(()));
+        assert!(f.game().join("data").join("sub").is_dir());
     }
 
     #[cfg(windows)]
@@ -1705,12 +1769,12 @@ mod tests {
                         std::ptr::null_mut(),
                     )
                 };
+                // (read at once: the first under_wine() looks up an export ntdll does not have on
+                // Windows, which sets the thread's last error to ERROR_PROC_NOT_FOUND)
+                let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
                 assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
                 if !crate::util::under_wine() {
-                    assert_eq!(
-                        unsafe { windows_sys::Win32::Foundation::GetLastError() },
-                        expected
-                    );
+                    assert_eq!(err, expected);
                 }
             }
         }
@@ -1785,6 +1849,10 @@ mod tests {
         std::fs::create_dir_all(f.game().join("data").join("sub")).unwrap();
         std::fs::write(f.game().join("data").join("sub").join("deep.txt"), b"deep").unwrap();
 
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(v.delete_file("data\\sub\\deep.txt"), Ok(()));
+        assert_eq!(v.remove_dir("data\\sub"), Ok(()));
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(v.is_whiteout("data"));
         assert!(v.is_whiteout("data\\hello.txt"));
