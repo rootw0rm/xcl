@@ -3,12 +3,14 @@
 //! next iteration.
 
 use std::collections::BTreeMap;
+#[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
 use crate::resolver::{self, Source};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -48,6 +50,7 @@ pub struct Report {
     pub crash: Option<String>,
     pub exit_code: Option<i64>,
     /// what the PC has of what a run needs (DXC, GPU features), checked by `xcl run` first
+    #[cfg(windows)]
     #[serde(default)]
     pub environment: Vec<crate::preflight::Check>,
     /// counts of static imports by how they were resolved
@@ -63,20 +66,25 @@ pub struct Report {
     pub shaders: crate::gpu::shader::ShaderStats,
     /// the DXC that compiled them: folder and versions of dxcompiler.dll and dxil.dll (empty:
     /// none was loaded)
+    #[cfg(windows)]
     #[serde(default)]
     pub dxc: crate::gpu::recomp::dxc::Toolchain,
     /// D3D12.X backend: adapter, interface layouts, unknown IIDs, fallbacks, presented frames
+    #[cfg(windows)]
     #[serde(default)]
     pub d3d12: crate::hle::d3d12x::real::D3d12Stats,
     /// XAudio2: engines, mastering/source voices, XMA voices played as silence, dropped console flags
+    #[cfg(windows)]
     #[serde(default)]
     pub audio: crate::hle::xaudio2::AudioStats,
     /// XGameRuntime through the GDK thunks: which classes the title asked for and who answered,
     /// XCL slots it called that XCL does not implement
+    #[cfg(windows)]
     #[serde(default)]
     pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
     /// DirectStorage: BCPack requests refused (no decoder) by mode, and bytes filled under
     /// `XCL_DSTORAGE_BCPACK_FILL`
+    #[cfg(windows)]
     #[serde(default)]
     pub dstorage: crate::hle::dstorage::DStorageStats,
     pub notes: Vec<String>,
@@ -85,6 +93,7 @@ pub struct Report {
 static CRASH: Mutex<Option<String>> = Mutex::new(None);
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(windows)]
 fn source_label(s: &Source) -> String {
     match s {
         Source::Hle(m) => format!("hle:{m}"),
@@ -95,8 +104,8 @@ fn source_label(s: &Source) -> String {
     }
 }
 
-pub fn build() -> Report {
-    let boot = crate::state::boot();
+#[cfg(windows)]
+fn import_stats() -> (BTreeMap<String, usize>, Vec<MissingImport>) {
     let records = resolver::records();
     let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
     let mut stubbed = Vec::new();
@@ -110,6 +119,16 @@ pub fn build() -> Report {
             stubbed.push(MissingImport { importer: r.importer.clone(), dll: r.dll.clone(), function: r.function.clone() });
         }
     }
+    (by_source, stubbed)
+}
+
+#[cfg(not(windows))]
+fn import_stats() -> (BTreeMap<String, usize>, Vec<MissingImport>) {
+    Default::default()
+}
+
+#[cfg(windows)]
+fn called_stubs() -> Vec<StubCall> {
     let mut called: Vec<StubCall> = crate::stubs::all_stubs()
         .into_iter()
         .filter(|s| s.calls.load(Ordering::Relaxed) > 0)
@@ -121,6 +140,17 @@ pub fn build() -> Report {
         })
         .collect();
     called.sort_by(|a, b| b.calls.cmp(&a.calls));
+    called
+}
+
+#[cfg(not(windows))]
+fn called_stubs() -> Vec<StubCall> {
+    Vec::new()
+}
+
+pub fn build() -> Report {
+    let boot = crate::state::boot();
+    let (imports_by_source, stubbed_imports) = import_stats();
     let modules = crate::modules::mapped_modules()
         .iter()
         .map(|m| ModuleInfo { name: m.name.clone(), base: format!("{:#x}", m.base), size: format!("{:#x}", m.size) })
@@ -128,29 +158,39 @@ pub fn build() -> Report {
     let vfs = crate::vfs::get()
         .map(|v| VfsInfo { unmapped_paths: v.unmapped_paths(), redirected_writes: v.redirected_writes(), whiteouts: v.whiteouts() })
         .unwrap_or_default();
+    #[cfg(windows)]
+    let notes = vec![
+        "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
+        "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
+        "Direct Nt* calls on files do not go through the VFS.".into(),
+    ];
+    #[cfg(not(windows))]
+    let notes = vec!["Linux reports fatal signals; Windows .pdata/C++ unwinding is not ported yet.".into()];
     Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
         exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
         crash: CRASH.lock().ok().and_then(|g| g.clone()),
         exit_code: None,
+        #[cfg(windows)]
         environment: Vec::new(),
-        imports_by_source: by_source,
-        stubbed_imports: stubbed,
-        called_stubs: called,
+        imports_by_source,
+        stubbed_imports,
+        called_stubs: called_stubs(),
         modules,
         vfs,
         shaders: crate::gpu::shader::stats(),
+        #[cfg(windows)]
         dxc: crate::gpu::recomp::dxc::toolchain(),
+        #[cfg(windows)]
         d3d12: crate::hle::d3d12x::real::stats(),
+        #[cfg(windows)]
         audio: crate::hle::xaudio2::stats(),
+        #[cfg(windows)]
         xgameruntime: crate::hle::xgameruntime::api::stats(),
+        #[cfg(windows)]
         dstorage: crate::hle::dstorage::stats(),
-        notes: vec![
-            "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
-            "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
-            "Direct Nt* calls on files do not go through the VFS.".into(),
-        ],
+        notes,
     }
 }
 
@@ -167,9 +207,33 @@ fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
     }
 }
 
+/// Write a crash-only report from outside signal context. The Linux signal handler records
+/// fixed-size values and wakes a watchdog thread; keeping allocation, locks and file I/O in
+/// that thread avoids doing non-async-signal-safe work in the handler itself.
+pub fn write_crash(crash: String) {
+    if let Some(mut g) = lock_within(&CRASH, Duration::from_secs(2)) {
+        g.get_or_insert(crash.clone());
+    }
+    let Some(_g) = lock_within(&WRITE_LOCK, Duration::from_secs(2)) else { return };
+    let Some(boot) = crate::state::boot() else { return };
+    let report = Report {
+        xcl_version: env!("CARGO_PKG_VERSION").to_string(),
+        title: boot.title.clone(),
+        exe: boot.exe_path.to_string_lossy().into_owned(),
+        crash: Some(crash),
+        #[cfg(not(windows))]
+        notes: vec!["Linux reports fatal signals; Windows .pdata/C++ unwinding is not ported yet.".into()],
+        ..Default::default()
+    };
+    if let Ok(s) = serde_json::to_string_pretty(&report) {
+        let _ = std::fs::write(boot.report_path(), s);
+    }
+}
+
 /// Write `report.json` (host side). `crash` is remembered for later writes.
 pub fn write_final(crash: Option<String>) {
     // the process ends: a cursor held in the XCL window is let go
+    #[cfg(windows)]
     crate::hle::kbm::release();
     // a crash is kept even while another thread writes the report, and is written once that
     // thread is done – the process ends right after (#106); other calls give way at once

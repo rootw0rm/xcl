@@ -2,10 +2,10 @@
 //!
 //! See `docs/specs/2026-11-20-xcl-design.md` for the design.
 //!
-//! The host runtime (loader, TLS, EH, HLE, VFS, hooks) is Windows-only for now; on Linux
-//! those modules stay out of the build and the CLI returns clean "not supported on Linux
-//! yet (Phase …)" errors instead. The offline tools (inspect, disasm, shaders, rpf) and
-//! the RDNA2 front-end are platform-neutral.
+//! The host runtime is split by platform: Windows keeps the full loader/HLE path, while Linux
+//! gains the Phase-C modules incrementally and returns clean "not supported on Linux yet
+//! (Phase …)" errors for the rest. The offline tools (inspect, disasm, shaders, rpf) and the
+//! RDNA2 front-end are platform-neutral.
 
 // Function → address casts are the whole point of an import resolver.
 #![allow(function_casts_as_integer)]
@@ -16,6 +16,9 @@ pub mod manifest;
 pub mod config;
 pub mod disasm;
 #[cfg(windows)]
+pub mod eh;
+#[cfg(target_os = "linux")]
+#[path = "eh_linux.rs"]
 pub mod eh;
 pub mod gpu;
 #[cfg(windows)]
@@ -39,7 +42,6 @@ pub mod pe;
 pub mod platform;
 #[cfg(windows)]
 pub mod preflight;
-#[cfg(windows)]
 pub mod report;
 #[cfg(windows)]
 pub mod resolver;
