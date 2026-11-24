@@ -209,12 +209,18 @@ mod tests {
 
     /// Linux has no `LoadLibrary`: unimplemented HLE-routed names are Stub metadata and
     /// every other unmapped import resolves to a callable auto-stub, never a claimed
-    /// Windows DLL. Step-10c file APIs are implemented HLE.
+    /// Windows DLL. Step-10c file APIs are implemented HLE, as is the step-11 CRT slice
+    /// (resolved from any api-ms-win-crt-* contract through the cross-HLE lookup).
     #[test]
     fn linux_classification_never_claims_hle() {
         assert_eq!(classify("kernel32.dll", &name("CreateFileW"), None), "HLE (kernelx.dll)");
         assert_eq!(classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice"), None), "STUB");
-        assert_eq!(classify("ucrtbase.dll", &name("malloc"), None), "STUB");
+        assert_eq!(classify("ucrtbase.dll", &name("malloc"), None), "HLE (ucrtbase.dll, other module)");
+        assert_eq!(
+            classify("api-ms-win-crt-stdio-l1-1-0.dll", &name("__p__fmode"), None),
+            "HLE (ucrtbase.dll, other module)"
+        );
+        assert_eq!(classify("ucrtbase.dll", &name("getenv"), None), "STUB");
     }
 
     #[test]

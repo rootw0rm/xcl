@@ -15,6 +15,8 @@
 
 #[path = "hle/kernelx_linux.rs"]
 pub mod kernelx_linux;
+#[path = "hle/crt_linux.rs"]
+pub mod crt_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -26,6 +28,12 @@ pub use crate::hle_routes::{
     ACPHAL, D3D12X, DXCOMPILER, GAMEINPUT, KERNELX, MFPLAT, MINUSERX, XAUDIO2, XCRDAPI, XG,
     XGAMERUNTIME,
 };
+
+/// Canonical name of the Linux CRT module. It intentionally has no route: CRT imports
+/// arrive as `api-ms-win-crt-*.dll` (and `ucrtbase.dll`) and resolve through the
+/// cross-HLE `find_any` name lookup, so every CRT contract variant works without
+/// route-table churn. `inspect` reports these as `HLE (ucrtbase.dll)`.
+pub const UCRT: &str = "ucrtbase.dll";
 
 /// Linux form: keep the name, store `0` as `Stub` metadata. The Windows form keeps
 /// `$name as usize`. Only one of the two is compiled (see `lib.rs` `#[path]`).
@@ -214,6 +222,12 @@ fn gameinput_exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![GameInputCreate]
 }
 
+/// Step-11 CRT startup slice: every name carries a real Linux address from
+/// `crt_linux` (never `0`/stub metadata).
+fn crt_exports() -> Vec<(&'static str, usize)> {
+    crt_linux::exports()
+}
+
 fn build(config: &Config) -> Registry {
     let modules = vec![
         HleModule::new(KERNELX, kernelx_exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
@@ -227,6 +241,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XG, xg_exports(), &[]),
         HleModule::new(ACPHAL, acphal_exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput_exports(), &[]),
+        HleModule::new(UCRT, crt_exports(), &[]),
     ];
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
@@ -324,14 +339,15 @@ mod tests {
     fn linux_exports_are_stub_metadata_except_kernelx_core() {
         let r = build(&Config::default());
         // Unimplemented names are metadata `0`, never a callable address. Steps 10b–10c
-        // implement the kernelx memory/thread/sync/time/file slices, so those resolve as HLE.
+        // implement the kernelx memory/thread/sync/time/file slices and step 11 the CRT
+        // startup slice, so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
             assert!(!m.exports.is_empty(), "{} has no exports", m.name);
             for (&name, &addr) in &m.exports {
                 total += 1;
-                if m.name == KERNELX && addr != 0 {
+                if (m.name == KERNELX || m.name == UCRT) && addr != 0 {
                     implemented += 1;
                     continue;
                 }
@@ -341,11 +357,12 @@ mod tests {
         assert!(total > 200, "expected the Windows export-name tables, got {total}");
         assert!(implemented > 70, "expected the step-10b/10c kernelx core, got {implemented}");
         // Spot-check counts against the Windows tables (kernelx grows with the Linux
-        // kernel-family fallbacks routed to it).
+        // kernel-family fallbacks routed to it; ucrtbase is a Linux-only CRT module).
         let kx = r.module_by_name(KERNELX).unwrap();
         assert_eq!(kx.exports.len(), 59 + kernelx_linux::exports().iter().filter(|(n, _)| !kx_stub_name(n)).count(), "kernelx export count");
         assert_eq!(r.module_by_name(XGAMERUNTIME).unwrap().exports.len(), 127);
         assert_eq!(r.module_by_name(D3D12X).unwrap().exports.len(), 13);
+        assert_eq!(r.module_by_name(UCRT).unwrap().exports.len(), crt_linux::exports().len());
         assert!(r.find_any("XMemAlloc").is_some());
         assert!(r.find_any("D3D12XboxCreateDevice").is_some());
         // Step-10b spot checks: real code, not stub metadata.
@@ -378,6 +395,31 @@ mod tests {
             assert_eq!(m.name, KERNELX);
             assert_eq!(addr, 0, "{name} stays Stub until its slice lands");
         }
+        // Step-11 CRT spot checks: real code, reachable from any api-ms-win-crt-*
+        // contract through the cross-HLE lookup (no per-contract routes).
+        for name in [
+            "__p__fmode",
+            "__p__commode",
+            "__p___argc",
+            "__p___argv",
+            "__p__environ",
+            "_errno",
+            "__acrt_iob_func",
+            "_initterm",
+            "_initterm_e",
+            "malloc",
+            "free",
+            "memcpy",
+            "memset",
+            "strlen",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, UCRT);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // CRT names stay routeless: contracts resolve via the name lookup above.
+        assert_eq!(r.hle_for("ucrtbase.dll").map(|m| m.name), None);
+        assert_eq!(r.hle_for("api-ms-win-crt-runtime-l1-1-0.dll").map(|m| m.name), None);
     }
 
     /// Windows `hle_exports![...]` names in `hle/kernelx.rs` (59). Kernel-family fallback

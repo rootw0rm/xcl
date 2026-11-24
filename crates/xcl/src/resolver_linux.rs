@@ -427,6 +427,36 @@ mod tests {
     }
 
     #[test]
+    fn crt_startup_imports_resolve_to_hle() {
+        // Step 11: CRT contracts have no routes but resolve through the cross-HLE
+        // name lookup to the ucrtbase module, callable directly (never a stub).
+        for (dll, sym) in [
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "__p__fmode"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "__p__commode"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p___argc"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p___argv"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_errno"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func"),
+            ("api-ms-win-crt-heap-l1-1-0.dll", "malloc"),
+            ("ucrtbase.dll", "memcpy"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::HleOther(_)),
+                "{dll}!{sym} must be cross-HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(stubs::info_of_stub(addr).is_none(), "{dll}!{sym} must not be a stub thunk");
+        }
+        // The pointer shim is directly callable with the Windows x64 ABI.
+        let (addr, _) =
+            resolve_inner(&dll_key("api-ms-win-crt-stdio-l1-1-0.dll"), &name("__p__fmode"), 0);
+        let p_fmode: unsafe extern "win64" fn() -> *mut i32 = unsafe { std::mem::transmute(addr) };
+        let p = unsafe { p_fmode() };
+        assert!(!p.is_null());
+    }
+
+    #[test]
     fn stub_thunk_calls_log_and_return() {
         let (addr, src) = resolve_inner("kernelx.dll", &name("LinuxProbeThunk"), 0);
         assert_eq!(src, Source::Stub);
@@ -487,13 +517,23 @@ mod tests {
 
     #[test]
     fn classify_never_claims_hle_on_linux() {
-        // File APIs are HLE on Linux now (step 10c); unimplemented HLE names stay Stub.
+        // File APIs are HLE on Linux now (step 10c), as is the step-11 CRT slice
+        // (resolved from any api-ms-win-crt-* contract via the cross-HLE lookup);
+        // unimplemented HLE names stay Stub.
         assert!(matches!(
             classify("kernel32.dll", &name("CreateFileW")),
             Source::Hle(_) | Source::HleOther(_)
         ));
         assert_eq!(classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice")), Source::Stub);
-        assert_eq!(classify("ucrtbase.dll", &name("malloc")), Source::Stub);
+        assert!(matches!(
+            classify("ucrtbase.dll", &name("malloc")),
+            Source::HleOther(_)
+        ));
+        assert!(matches!(
+            classify("api-ms-win-crt-stdio-l1-1-0.dll", &name("__p__fmode")),
+            Source::HleOther(_)
+        ));
+        assert_eq!(classify("ucrtbase.dll", &name("getenv")), Source::Stub);
     }
 
     #[test]
