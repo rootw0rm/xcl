@@ -547,7 +547,7 @@ impl Lw {
             "v_exp_f16" => f1!(|s: &mut Self, x| s.un(op::EXP, x)),
             "v_sin_f16" | "v_cos_f16" => {
                 let x = fh(self, 0);
-                let k = self.fc(6.283_185_3);
+                let k = self.fc(std::f32::consts::TAU);
                 let x = self.fmul(x, k);
                 let e = self.un(if name == "v_sin_f16" { op::SIN } else { op::COS }, x);
                 fr(self, e)
