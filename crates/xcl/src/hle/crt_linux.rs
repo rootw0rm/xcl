@@ -912,6 +912,122 @@ pub unsafe extern "win64" fn wmemmove(dst: *mut u16, src: *const u16, n: usize) 
     dst
 }
 
+// ---------------------------------------------------------------------------------------
+// String search/duplication (Phase C step-12b): DllMain/config parsing uses
+// `strstr`/`strrchr`/`strdup` and the wide `wcschr`/`wcsstr`/`_wcsdup` forms. Same
+// NULL-stub fault class as memcpy: a logging stub returning NULL would look like
+// "not found" or a failed alloc and silently mis-route callers, so these are real
+// NUL-safe win64 loops (narrow = bytes, wide = UTF-16 units). `strstr`/`wcsstr`
+// with an empty needle return `haystack`; `strrchr`/`wcschr` with `c == 0` return
+// the NUL terminator. `strdup`/`_strdup`/`_wcsdup` allocate via the CRT heap above
+// (assert on OOM, like `malloc`) and return an owned copy.
+// ---------------------------------------------------------------------------------------
+
+/// `char* strstr(haystack, needle)` — first `needle` in `haystack`; NULL when absent.
+/// Empty `needle` returns `haystack`, as on Windows.
+pub unsafe extern "win64" fn strstr(haystack: *const u8, needle: *const u8) -> *mut u8 {
+    if *needle == 0 {
+        return haystack as *mut u8;
+    }
+    let mut h = 0;
+    loop {
+        let hb = *haystack.add(h);
+        if hb == 0 {
+            return std::ptr::null_mut();
+        }
+        let mut i = 0;
+        loop {
+            let nb = *needle.add(i);
+            if nb == 0 {
+                return haystack.add(h) as *mut u8;
+            }
+            if *haystack.add(h + i) != nb {
+                break;
+            }
+            // If haystack hit its NUL mid-needle the bytes differ (nb != 0),
+            // so the break above already fired; no extra bound check needed.
+            i += 1;
+        }
+        h += 1;
+    }
+}
+
+/// `char* strrchr(s, c)` — last `c` (as `u8`) in `s` including the NUL; NULL when absent.
+pub unsafe extern "win64" fn strrchr(s: *const u8, c: i32) -> *mut u8 {
+    let target = c as u8;
+    let mut last: *mut u8 = std::ptr::null_mut();
+    let mut i = 0;
+    loop {
+        let b = *s.add(i);
+        if b == target {
+            last = s.add(i) as *mut u8;
+        }
+        if b == 0 {
+            break;
+        }
+        i += 1;
+    }
+    last
+}
+
+/// `char* strdup(s)` — owned heap copy (incl. NUL); asserts on OOM like `malloc`.
+pub unsafe extern "win64" fn strdup(s: *const u8) -> *mut u8 {
+    let n = strlen(s);
+    let p = malloc(n + 1) as *mut u8;
+    std::ptr::copy_nonoverlapping(s, p, n + 1);
+    p
+}
+
+/// `wchar_t* wcschr(s, c)` — first `c` (as `u16`) in `s` including NUL; NULL when absent.
+pub unsafe extern "win64" fn wcschr(s: *const u16, c: i32) -> *mut u16 {
+    let target = c as u16;
+    let mut i = 0;
+    loop {
+        let w = *s.add(i);
+        if w == target {
+            return s.add(i) as *mut u16;
+        }
+        if w == 0 {
+            return std::ptr::null_mut();
+        }
+        i += 1;
+    }
+}
+
+/// `wchar_t* wcsstr(haystack, needle)` — first wide `needle`; NULL when absent.
+/// Empty `needle` returns `haystack`, as on Windows.
+pub unsafe extern "win64" fn wcsstr(haystack: *const u16, needle: *const u16) -> *mut u16 {
+    if *needle == 0 {
+        return haystack as *mut u16;
+    }
+    let mut h = 0;
+    loop {
+        if *haystack.add(h) == 0 {
+            return std::ptr::null_mut();
+        }
+        let mut i = 0;
+        loop {
+            let nb = *needle.add(i);
+            if nb == 0 {
+                return haystack.add(h) as *mut u16;
+            }
+            if *haystack.add(h + i) != nb {
+                break;
+            }
+            i += 1;
+        }
+        h += 1;
+    }
+}
+
+/// `wchar_t* _wcsdup(s)` — owned wide heap copy (incl. NUL); asserts on OOM.
+pub unsafe extern "win64" fn wcsdup_impl(s: *const u16) -> *mut u16 {
+    let n = wcslen(s);
+    let p = malloc((n + 1) * 2) as *mut u16;
+    std::ptr::copy_nonoverlapping(s, p, n + 1);
+    p
+}
+
 /// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
 pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
@@ -1260,6 +1376,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("wcsncat", wcsncat as usize),
         ("wmemcpy", wmemcpy as usize),
         ("wmemmove", wmemmove as usize),
+        ("strstr", strstr as usize),
+        ("strrchr", strrchr as usize),
+        ("strdup", strdup as usize),
+        ("_strdup", strdup as usize),
+        ("wcschr", wcschr as usize),
+        ("wcsstr", wcsstr as usize),
+        ("_wcsdup", wcsdup_impl as usize),
+        ("wcsdup", wcsdup_impl as usize),
         ("getenv", getenv as usize),
         ("setvbuf", setvbuf as usize),
         ("fopen", fopen as usize),
@@ -1621,6 +1745,79 @@ mod tests {
             wmemcpy(wzero.as_mut_ptr(), wsrc2.as_ptr(), 0);
             wmemmove(wzero.as_mut_ptr(), wsrc2.as_ptr(), 0);
             assert_eq!(&wzero, &[9, 9]);
+        }
+    }
+
+    #[test]
+    fn string_search_and_dup_match_libc() {
+        unsafe {
+            // strstr finds first needle, misses NULL, empty needle returns haystack.
+            let hay = b"hello world\0";
+            assert_eq!(
+                strstr(hay.as_ptr(), b"world\0".as_ptr()),
+                hay.as_ptr().add(6) as *mut u8
+            );
+            assert_eq!(
+                strstr(hay.as_ptr(), b"o w\0".as_ptr()),
+                hay.as_ptr().add(4) as *mut u8
+            );
+            assert!(strstr(hay.as_ptr(), b"zzz\0".as_ptr()).is_null());
+            assert!(strstr(hay.as_ptr(), b"world!\0".as_ptr()).is_null());
+            assert_eq!(
+                strstr(hay.as_ptr(), b"\0".as_ptr()),
+                hay.as_ptr() as *mut u8
+            );
+            // strrchr finds the last occurrence; c == 0 returns the terminator.
+            assert_eq!(
+                strrchr(hay.as_ptr(), b'l' as i32),
+                hay.as_ptr().add(9) as *mut u8
+            );
+            assert_eq!(
+                strrchr(hay.as_ptr(), b'h' as i32),
+                hay.as_ptr() as *mut u8
+            );
+            assert_eq!(
+                strrchr(hay.as_ptr(), 0),
+                hay.as_ptr().add(11) as *mut u8
+            );
+            assert!(strrchr(hay.as_ptr(), b'z' as i32).is_null());
+            // strdup/_strdup return an owned equal copy at a different address.
+            for dup in [strdup as unsafe extern "win64" fn(*const u8) -> *mut u8] {
+                let p = dup(hay.as_ptr());
+                assert!(!p.is_null() && p != hay.as_ptr() as *mut u8);
+                assert_eq!(strlen(p), strlen(hay.as_ptr()));
+                assert_eq!(strcmp(p, hay.as_ptr()), 0);
+                free(p as *mut c_void);
+            }
+            // Wide search mirrors the narrow semantics in UTF-16 units.
+            let whay: [u16; 12] = [0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, 0];
+            assert_eq!(
+                wcschr(whay.as_ptr(), 0x6C as i32),
+                whay.as_ptr().add(2) as *mut u16
+            );
+            assert_eq!(
+                wcschr(whay.as_ptr(), 0),
+                whay.as_ptr().add(11) as *mut u16
+            );
+            assert!(wcschr(whay.as_ptr(), 0x7A as i32).is_null());
+            assert_eq!(
+                wcsstr(whay.as_ptr(), [0x77, 0x6F, 0x72, 0x6C, 0x64, 0].as_ptr()),
+                whay.as_ptr().add(6) as *mut u16
+            );
+            assert!(wcsstr(
+                whay.as_ptr(),
+                [0x7A, 0x7A, 0x7A, 0].as_ptr()
+            )
+            .is_null());
+            assert_eq!(
+                wcsstr(whay.as_ptr(), [0].as_ptr()),
+                whay.as_ptr() as *mut u16
+            );
+            let w = wcsdup_impl(whay.as_ptr());
+            assert!(!w.is_null() && w != whay.as_ptr() as *mut u16);
+            assert_eq!(wcslen(w), wcslen(whay.as_ptr()));
+            assert_eq!(wcscmp(w, whay.as_ptr()), 0);
+            free(w as *mut c_void);
         }
     }
 

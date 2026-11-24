@@ -712,3 +712,35 @@ Verification (this host, no game files — retail SKIPPED):
 - `cargo test -p xcl --lib -- --test-threads=4` → 371 passed; 0 failed; 0 ignored.
 - `cargo check --workspace` → Finished, 6 pre-existing warnings, 0 errors.
 - Cross-built synthetic title (prebuilt `target/debug/xcl_testtitle.exe` + `testgame_mw.dll`, fresh temp game+data dirs): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 16`, `ExitProcess(0x10)`. Baseline without this slice on a fresh dir is also 16 (same GPU/null-device + first-run overlay quirks: real-GPU triangle/Present, sparse VRAM, DirectStorage, MFPlat, XG texture pools). No CRT regression; title reaches `ExitProcess`. A rerun on a reused dir drops to 14 (overlay already populated), so fresh-dir counts are the comparator.
+
+## Critic review — step-12a crt-copy (Fresh-Eyes, 2026-11-25, `linux` @ `38f95fd`)
+
+Task `task-1795560125-71aa` (`linux:crt-copy`) — PASS, closed.
+
+Independent re-verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib crt -- --test-threads=4` → 18 passed; 0 failed (includes `string_copy_and_concat_match_libc` + both resolver forwarding tests).
+- `cargo test -p xcl --lib -- --test-threads=4` → 371 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors, 6 pre-existing warnings; `cargo clippy -p xcl --lib` → 0 errors (502 pre-existing warnings only).
+- Synthetic title (`target/debug/xcl_testtitle.exe` + `testgame_mw.dll`, fresh temp game + `XCL_DATA_ROOT`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `crash: null`, `exit_code: 14`, `called_stubs: 34`, `imports_by_source` includes `hle-cross:ucrtbase.dll`. All 14 FAILs are the known null-device categories (real-GPU triangle/Present, command-list writes, sparse VRAM/coherent window, descriptor-heap reservation, depth bias, raytracing tail, DirectStorage, XG title/streaming textures, MFPlat); no CRT/DllMain failure, title reaches `ExitProcess`. A run via the default data root on the same binaries reported 16 (same categories + first-run overlay variance), so the 14-vs-16 delta is environment/overlay state, not a CRT regression.
+
+Requirements: met — 10 NUL-safe win64 exports (`strcpy`/`strncpy`/`strcat`/`strncat`/`wcscpy`/`wcsncpy`/`wcscat`/`wcsncat`/`wmemcpy`/`wmemmove`) with `dst` return, UCRT pad/truncate/NUL semantics, overlap-safe wide block copy, wired through `exports()` + HLE spot list + `api-ms-win-crt-string` contract and bundled-DLL resolver checks + unit test. One commit, no refactors.
+
+## Follow-ups (minor, non-blocking)
+- `plan.md` step 12a acceptance still says the title reports `failures: 0`; on Linux null-device the comparator is 14–16 known failures (Windows `e2e.rs` expects 0 with a real GPU). Worth a plan.md wording touch, not this slice.
+- `strncpy` pad / `strncat` re-terminate / `wmemmove` overlap edge cases are covered; null-dest fault parity with `memcpy` holds by construction (deref faults, never a NULL-stub return) with no explicit null test — same as the prior slices.
+
+## Verification Notes — step-12b crt-search-dup (Builder, 2026-11-25, `linux`)
+
+Task `task-1795564589-a185` (`linux:crt-search-dup`, plan.md §4.7a next family).
+Retail-smoke `task-1795516176-5dde` SKIPPED here: `/run/media/...` absent (verified `ls` both dirs → No such file or directory), game folder stays untouched; synthetic title is the e2e gate.
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/hle/crt_linux.rs`: NUL-safe win64 `strstr`/`strrchr`/`strdup`+`_strdup`/`wcschr`/`wcsstr`/`wcsdup_impl` (exported as `_wcsdup`+`wcsdup`), wired into `exports()`, plus `string_search_and_dup_match_libc` unit test (empty-needle returns haystack, NUL terminator find, miss NULL, dup owned-copy + free).
+- `crates/xcl/src/hle_linux.rs`: 8 new names in the CRT spot list.
+- `crates/xcl/src/resolver_linux.rs`: `api-ms-win-crt-string` contract checks + bundled-DLL (`msvcp140`/`vcruntime140`) forwarding checks for the new names.
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib crt -- --test-threads=4` → 19 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 372 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors, 6 pre-existing warnings; `cargo clippy -p xcl --lib` → 0 errors (508 pre-existing warnings only).
+- Synthetic title (prebuilt `target/debug/xcl_testtitle.exe` + `testgame_mw.dll`, proper `tests/data/testgame` game dir + fresh `XCL_DATA_ROOT`, `XCL_DUMP_SHADERS=1`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `crash: null`, `exit_code: 14`, `called_stubs: 34`, `imports_by_source` includes `hle-cross:ucrtbase.dll: 68`. All 14 FAILs are the known null-device categories; no CRT regression.
