@@ -99,12 +99,10 @@ fn run_command(target: &Path, rest: &[String]) -> i32 {
     xcl::launcher::run(target, rest)
 }
 
-/// The host runtime (launcher, loader, HLE) is Windows-only until Phase C.
-// LINUX-TODO: Phase C — call the Linux launcher.
+/// Linux (Phase C step 10e): the launcher runs the title in-process.
 #[cfg(not(windows))]
-fn run_command(_target: &Path, _rest: &[String]) -> i32 {
-    eprintln!("xcl run: not supported on Linux yet (Phase C)");
-    2
+fn run_command(target: &Path, rest: &[String]) -> i32 {
+    xcl::launcher::run(target, rest)
 }
 
 fn inspect_command(target: &Path, args: &[String]) -> i32 {

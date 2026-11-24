@@ -31,9 +31,15 @@ pub mod hle_routes;
 pub mod hooks;
 #[cfg(windows)]
 pub mod host;
+#[cfg(not(windows))]
+#[path = "host_linux.rs"]
+pub mod host;
 pub mod insn;
 pub mod inspect;
 #[cfg(windows)]
+pub mod launcher;
+#[cfg(not(windows))]
+#[path = "launcher_linux.rs"]
 pub mod launcher;
 #[cfg(windows)]
 pub mod loader;
