@@ -463,6 +463,8 @@ mod tests {
             ("kernelx.dll", "XMemMapPhysicalPages"),
             ("kernelx.dll", "XMemFreePhysicalPages"),
             ("xmem.dll", "XMemAllocatePhysicalPages"),
+            // Step 11o LSA probe backing advapi32legacy dynamic lookups.
+            ("advapi32legacy.dll", "LsaOpenPolicy"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
@@ -613,6 +615,70 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let b = unsafe { ts(gi) };
         assert!(a > 0 && b > a, "timestamps {a} {b}");
+    }
+
+    #[test]
+    fn xtaskqueue_imports_resolve_to_hle() {
+        // Step 11o: manual/delayed/pool dispatch + composite + networking + LSA probe.
+        for (dll, sym) in [
+            ("xgameruntime.dll", "XTaskQueueCreate"),
+            ("xgameruntime.dll", "XTaskQueueCreateComposite"),
+            ("xgameruntime.dll", "XTaskQueueGetPort"),
+            ("xgameruntime.dll", "XTaskQueueSubmitCallback"),
+            ("xgameruntime.dll", "XTaskQueueSubmitDelayedCallback"),
+            ("xgameruntime.dll", "XTaskQueueDispatch"),
+            ("xgameruntime.dll", "XTaskQueueTerminate"),
+            ("xgameruntime.dll", "XTaskQueueCloseHandle"),
+            ("xgameruntime.dll", "XNetworkingQueryPreferredLocalUdpMultiplayerPort"),
+            ("xgameruntime.dll", "XNetworkingGetConnectivityHint"),
+            ("advapi32legacy.dll", "LsaOpenPolicy"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // Direct ABI: manual queue dispatches, delayed fires via timeout, pool runs async.
+        let (addr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XTaskQueueCreate"), 0);
+        let create: unsafe extern "win64" fn(u32, u32, *mut *mut std::ffi::c_void) -> i32 =
+            unsafe { std::mem::transmute(addr) };
+        let (daddr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XTaskQueueDispatch"), 0);
+        let dispatch: unsafe extern "win64" fn(*mut std::ffi::c_void, u32, u32) -> bool =
+            unsafe { std::mem::transmute(daddr) };
+        let (saddr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XTaskQueueSubmitCallback"), 0);
+        let submit: unsafe extern "win64" fn(*mut std::ffi::c_void, u32, *mut std::ffi::c_void, usize) -> i32 =
+            unsafe { std::mem::transmute(saddr) };
+        let (taddr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XTaskQueueTerminate"), 0);
+        let terminate: unsafe extern "win64" fn(*mut std::ffi::c_void, bool, *mut std::ffi::c_void, usize) -> i32 =
+            unsafe { std::mem::transmute(taddr) };
+        let (caddr, _) = resolve_inner(&dll_key("xgameruntime.dll"), &name("XTaskQueueCloseHandle"), 0);
+        let close: unsafe extern "win64" fn(*mut std::ffi::c_void) =
+            unsafe { std::mem::transmute(caddr) };
+        unsafe extern "win64" fn bump(ctx: *mut std::ffi::c_void, canceled: bool) {
+            assert!(!canceled);
+            let hits = &*(ctx as *const std::sync::atomic::AtomicU32);
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let hits = std::sync::atomic::AtomicU32::new(0);
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create(0, 0, &mut q), 0);
+            assert_eq!(submit(q, 0, &hits as *const _ as *mut _, bump as usize), 0);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(dispatch(q, 0, 0));
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(terminate(q, true, std::ptr::null_mut(), 0), 0);
+            close(q);
+        }
+        // LSA probe resolves through the kernelx HLE handle for GetProcAddress checks.
+        let h = load_library("advapi32legacy.dll").expect("advapi32legacy HLE handle");
+        assert!(get_proc_address(h, &name("LsaOpenPolicy")).is_some());
     }
 
     #[test]

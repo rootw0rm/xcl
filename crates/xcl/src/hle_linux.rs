@@ -23,6 +23,8 @@ pub mod xgameruntime_linux;
 pub mod minuserx_linux;
 #[path = "hle/gameinput_linux.rs"]
 pub mod gameinput_linux;
+#[path = "hle/xtaskqueue_linux.rs"]
+pub mod xtaskqueue_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -176,7 +178,15 @@ fn xgameruntime_exports() -> Vec<(&'static str, usize)> {
         XStoreCloseContextHandle,
     ];
     // Step-11i identity slice carries real Linux addresses; the rest stays Stub (0).
+    // Step-11o taskqueue + networking slice merges real addresses below.
     for (name, addr) in xgameruntime_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    for (name, addr) in xtaskqueue_linux::exports() {
         if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
             slot.1 = addr;
         } else {
@@ -375,8 +385,8 @@ mod tests {
         // Unimplemented names are metadata `0`, never a callable address. Steps 10b–10c
         // implement the kernelx memory/thread/sync/time/file slices, step 11 the CRT
         // startup slice, step 11i the xgameruntime identity slice, step 11m the
-        // minuserx window slice and step 11n the headless GameInput slice,
-        // so those resolve as HLE.
+        // minuserx window slice, step 11n the headless GameInput slice and step 11o
+        // the XTaskQueue + networking slice, so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
@@ -567,6 +577,33 @@ mod tests {
         for name in ["GameInputCreate"] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, GAMEINPUT);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.
+        for name in [
+            "XTaskQueueCreate",
+            "XTaskQueueCreateComposite",
+            "XTaskQueueGetPort",
+            "XTaskQueueDuplicateHandle",
+            "XTaskQueueCloseHandle",
+            "XTaskQueueSubmitCallback",
+            "XTaskQueueSubmitDelayedCallback",
+            "XTaskQueueDispatch",
+            "XTaskQueueIsEmpty",
+            "XTaskQueueTerminate",
+            "XTaskQueueRegisterWaiter",
+            "XTaskQueueRegisterMonitor",
+            "XNetworkingQueryPreferredLocalUdpMultiplayerPort",
+            "XNetworkingGetConnectivityHint",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, XGAMERUNTIME);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-11o LSA probe backing `advapi32legacy.dll!LsaOpenPolicy`.
+        for name in ["LsaOpenPolicy"] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, KERNELX);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
     }

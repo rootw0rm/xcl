@@ -2682,6 +2682,24 @@ pub unsafe extern "win64" fn RegCloseKey(key: usize) -> u32 {
     }
 }
 
+/// `NTSTATUS LsaOpenPolicy(...)`: headless success with a dummy policy handle.
+/// The title's composite check only probes `GetProcAddress(advapi32legacy, "LsaOpenPolicy")`
+/// for non-null; a real callable address keeps that probe working without an LSA database.
+pub unsafe extern "win64" fn LsaOpenPolicy(
+    _system: *const c_void,
+    _attrs: *const c_void,
+    _access: u32,
+    out: *mut usize,
+) -> u32 {
+    static POLICY: u8 = 0;
+    if out.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    *out = &POLICY as *const u8 as usize;
+    crate::xlog_info!("kernelx: LsaOpenPolicy -> headless success");
+    0 // STATUS_SUCCESS
+}
+
 /// `ULONG RegisterAppStateChangeNotification(...)`: a title is never suspended here.
 static APP_NOTIFICATION: u8 = 0;
 
@@ -7045,6 +7063,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("RegOpenKeyExW", RegOpenKeyExW as usize),
         ("RegQueryValueExW", RegQueryValueExW as usize),
         ("RegCloseKey", RegCloseKey as usize),
+        ("LsaOpenPolicy", LsaOpenPolicy as usize),
         ("VirtualAlloc", VirtualAlloc as usize),
         ("VirtualAllocEx", VirtualAllocEx as usize),
         ("VirtualFree", VirtualFree as usize),
