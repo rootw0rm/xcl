@@ -10,10 +10,19 @@
 //!
 //! Not ported yet (explicit Phase C/C steps, no silent stubs):
 //! * import resolution/HLE/auto-stubs — step 10; the IAT stays empty for now,
-//! * game-DLL DllMain/TLS installation — step 10; the main image's static TLS runs here,
+//!   `load_main` still rejects images with unresolved imports,
 //! * `.pdata` translation / C++ unwinding — later Phase C work,
-//! * the title PEB, argv and dedicated entry-thread stack — step 10d.
+//! * the title PEB, argv and dedicated entry-thread stack — step 10e.
+//!
+//! Ported in step 10d: serialized game-DLL loading (`load_game_dll`) with strict
+//! fixed-address mapping, per-DLL static-TLS install, ordered process TLS
+//! attach/detach callbacks and `DllMain`, plus `run_main` host entry that attaches the
+//! calling thread before process attach. `DllMain(DLL_THREAD_*)` notifications for
+//! game threads remain a follow-up (kernelx thread entry currently runs TLS
+//! attach/detach only).
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -24,6 +33,56 @@ use crate::pe::{self, Layout, OwnedExports, Pe};
 /// `MAP_FIXED_NOREPLACE` (Linux 4.17+). Not exposed by this `libc` version for plain Linux,
 /// and it must be a build-time constant of the kernel ABI.
 const MAP_FIXED_NOREPLACE: libc::c_int = 0x10_0000;
+
+/// Serialises image loads so dependency/DLL installs cannot race. Re-entrant: a DllMain
+/// that loads another DLL re-enters on the same thread without deadlocking.
+static LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+thread_local! {
+    static IN_LOAD: Cell<usize> = const { Cell::new(0) };
+}
+
+struct LoadGuard {
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl LoadGuard {
+    fn enter() -> LoadGuard {
+        let outer = IN_LOAD.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v == 0
+        });
+        let lock = if outer {
+            Some(LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
+        LoadGuard { _lock: lock }
+    }
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        IN_LOAD.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Game-DLL entry: `BOOL DllMain(HINSTANCE, DWORD reason, LPVOID)` on the Windows x64 ABI.
+type DllMain = unsafe extern "win64" fn(*mut c_void, u32, *mut c_void) -> i32;
+
+/// Static-TLS install data for a mapped non-main image, waiting for `init_dll`.
+struct PendingTls {
+    name: String,
+    template: usize,
+    template_len: usize,
+    total_len: u64,
+    index_ptr: usize,
+    hinst: usize,
+    callbacks: Vec<usize>,
+}
+
+static PENDING_TLS: LazyLock<Mutex<HashMap<usize, PendingTls>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static PAGE_SIZE: LazyLock<usize> = LazyLock::new(|| {
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -120,7 +179,104 @@ pub fn map_image(path: &Path) -> Result<Arc<MappedModule>, String> {
 
 /// Map the title's main executable and register it as the main image.
 pub fn load_main(path: &Path) -> Result<Arc<MappedModule>, String> {
+    let _guard = LoadGuard::enter();
     map_image_ex(path, true)
+}
+
+/// Run a freshly mapped DLL's TLS install, process TLS attach callbacks and DllMain.
+///
+/// Order mirrors Windows `loader::init_dll`: static-TLS blocks first, then the TLS
+/// directory's `DLL_PROCESS_ATTACH` callbacks in order, then
+/// `DllMain(hinst, DLL_PROCESS_ATTACH)`. A `FALSE` (0) return fails the load and takes
+/// the module out of the registry, like Windows; the mapping itself stays (DllMain may
+/// have left threads behind) and a later load maps it again.
+pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
+    // Process callbacks read `gs:[0x58]`; the loading thread must own TLS blocks first.
+    // An already-attached thread is unaffected (idempotent); a fresh thread attaches to
+    // the previously installed images only, so it correctly receives no THREAD_ATTACH
+    // for the image being installed now.
+    crate::tls::attach_current_thread().map_err(|e| format!("{}: {e}", m.name))?;
+    if let Some(pending) = PENDING_TLS.lock().unwrap().remove(&m.base) {
+        unsafe {
+            crate::tls::install(crate::tls::ImageSpec {
+                name: pending.name.clone(),
+                template: pending.template,
+                template_len: pending.template_len,
+                total_len: pending.total_len,
+                index_ptr: pending.index_ptr,
+                hinst: pending.hinst,
+                callbacks: pending.callbacks,
+                main: false,
+            })
+        }
+        .map_err(|e| format!("{}: static TLS: {e}", m.name))?;
+    }
+    unsafe {
+        run_tls_callbacks(m, crate::tls::DLL_PROCESS_ATTACH);
+        if m.entry_rva != 0 {
+            let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
+            crate::xlog_info!("DllMain({}, PROCESS_ATTACH)", m.name);
+            if f(
+                m.base as *mut c_void,
+                crate::tls::DLL_PROCESS_ATTACH,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                modules::unregister_mapped(m.base);
+                return Err(format!("DllMain({}) returned FALSE", m.name));
+            }
+        }
+    }
+    m.initialized
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Run a DLL's `DLL_PROCESS_DETACH` (DllMain then TLS callbacks, the reverse of
+/// `init_dll`). Used for the process-exit path in `run_main`; full unload/munmap is a
+/// follow-up.
+fn deinit_dll(m: &Arc<MappedModule>) {
+    if !m.initialized.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // LINUX-TODO: respect DisableThreadLibraryCalls / no_thread_calls for the process
+    // path once kernelx wires it; Windows still calls DllMain(PROCESS_DETACH) for those.
+    unsafe {
+        if m.entry_rva != 0 {
+            let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
+            crate::xlog_info!("DllMain({}, PROCESS_DETACH)", m.name);
+            f(
+                m.base as *mut c_void,
+                crate::tls::DLL_PROCESS_DETACH,
+                std::ptr::null_mut(),
+            );
+        }
+        run_tls_callbacks(m, crate::tls::DLL_PROCESS_DETACH);
+    }
+    m.initialized
+        .store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Map + initialise a DLL that ships with the game (idempotent by file name).
+///
+/// Serialized with the main-image load and concurrent DLL loads; an occupied preferred
+/// base stays a hard error (DEC-010), never a silent relocation.
+pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
+    let key = crate::util::dll_key(&path.to_string_lossy());
+    let _guard = LoadGuard::enter();
+    if let Some(m) = modules::find_mapped_by_name(&key) {
+        return Ok(m);
+    }
+    let m = map_image_ex(path, false)?;
+    if !m.is_dll {
+        crate::xlog_warn!("{key} is not a DLL but is being loaded as a library");
+    }
+    if let Err(e) = init_dll(&m) {
+        modules::unregister_mapped(m.base);
+        PENDING_TLS.lock().unwrap().remove(&m.base);
+        return Err(e);
+    }
+    Ok(m)
 }
 
 type ExeEntry = unsafe extern "win64" fn(*mut c_void) -> u32;
@@ -140,9 +296,10 @@ unsafe fn run_tls_callbacks(m: &MappedModule, reason: u32) {
 /// Run an import-free main image on the calling thread with the Windows x64 ABI.
 ///
 /// The calling thread first receives its TLS blocks and `DLL_THREAD_ATTACH` callbacks, then
-/// the image's process-attach callbacks and entry point run. After the entry returns, process
-/// detach runs while the blocks are still alive, followed by thread detach and restoration of
-/// the host's previous `GS`.
+/// the image's process-attach callbacks and entry point run. After the entry returns,
+/// loaded game DLLs receive `DLL_PROCESS_DETACH` (reverse load order) followed by the
+/// main image's process-detach callbacks while the blocks are still alive, then thread
+/// detach restores the host's previous `GS`.
 pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     const ENTRY_START_FAILED: u32 = 0xC000_0001;
     if m.is_dll {
@@ -178,10 +335,16 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
             modules::describe_address(m.base + m.entry_rva as usize)
         );
         crate::log::flush();
-        // LINUX-TODO: Phase C step-10d — supply the title PEB/argv and dedicated stack. The
+        // LINUX-TODO: Phase C step-10e — supply the title PEB/argv and dedicated stack. The
         // import-free synthetic entry does not read its Windows PEB argument.
         let code = entry(std::ptr::null_mut());
         // Process detach must see the thread's blocks; free them only afterwards.
+        // Game DLLs first (reverse load order, DllMain then TLS each), then the main image.
+        for dll in modules::mapped_modules().into_iter().rev() {
+            if dll.is_dll {
+                deinit_dll(&dll);
+            }
+        }
         run_tls_callbacks(m, crate::tls::DLL_PROCESS_DETACH);
         crate::tls::detach_current_thread();
         crate::xlog_info!("{}: entry point returned code {code:#x}", m.name);
@@ -286,8 +449,8 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     }
 
     // 5. static TLS: keep the directory's callbacks in order, then (for the main image)
-    // install the per-thread blocks. DLL TLS install follows the game-DLL load path —
-    // LINUX-TODO: Phase C step-10.
+    // install the per-thread blocks. DLL blocks install in `init_dll`, before the DLL's
+    // process-attach callbacks and DllMain run.
     let mut tls_callbacks = Vec::new();
     let mut tls_dir = None;
     match pe.tls() {
@@ -357,10 +520,22 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             }
             .map_err(|e| format!("{name}: static TLS: {e}"))?;
         } else {
-            // LINUX-TODO: Phase C step-10 — the game-DLL load path (DllMain/init_dll) does
-            // not exist yet; install the DLL's blocks there, before running its code.
+            // The game-DLL load path (`init_dll`) installs this before running the
+            // DLL's code. Stash it keyed by base; `map_image` alone runs no image code.
+            PENDING_TLS.lock().unwrap().insert(
+                base,
+                PendingTls {
+                    name: name.clone(),
+                    template,
+                    template_len,
+                    total_len: t.total_len(),
+                    index_ptr,
+                    hinst: base,
+                    callbacks: tls_callbacks.clone(),
+                },
+            );
             crate::xlog_info!(
-                "{name}: non-main image: static TLS installs on the game-DLL load path (Phase C step-10)"
+                "{name}: non-main image: static TLS installs in init_dll before DllMain"
             );
         }
     }
@@ -999,5 +1174,232 @@ mod tests {
             callbacks.len(),
             perms_at(m.base + pe.sections.iter().find(|s| s.name == ".text").map(|s| s.va as usize).unwrap_or(0x1000))
         );
+    }
+
+    /// DllMain code: append `(tls_byte << 16 | reason << 8 | id)` to the image trace,
+    /// then return 1 (TRUE). Same register discipline as the TLS callback helper.
+    fn dllmain_code(index_ptr: u64, trace_count: u64, id: u8) -> Vec<u8> {
+        let mut c = lifecycle_callback_code(index_ptr, trace_count, id);
+        c.pop(); // drop the bare `ret`
+        c.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // mov eax, 1
+        c.push(0xC3); // ret
+        c
+    }
+
+    /// Entry code for the combined test: require the DLL's TLS byte to be `want`
+    /// (proves main-thread visibility of the DLL block), then return 0x2a.
+    fn entry_checks_dll_byte(dll_index_ptr: u64, want: u8) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&[0x49, 0xBA]); // mov r10, dll_index_ptr
+        c.extend_from_slice(&dll_index_ptr.to_le_bytes());
+        c.extend_from_slice(&[0x45, 0x8B, 0x1A]); // mov r11d, [r10]
+        c.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // mov rax, gs:[0x58]
+        c.extend_from_slice(&[0x4E, 0x8B, 0x0C, 0xD8]); // mov r9, [rax+r11*8]
+        c.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x01]); // movzx eax, byte [r9]
+        c.extend_from_slice(&[0x3C, want]); // cmp al, want
+        let jne = c.len();
+        c.extend_from_slice(&[0x75, 0]); // jne failure
+        c.extend_from_slice(&[0xB8, 0x2A, 0, 0, 0, 0xC3]); // mov eax, 0x2a; ret
+        let failure = c.len();
+        c[jne + 1] = (failure - (jne + 2)) as u8;
+        c.extend_from_slice(&[0xB8, 0x99, 0, 0, 0, 0xC3]); // mov eax, 0x99; ret
+        c
+    }
+
+    /// Build a synthetic game DLL: TLS template byte `template`, two TLS callbacks
+    /// (ids 1, 2) and a DllMain (id 0x10) that all log to the trace at RVA 0x20C0.
+    fn dll_with_tls_and_main(base: u64, template: u8) -> Vec<u8> {
+        let index_ptr = base + 0x2088;
+        let trace_count = base + 0x20C0;
+        let cb_a = lifecycle_callback_code(index_ptr, trace_count, 1);
+        let cb_b = lifecycle_callback_code(index_ptr, trace_count, 2);
+        let main = dllmain_code(index_ptr, trace_count, 0x10);
+        let mut code = vec![0xCC; 0x100];
+        assert!(main.len() <= 0x60, "DllMain must fit before callback A");
+        code[..main.len()].copy_from_slice(&main);
+        code[0x60..0x60 + cb_a.len()].copy_from_slice(&cb_a);
+        code[0xB0..0xB0 + cb_b.len()].copy_from_slice(&cb_b);
+        let mut file = tiny_dll(base, &code, None);
+        set_tls(&mut file, base, template);
+        p64(&mut file, 0x440, base + 0x1060);
+        p64(&mut file, 0x448, base + 0x10B0);
+        file
+    }
+
+    unsafe fn dll_trace(base: usize) -> (u32, Vec<u32>) {
+        let count = std::ptr::read_volatile((base + 0x20C0) as *const u32);
+        let events =
+            std::slice::from_raw_parts((base + 0x20C4) as *const u32, count as usize).to_vec();
+        (count, events)
+    }
+
+    #[test]
+    fn dll_process_attach_runs_tls_then_dllmain_in_order() {
+        const CHILD: &str = "XCL_LOADER_DLL_CHILD";
+        const PE_PATH: &str = "XCL_LOADER_DLL_PE";
+        if std::env::var_os(CHILD).is_none() {
+            let base = 0x6E58_0000_0000u64;
+            let path = write("xcl_dll_init.dll", &dll_with_tls_and_main(base, 9));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("loader::tests::dll_process_attach_runs_tls_then_dllmain_in_order")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env(PE_PATH, &path)
+                .output()
+                .expect("run dll-init child");
+            assert!(
+                output.status.success(),
+                "dll-init child failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("synthetic dll lifecycle: ok"));
+            return;
+        }
+
+        let path = PathBuf::from(std::env::var(PE_PATH).unwrap());
+        let m = load_game_dll(&path).expect("synthetic game DLL loads");
+        assert!(m.is_dll);
+        assert!(m.initialized.load(std::sync::atomic::Ordering::Acquire));
+        let index = unsafe { std::ptr::read_volatile((m.base + 0x2088) as *const u32) };
+        assert_ne!(index, 0xDEAD_BEEF, "init_dll installs the DLL TLS slot");
+        assert!(index < crate::tls::MAX_TLS_SLOTS, "slot is preallocated");
+
+        // Process attach order: TLS callbacks first, then DllMain — all with reason 1.
+        let (count, events) = unsafe { dll_trace(m.base) };
+        assert_eq!(count, 3, "two TLS callbacks + DllMain on process attach");
+        assert_eq!(
+            events,
+            vec![0x0901_01, 0x0901_02, 0x0901_10],
+            "TLS cb1 → TLS cb2 → DllMain(PROCESS_ATTACH)"
+        );
+
+        // Idempotent reload: same module, no second attach run.
+        let again = load_game_dll(&path).expect("reload is idempotent");
+        assert!(Arc::ptr_eq(&m, &again));
+        assert_eq!(
+            unsafe { dll_trace(m.base) }.0,
+            3,
+            "reload must not re-run DllMain"
+        );
+
+        // Main-thread visibility: attaching the calling thread materialises the DLL block.
+        crate::tls::attach_current_thread().expect("attach calling thread");
+        unsafe {
+            let slots: *mut *mut u8;
+            core::arch::asm!(
+                "mov {}, gs:[0x58]",
+                out(reg) slots,
+                options(nostack, readonly, preserves_flags)
+            );
+            assert_eq!(
+                **slots.add(index as usize),
+                9,
+                "DLL TLS template on this thread"
+            );
+        }
+
+        // Process detach order: DllMain first, then TLS callbacks — all with reason 0.
+        deinit_dll(&m);
+        let (count, events) = unsafe { dll_trace(m.base) };
+        assert_eq!(count, 6, "detach appends DllMain + two TLS callbacks");
+        assert_eq!(
+            &events[3..],
+            &[0x0900_10, 0x0900_01, 0x0900_02],
+            "DllMain(PROCESS_DETACH) → TLS cb1 → TLS cb2"
+        );
+        crate::tls::detach_current_thread();
+        println!("synthetic dll lifecycle: ok");
+    }
+
+    #[test]
+    fn run_main_detaches_dlls_after_the_entry_returns() {
+        const CHILD: &str = "XCL_LOADER_DLL_RUN_CHILD";
+        const DLL_PATH: &str = "XCL_LOADER_DLL_RUN_DLL";
+        const EXE_PATH: &str = "XCL_LOADER_DLL_RUN_EXE";
+        if std::env::var_os(CHILD).is_none() {
+            let dll_base = 0x6E5A_0000_0000u64;
+            let exe_base = 0x6E5B_0000_0000u64;
+            let dll_path = write("xcl_dll_run.dll", &dll_with_tls_and_main(dll_base, 9));
+            let entry = entry_checks_dll_byte(dll_base + 0x2088, 9);
+            let mut code = vec![0xCC; 0x100];
+            code[..entry.len()].copy_from_slice(&entry);
+            code[0x60] = 0xC3;
+            code[0xB0] = 0xC3;
+            let mut exe = tiny_dll(exe_base, &code, None);
+            p16(&mut exe, 0x56, 0x0022);
+            set_tls(&mut exe, exe_base, 7);
+            // Keep TLS callbacks as plain rets; the entry lives at 0x1000.
+            p64(&mut exe, 0x440, exe_base + 0x1060);
+            p64(&mut exe, 0x448, exe_base + 0x10B0);
+            let exe_path = write("xcl_dll_run.exe", &exe);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("loader::tests::run_main_detaches_dlls_after_the_entry_returns")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env(DLL_PATH, &dll_path)
+                .env(EXE_PATH, &exe_path)
+                .output()
+                .expect("run dll-run child");
+            assert!(
+                output.status.success(),
+                "dll-run child failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("synthetic dll run: ok"));
+            return;
+        }
+
+        let dll_path = PathBuf::from(std::env::var(DLL_PATH).unwrap());
+        let exe_path = PathBuf::from(std::env::var(EXE_PATH).unwrap());
+        let dll = load_game_dll(&dll_path).expect("game DLL loads before main");
+        let exe = load_main(&exe_path).expect("import-free main loads");
+        assert_eq!(
+            run_main(&exe),
+            0x2a,
+            "entry saw the DLL TLS byte and returned 0x2a"
+        );
+        // run_main ran DLL process detach after the entry: 3 attach + 3 detach events.
+        let (count, events) = unsafe { dll_trace(dll.base) };
+        assert_eq!(count, 6, "attach at load, detach at run_main exit");
+        assert_eq!(
+            events,
+            vec![
+                0x0901_01, 0x0901_02, 0x0901_10, // process attach at load_game_dll
+                0x0900_10, 0x0900_01, 0x0900_02, // process detach at run_main exit
+            ]
+        );
+        println!("synthetic dll run: ok");
+    }
+
+    #[test]
+    fn load_game_dll_rejects_an_occupied_base() {
+        let len = page_size() * 2;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let base = p as u64;
+        let path = write("xcl_occupied_dll.dll", &dll_with_tls_and_main(base, 5));
+        let e = load_game_dll(&path).err().expect("occupied base must fail");
+        assert!(e.contains(&format!("{base:#x}")), "{e}");
+        assert!(e.contains("occupied"), "{e}");
+        assert!(modules::find_mapped_by_base(base as usize).is_none());
+        assert!(modules::find_mapped_by_name("xcl_occupied_dll.dll").is_none());
+        unsafe {
+            libc::munmap(p, len);
+        }
     }
 }

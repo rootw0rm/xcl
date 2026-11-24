@@ -1,4 +1,4 @@
-//! Linux import resolver (Phase C step 10a): same routes as Windows, stubs not nulls.
+//! Linux import resolver (Phase C steps 10a–10d): same routes as Windows, stubs not nulls.
 //!
 //! Routing (`hle::registry`) is identical to Windows. The Linux differences:
 //! * no `LoadLibrary`/`GetProcAddress` — the system leg always misses;
@@ -6,10 +6,10 @@
 //! * unresolved imports get a safe executable auto-stub thunk (`stubs::make_stub`)
 //!   whose address is written into the IAT.
 //!
-//! Real HLE implementations and game-DLL auto-loading land in later slices
-//! (steps 10b–10d); this slice only guarantees a logged stub, never a null call.
-// LINUX-TODO: Phase C steps 10b–10d — real HLE bodies, kernel-family libc fallbacks,
-// game-DLL `load_game_dll` + DllMain/TLS install, `XCL_TRACE_IMPORTS` tracer.
+//! Steps 10b–10c contribute real HLE bodies; step 10d auto-loads unmapped game DLLs
+//! through `loader::load_game_dll` (DllMain/TLS install) before falling back to a stub.
+// LINUX-TODO: Phase C step 10e+ — `XCL_TRACE_IMPORTS` tracer; static IAT fill for the
+//! main image still waits on the launcher path.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -223,10 +223,15 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
         }
         return allow_stub.then(|| stub_for(key, None, what));
     }
-    // LINUX-TODO: Phase C step 10d — auto-load a game DLL from `find_game_dll` through
-    // the game-DLL load path (DllMain/TLS install). Until then an unmapped game DLL is
-    // still a safe stub, never a null.
-    if find_game_dll(key).is_some() {
+    // Step 10d: auto-load an unmapped game DLL through the game-DLL load path
+    // (DllMain/TLS install), then resolve against it. A load failure stays a safe
+    // stub, never a null.
+    if let Some(path) = find_game_dll(key) {
+        if let Ok(m) = crate::loader::load_game_dll(&path) {
+            if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub) {
+                return Some((a, Source::GameDll(key.to_string())));
+            }
+        }
         return allow_stub.then(|| stub_for(key, None, what));
     }
     // No system DLLs on Linux.
@@ -311,8 +316,12 @@ pub fn load_library(name: &str) -> Option<usize> {
     if let Some(m) = modules::find_mapped_by_name(&key) {
         return Some(m.base);
     }
-    // LINUX-TODO: Phase C step 10d — load the game DLL from the VFS/game folder here.
-    find_game_dll(name).and(system_module(name))
+    // Step 10d: load the game DLL through the game-DLL load path. A load failure
+    // returns None so optional-API probing still works.
+    if let Some(path) = find_game_dll(name) {
+        return crate::loader::load_game_dll(&path).ok().map(|m| m.base);
+    }
+    None
 }
 
 /// GetProcAddress as seen by the game. Missing functions return None (no stub) so
