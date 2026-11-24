@@ -1644,6 +1644,7 @@ impl<I: Ir> Lower<'_, I> {
         if writes_scc {
             outputs.push(Var::Scc);
         }
+        let old_exec = if cmpx { Some(self.read_bit(b, EXEC)?) } else { None };
         let guard = if cmpx || in_guarded_run || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
         let vals = self.ir.foreign(d, guard, &inputs, &outputs)?;
         for (&var, &v) in outputs.iter().zip(&vals) {
@@ -1678,6 +1679,12 @@ impl<I: Ir> Lower<'_, I> {
             let x = self.ir.bin(Bin::And, x, one);
             let z = self.ir.int(0);
             let bit = self.ir.icmp(Cmp::Ne, x, z);
+            // `v_cmpx`: the new EXEC is the compare in the lanes that were in EXEC (#1426's
+            // lowering ran with the guard `true`, so its result is the compare alone)
+            let bit = match old_exec {
+                Some(e) => self.ir.bin(Bin::And, bit, e),
+                None => bit,
+            };
             self.write_bit(b, base, bit);
         } else {
             for (&var, &v) in outputs.iter().zip(&vals) {
@@ -3140,7 +3147,11 @@ pub(crate) mod tests {
         const CMP: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]);
         const MOV7: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]);
         const AND: I = ("S_AND_B32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 106), ("SSRC1", 126)]);
-        let programs: [(&str, Vec<I>); 5] = [
+        let mixed: I = ("S_AND_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 106), ("SSRC1", 8)]);
+        let programs: [(&str, Vec<I>); 8] = [
+            ("mask and number + scc0", vec![CMP, mixed, ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
+            ("mask and number + select", vec![CMP, mixed, ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 133), ("SSRC1", 135)]), ENDPGM]),
+            ("mask compared with number", vec![CMP, ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 106), ("SSRC1", 8)]), ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
             ("vccnz", vec![CMP, ("S_CBRANCH_VCCNZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
             ("vccz", vec![CMP, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
             ("and + scc1", vec![CMP, AND, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),

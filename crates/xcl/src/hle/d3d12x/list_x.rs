@@ -3515,7 +3515,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
                     let data = (title != 0 && crate::gpu::shader::readable(title as usize, n)).then(|| std::slice::from_raw_parts(title as *const u8, n).iter().filter(|&&b| b != 0).count());
                     let win = crate::gpu::uma::get().and_then(|u| u.window_of(title as usize).map(|w| (w, u.window(w), u.is_sparse(title as usize))));
                     let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-                    let q = windows_sys::Win32::System::Memory::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+                    let q = crate::hle::kernelx::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
                     crate::xlog_info!(
                         "frame trace: vertex buffer #{i} slot {}: title {title:#x} → PC {:#x}, {} bytes, stride {}; non-zero in the first {n} bytes (CPU view): {data:?}; window (index, (base, size), sparse) {win:x?}; memory state {:#x} protect {:#x} (query {q})",
                         start + k as u32,

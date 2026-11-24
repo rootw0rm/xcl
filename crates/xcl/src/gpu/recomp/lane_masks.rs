@@ -525,7 +525,16 @@ impl<'a> Lanes<'a> {
                 }
                 scc = Some((new, true));
             } else {
-                let (a, b) = (self.mask_src(st, d, s0), self.mask_src(st, d, s1));
+                let (mut a, mut b) = (self.mask_src(st, d, s0), self.mask_src(st, d, s1));
+                // A bitwise scalar instruction can mix a tracked mask and an SGPR
+                // holding a number. The lowering extracts each lane's bit of that
+                // number. Its unknown bits must not turn the result's SCC uniform.
+                if matches!(op, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "ANDN1" | "NAND" | "NOR" | "XNOR")
+                    && (sd == Some(EXEC) || (s0 < 128 && a.is_some()) || (s1 < 128 && b.is_some()))
+                {
+                    a = Some(self.need(st, d, s0, block)?);
+                    b = Some(self.need(st, d, s1, block)?);
+                }
                 let value = match (op, a, b) {
                     ("MOV", Some(a), _) => Some(a),
                     ("NOT", Some(a), _) => Some(self.bdd.not(a)?),
@@ -553,11 +562,11 @@ impl<'a> Lanes<'a> {
         let cmp = if self.wave64 { ("S_CMP_EQ_U64", "S_CMP_LG_U64") } else { ("S_CMP_EQ_U32", "S_CMP_LG_U32") };
         if name == cmp.0 || name == cmp.1 {
             let (s0, s1) = (fv("SSRC0").unwrap_or(255), fv("SSRC1").unwrap_or(255));
-            if let (Some(a), Some(b)) = (self.mask_src(st, d, s0), self.mask_src(st, d, s1)) {
-                if s0 < 128 || s1 < 128 {
-                    let x = self.bdd.apply(Op::Xor, a, b)?;
-                    scc = Some((if name == cmp.0 { self.bdd.not(x)? } else { x }, true));
-                }
+            if (s0 < 128 && st.regs[s0 as usize].is_some()) || (s1 < 128 && st.regs[s1 as usize].is_some()) {
+                let a = self.need(st, d, s0, block)?;
+                let b = self.need(st, d, s1, block)?;
+                let x = self.bdd.apply(Op::Xor, a, b)?;
+                scc = Some((if name == cmp.0 { self.bdd.not(x)? } else { x }, true));
             }
         }
         // whatever else the instruction writes is no longer a known mask

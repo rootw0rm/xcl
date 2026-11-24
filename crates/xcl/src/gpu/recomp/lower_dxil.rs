@@ -460,6 +460,35 @@ mod tests {
         super::kernel(&decode(&denorm), false).unwrap();
     }
 
+    /// A float `v_cmpx` lowered by #1426 leaves EXEC as the compare in the lanes that were in
+    /// EXEC, not the compare alone (thehollowedone's program on #1269): EXEC = lanes 0–15, then
+    /// `v_cmpx_le_f32 0, v1` true in every lane, then `v_mov v2, 7` writes lanes 0–15 only.
+    #[test]
+    fn a_bridged_v_cmpx_keeps_the_lanes_outside_exec_out() {
+        if !gpu() {
+            return;
+        }
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_CMPX_LE_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 135)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ENDPGM,
+        ];
+        let (dxil, _) = super::kernel(&decode(lines), false).unwrap_or_else(|e| panic!("{e}"));
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let out = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..32 {
+            assert_eq!(out.vgpr[l][2], if l < 16 { 7 } else { 0 }, "lane {l}");
+        }
+    }
+
     /// An instruction lowered by #1426 that writes to `Lw`'s entry block after the program's
     /// blocks are written (scratch) gives a container, and runs.
     #[cfg(windows)]
@@ -545,6 +574,46 @@ mod tests {
             for l in 0..32 {
                 for &r in &vregs {
                     assert_eq!(gpu.vgpr[l][r], cv[l][r], "{name}: lane {l} v{r}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_branch_on_a_mixed_mask_matches_the_hlsl_path_on_the_gpu() {
+        if !gpu() { return; }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        // Only the low 16 bits of VCC are set. AND with the user SGPR still
+        // leaves a nonzero word, so the scalar move runs for the entire wave.
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 106), ("SSRC1", 8)]),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 129)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 6)]),
+            ENDPGM,
+        ];
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        let mut state = runner::KernelState::default();
+        state.sgpr[8] = u32::MAX;
+        state.sgpr[126] = u32::MAX;
+        for lane in 0..32 {
+            state.vgpr[lane][0] = lane as u32;
+        }
+        let tr = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(tr.complete(), "{:?}", tr.unsupported_why);
+        let hlsl = dxc::compile(&tr.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let reference = runner::run(&hlsl, &state, &[]).unwrap();
+        assert!(reference.vgpr[..32].iter().all(|v| v[1] == 1));
+        match super::kernel(&decode(lines), false) {
+            Err(e) => assert!(e.contains("any lane of a mask"), "{e}"),
+            Ok((dxil, _)) => {
+                let actual = runner::run(&dxil, &state, &[]).unwrap();
+                for lane in 0..32 {
+                    assert_eq!(actual.vgpr[lane][1], reference.vgpr[lane][1], "lane {lane}");
                 }
             }
         }
