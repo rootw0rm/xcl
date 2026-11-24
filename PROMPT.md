@@ -9,21 +9,25 @@ full work plan.
 
 ## Status snapshot (2026-11-24 — refresh this when a phase flips)
 
-- `linux` @ `141768c` (merge `7393c0e` of upstream `main` @ `20cf130`
-  plus a Linux gate fix; `origin/linux` trails — push when asked).
+- `linux` @ `a8f6e7e` (merge `fb14aba` of upstream `main` @ `62265d3`
+  plus a Linux gate fix; pushed to `origin/linux`).
   Verify with `git log --oneline -3; git status -sb`.
-  Upstream brought the direct-DXIL follow-up (`TRANSLATOR_VERSION` 6→7:
-  MSAA `textureLoad`-before-dimensions fix, geometry records, rounding
-  lowers) — cache invalidation rides the version bump in `pso.rs`, no
-  `build.rs` change needed. Its 4 new GPU test modules
-  (`fuzz/msaa/round/geometry_tests`) are `cfg(all(test, windows))` on
-  Linux, same as `core_tests` (`141768c`).
+  Upstream brought per-lane mixed-mask work (SCC tracking, `v_cmpx` EXEC
+  bridging, fast-boot env vars, coherent-UMA `VirtualQuery` skip, Bink HLE
+  additions) — `lane_masks.rs`/`lower.rs`/`lower_dxil.rs` are already in
+  `PER_LANE_SOURCES`, so the per-lane cache rehashes automatically. Two new
+  GPU tests in `lower_dxil.rs` missed upstream's `cfg(windows)` and broke
+  the Linux build; gated (`a8f6e7e`). Previous sync's notes still hold:
+  direct-DXIL follow-up (`TRANSLATOR_VERSION` 7), 4 GPU test modules
+  `cfg(all(test, windows))` on Linux.
+  A ralph loop is actively working CRT copies (`crt_linux.rs` WIP,
+  uncommitted) — do not touch those files or stash the workdir.
   NOTE: this machine has **no game files** — `/run/media/...` does not
   exist here. Retail-dependent steps are SKIPPED on this host (see §4.7);
   never block the loop on them.
 - **Phase A done.** `cargo check -p xcl --tests` and `cargo check --workspace`
   are green (0 errors) on `x86_64-unknown-linux-gnu`; `cargo test -p xcl --lib`
-  passes (369 passed, 0 failed, re-verified after the `20cf130` sync).
+  passes (370 passed, 0 failed, re-verified after the `62265d3` sync).
   `target/debug/xcl` builds.
 - **Phase B done** (where game files exist). Offline tools run on the real
   paths, e.g. `xcl inspect .../game_scarlett_master.exe` reports 587 imports /
