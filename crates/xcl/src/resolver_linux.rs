@@ -585,6 +585,37 @@ mod tests {
     }
 
     #[test]
+    fn gameinput_imports_resolve_to_hle() {
+        // Step 11n: headless IGameInput. `gameinput.dll` is routed HLE.
+        for (dll, sym) in [("gameinput.dll", "GameInputCreate")] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // Timestamps advance through the COM vtable slot 3, as the title reads them.
+        let (addr, _) = resolve_inner(&dll_key("gameinput.dll"), &name("GameInputCreate"), 0);
+        let create: unsafe extern "win64" fn(*mut *mut std::ffi::c_void) -> i32 =
+            unsafe { std::mem::transmute(addr) };
+        let mut gi: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert_eq!(unsafe { create(&mut gi) }, 0);
+        assert!(!gi.is_null());
+        let vt = unsafe { *(gi as *const *const usize) };
+        let ts: unsafe extern "win64" fn(*mut std::ffi::c_void) -> u64 =
+            unsafe { std::mem::transmute(*vt.add(3)) };
+        let a = unsafe { ts(gi) };
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let b = unsafe { ts(gi) };
+        assert!(a > 0 && b > a, "timestamps {a} {b}");
+    }
+
+    #[test]
     fn stub_thunk_calls_log_and_return() {
         let (addr, src) = resolve_inner("kernelx.dll", &name("LinuxProbeThunk"), 0);
         assert_eq!(src, Source::Stub);

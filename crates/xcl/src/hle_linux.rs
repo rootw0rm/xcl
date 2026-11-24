@@ -21,6 +21,8 @@ pub mod crt_linux;
 pub mod xgameruntime_linux;
 #[path = "hle/minuserx_linux.rs"]
 pub mod minuserx_linux;
+#[path = "hle/gameinput_linux.rs"]
+pub mod gameinput_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -242,7 +244,16 @@ fn acphal_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn gameinput_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![GameInputCreate]
+    let mut v = crate::hle_exports![GameInputCreate];
+    // Step-11n headless IGameInput: real code, not stub metadata.
+    for (name, addr) in gameinput_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 /// Step-11 CRT startup slice: every name carries a real Linux address from
@@ -363,15 +374,20 @@ mod tests {
         let r = build(&Config::default());
         // Unimplemented names are metadata `0`, never a callable address. Steps 10b–10c
         // implement the kernelx memory/thread/sync/time/file slices, step 11 the CRT
-        // startup slice, step 11i the xgameruntime identity slice and step 11m the
-        // minuserx window slice, so those resolve as HLE.
+        // startup slice, step 11i the xgameruntime identity slice, step 11m the
+        // minuserx window slice and step 11n the headless GameInput slice,
+        // so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
             assert!(!m.exports.is_empty(), "{} has no exports", m.name);
             for (&name, &addr) in &m.exports {
                 total += 1;
-                if (m.name == KERNELX || m.name == UCRT || m.name == XGAMERUNTIME || m.name == MINUSERX)
+                if (m.name == KERNELX
+                    || m.name == UCRT
+                    || m.name == XGAMERUNTIME
+                    || m.name == MINUSERX
+                    || m.name == GAMEINPUT)
                     && addr != 0
                 {
                     implemented += 1;
@@ -545,6 +561,12 @@ mod tests {
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, MINUSERX);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-11n headless GameInput slice: timestamps only, not stub metadata.
+        for name in ["GameInputCreate"] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, GAMEINPUT);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
     }
