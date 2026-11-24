@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface; step-11 gates it on Linux.
 //! The console's texture layout library as a reference (`XCL_SAMPLE_XG` = the console's own
 //! `xg_xs.dll`, from the user's console files – skipped when unset): loaded through XCL's
 //! loader and asked the same questions as XCL's implementation.

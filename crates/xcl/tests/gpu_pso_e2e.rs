@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! End to end without a game executable: real console shaders from the retail pack
 //! (`XCL_SAMPLE_RPF`) go through the D3D12.X backend's CreateGraphicsPipelineState hook
 //! exactly as a title would hand them over → recompiled VS/PS → D3D12 pipeline → drawn into

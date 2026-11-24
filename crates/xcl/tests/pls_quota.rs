@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! Exercise the native A/W hooks without loading a title or initializing graphics.
 
 use std::fs;

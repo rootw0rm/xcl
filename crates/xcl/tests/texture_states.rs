@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! Uploads into a texture whose subresources are in different states (#104): the barriers
 //! `gpu::texture::upload_batch` records start from each subresource's own state and return to
 //! it, checked by the D3D12 debug layer's state tracking. Its own process: the debug layer has

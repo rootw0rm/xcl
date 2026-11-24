@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! Real console DLLs from the game package (`XCL_SAMPLE_DLLS` = their folder; skipped when
 //! unset) through XCL's loader: mapped, imports resolved (HLE / Windows / the game's own
 //! DLLs), TLS + DllMain run – then their code is called.

@@ -8,9 +8,7 @@
 //! order, and the entry RVA is preserved. An occupied link address is a hard error: there is
 //! no relocation-based fallback, because the title's pointers assume the link address.
 //!
-//! Not ported yet (explicit Phase C/C steps, no silent stubs):
-//! * import resolution/HLE/auto-stubs — step 10; the IAT stays empty for now,
-//!   `load_main` still rejects images with unresolved imports,
+//! Not ported yet (explicit Phase C work, no silent stubs):
 //! * `.pdata` translation / C++ unwinding — later Phase C work,
 //! * the title PEB, argv and dedicated entry-thread stack — step 10e.
 //!
@@ -414,43 +412,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
 
     let exports = OwnedExports::from_pe(&pe).unwrap_or_default();
 
-    // 4. imports (normal + delay-load). Parse with the same parser as Windows first: a broken
-    // table must fail the load. Resolution is step 10 and has no business faking addresses.
-    let imports = pe
-        .imports()
-        .map_err(|e| format!("{name}: import table: {e}"))?;
-    let delay = match pe.delay_imports() {
-        Ok(v) => v,
-        Err(e) => {
-            crate::xlog_warn!("{name}: delay-imports: {e}");
-            Vec::new()
-        }
-    };
-    let import_entries: usize = imports.iter().map(|d| d.entries.len()).sum();
-    let delay_entries: usize = delay.iter().map(|d| d.entries.len()).sum();
-    if !imports.is_empty() || !delay.is_empty() {
-        if is_main {
-            // This slice can execute only self-contained images. Do not leave callable IAT
-            // slots at zero and then let run_main jump into an unresolved import.
-            // LINUX-TODO: Phase C step-10 — remove this guard once the resolver fills the IAT.
-            return Err(format!(
-                "{name}: import resolution is unavailable on Linux until Phase C step-10"
-            ));
-        }
-        // LINUX-TODO: Phase C step-10 — resolve imports through the HLE registry/game DLLs
-        // and write the IAT slots; keep name/ordinal/delay ordering identical.
-        crate::xlog_info!(
-            "{name}: import tables parsed ({} DLLs/{} functions, delay {} DLLs/{} functions); resolution is Phase C step-10",
-            imports.len(),
-            import_entries,
-            delay.len(),
-            delay_entries
-        );
-    }
-
-    // 5. static TLS: keep the directory's callbacks in order, then (for the main image)
-    // install the per-thread blocks. DLL blocks install in `init_dll`, before the DLL's
-    // process-attach callbacks and DllMain run.
+    // 4. static TLS directory: keep the callbacks in order. The install itself
+    // happens after import resolution (Windows order: register, resolve, TLS),
+    // because resolving imports may recursively map game DLLs.
     let mut tls_callbacks = Vec::new();
     let mut tls_dir = None;
     match pe.tls() {
@@ -486,6 +450,76 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         Err(e) => return Err(format!("{name}: TLS directory: {e}")),
     }
 
+    // 5. register before import resolution so cyclic game-DLL imports terminate
+    // (mirrors Windows `loader::map_image_ex`).
+    let module = Arc::new(MappedModule {
+        name: name.clone(),
+        path: path.to_path_buf(),
+        base,
+        size,
+        entry_rva: pe.entry_rva,
+        is_dll: pe.is_dll(),
+        exports,
+        tls_callbacks: Mutex::new(tls_callbacks.clone()),
+        no_thread_calls: std::sync::atomic::AtomicBool::new(false),
+        initialized: std::sync::atomic::AtomicBool::new(false),
+        stack_reserve: pe.stack_reserve,
+    });
+    modules::register_mapped(module.clone());
+    if is_main {
+        // Game DLLs initialised during import resolution may already ask for
+        // GetModuleHandle(NULL) / GetModuleFileName(NULL).
+        modules::set_main(module.clone());
+    }
+
+    // 6. imports (normal + delay-load, resolved eagerly like Windows). A broken
+    // table fails the load and takes the module back out of the registry.
+    let mut all = match pe.imports() {
+        Ok(v) => v,
+        Err(e) => {
+            modules::unregister_mapped(base);
+            return Err(format!("{name}: import table: {e}"));
+        }
+    };
+    match pe.delay_imports() {
+        Ok(v) => all.extend(v),
+        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
+    }
+    for dll in &all {
+        for e in &dll.entries {
+            let addr = crate::resolver::resolve_import(&dll.dll, &e.what, &name, dll.delay);
+            let slot = base + e.iat_rva as usize;
+            if e.iat_rva as usize + 8 > size {
+                modules::unregister_mapped(base);
+                return Err(format!("{name}: IAT slot {:#x} outside the image", e.iat_rva));
+            }
+            unsafe { (slot as *mut u64).write_unaligned(addr as u64) };
+        }
+        if dll.delay && dll.module_handle_rva != 0 {
+            let h = crate::resolver::load_library(&dll.dll).unwrap_or(1);
+            let slot = base + dll.module_handle_rva as usize;
+            if dll.module_handle_rva as usize + 8 > size {
+                modules::unregister_mapped(base);
+                return Err(format!(
+                    "{name}: delay module-handle {:#x} outside the image",
+                    dll.module_handle_rva
+                ));
+            }
+            unsafe { (slot as *mut u64).write_unaligned(h as u64) };
+        }
+    }
+    if !all.is_empty() {
+        let (n, d): (usize, usize) = (
+            all.iter().filter(|d| !d.delay).count(),
+            all.iter().filter(|d| d.delay).count(),
+        );
+        let entries: usize = all.iter().map(|d| d.entries.len()).sum();
+        crate::xlog_info!(
+            "{name}: imports resolved ({n} DLLs + {d} delay, {entries} functions)"
+        );
+    }
+
+    // 7. static TLS install: main image now, DLLs in `init_dll` before DllMain.
     let tls_count = tls_callbacks.len();
     if let Some(t) = tls_dir {
         let template_len = t.template_len() as usize;
@@ -518,7 +552,10 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                     main: true,
                 })
             }
-            .map_err(|e| format!("{name}: static TLS: {e}"))?;
+            .map_err(|e| {
+                modules::unregister_mapped(base);
+                format!("{name}: static TLS: {e}")
+            })?;
         } else {
             // The game-DLL load path (`init_dll`) installs this before running the
             // DLL's code. Stash it keyed by base; `map_image` alone runs no image code.
@@ -540,30 +577,13 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
-    let module = Arc::new(MappedModule {
-        name: name.clone(),
-        path: path.to_path_buf(),
-        base,
-        size,
-        entry_rva: pe.entry_rva,
-        is_dll: pe.is_dll(),
-        exports,
-        tls_callbacks: Mutex::new(tls_callbacks),
-        no_thread_calls: std::sync::atomic::AtomicBool::new(false),
-        initialized: std::sync::atomic::AtomicBool::new(false),
-        stack_reserve: pe.stack_reserve,
-    });
     mapping.keep();
-    modules::register_mapped(module.clone());
-    if is_main {
-        modules::set_main(module.clone());
-    }
     crate::xlog_info!(
         "loaded {name} @ {base:#x} (size {size:#x}, preferred {:#x})",
         pe.image_base
     );
 
-    // 6. page protections (headers read-only, sections from their characteristics) and
+    // 8. page protections (headers read-only, sections from their characteristics) and
     // transparent huge pages for large sections.
     protect_image(&pe, base, size);
 
@@ -1101,30 +1121,48 @@ mod tests {
     }
 
     #[test]
-    fn main_image_with_imports_is_rejected_before_execution() {
-        let base = 0x6E57_0000_0000u64;
-        let mut code = vec![0x31, 0xC0, 0xC3];
-        code.resize(0x80, 0xCC);
-        // One valid IMAGE_IMPORT_DESCRIPTOR at RVA 0x1010, followed by its null terminator.
-        for (i, v) in [0x1040u32, 0, 0, 0x1050, 0x1060].into_iter().enumerate() {
-            p32(&mut code, 0x10 + i * 4, v);
+    fn main_image_with_imports_resolves_through_hle_or_stub() {
+        const CHILD: &str = "XCL_LOADER_IMPORT_MAIN_CHILD";
+        const PE_PATH: &str = "XCL_LOADER_IMPORT_MAIN_PE";
+        if std::env::var_os(CHILD).is_none() {
+            let base = 0x6E57_0000_0000u64;
+            let mut code = vec![0x31, 0xC0, 0xC3];
+            code.resize(0x80, 0xCC);
+            // One valid IMAGE_IMPORT_DESCRIPTOR at RVA 0x1010, followed by its null terminator.
+            for (i, v) in [0x1040u32, 0, 0, 0x1050, 0x1060].into_iter().enumerate() {
+                p32(&mut code, 0x10 + i * 4, v);
+            }
+            code[0x24..0x38].fill(0); // null IMAGE_IMPORT_DESCRIPTOR
+            p64(&mut code, 0x40, base + 0x1070); // OriginalFirstThunk
+            p64(&mut code, 0x48, 0);
+            code[0x50..0x50 + b"kernel32.dll\0".len()].copy_from_slice(b"kernel32.dll\0");
+            p64(&mut code, 0x60, base + 0x1070); // FirstThunk
+            p64(&mut code, 0x68, 0);
+            code[0x72..0x72 + b"ExitProcess\0".len()].copy_from_slice(b"ExitProcess\0");
+            let mut file = tiny_dll(base, &code, Some((0x1010, 40)));
+            p16(&mut file, 0x56, 0x0022);
+            let path = write("xcl_import_main.exe", &file);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("loader::tests::main_image_with_imports_resolves_through_hle_or_stub")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env(PE_PATH, &path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
         }
-        code[0x24..0x38].fill(0); // null IMAGE_IMPORT_DESCRIPTOR
-        p64(&mut code, 0x40, base + 0x1070); // OriginalFirstThunk
-        p64(&mut code, 0x48, 0);
-        code[0x50..0x50 + b"kernel32.dll\0".len()].copy_from_slice(b"kernel32.dll\0");
-        p64(&mut code, 0x60, base + 0x1070); // FirstThunk
-        p64(&mut code, 0x68, 0);
-        code[0x72..0x72 + b"ExitProcess\0".len()].copy_from_slice(b"ExitProcess\0");
-        let mut file = tiny_dll(base, &code, Some((0x1010, 40)));
-        p16(&mut file, 0x56, 0x0022);
-        let path = write("xcl_import_main.exe", &file);
-
-        let error = load_main(&path)
-            .err()
-            .expect("unresolved imports must not run");
-        assert!(error.contains("import resolution"), "{error}");
-        assert!(modules::find_mapped_by_base(base as usize).is_none());
+        let path = PathBuf::from(std::env::var(PE_PATH).unwrap());
+        let m = load_main(&path).expect("main image with imports resolves on Linux");
+        // IAT slot (FirstThunk at file offset 0x60 -> RVA 0x1060) holds a callable address.
+        let slot = unsafe { std::ptr::read_unaligned((m.base + 0x1060) as *const u64) };
+        assert_ne!(slot, 0, "IAT slot must be resolved, not left null");
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! The sparse windows set up again while the state they replace holds resources of its own
 //! (#344): the old state was dropped under its lock, and the release of its last buffers
 //! (`real::res_release` → `sparse::forget_buffer`) took the lock again – the thread waited for

@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface; step-11 gates it on Linux.
 //! Retail BCPack chunks decoded by XCL against a reference decoder's blocks.
 //! Set `XCL_SAMPLE_BCPACK` to a directory of `<name>.bc<N>` + `<name>.vic<N>` files;
 //! without it the test does nothing.

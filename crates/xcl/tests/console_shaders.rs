@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! The console's shader compiler as a test generator for the recompiler: HLSL compiled by the
 //! console's `dxcompiler_xs.dll` (DXIL + the native RDNA2 code in XDAT → XBCH → FSSM) goes
 //! through XCL's RDNA2 → HLSL translation and runs on the PC GPU; the same HLSL compiled by the

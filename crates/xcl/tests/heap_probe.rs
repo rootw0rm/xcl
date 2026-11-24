@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! What D3D12 accepts as a heap over memory a title addresses: a pagefile-backed section
 //! reserved (SEC_RESERVE) at an address XCL picks, committed only in part – and whether pages
 //! committed after the heap was opened are seen by the GPU. GPU copies only, of committed

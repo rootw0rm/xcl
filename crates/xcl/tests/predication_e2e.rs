@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! End-to-end GPU + D3D12 debug-layer test for `SetPredicationBufferX`.
 //!
 //! Exercises:

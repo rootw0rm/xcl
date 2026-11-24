@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12/XGameRuntime hooks); step-11 gates it on Linux.
 //! End to end without a game executable: a console compute shader in the retail container
 //! layout (DXBC → DXIL part with XDAT → XBCH → FSSM, CS stage descriptor) goes through the
 //! D3D12.X backend's CreateComputePipelineState hook as a title would hand it over →
