@@ -1,17 +1,20 @@
-//! Linux HLE registry (Phase C step 10a): routing without implementations.
+//! Linux HLE registry (Phase C steps 10a–10b): routing plus the kernelx core.
 //!
-//! The Windows `hle` module stays the implementation source of truth. On Linux this
-//! twin provides the same ordered routes (`hle_routes::ROUTES`) and the same export
-//! *names* with metadata address `0` (meaning `Stub`). The runtime resolver turns
-//! `0` into a safe executable auto-stub thunk; it never writes a null callable
-//! address into the IAT. No `LoadLibrary`/`GetProcAddress` on Linux.
+//! The Windows `hle` module stays the implementation source of truth for the full title
+//! path. On Linux this twin provides the same ordered routes (`hle_routes::ROUTES`).
+//! Unimplemented exports keep metadata address `0` (meaning `Stub`); the runtime
+//! resolver turns `0` into a safe executable auto-stub thunk. Step 10b implements the
+//! kernelx memory/thread/sync/time slice in `hle/kernelx_linux.rs`, so those names
+//! carry real code addresses here and resolve as `HLE`. No `LoadLibrary`/`GetProcAddress`
+//! on Linux.
 //!
 //! Export-name lists below must match the `hle_exports![...]` invocations in the
 //! corresponding Windows files (`hle/kernelx.rs`, `hle/xgameruntime/mod.rs`, …).
 //! They are duplicated here until the implementation bodies move to `_windows.rs`
 //! (DEC-002); `inspect` and the registry tests pin the counts.
-// LINUX-TODO: Phase C (kernelx port) — move Windows bodies to `_windows.rs` and share
-// one `hle_exports!` invocation per module instead of duplicating names here.
+
+#[path = "hle/kernelx_linux.rs"]
+pub mod kernelx_linux;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -70,7 +73,10 @@ pub struct Registry {
 static REG: OnceLock<Registry> = OnceLock::new();
 
 fn kernelx_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![
+    // Step-10b names below carry real Linux addresses from `kernelx_linux`; the rest stay
+    // `Stub` metadata (0) until steps 10c–10d and Phase D/E land. The stub list must match
+    // the Windows `hle_exports![...]` in `hle/kernelx.rs`; `inspect` pins the totals.
+    let mut v = crate::hle_exports![
         RegOpenKeyW, RegOpenKeyExW, RegQueryValueExW, RegCloseKey, VirtualAlloc, VirtualAllocEx,
         VirtualFree, VirtualFreeEx, VirtualProtect, VirtualProtectEx, XMemAlloc, XMemFree,
         XMemAllocDefault, XMemFreeDefault, XMemSetAllocationHooks, XMemVirtualQuery,
@@ -87,7 +93,17 @@ fn kernelx_exports() -> Vec<(&'static str, usize)> {
         GetModuleHandleW, GetModuleHandleA, GetModuleHandleExW, GetModuleHandleExA,
         GetModuleFileNameW, GetModuleFileNameA, FreeLibrary, FreeLibraryWhenCallbackReturns,
         DisableThreadLibraryCalls,
-    ]
+    ];
+    // Kernel-family fallbacks routed to KERNELX (api-ms-win-core-*) live outside the
+    // Windows `hle_exports!` list; they are always real on Linux when implemented.
+    for (name, addr) in kernelx_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn xgameruntime_exports() -> Vec<(&'static str, usize)> {
@@ -305,25 +321,120 @@ mod tests {
     }
 
     #[test]
-    fn linux_exports_are_stub_metadata() {
+    fn linux_exports_are_stub_metadata_except_kernelx_core() {
         let r = build(&Config::default());
-        // Every preserved name is metadata `0`, never a callable address.
+        // Unimplemented names are metadata `0`, never a callable address. Step 10b
+        // implements the kernelx memory/thread/sync/time slice, so those resolve as HLE.
         let mut total = 0;
+        let mut implemented = 0;
         for m in &r.modules {
             assert!(!m.exports.is_empty(), "{} has no exports", m.name);
             for (&name, &addr) in &m.exports {
-                assert_eq!(addr, 0, "{}!{} must be Stub metadata", m.name, name);
                 total += 1;
+                if m.name == KERNELX && addr != 0 {
+                    implemented += 1;
+                    continue;
+                }
+                assert_eq!(addr, 0, "{}!{} must be Stub metadata", m.name, name);
             }
         }
         assert!(total > 200, "expected the Windows export-name tables, got {total}");
-        // Spot-check counts against the Windows tables.
+        assert!(implemented > 40, "expected the step-10b kernelx core, got {implemented}");
+        // Spot-check counts against the Windows tables (kernelx grows with the Linux
+        // kernel-family fallbacks routed to it).
         let kx = r.module_by_name(KERNELX).unwrap();
-        assert_eq!(kx.exports.len(), 59, "kernelx export count");
+        assert_eq!(kx.exports.len(), 59 + kernelx_linux::exports().iter().filter(|(n, _)| !kx_stub_name(n)).count(), "kernelx export count");
         assert_eq!(r.module_by_name(XGAMERUNTIME).unwrap().exports.len(), 127);
         assert_eq!(r.module_by_name(D3D12X).unwrap().exports.len(), 13);
         assert!(r.find_any("XMemAlloc").is_some());
         assert!(r.find_any("D3D12XboxCreateDevice").is_some());
+        // Step-10b spot checks: real code, not stub metadata.
+        for name in [
+            "VirtualAlloc",
+            "VirtualProtect",
+            "CreateThread",
+            "WaitForSingleObject",
+            "QueryPerformanceCounter",
+            "InitializeCriticalSection",
+            "AcquireSRWLockExclusive",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, KERNELX);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Steps 10c–10d stay stubs here (names present in the Windows export list).
+        for name in ["GetModuleHandleW", "LoadLibraryW", "XMemAlloc"] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, KERNELX);
+            assert_eq!(addr, 0, "{name} stays Stub until its slice lands");
+        }
+    }
+
+    /// Windows `hle_exports![...]` names in `hle/kernelx.rs` (59). Kernel-family fallback
+    /// names below are Linux additions and do not change the Windows count.
+    fn kx_stub_name(name: &str) -> bool {
+        matches!(
+            name,
+            "RegOpenKeyW"
+                | "RegOpenKeyExW"
+                | "RegQueryValueExW"
+                | "RegCloseKey"
+                | "VirtualAlloc"
+                | "VirtualAllocEx"
+                | "VirtualFree"
+                | "VirtualFreeEx"
+                | "VirtualProtect"
+                | "VirtualProtectEx"
+                | "XMemAlloc"
+                | "XMemFree"
+                | "XMemAllocDefault"
+                | "XMemFreeDefault"
+                | "XMemSetAllocationHooks"
+                | "XMemVirtualQuery"
+                | "XMemVirtualAlloc"
+                | "XMemAllocatePhysicalPages"
+                | "XMemMapPhysicalPages"
+                | "XMemMapPhysicalPagesScatter"
+                | "XMemFreePhysicalPages"
+                | "XMemTransferMemory"
+                | "XMemGetWorkingSetStatistics"
+                | "TitleMemoryStatus"
+                | "JobTitleMemoryStatus"
+                | "ToolingMemoryStatus"
+                | "AllocateTitlePhysicalPages"
+                | "FreeTitlePhysicalPages"
+                | "MapTitlePhysicalPages"
+                | "RegisterAppStateChangeNotification"
+                | "UnregisterAppStateChangeNotification"
+                | "RegisterAppConstrainedChangeNotification"
+                | "UnregisterAppConstrainedChangeNotification"
+                | "SetUnhandledExceptionFilter"
+                | "SetThreadName"
+                | "GetThreadName"
+                | "SetThreadpoolAffinityMask"
+                | "SetThreadAffinityMask"
+                | "SetThreadGroupAffinity"
+                | "QueryProcessorSchedulingStatistics"
+                | "GetConsoleType"
+                | "OutputDebugStringA"
+                | "OutputDebugStringW"
+                | "GetSystemOSVersion"
+                | "LoadLibraryW"
+                | "LoadLibraryA"
+                | "LoadLibraryExW"
+                | "LoadLibraryExA"
+                | "LoadPackagedLibrary"
+                | "GetProcAddress"
+                | "GetModuleHandleW"
+                | "GetModuleHandleA"
+                | "GetModuleHandleExW"
+                | "GetModuleHandleExA"
+                | "GetModuleFileNameW"
+                | "GetModuleFileNameA"
+                | "FreeLibrary"
+                | "FreeLibraryWhenCallbackReturns"
+                | "DisableThreadLibraryCalls"
+        )
     }
 
     #[test]

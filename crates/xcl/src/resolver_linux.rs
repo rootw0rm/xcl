@@ -378,6 +378,40 @@ mod tests {
     }
 
     #[test]
+    fn kernelx_core_imports_resolve_to_hle() {
+        // Step 10b: memory/thread/sync/time imports are real HLE, callable directly.
+        for (dll, sym) in [
+            ("kernel32.dll", "VirtualAlloc"),
+            ("api-ms-win-core-memory-l1-1-0.dll", "VirtualProtect"),
+            ("api-ms-win-core-processthreads-l1-1-0.dll", "CreateThread"),
+            ("api-ms-win-core-synch-l1-1-0.dll", "WaitForSingleObject"),
+            ("api-ms-win-core-synch-l1-1-0.dll", "EnterCriticalSection"),
+            ("api-ms-win-core-profile-l1-1-0.dll", "QueryPerformanceCounter"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // The implementation is directly callable with the Windows x64 ABI.
+        let (addr, _) = resolve_inner(
+            &dll_key("api-ms-win-core-profile-l1-1-0.dll"),
+            &name("QueryPerformanceFrequency"),
+            0,
+        );
+        let qpf: unsafe extern "win64" fn(*mut u64) -> i32 = unsafe { std::mem::transmute(addr) };
+        let mut freq = 0u64;
+        assert_eq!(unsafe { qpf(&mut freq) }, 1);
+        assert_eq!(freq, 10_000_000);
+    }
+
+    #[test]
     fn stub_thunk_calls_log_and_return() {
         let (addr, src) = resolve_inner("kernelx.dll", &name("LinuxProbeThunk"), 0);
         assert_eq!(src, Source::Stub);
