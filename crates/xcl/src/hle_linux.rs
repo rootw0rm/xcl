@@ -363,6 +363,22 @@ fn build(config: &Config) -> Registry {
     for &(pattern, module) in &crate::hle_routes::ROUTES {
         routes.push((pattern.into(), Route::Hle(idx(module))));
     }
+    // Phase C frontier: the game ships its own CRT DLLs; their imports of each
+    // other and of api-ms-win-crt-*/ucrtbase must resolve to the real
+    // implementations in `crt_linux`, never to bundled GameDll code or logging
+    // stubs. Routing them to UCRT makes `resolve_hle` hit `crt_exports`
+    // first (Hle) and `find_any` second (HleOther), skipping the game-DLL
+    // branch that would otherwise load the bundled files.
+    let ucrt = idx(UCRT);
+    for pat in [
+        "vcruntime140.dll",
+        "msvcp140.dll",
+        "concrt140.dll",
+        "vcomp140.dll",
+        "vccorlib140.dll",
+    ] {
+        routes.push((pat.into(), Route::Hle(ucrt)));
+    }
     // LINUX-TODO: Phase C — `XCL_NETWORK=0` offline routes (`netoff`) once its Linux
     // implementation lands; Windows adds winhttp/ws2_32 routes here.
     Registry { modules, routes }
@@ -432,6 +448,24 @@ mod tests {
         assert_eq!(r.route("kernel32.dll"), Some(&Route::System));
         assert_eq!(r.route("mystery42.dll"), Some(&Route::Stub));
         assert_eq!(r.hle_for("xboxthing.dll").map(|m| m.name), Some(XGAMERUNTIME));
+    }
+
+    #[test]
+    fn bundled_crt_dlls_route_to_ucrt() {
+        // The game ships its own CRT DLLs; they must resolve to `crt_linux`
+        // (UCRT), never to bundled GameDll code. Contracts stay routeless.
+        let r = build(&Config::default());
+        for dll in [
+            "vcruntime140.dll",
+            "msvcp140.dll",
+            "concrt140.dll",
+            "vcomp140.dll",
+            "vccorlib140.dll",
+        ] {
+            assert_eq!(r.hle_for(dll).map(|m| m.name), Some(UCRT), "{dll}");
+        }
+        assert_eq!(r.hle_for("ucrtbase.dll").map(|m| m.name), None);
+        assert_eq!(r.hle_for("api-ms-win-crt-runtime-l1-1-0.dll").map(|m| m.name), None);
     }
 
     #[test]

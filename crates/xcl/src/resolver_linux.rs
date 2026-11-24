@@ -526,6 +526,80 @@ mod tests {
     }
 
     #[test]
+    fn bundled_crt_dlls_forward_to_ucrt_hle() {
+        // Phase C frontier: the game ships vcruntime140/msvcp140/concrt140/vcomp140/
+        // vccorlib140. Their imports must resolve to `crt_linux`, never to bundled
+        // GameDll code or logging stubs (which returned NULL for memcpy and faulted
+        // msvcp140 DllMain at +0x2efd).
+        let reg = registry();
+        for dll in [
+            "vcruntime140.dll",
+            "msvcp140.dll",
+            "concrt140.dll",
+            "vcomp140.dll",
+            "vccorlib140.dll",
+        ] {
+            assert_eq!(
+                reg.hle_for(dll).map(|m| m.name),
+                Some(crate::hle::UCRT),
+                "{dll} must route to ucrtbase"
+            );
+        }
+        // Routed CRT primitives are real HLE, callable directly (never a stub).
+        for (dll, sym) in [
+            ("vcruntime140.dll", "memcpy"),
+            ("vcruntime140.dll", "memset"),
+            ("vcruntime140.dll", "malloc"),
+            ("msvcp140.dll", "memcpy"),
+            ("msvcp140.dll", "memmove"),
+            ("concrt140.dll", "malloc"),
+            ("vcomp140.dll", "memset"),
+            ("vccorlib140.dll", "free"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(ref m) if m == crate::hle::UCRT),
+                "{dll}!{sym} must be Hle(ucrtbase), got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(stubs::info_of_stub(addr).is_none(), "{dll}!{sym} must not be a stub thunk");
+        }
+        // The routed memcpy is directly callable with the Windows x64 ABI.
+        let (addr, _) = resolve_inner(&dll_key("vcruntime140.dll"), &name("memcpy"), 0);
+        let memcpy: unsafe extern "win64" fn(*mut u8, *const u8, usize) -> *mut u8 =
+            unsafe { std::mem::transmute(addr) };
+        unsafe {
+            let mut dst = [0u8; 8];
+            let src = *b"ABCDEFGH";
+            assert_eq!(memcpy(dst.as_mut_ptr(), src.as_ptr(), 8), dst.as_mut_ptr());
+            assert_eq!(&dst, &src);
+        }
+        // Even when a bundled file exists on disk, the HLE route wins over GameDll.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("xcl-crt-fwd-{nonce}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vcruntime140.dll"), b"not-a-pe").unwrap();
+        let old = super::SEARCH_DIRS.read().unwrap().clone();
+        super::set_search_dirs(vec![dir.clone()]);
+        let (addr, src) = resolve_inner(&dll_key("vcruntime140.dll"), &name("memcpy"), 0);
+        assert!(matches!(src, Source::Hle(_)), "bundled file must not shadow HLE, got {src:?}");
+        assert!(stubs::info_of_stub(addr).is_none());
+        // LoadLibrary hands out the HLE pseudo-handle, and GetProcAddress resolves it.
+        let h = load_library("vcruntime140.dll").expect("bundled CRT HLE handle");
+        assert!(crate::modules::hle_name_by_handle(h).is_some());
+        assert!(get_proc_address(h, &name("memcpy")).is_some());
+        super::set_search_dirs(old);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Unknown C++ names stay stubs (return 0), never GameDll.
+        let (addr, src) = resolve_inner(&dll_key("msvcp140.dll"), &name("LinuxProbeMissingCxx"), 0);
+        assert_eq!(src, Source::Stub);
+        assert_ne!(addr, 0);
+    }
+
+    #[test]
     fn xgr_identity_imports_resolve_to_hle() {
         // Step 11i: console identity + package imports are real HLE, callable directly.
         for (dll, sym) in [
