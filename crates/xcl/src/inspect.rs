@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::pe::{Layout, Pe};
+#[cfg(windows)]
 use crate::resolver::{self, Source};
 
 #[derive(Serialize)]
@@ -34,6 +35,10 @@ struct Out {
 
 /// Console-only DLLs a PE imports (kernelx.dll, xgameruntime*, d3d12_xs …).
 /// `None` when the file is not a valid x64 PE. A plain Windows program yields `Some([])`.
+///
+/// On Windows the returned names are the imported DLL keys; on Linux they are the HLE
+/// modules they route to (the implementation modules are not compiled before Phase C).
+#[cfg(windows)]
 pub fn console_imports(path: &Path) -> Option<Vec<String>> {
     let data = std::fs::read(path).ok()?;
     let pe = Pe::parse(&data, Layout::File).ok()?;
@@ -55,6 +60,29 @@ pub fn console_imports(path: &Path) -> Option<Vec<String>> {
     Some(out)
 }
 
+#[cfg(not(windows))]
+pub fn console_imports(path: &Path) -> Option<Vec<String>> {
+    let data = std::fs::read(path).ok()?;
+    let pe = Pe::parse(&data, Layout::File).ok()?;
+    let mut all = pe.imports().unwrap_or_default();
+    all.extend(pe.delay_imports().unwrap_or_default());
+    let mut out: Vec<String> = Vec::new();
+    for d in &all {
+        let key = crate::util::dll_key(&d.dll);
+        if !crate::hle_routes::is_console_game_dll(&key) {
+            continue;
+        }
+        if let Some(module) = crate::hle_routes::module_for(&key) {
+            if !out.iter().any(|m| m == module) {
+                out.push(module.to_string());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Function-level classification string.
+#[cfg(windows)]
 fn status(s: &Source) -> String {
     match s {
         Source::Hle(m) => format!("HLE ({m})"),
@@ -63,6 +91,42 @@ fn status(s: &Source) -> String {
         Source::GameDll(d) => format!("game DLL ({d})"),
         Source::Stub => "STUB".into(),
     }
+}
+
+#[cfg(windows)]
+fn classify(dll: &str, what: &crate::pe::ImportName, _search_dir: Option<&Path>) -> String {
+    status(&resolver::classify(dll, what))
+}
+
+/// Phase B: no HLE module is compiled on Linux yet, so every function routed to one is a
+/// stub; the system leg has no `LoadLibrary` and is named as unavailable rather than claimed.
+// LINUX-TODO: Phase C — call resolver::classify once the HLE registry builds on Linux.
+#[cfg(not(windows))]
+fn classify(dll: &str, _what: &crate::pe::ImportName, search_dir: Option<&Path>) -> String {
+    let key = crate::util::dll_key(dll);
+    if crate::hle_routes::module_for(&key).is_some() {
+        return "STUB".into();
+    }
+    if search_dir.is_some_and(|dir| find_game_dll(dir, &key)) {
+        return format!("game DLL ({key})");
+    }
+    format!("Windows ({key}; unavailable on Linux)")
+}
+
+/// Case-insensitive DLL lookup in the folder being inspected (no mapping; the Windows
+/// resolver has the same rule for its dry run).
+#[cfg(not(windows))]
+fn find_game_dll(dir: &Path, key: &str) -> bool {
+    if dir.join(key).is_file() {
+        return true;
+    }
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name().to_string_lossy().to_ascii_lowercase() == key && e.path().is_file()
+            })
+        })
+        .unwrap_or(false)
 }
 
 pub fn run(path: &Path, json: bool) -> i32 {
@@ -83,7 +147,9 @@ pub fn run(path: &Path, json: bool) -> i32 {
             return 3;
         }
     };
-    if let Some(dir) = path.parent() {
+    let search_dir = path.parent();
+    #[cfg(windows)]
+    if let Some(dir) = search_dir {
         resolver::set_search_dirs(vec![dir.to_path_buf()]);
     }
     let mut imports = Vec::new();
@@ -91,8 +157,8 @@ pub fn run(path: &Path, json: bool) -> i32 {
     all.extend(pe.delay_imports().unwrap_or_default());
     for d in &all {
         for e in &d.entries {
-            let s = resolver::classify(&d.dll, &e.what);
-            imports.push(Entry { dll: d.dll.clone(), function: e.what.to_string(), delay: d.delay, status: status(&s) });
+            let s = classify(&d.dll, &e.what, search_dir);
+            imports.push(Entry { dll: d.dll.clone(), function: e.what.to_string(), delay: d.delay, status: s });
         }
     }
     let tls = pe.tls().ok().flatten().map(|t| t.total_len());
@@ -119,7 +185,11 @@ pub fn run(path: &Path, json: bool) -> i32 {
     println!("Type:          {} x64, subsystem {}", if out.is_dll { "DLL" } else { "EXE" }, out.subsystem);
     println!("ImageBase:     {}  (size {}, entry +{})", out.image_base, out.size_of_image, out.entry_rva);
     println!("Relocations:   {}", if out.has_relocations { "yes" } else { "NO (the image must be mapped at ImageBase)" });
+    #[cfg(windows)]
     println!("Static TLS:    {}", tls.map(|n| format!("{n} B (handled by the TLS carrier)")).unwrap_or_else(|| "none".into()));
+    // LINUX-TODO: Phase C — the per-thread TLS carrier is not implemented on Linux yet.
+    #[cfg(not(windows))]
+    println!("Static TLS:    {}", tls.map(|n| format!("{n} B (TLS carrier is Phase C on Linux)")).unwrap_or_else(|| "none".into()));
     println!("Exceptions:    {} .pdata entries", out.exception_entries);
     println!("Stack:         {}", out.stack_reserve);
     match console_imports(path) {
@@ -153,4 +223,33 @@ pub fn run(path: &Path, json: bool) -> i32 {
         }
     }
     0
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    fn name(s: &str) -> crate::pe::ImportName {
+        crate::pe::ImportName::Name { hint: 0, name: s.into() }
+    }
+
+    /// No HLE module is compiled on Linux before Phase C: routed functions are stubs, and
+    /// the system leg is named unavailable instead of pretending `LoadLibrary` works.
+    #[test]
+    fn linux_classification_never_claims_hle() {
+        assert_eq!(classify("kernel32.dll", &name("CreateFileW"), None), "STUB");
+        assert_eq!(classify("d3d12_xs.dll", &name("D3D12XboxCreateDevice"), None), "STUB");
+        assert_eq!(classify("ucrtbase.dll", &name("malloc"), None), "Windows (ucrtbase.dll; unavailable on Linux)");
+    }
+
+    #[test]
+    fn game_dlls_in_the_inspected_folder_are_recognised_case_insensitively() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("xcl-inspect-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("MyLib.DLL"), b"").unwrap();
+        let got = classify("mylib.dll", &name("Thing"), Some(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, "game DLL (mylib.dll)");
+    }
 }

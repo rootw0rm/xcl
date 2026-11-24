@@ -107,16 +107,8 @@ fn run_command(_target: &Path, _rest: &[String]) -> i32 {
     2
 }
 
-#[cfg(windows)]
 fn inspect_command(target: &Path, args: &[String]) -> i32 {
     xcl::inspect::run(target, args.iter().any(|a| a == "--json"))
-}
-
-// LINUX-TODO: Phase B — inspect already parses PE; the HLE classification needs the route table.
-#[cfg(not(windows))]
-fn inspect_command(_target: &Path, _args: &[String]) -> i32 {
-    eprintln!("xcl inspect: not supported on Linux yet (Phase B)");
-    2
 }
 
 /// xcl.exe opened from Explorer with no arguments: run the picked game.

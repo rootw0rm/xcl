@@ -77,23 +77,10 @@ pub struct Registry {
 
 static REG: OnceLock<Registry> = OnceLock::new();
 
-pub const KERNELX: &str = "kernelx.dll";
-pub const XGAMERUNTIME: &str = "xgameruntime.dll";
-pub const D3D12X: &str = "d3d12_xs.dll";
-pub const XAUDIO2: &str = "xaudio2_9.dll";
-pub const MFPLAT: &str = "mfplat.dll";
-pub const DXCOMPILER: &str = "dxcompiler_xs.dll";
-/// the console's texture layout library (`xg`)
-pub const XG: &str = "xg_xs.dll";
-/// the console's DirectStorage (`dstorage`)
-pub const XCRDAPI: &str = "xcrdapi.dll";
-/// the console's user32 subset (windows, the message loop): the PC user32
-pub const MINUSERX: &str = "minuserx.dll";
-/// the console's audio processor (APU memory, its channel, SHAPE contexts), decoder (xapu) and
-/// DSP (chad)
-pub const ACPHAL: &str = "acphal.dll";
-/// controllers (`GameInputCreate`)
-pub const GAMEINPUT: &str = "gameinput.dll";
+pub use crate::hle_routes::{
+    ACPHAL, D3D12X, DXCOMPILER, GAMEINPUT, KERNELX, MFPLAT, MINUSERX, XAUDIO2, XCRDAPI, XG,
+    XGAMERUNTIME,
+};
 
 fn build(config: &Config) -> Registry {
     let mut modules = vec![
@@ -135,56 +122,9 @@ fn build(config: &Config) -> Registry {
             None => crate::xlog_warn!("aliases: unknown target '{target}' for '{pat}' – skipping"),
         }
     }
-    let k = idx(KERNELX);
-    // the console's *legacy / minappmodelx DLLs: kernel32 / advapi32 functions (Fortnite takes
-    // GetProcessAffinityMask / SetThreadAffinityMask from kernel32legacy) and app-state notifications
-    for p in [
-        "kernelx.dll",
-        "kernel32.dll",
-        "kernelbase.dll",
-        "advapi32.dll",
-        "kernel32legacy.dll",
-        "advapi32legacy.dll",
-        "minappmodelx.dll",
-        "api-ms-win-core-*",
-        "ext-ms-win-core-*",
-    ] {
-        routes.push((p.into(), Route::Hle(k)));
-    }
-    let x = idx(XGAMERUNTIME);
-    for p in ["xgameruntime.dll", "xgameruntime*.dll", "xgameplatform.dll"] {
-        routes.push((p.into(), Route::Hle(x)));
-    }
-    let d = idx(D3D12X);
-    for p in ["d3d12_xs.dll", "d3d12_x.dll", "d3d12x.dll"] {
-        routes.push((p.into(), Route::Hle(d)));
-    }
-    let a = idx(XAUDIO2);
-    for p in ["xaudio2_9.dll", "xaudio2_9redist.dll"] {
-        routes.push((p.into(), Route::Hle(a)));
-    }
-    let mf = idx(MFPLAT);
-    routes.push((MFPLAT.into(), Route::Hle(mf)));
-    let u = idx(MINUSERX);
-    routes.push((MINUSERX.into(), Route::Hle(u)));
-    // the console's ntuser API sets: Windows' user32 but for the ANSI window functions (`user`)
-    routes.push(("ext-ms-win-rtcore-ntuser-window-ansi-*".into(), Route::Hle(u)));
-    // … and its Unicode window functions: CreateWindowExW makes the console's screen, the rest
-    // is user32 (the module's fallback)
-    routes.push(("ext-ms-win-rtcore-ntuser-window-l1-*".into(), Route::Hle(u)));
-    let s = idx(XCRDAPI);
-    routes.push((XCRDAPI.into(), Route::Hle(s)));
-    let g = idx(XG);
-    routes.push((XG.into(), Route::Hle(g)));
-    let ap = idx(ACPHAL);
-    for p in ["acphal.dll", "xapu.dll", "chad.dll"] {
-        routes.push((p.into(), Route::Hle(ap)));
-    }
-    let gi = idx(GAMEINPUT);
-    routes.push((GAMEINPUT.into(), Route::Hle(gi)));
-    let c = idx(DXCOMPILER);
-    for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
-        routes.push((p.into(), Route::Hle(c)));
+    // Shared with the Linux `inspect` path: one ordered table, no second DLL list.
+    for &(pattern, module) in &crate::hle_routes::ROUTES {
+        routes.push((pattern.into(), Route::Hle(idx(module))));
     }
     if offline {
         let n = idx(netoff::NETOFF);

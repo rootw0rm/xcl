@@ -4,8 +4,8 @@
 //!
 //! The host runtime (loader, TLS, EH, HLE, VFS, hooks) is Windows-only for now; on Linux
 //! those modules stay out of the build and the CLI returns clean "not supported on Linux
-//! yet (Phase …)" errors instead. The offline tools (inspect once Phase B lands, disasm,
-//! shaders, rpf) and the RDNA2 front-end are platform-neutral.
+//! yet (Phase …)" errors instead. The offline tools (inspect, disasm, shaders, rpf) and
+//! the RDNA2 front-end are platform-neutral.
 
 // Function → address casts are the whole point of an import resolver.
 #![allow(function_casts_as_integer)]
@@ -20,12 +20,12 @@ pub mod eh;
 pub mod gpu;
 #[cfg(windows)]
 pub mod hle;
+pub mod hle_routes;
 #[cfg(windows)]
 pub mod hooks;
 #[cfg(windows)]
 pub mod host;
 pub mod insn;
-#[cfg(windows)]
 pub mod inspect;
 #[cfg(windows)]
 pub mod launcher;
