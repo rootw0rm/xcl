@@ -51,11 +51,13 @@ mod ops_tests;
 mod bitreader_tests;
 #[cfg(test)]
 mod robustness_tests;
-#[cfg(test)]
+// LINUX-TODO Phase D: GPU/DXC-backed translation tests; validate/runner/dxc
+// are Windows-only until the SPIR-V backend lands.
+#[cfg(all(test, windows))]
 mod fuzz_tests;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod msaa_tests;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod round_tests;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod geometry_tests;
