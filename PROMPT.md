@@ -27,8 +27,12 @@ first (short contract); this file is the work plan. Details live in
 - Stream B landed 17d review (PASS, no changes) + step 16/selector
   verified already-in-tree + windowed present of the recompiler-driven
   triangle via raw X11/`dlopen` (`fb58739`, no `winit` — Apache-only;
-  lib tests 502 passed). Remaining for the 12 GPU FAILs: route D3D12.X
-  device creation to the Vulkan backend (rest of step 17).
+  lib tests 502 passed). Stream A2 landed the GDK-thunk protocol
+  (`98139c6`, lib tests 511 passed): the 4 xgameruntime resolves work,
+  retail now completes GDK init and traps at `exe+0x2237179` (config-
+  selection abort on an all-zero heap struct, no stub implicated —
+  plausibly needs real device creation). Remaining for the 12 GPU FAILs:
+  route D3D12.X device creation to the Vulkan backend (rest of step 17).
 - **Game files are PRESENT on this host** (the drive is mounted):
   `/run/media/anon/12TB_B/torrents/GTA6.Xbox.v1.0.2.1-CYBERLEEK/`
   (`game_scarlett_master.exe`, 120 MB, + `MicrosoftGame.Config`) and
