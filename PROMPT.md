@@ -9,11 +9,12 @@ full work plan.
 
 ## Status snapshot (2026-11-24 — refresh this when a phase flips)
 
-- `linux` @ `5fc2e8c` (merge of upstream `main` @ `6987e49`, plus Linux
+- `linux` @ `a776061` (merge of upstream `main` @ `6e1e2be`, plus Linux
   fixes; pushed to `origin/linux`).
   Verify with `git log --oneline -3; git status -sb`.
-  Upstream `cbc296a` → `6987e49` is README-only (Discord link formatting) —
-  no code, no Linux fallout. Previous syncs' notes still hold.
+  Upstream `6987e49` → `6e1e2be` is README/assets only (front-page banner,
+  status, DXC line) — no code, no Linux fallout. Previous syncs' notes
+  still hold.
   A ralph loop is actively working the tree (glsl/spirv/vulkan_graphics WIP,
   uncommitted) — do not touch its files or stash the workdir.
   NOTE: this machine has **no game files** — `/run/media/...` does not
@@ -21,7 +22,7 @@ full work plan.
   never block the loop on them.
 - **Phase A done.** `cargo check -p xcl --tests` and `cargo check --workspace`
   are green (0 errors) on `x86_64-unknown-linux-gnu`; `cargo test -p xcl --lib`
-  passes (490 passed, 0 failed, 1 ignored; re-verified after the `6987e49` sync).
+  passes (490 passed, 0 failed, 1 ignored; re-verified after the `6e1e2be` sync).
   `target/debug/xcl` builds.
 - **Phase B done** (where game files exist). Offline tools run on the real
   paths, e.g. `xcl inspect .../game_scarlett_master.exe` reports 587 imports /
