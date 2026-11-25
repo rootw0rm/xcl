@@ -229,6 +229,24 @@ fn terminate_with_signal(signal: libc::c_int) -> ! {
     }
 }
 
+pub(crate) static ENDING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn begin_termination(
+    h: isize,
+    ending: &AtomicBool,
+    wine: impl FnOnce() -> bool,
+    write_report: impl FnOnce(),
+) -> bool {
+    if (h != 0 && h != -1) || ending.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    // Wine does not deliver the executable's process-detach TLS callback.
+    if wine() {
+        write_report();
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +327,21 @@ mod tests {
     fn pc_hook_is_an_explicit_unsupported_path() {
         let error = install_pc_hook().unwrap_err();
         assert!(error.contains("not available on Linux"), "{error}");
+    }
+
+    #[test]
+    fn termination_reports_once_for_the_current_process_under_wine() {
+        use std::sync::atomic::AtomicBool;
+        let ending = AtomicBool::new(false);
+        let writes = std::cell::Cell::new(0);
+        let report = || writes.set(writes.get() + 1);
+        assert!(!begin_termination(42, &ending, || panic!("other process"), report));
+        assert!(begin_termination(-1, &ending, || true, report));
+        assert!(!begin_termination(0, &ending, || true, report));
+        assert_eq!(writes.get(), 1);
+        let windows = AtomicBool::new(false);
+        assert!(begin_termination(0, &windows, || false, report));
+        assert_eq!(writes.get(), 1);
     }
 
     #[test]

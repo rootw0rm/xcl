@@ -486,13 +486,23 @@ pub unsafe extern "win64" fn GetThreadId(handle: usize) -> u32 {
 // host process with the same code.
 
 pub unsafe extern "win64" fn ExitProcess(code: u32) -> ! {
-    crate::xlog_info!("ExitProcess({code:#x})");
-    crate::log::flush();
-    // Best-effort DLL/FLS/TLS process-detach would run here on Windows; on Linux the
-    // mapped images stay valid until `_exit`, and taking more locks from inside an
-    // arbitrary guest call risks deadlock, so only the report is written.
-    crate::report::write_final_with_code(None, code as i64);
-    crate::log::flush();
+    // Port of upstream #1479: the ending is logged and reported once, for the
+    // current process only. On the Linux host there is no process-detach to
+    // write the buffered report (like Wine), so the predicate is always true
+    // and the report is written before the log flush.
+    if crate::eh::begin_termination(
+        -1,
+        &crate::eh::ENDING,
+        || true,
+        || crate::report::write_final_with_code(None, code as i64),
+    ) {
+        crate::xlog_info!("ExitProcess({code:#x})");
+        // Best-effort DLL/FLS/TLS process-detach would run here on Windows; on Linux the
+        // mapped images stay valid until `_exit`, and taking more locks from inside an
+        // arbitrary guest call risks deadlock, so only the report is written.
+        // (The report itself was written by `begin_termination` above.)
+        crate::log::flush();
+    }
     std::process::exit(code as i32);
 }
 
@@ -502,10 +512,15 @@ pub unsafe extern "win64" fn TerminateProcess(proc_: usize, code: u32) -> i32 {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    crate::xlog_info!("TerminateProcess(current, {code:#x})");
-    crate::log::flush();
-    crate::report::write_final_with_code(None, code as i64);
-    crate::log::flush();
+    if crate::eh::begin_termination(
+        -1,
+        &crate::eh::ENDING,
+        || true,
+        || crate::report::write_final_with_code(None, code as i64),
+    ) {
+        crate::xlog_info!("TerminateProcess(current, {code:#x})");
+        crate::log::flush();
+    }
     std::process::exit(code as i32);
 }
 
