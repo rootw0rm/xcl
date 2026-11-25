@@ -775,6 +775,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn native_wave_branches_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        let mut cs = compute_cs();
+        cs.threads = [32, 1, 1];
+        for (lines, expected) in wave_branch_cases(false) {
+            let dxil = super::compute(&decode(&lines), &cs, false).unwrap();
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[], &[0; 32]).unwrap();
+            assert_eq!(&out[..32], &[expected; 32], "{lines:?}");
+        }
+    }
+
+    #[test]
     fn a_per_lane_compute_program_runs_on_the_gpu() {
         use super::super::{dxc, runner};
         if !gpu() {
@@ -862,5 +876,62 @@ mod tests {
             }
         }
         assert_eq!((direct.sgpr[106], direct.sgpr[126]), (hlsl.sgpr[106], hlsl.sgpr[126]));
+    }
+
+    /// Inline-constant, literal, and NULL mask operands in `v_add_co_ci_u32`, `v_cndmask_b32`,
+    /// and mask SALU ops agree with HLSL on wave32 and wave64.
+    #[test]
+    fn const_and_null_mask_operands_agree_with_hlsl_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let wave64_ok = runner::wave64_supported() == Ok(true);
+        for w64 in [false, true] {
+            let lanes = if w64 { 64 } else { 32 };
+            if w64 && !wave64_ok {
+                runner::skip_test("const_mask, wave64: no wave64");
+                continue;
+            }
+            let s_and = if w64 { "S_AND_B64" } else { "S_AND_B32" };
+            let lines: &[I] = &[
+                // v1 = v0 + 10; v2 = v0 + 100
+                ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 138), ("VSRC1", 0)]),
+                ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 100)]),
+                // bridged V_ADD_CO_CI_U32 with inline carry-in 0 (128), -1 (193), NULL (125)
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 3), ("SDST", 106), ("SRC0", 257), ("SRC1", 258), ("SRC2", 128)]),
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 106), ("SRC0", 257), ("SRC1", 258), ("SRC2", 193)]),
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 5), ("SDST", 106), ("SRC0", 257), ("SRC1", 258), ("SRC2", 125)]),
+                // V_CNDMASK_B32 with inline positive mask (0x15 = 21 -> code 149), negative mask (-4 -> code 196), NULL (125)
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 257), ("SRC1", 258), ("SRC2", 149)]),
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", 257), ("SRC1", 258), ("SRC2", 196)]),
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", 257), ("SRC1", 258), ("SRC2", 125)]),
+                // Mask SALU with inline mask 0x15 (149) and NULL (125), read via V_CNDMASK_B32
+                (s_and, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 126), ("SSRC1", 149)]),
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", 125), ("SRC1", 258), ("SRC2", 4)]),
+                ("S_ENDPGM", "ENC_SOPP", &[]),
+            ];
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "wave{lanes}: {:?}", t.unsupported_why);
+            let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &["-Gis"]).unwrap(), &st, &[]).unwrap();
+            let insts = decode(lines);
+            let (dxil, _) = super::kernel(&insts, w64).unwrap_or_else(|e| panic!("wave{lanes}: {e}"));
+            let direct = runner::run(&dxil, &st, &[]).unwrap();
+            for l in 0..lanes {
+                for r in 3..=9 {
+                    assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
+                }
+            }
+        }
     }
 }

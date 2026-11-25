@@ -1050,14 +1050,13 @@ impl Lw {
         if self.dyn_rm {
             let sd = Self::field(d, "SDST");
             let src = self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?;
-            let sh = 2 - off;
             let v = match dp_mask {
                 3 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     self.andc(x, 3)
                 }
                 1 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     let bit = self.andc(x, 1);
                     let cur = self.rd(VAR_FP16_RM);
                     let keep = self.andc(cur, 2);

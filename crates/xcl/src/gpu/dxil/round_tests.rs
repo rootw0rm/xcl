@@ -447,3 +447,25 @@ fn direct_f32_round_mode_unsupported_op_rejected() {
     let e = runner::direct_kernel(&code, true).unwrap_err();
     assert!(e.contains("directed f32 rounding"), "{e}");
 }
+
+/// In a directed rounding mode with input denormals preserved (the default `MODE_INIT`,
+/// `s_denorm_mode 3`), `denormal * +inf` and `fma(denormal, +inf, 1.0)` must produce `+inf`,
+/// not fall back to the D3D12 native f32 op (which flushes f32 denormals and yields NaN).
+#[test]
+fn gpu_direct_f32_round_preserved_denormal_times_inf_is_inf() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut code = Vec::new();
+    code.extend(encode("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 1)], None).unwrap());
+    code.extend(encode("V_MUL_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V), ("VSRC1", 1)], None).unwrap());
+    code.extend(encode("V_FMA_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None).unwrap());
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.vgpr[0][0] = 0x0000_0001; // smallest positive f32 denormal (preserved in MODE_INIT)
+    st.vgpr[0][1] = 0x7F80_0000; // +inf
+    st.vgpr[0][2] = 0x3F80_0000; // 1.0
+    let r = run(&code, &st);
+    assert_eq!(r.vgpr[0][10], 0x7F80_0000, "v_mul_f32(denorm, +inf) with preserve = {:#010x}, expected +inf", r.vgpr[0][10]);
+    assert_eq!(r.vgpr[0][11], 0x7F80_0000, "v_fma_f32(denorm, +inf, 1.0) with preserve = {:#010x}, expected +inf", r.vgpr[0][11]);
+}

@@ -275,6 +275,7 @@ struct Lanes<'a> {
     insts: &'a [Decoded],
     wave64: bool,
     launch: LaunchExec,
+    wave_branches: bool,
     bdd: Bdd,
     atoms: HashMap<Atom, u32>,
     /// block each atom is born in
@@ -421,7 +422,7 @@ impl<'a> Lanes<'a> {
                 (written, kill, d.ienc.operands.iter().any(|o| o.output && o.ty == "OPR_SSRC_SPECIAL_SCC"))
             })
             .collect();
-        Ok(Lanes { insts, wave64, launch, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, body, effects })
+        Ok(Lanes { insts, wave64, launch, wave_branches: false, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, body, effects })
     }
 
     fn atom(&mut self, a: Atom, block: usize) -> R<B> {
@@ -453,7 +454,7 @@ impl<'a> Lanes<'a> {
             st.regs[EXEC] = Some(self.atom(Atom::Opaque(d.pc, EXEC), block)?);
         }
         if writes_scc {
-            st.scc = Some((self.atom(Atom::Scc(d.pc), block)?, true));
+            st.scc = Some((self.atom(Atom::Scc(d.pc), block)?, !self.wave_branches));
         }
         Ok(())
     }
@@ -581,7 +582,7 @@ impl<'a> Lanes<'a> {
             st.regs[EXEC] = Some(self.atom(Atom::Opaque(d.pc, EXEC), block)?);
         }
         if writes_scc {
-            st.scc = match scc {
+            st.scc = match scc.filter(|_| !self.wave_branches) {
                 Some(s) => Some(s),
                 None => Some((self.atom(Atom::Scc(d.pc), block)?, false)),
             };
@@ -626,6 +627,11 @@ impl<'a> Lanes<'a> {
     /// lane mask's.
     fn cond(&mut self, st: &State, d: &Decoded, block: usize) -> R<(B, bool)> {
         let e = st.regs[EXEC].expect("EXEC");
+        // All hardware lanes take the same edge. A wave decision carries no fact about
+        // this lane's mask bit, even when the wave took the nonzero edge.
+        if self.wave_branches {
+            return Ok((self.atom(Atom::Scc(d.pc), block)?, false));
+        }
         let (c, lane, negate) = match d.inst.name {
             n @ ("S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") => {
                 let (c, lane) = match st.scc {
@@ -889,10 +895,16 @@ pub fn analyze(insts: &[Decoded], wave64: bool) -> R<Summary> {
 
 /// Analyses a decoded program (far jumps resolved) that starts with EXEC as `launch` says.
 pub fn analyze_launch(insts: &[Decoded], wave64: bool, launch: LaunchExec) -> R<Summary> {
+    analyze_branches(insts, wave64, launch, false)
+}
+
+pub(super) fn analyze_branches(insts: &[Decoded], wave64: bool, launch: LaunchExec, wave_branches: bool) -> R<Summary> {
     if insts.is_empty() {
         return Ok(Summary::default());
     }
-    Lanes::new(insts, wave64, launch)?.analyze()
+    let mut lanes = Lanes::new(insts, wave64, launch)?;
+    lanes.wave_branches = wave_branches;
+    lanes.analyze()
 }
 
 /// Decodes and analyses a program.

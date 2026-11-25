@@ -3929,9 +3929,22 @@ pub(crate) mod driver_cache {
         format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
-    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+    /// The file of a translated graphics pipeline keyed by its full state + shader digest.
+    pub fn graphics_name(hash: u64, bytes: usize) -> String {
+        format!("gfx-{hash:016x}-{bytes:x}.pso")
+    }
+
+    fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+    }
+
+    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+    }
+
+    pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(hash, bytes)))
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -4131,19 +4144,36 @@ mod compute_blob_tests {
     }
 }
 
-/// The driver's blob of the PSO just built (adopted: its PC `GetCachedBlob` through `orig_fn`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || !is_adopted(pso) || compute_blob(key).is_some() {
-        return;
+/// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
+unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
+    if pso.is_null() {
+        return None;
     }
-    type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
-    let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
-    let mut raw = std::ptr::null_mut();
-    if get(pso, &mut raw) < 0 || raw.is_null() {
-        return;
-    }
+    let raw = if is_adopted(pso) {
+        type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+        let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
+        let mut out = std::ptr::null_mut();
+        if get(pso, &mut out) < 0 || out.is_null() {
+            return None;
+        }
+        out
+    } else {
+        let p = ID3D12PipelineState::from_raw_borrowed(&pso)?;
+        let blob = p.GetCachedBlob().ok()?;
+        return Some(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec());
+    };
     let blob = ID3DBlob::from_raw(raw);
     let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
+/// passes owned by `TwoPassPso`).
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || compute_blob(key).is_some() {
+        return;
+    }
+    let Some(bytes) = read_pso_cached_blob(pso) else { return };
     let mut g = COMPUTE_BLOBS.lock().unwrap();
     let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
     if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
@@ -4151,6 +4181,226 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
     }
     *total += bytes.len();
     m.insert(key, std::sync::Arc::new(bytes));
+}
+
+/// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
+/// keyed by `(full_state_and_shader_hash, total_dxil_bytes)`, up to `GRAPHICS_BLOBS_MAX`.
+static GRAPHICS_BLOBS: Mutex<Option<(HashMap<(u64, usize), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+const GRAPHICS_BLOBS_MAX: usize = 256 << 20;
+
+fn graphics_blob(key: (u64, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
+    GRAPHICS_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
+}
+
+fn forget_graphics_blob(key: (u64, usize)) {
+    if let Some((m, total)) = GRAPHICS_BLOBS.lock().unwrap().as_mut() {
+        if let Some(b) = m.remove(&key) {
+            *total -= b.len();
+        }
+    }
+}
+
+unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || graphics_blob(key).is_some() {
+        return;
+    }
+    let Some(bytes) = read_pso_cached_blob(pso) else { return };
+    let mut g = GRAPHICS_BLOBS.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if bytes.is_empty() || *total + bytes.len() > GRAPHICS_BLOBS_MAX {
+        return;
+    }
+    *total += bytes.len();
+    m.insert(key, std::sync::Arc::new(bytes));
+}
+
+/// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
+/// samplers, blend/rasterizer/depth-stencil state, input layout, render target / depth formats,
+/// sample desc, topology, flags) for in-memory and on-disk driver blob caching.
+unsafe fn graphics_blob_key(
+    copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    vs_dxil: &[u8],
+    ps_dxil: Option<&[u8]>,
+    rect_gs: Option<&[u8]>,
+    samplers: &[crate::gpu::recomp::pso::StaticSampler],
+) -> (u64, usize) {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let feed = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    let feed_u64 = |h: &mut u64, v: u64| feed(h, &v.to_le_bytes());
+    let feed_u32 = |h: &mut u64, v: u32| feed(h, &v.to_le_bytes());
+    let feed_u8 = |h: &mut u64, v: u8| feed(h, &[v]);
+
+    feed_u64(&mut h, crate::gpu::shader::fnv64(vs_dxil));
+    feed_u64(&mut h, vs_dxil.len() as u64);
+    if let Some(ps) = ps_dxil {
+        feed_u64(&mut h, crate::gpu::shader::fnv64(ps));
+        feed_u64(&mut h, ps.len() as u64);
+    } else {
+        feed_u64(&mut h, 0);
+    }
+    if let Some(gs) = rect_gs {
+        feed_u64(&mut h, crate::gpu::shader::fnv64(gs));
+        feed_u64(&mut h, gs.len() as u64);
+    } else {
+        feed_u64(&mut h, 0);
+    }
+    feed_u64(&mut h, samplers.len() as u64);
+    for (w, cmp) in samplers {
+        for &x in w {
+            feed_u32(&mut h, x);
+        }
+        feed_u8(&mut h, *cmp as u8);
+    }
+    // Hash BlendState, RasterizerState, and DepthStencilState field-by-field so struct
+    // padding bytes (e.g. D3D12_RENDER_TARGET_BLEND_DESC tail padding and the 2 bytes after
+    // DepthStencilState.StencilWriteMask) never cause nondeterministic cache keys.
+    let bs = &copy.BlendState;
+    feed_u32(&mut h, bs.AlphaToCoverageEnable.0 as u32);
+    feed_u32(&mut h, bs.IndependentBlendEnable.0 as u32);
+    for rt in &bs.RenderTarget {
+        feed_u32(&mut h, rt.BlendEnable.0 as u32);
+        feed_u32(&mut h, rt.LogicOpEnable.0 as u32);
+        feed_u32(&mut h, rt.SrcBlend.0 as u32);
+        feed_u32(&mut h, rt.DestBlend.0 as u32);
+        feed_u32(&mut h, rt.BlendOp.0 as u32);
+        feed_u32(&mut h, rt.SrcBlendAlpha.0 as u32);
+        feed_u32(&mut h, rt.DestBlendAlpha.0 as u32);
+        feed_u32(&mut h, rt.BlendOpAlpha.0 as u32);
+        feed_u32(&mut h, rt.LogicOp.0 as u32);
+        feed_u8(&mut h, rt.RenderTargetWriteMask);
+    }
+    feed_u32(&mut h, copy.SampleMask);
+    let rs = &copy.RasterizerState;
+    feed_u32(&mut h, rs.FillMode.0 as u32);
+    feed_u32(&mut h, rs.CullMode.0 as u32);
+    feed_u32(&mut h, rs.FrontCounterClockwise.0 as u32);
+    feed_u32(&mut h, rs.DepthBias as u32);
+    feed_u32(&mut h, rs.DepthBiasClamp.to_bits());
+    feed_u32(&mut h, rs.SlopeScaledDepthBias.to_bits());
+    feed_u32(&mut h, rs.DepthClipEnable.0 as u32);
+    feed_u32(&mut h, rs.MultisampleEnable.0 as u32);
+    feed_u32(&mut h, rs.AntialiasedLineEnable.0 as u32);
+    feed_u32(&mut h, rs.ForcedSampleCount);
+    feed_u32(&mut h, rs.ConservativeRaster.0 as u32);
+    let ds = &copy.DepthStencilState;
+    feed_u32(&mut h, ds.DepthEnable.0 as u32);
+    feed_u32(&mut h, ds.DepthWriteMask.0 as u32);
+    feed_u32(&mut h, ds.DepthFunc.0 as u32);
+    feed_u32(&mut h, ds.StencilEnable.0 as u32);
+    feed_u8(&mut h, ds.StencilReadMask);
+    feed_u8(&mut h, ds.StencilWriteMask);
+    for op in [&ds.FrontFace, &ds.BackFace] {
+        feed_u32(&mut h, op.StencilFailOp.0 as u32);
+        feed_u32(&mut h, op.StencilDepthFailOp.0 as u32);
+        feed_u32(&mut h, op.StencilPassOp.0 as u32);
+        feed_u32(&mut h, op.StencilFunc.0 as u32);
+    }
+    feed_u32(&mut h, copy.InputLayout.NumElements);
+    if copy.InputLayout.NumElements > 0 && !copy.InputLayout.pInputElementDescs.is_null() {
+        let elems = std::slice::from_raw_parts(copy.InputLayout.pInputElementDescs, copy.InputLayout.NumElements as usize);
+        for e in elems {
+            if !e.SemanticName.0.is_null() {
+                feed(&mut h, std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_bytes_with_nul());
+            } else {
+                feed(&mut h, &[0]);
+            }
+            feed_u32(&mut h, e.SemanticIndex);
+            feed_u32(&mut h, e.Format.0 as u32);
+            feed_u32(&mut h, e.InputSlot);
+            feed_u32(&mut h, e.AlignedByteOffset);
+            feed_u32(&mut h, e.InputSlotClass.0 as u32);
+            feed_u32(&mut h, e.InstanceDataStepRate);
+        }
+    }
+    feed_u32(&mut h, copy.IBStripCutValue.0 as u32);
+    feed_u32(&mut h, copy.PrimitiveTopologyType.0 as u32);
+    feed_u32(&mut h, copy.NumRenderTargets);
+    for f in &copy.RTVFormats {
+        feed_u32(&mut h, f.0 as u32);
+    }
+    feed_u32(&mut h, copy.DSVFormat.0 as u32);
+    feed_u32(&mut h, copy.SampleDesc.Count);
+    feed_u32(&mut h, copy.SampleDesc.Quality);
+    feed_u32(&mut h, copy.NodeMask);
+    feed_u32(&mut h, copy.Flags.0 as u32);
+    let total_bytes = vs_dxil.len() + ps_dxil.map_or(0, <[u8]>::len) + rect_gs.map_or(0, <[u8]>::len);
+    (h, total_bytes)
+}
+
+#[cfg(test)]
+mod graphics_blob_tests {
+    use super::*;
+
+    #[test]
+    fn graphics_blob_key_tracks_shaders_samplers_and_state() {
+        unsafe {
+            let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            d.NumRenderTargets = 1;
+            d.RTVFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+            d.SampleDesc.Count = 1;
+            let vs = b"vs-dxil-1";
+            let ps = b"ps-dxil-1";
+            let k0 = graphics_blob_key(&d, vs, Some(ps), None, &[]);
+            assert_eq!(k0, graphics_blob_key(&d, vs, Some(ps), None, &[]));
+            assert_ne!(k0, graphics_blob_key(&d, b"vs-dxil-2", Some(ps), None, &[]));
+            assert_ne!(k0, graphics_blob_key(&d, vs, None, None, &[]));
+            assert_ne!(k0, graphics_blob_key(&d, vs, Some(ps), Some(b"gs"), &[]));
+            assert_ne!(k0, graphics_blob_key(&d, vs, Some(ps), None, &[([1, 2, 3, 4], false)]));
+            let mut d2 = d;
+            d2.RTVFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+            assert_ne!(k0, graphics_blob_key(&d2, vs, Some(ps), None, &[]));
+        }
+    }
+
+    #[test]
+    fn graphics_blob_key_ignores_struct_padding_bytes() {
+        unsafe {
+            let mut a: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::mem::zeroed();
+            let mut b: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::mem::zeroed();
+            // Fill every byte of DepthStencilState and BlendState with distinct poison patterns,
+            // then populate every semantic field identically so only padding bytes differ.
+            std::ptr::write_bytes(&mut a.DepthStencilState as *mut _ as *mut u8, 0xAA, std::mem::size_of::<D3D12_DEPTH_STENCIL_DESC>());
+            std::ptr::write_bytes(&mut b.DepthStencilState as *mut _ as *mut u8, 0x55, std::mem::size_of::<D3D12_DEPTH_STENCIL_DESC>());
+            std::ptr::write_bytes(&mut a.BlendState as *mut _ as *mut u8, 0xAA, std::mem::size_of::<D3D12_BLEND_DESC>());
+            std::ptr::write_bytes(&mut b.BlendState as *mut _ as *mut u8, 0x55, std::mem::size_of::<D3D12_BLEND_DESC>());
+
+            for d in [&mut a, &mut b] {
+                d.DepthStencilState.DepthEnable = true.into();
+                d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+                d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+                d.DepthStencilState.StencilEnable = false.into();
+                d.DepthStencilState.StencilReadMask = 0xFF;
+                d.DepthStencilState.StencilWriteMask = 0xFF;
+                d.DepthStencilState.FrontFace = D3D12_DEPTH_STENCILOP_DESC::default();
+                d.DepthStencilState.BackFace = D3D12_DEPTH_STENCILOP_DESC::default();
+                d.BlendState.AlphaToCoverageEnable = false.into();
+                d.BlendState.IndependentBlendEnable = false.into();
+                for rt in &mut d.BlendState.RenderTarget {
+                    rt.BlendEnable = false.into();
+                    rt.LogicOpEnable = false.into();
+                    rt.SrcBlend = D3D12_BLEND_ONE;
+                    rt.DestBlend = D3D12_BLEND_ZERO;
+                    rt.BlendOp = D3D12_BLEND_OP_ADD;
+                    rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+                    rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                    rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+                    rt.RenderTargetWriteMask = 0xF;
+                }
+            }
+            let ka = graphics_blob_key(&a, b"vs", Some(b"ps"), None, &[]);
+            let kb = graphics_blob_key(&b, b"vs", Some(b"ps"), None, &[]);
+            assert_eq!(ka, kb, "padding bytes must not affect graphics_blob_key");
+
+            b.DepthStencilState.StencilWriteMask = 0x7F;
+            assert_ne!(ka, graphics_blob_key(&b, b"vs", Some(b"ps"), None, &[]));
+        }
+    }
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4171,13 +4421,13 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         note_translation_error("PSO with HS/DS – not supported yet".into());
         return None;
     }
+    // made when first used (`pso_async::lazy`): not even translated now (covers both VS+PS and GS)
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
     if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
         let _ = f;
         return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
-    }
-    // made when first used (`pso_async::lazy`): not even translated now
-    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
-        return None;
     }
     // a GPU that can run 32-lane waves may run a wave64 VS / PS in waves of 32 (the driver
     // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
@@ -4231,7 +4481,48 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
-    let hr = driver_compile("graphics", bytes, true, || retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)));
+    let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
+    let mut cached = graphics_blob(gkey);
+    let disk = driver_cache::graphics_path(gkey.0, gkey.1);
+    let from_disk = cached.is_none();
+    if from_disk {
+        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+    }
+    if let Some(b) = &cached {
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    }
+    let (mut hr, mut in_driver) = driver_compile_identified(
+        "graphics",
+        bytes,
+        gate_compute_driver_compile(cached.is_some()),
+        Some((ps_hash, cached.is_some())),
+        || retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)),
+    );
+    if hr < 0 && cached.is_some() {
+        forget_graphics_blob(gkey);
+        if from_disk {
+            driver_cache::note(false, disk.as_deref());
+        }
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        let (retried, took) = driver_compile_identified(
+            "graphics retry",
+            bytes,
+            true,
+            Some((ps_hash, false)),
+            || retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)),
+        );
+        hr = retried;
+        in_driver += took;
+    }
+    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+    if hr >= 0 && !reused {
+        keep_graphics_blob(gkey, *ppv, bytes);
+        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
+            driver_cache::keep(p, &b, in_driver);
+        }
+    } else if reused && from_disk {
+        driver_cache::note(true, None);
+    }
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -4744,6 +5035,71 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
+/// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
+fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if let Some(ps) = ps {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
+    use crate::gpu::recomp::{dxc, runner};
+    if dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if super::backend() != super::Backend::Real {
+        return runner::skip_test("no GPU");
+    }
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    if unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS7).cast(), std::mem::size_of_val(&options) as u32) }.is_err()
+        || options.MeshShaderTier.0 < D3D12_MESH_SHADER_TIER_1.0
+    {
+        return runner::skip_test("no mesh shaders");
+    }
+    let (ms, _) = dummy_mesh().expect("compile a synthetic triangle mesh shader");
+    unsafe {
+        let mut sig = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+        let sig = sig.unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(
+            0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize()),
+        ).unwrap();
+        let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreatePipelineState")));
+        let build = |stream: &StreamOut| {
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            let mut pso = std::ptr::null_mut();
+            let hr = create(raw, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut pso);
+            assert!(hr >= 0 && !pso.is_null(), "mesh PSO creation failed ({hr:#x})");
+            ID3D12PipelineState::from_raw(pso)
+        };
+
+        let mut reference = StreamOut::default();
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs.as_raw());
+        reference.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        let blob = build(&reference).GetCachedBlob().unwrap();
+        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None);
+        let subobjects = stream_subobjects(&translated.0).unwrap();
+        let topology = subobjects.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32);
+        assert_eq!(topology.map(|(_, payload)| *payload), Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().as_slice()));
+        translated.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: blob.GetBufferPointer(),
+            CachedBlobSizeInBytes: blob.GetBufferSize(),
+        });
+        build(&translated);
+    }
+}
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
@@ -4779,11 +5135,45 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
+    // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
+    // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+    let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
+    let mut ccached = compute_blob(ckey);
+    let cdisk = driver_cache::path(&tp.cs, 0);
+    let cfrom_disk = ccached.is_none();
+    if cfrom_disk {
+        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+    }
+    if let Some(b) = &ccached {
+        cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let hc = driver_compile("compute pass", tp.cs.len(), false, || {
+    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
+    if hc < 0 && ccached.is_some() {
+        forget_compute_blob(ckey);
+        if cfrom_disk {
+            driver_cache::note(false, cdisk.as_deref());
+        }
+        cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        compute = std::ptr::null_mut();
+        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, || {
+            driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
+        });
+        hc = retried;
+        cin_driver += took;
+    }
+    let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+    if hc >= 0 && !creused && !compute.is_null() {
+        keep_compute_blob(ckey, compute, tp.cs.len());
+        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
+            driver_cache::keep(p, &b, cin_driver);
+        }
+    } else if creused && cfrom_disk {
+        driver_cache::note(true, None);
+    }
     drop(_slot);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
@@ -4842,6 +5232,10 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         ));
         return Some(E_INVALIDARG);
     }
+    // made when first bound (`pso_async::lazy`): not even translated now
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
@@ -4856,14 +5250,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -4931,12 +5320,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
@@ -5117,6 +5501,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
         FrontFace: keep,
         BackFace: keep,
     };
+    let mut has_depth_stencil = false;
     for (ty, p) in &subs {
         match ty {
             0 => put(&mut g.pRootSignature, p),
@@ -5130,7 +5515,10 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             9 => put(&mut g.SampleMask, p),
             10 => put(&mut g.RasterizerState, p),
             // DEPTH_STENCIL; DEPTH_STENCIL1 is that and the depth bounds test
-            11 | 21 => put(&mut g.DepthStencilState, p),
+            11 | 21 => {
+                has_depth_stencil = true;
+                put(&mut g.DepthStencilState, p);
+            }
             12 => put(&mut g.InputLayout, p),
             13 => put(&mut g.IBStripCutValue, p),
             14 => put(&mut g.PrimitiveTopologyType, p),
@@ -5145,6 +5533,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             18 => put(&mut g.NodeMask, p),
             20 => put(&mut g.Flags, p),
             26 => {
+                has_depth_stencil = true;
                 let mut d: D3D12_DEPTH_STENCIL_DESC2 = std::mem::zeroed();
                 put(&mut d, p);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC1| D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: f.StencilFailOp, StencilDepthFailOp: f.StencilDepthFailOp, StencilPassOp: f.StencilPassOp, StencilFunc: f.StencilFunc };
@@ -5176,6 +5565,11 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             }
             _ => {}
         }
+    }
+    // D3D12 pipeline state streams default DepthEnable to FALSE when no depth-stencil
+    // subobject is supplied and DSVFormat is DXGI_FORMAT_UNKNOWN (0).
+    if !has_depth_stencil && g.DSVFormat.0 == 0 {
+        g.DepthStencilState.DepthEnable = false.into();
     }
     // a rect list stays one for translated_graphics_pso, which gives it its GS (untranslated, it
     // becomes the PC's in graphics_pso)
@@ -6533,5 +6927,62 @@ mod map_tests {
                 m.remove(&(upload.as_raw() as usize));
             }
         }
+    }
+
+    #[test]
+    fn stream_pipeline_defaults_depth_enable_from_dsv_format() {
+        let console_vs = crate::gpu::xbox::tests::sample(
+            1,
+            &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])],
+        );
+        let push_sub = |buf: &mut Vec<u8>, ty: u32, payload: &[u8], align: usize| {
+            buf.extend_from_slice(&ty.to_le_bytes());
+            if align == 8 {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+            buf.extend_from_slice(payload);
+            while buf.len() % 8 != 0 {
+                buf.push(0);
+            }
+        };
+        let parse = |dsv_format: Option<u32>, explicit_depth: Option<bool>| -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            let mut stream = Vec::new();
+            let mut vs_bc = [0u8; 16];
+            vs_bc[0..8].copy_from_slice(&(console_vs.as_ptr() as usize).to_le_bytes());
+            vs_bc[8..16].copy_from_slice(&console_vs.len().to_le_bytes());
+            push_sub(&mut stream, 1, &vs_bc, 8);
+            if let Some(fmt) = dsv_format {
+                push_sub(&mut stream, 16, &fmt.to_le_bytes(), 4);
+            }
+            if let Some(en) = explicit_depth {
+                let ds = D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: en.into(),
+                    ..Default::default()
+                };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(&ds as *const _ as *const u8, std::mem::size_of::<D3D12_DEPTH_STENCIL_DESC>())
+                };
+                push_sub(&mut stream, 11, bytes, 4);
+            }
+            #[repr(C)]
+            struct StreamDesc {
+                size: usize,
+                ptr: usize,
+            }
+            let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
+            match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
+                StreamPipeline::Graphics(g) => *g,
+                _ => panic!("expected graphics stream pipeline"),
+            }
+        };
+
+        // Omitted DEPTH_STENCIL + omitted/UNKNOWN DSVFormat -> DepthEnable defaults to false.
+        assert!(!parse(None, None).DepthStencilState.DepthEnable.as_bool());
+        assert!(!parse(Some(0), None).DepthStencilState.DepthEnable.as_bool());
+        // Omitted DEPTH_STENCIL + non-UNKNOWN DSVFormat (D32_FLOAT = 40) -> DepthEnable defaults to true.
+        assert!(parse(Some(40), None).DepthStencilState.DepthEnable.as_bool());
+        // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
+        assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
+        assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
     }
 }

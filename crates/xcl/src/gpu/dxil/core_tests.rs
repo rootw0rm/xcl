@@ -437,3 +437,33 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+/// `s_setreg_b32 hwreg(HW_REG_MODE, 3, 1), s0` sets bit 3 of `MODE` (offset 3, dp_mask 2):
+/// lowering must not subtract `2 - off` before matching `dp_mask`, and the dynamic f16 rounding
+/// result must agree with HLSL on the GPU.
+#[test]
+fn s_setreg_b32_mode_bit3_does_not_underflow() {
+    use crate::gpu::recomp::{dxc, runner, Options};
+    // HW_REG_MODE (1), offset 3, size-1 = 0 -> 1 | (3 << 6) = 0x00C1
+    let code = prog(&[
+        ("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 0x00C1)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 257)], None),
+    ]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("direct DXIL failed: {e}"));
+    if runner::wave32_supported() != Ok(true) {
+        return runner::skip_test("no wave32");
+    }
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mut st = runner::KernelState::default();
+    st.sgpr[0] = 1; // MODE[3:2] = 0b10 (RTN, round toward -inf)
+    st.vgpr[0][1] = 0x3F80_0001; // +1.0 + 2^-23 -> 0x3C00
+    st.vgpr[1][1] = 0xBF80_0001; // -1.0 - 2^-23 -> 0xBC01
+    let direct = runner::run(&dxil, &st, &[]).unwrap();
+    let t = crate::gpu::recomp::translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (hlsl.vgpr[0][0], hlsl.vgpr[1][0]));
+    assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (0x3C00, 0xBC01));
+}

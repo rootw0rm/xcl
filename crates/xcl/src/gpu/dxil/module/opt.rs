@@ -468,6 +468,10 @@ impl Module {
                                     undo.push((key, old));
                                 }
                             }
+                        } else if matches!(&op, Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.discard") {
+                            // `dx.op.discard` demotes lanes mid-block, changing the active lane
+                            // set for subsequent wave/quad intrinsics in the same basic block.
+                            local.clear();
                         }
                     }
                 }
@@ -570,4 +574,66 @@ fn resolve(repl: &mut [Option<Value>], v: Value) -> Value {
         }
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count_calls(m: &Module, target_fn: u32) -> usize {
+        m.blocks
+            .iter()
+            .flat_map(|b| b.iter())
+            .filter(|&&i| matches!(m.insts[i as usize].op, Op::Call(f, _) if f == target_fn))
+            .count()
+    }
+
+    #[test]
+    fn block_cse_invalidates_wave_and_quad_calls_across_discard() {
+        let build = |op_name: &str, with_discard: bool| -> (Module, u32) {
+            let mut m = Module::new();
+            m.define_entry("main");
+            let b = m.entry_block();
+            m.set_block(b);
+
+            let void = m.void();
+            let i1 = m.i1();
+            let i32t = m.i32();
+
+            let wave_ty = m.func_ty(i32t, &[i32t, i1]);
+            let wave_fn = m.declare(op_name, wave_ty, FnAttrs::NoUnwind);
+            let discard_ty = m.func_ty(void, &[i32t, i1]);
+            let discard_fn = m.declare("dx.op.discard", discard_ty, FnAttrs::NoUnwind);
+            let sink_ty = m.func_ty(void, &[i32t, i32t]);
+            let sink_fn = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+            let c_op = m.i32c(116);
+            let c_true = m.i1c(true);
+            let c_discard_op = m.i32c(82);
+
+            let first = m.call(wave_fn, &[c_op, c_true]);
+            if with_discard {
+                m.call(discard_fn, &[c_discard_op, c_true]);
+            }
+            let second = m.call(wave_fn, &[c_op, c_true]);
+            m.call(sink_fn, &[first, second]);
+            m.ret();
+            m.optimize();
+            (m, wave_fn)
+        };
+
+        // Without `dx.op.discard`, identical wave/quad calls in the same block still CSE to 1.
+        let (m_no_discard, f_no_discard) = build("dx.op.waveActiveBallot", false);
+        assert_eq!(count_calls(&m_no_discard, f_no_discard), 1);
+
+        // Across `dx.op.discard`, active lanes change so both calls must be preserved.
+        for op_name in ["dx.op.waveActiveBallot", "dx.op.quadReadLaneAt"] {
+            let (m_with_discard, f_with_discard) = build(op_name, true);
+            assert_eq!(
+                count_calls(&m_with_discard, f_with_discard),
+                2,
+                "{op_name} must not be CSE-merged across dx.op.discard"
+            );
+        }
+    }
 }
