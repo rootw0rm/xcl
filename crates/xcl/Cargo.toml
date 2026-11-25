@@ -21,8 +21,12 @@ toml = "1"
 
 # Linux: the host runtime maps images with mmap/mprotect and will need sigaction/pthread as
 # Phase C/D land. `libc` is MIT OR Apache-2.0 (used under the MIT grant) and musl-friendly.
+# `ash` 0.38 is MIT OR Apache-2.0 (used under the MIT grant, like `libc`): Vulkan bindings
+# that `dlopen` libvulkan.so.1 at runtime via `libloading` (ISC, BSD-style), so the static
+# exe ships no `.so`. Linux-only compute runner (Phase D step 15).
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+ash = "0.38"
 
 # Windows-only: the host runtime (loader/hooks/HLE) is behind `cfg(windows)`; Linux gets
 # clean stubs until the Phase C/D/E ports land.

@@ -69,6 +69,8 @@ pub mod pso;
 pub use emit::mesh_passthrough;
 #[cfg(windows)]
 pub mod runner;
+#[cfg(target_os = "linux")]
+pub mod vulkan_runner;
 pub mod ssa;
 #[cfg(all(test, windows))]
 mod tests;

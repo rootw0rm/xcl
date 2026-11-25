@@ -1122,3 +1122,21 @@ Requirements: met — hand-assembled SPIR-V 1.0 words for the blit subset (SALU 
 ## Follow-ups (minor, non-blocking)
 - None from 14. `wave64` is `#[allow(dead_code)]` on `SpirvEm` (GLSL silences it with `let _ =` instead) — cosmetic, same bring-up semantics either way.
 - `TRANSLATOR_SOURCES` still omits both `glsl.rs` and `spirv.rs` (correct while neither backend has a disk cache); revisit when translation caching lands.
+
+## Verification Notes — step-15 vulkan-runner (Builder, 2026-11-25, `linux`)
+
+Task `task-1795569389-dcf9` (`linux:vulkan-runner`, plan.md step 15, DEC-022).
+Retail-smoke SKIPPED here: `/run/media/...` absent (no game files on host); synthetic title is the e2e gate.
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/gpu/recomp/vulkan_runner.rs` (new, Linux-only): `ash` compute dispatch for caller-supplied SPIR-V words — `Entry::load` (runtime `dlopen`, no link-time Vulkan), instance/physical-device/compute-queue pick, storage-buffer + descriptor set/pipeline layout + compute pipeline from the words, one group of 64 work-items pinned (`WORK_ITEMS = 64`, `local_size_x = 64`), 5 s fence wait, host-visible/coherent readback. `adapter_name()` helper, `skip_test()` mirroring `runner::skip_test` (`SKIPPED <test>: <reason>` to stderr, `XCL_REQUIRE_GPU` fast-fail), `subgroupSize` logged via `eprintln!` (32/64 selection stays step-16). Errors are `String`s, never panics; missing Vulkan/device errors start with `"no "` so tests skip cleanly. No window, no graphics pipeline, no D3D12.X routing change, no `TRANSLATOR_SOURCES` change.
+- `crates/xcl/Cargo.toml`: `ash = "0.38"` under Linux deps. License verified GPL-2.0-compatible: `cargo metadata` shows `ash 0.38.0+1.3.281` license `MIT OR Apache-2.0` (used under MIT per AGENTS.md), dep `libloading 0.8.9` license `ISC` (BSD-style); `ldd target/debug/xcl` shows no vulkan link and `nm -D` shows no `vkCreate*` symbols — runtime `dlopen` only, static exe ships no `.so`.
+- `crates/xcl/src/gpu/recomp/mod.rs`: `#[cfg(target_os = "linux")] pub mod vulkan_runner;` (2 lines).
+- Tests: embedded trivial kernel (`buf.data[i] = buf.data[i] * 2 + 1`, SPIR-V 1.6 from `glslc --target-env=vulkan1.3`, 157 words) + `embedded_trivial_words_are_spirv` structural + `trivial_copy_add_runs_on_device` real-device gate + `bad_words_and_len_fail_closed` fail-closed.
+
+Verification (this host, real Vulkan devices present):
+- `cargo test -p xcl --lib gpu::recomp::vulkan_runner -- --nocapture` → 3 passed; 0 failed (`vulkan: Intel(R) Arc(tm) A770 Graphics (DG2) subgroupSize 32`, trivial kernel `0..64` → `*2+1` passes on-device, no skip).
+- `cargo test -p xcl --lib -- --test-threads=4` → 394 passed; 0 failed; 0 ignored (was 391; +3 vulkan_runner).
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (532 pre-existing warnings); `git diff --check` clean; `rustfmt --check` clean on new file + 2-line `mod.rs` hunk.
+- Shipped-path shell-out audit: `grep -rn "Command::new\|std::process" crates/xcl/src/gpu/recomp/vulkan_runner.rs` → only the `glslc` mention in a doc comment, no spawn; `TRANSLATOR_SOURCES` untouched (no disk cache).
+- Synthetic title (fresh `/tmp/vk-fresh2-game` from `tests/data/testgame` + prebuilt exes, fresh `XCL_DATA_ROOT=/tmp/vk-fresh2-data`): `XCL_DATA_ROOT=... timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `called_stubs: 29` (28 `d3d12_xs` console slots + probe, zero `xcrdapi`/`mfplat`/`FormatMessage`) — matches the 12g/13/14 baseline; `[PASS] DirectStorage`, `[PASS] MFPlat` hold. No new failure.
