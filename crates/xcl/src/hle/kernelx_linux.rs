@@ -72,6 +72,7 @@ pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 
 const ERROR_TIMEOUT: u32 = 1460;
+const ERROR_TOO_MANY_POSTS: u32 = 298;
 
 // Memory types.
 const MEM_COMMIT: u32 = 0x1000;
@@ -1141,6 +1142,13 @@ pub unsafe extern "win64" fn WaitForSingleObject(handle: usize, timeout_ms: u32)
             WAIT_TIMEOUT
         };
     }
+    if let Some(sem) = is_sem(handle) {
+        return if wait_sem(&sem, timeout_ms) {
+            WAIT_OBJECT_0
+        } else {
+            WAIT_TIMEOUT
+        };
+    }
     if let Some(t) = is_timer(handle) {
         return if wait_timer(&t, timeout_ms) {
             WAIT_OBJECT_0
@@ -1207,6 +1215,11 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         all = false;
                         break;
                     }
+                } else if let Some(s) = is_sem(h) {
+                    if *s.count.lock().unwrap() <= 0 {
+                        all = false;
+                        break;
+                    }
                 } else if joins().lock().unwrap().contains_key(&h) {
                     if join_if_finished(h).is_none() {
                         // `join_if_finished` consumes a finished join; re-check below.
@@ -1230,6 +1243,8 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         if !ev.manual {
                             *ev.signaled.lock().unwrap() = false;
                         }
+                    } else if let Some(s) = is_sem(h) {
+                        try_acquire_sem(&s);
                     } else if let Some(t) = is_timer(h) {
                         if !t.manual {
                             *t.signaled.lock().unwrap() = false;
@@ -1256,6 +1271,10 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         }
                         return WAIT_OBJECT_0 + i as u32;
                     }
+                } else if let Some(s) = is_sem(h) {
+                    if try_acquire_sem(&s) {
+                        return WAIT_OBJECT_0 + i as u32;
+                    }
                 } else if joins().lock().unwrap().contains_key(&h) {
                     if join_if_finished(h).is_some() || !joins().lock().unwrap().contains_key(&h) {
                         return WAIT_OBJECT_0 + i as u32;
@@ -1274,6 +1293,192 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Semaphores: Linux-backed counting objects (retail `CreateSemaphoreExW` path).
+// ---------------------------------------------------------------------------------------
+//
+// The game creates a semaphore early in startup and retry-loops the call: the old
+// auto-stub returned NULL, so the loop fell through to the title's deliberate `int3`.
+// These are real host objects in their own handle table (closed through `CloseHandle`)
+// and waitable through `WaitForSingleObject`/`WaitForMultipleObjects` above: each
+// successful wait consumes one count, `ReleaseSemaphore` adds back up to the maximum.
+// Names/security/flags/access are accepted and ignored (no cross-process sharing on
+// Linux); validation mirrors Windows (`max <= 0` or `initial` outside `0..=max`
+// fails with `ERROR_INVALID_PARAMETER`, over-release with `ERROR_TOO_MANY_POSTS`).
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+struct SemState {
+    count: Mutex<i32>,
+    max: i32,
+    cvar: Condvar,
+}
+
+static SEMAPHORES: OnceLock<Mutex<HashMap<usize, std::sync::Arc<SemState>>>> = OnceLock::new();
+
+fn semaphores() -> &'static Mutex<HashMap<usize, std::sync::Arc<SemState>>> {
+    SEMAPHORES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_sem(handle: usize) -> Option<std::sync::Arc<SemState>> {
+    semaphores().lock().unwrap().get(&handle).cloned()
+}
+
+fn close_sem_handle(h: usize) -> bool {
+    if let Some(s) = semaphores().lock().unwrap().remove(&h) {
+        s.cvar.notify_all();
+        true
+    } else {
+        false
+    }
+}
+
+fn wait_sem(sem: &std::sync::Arc<SemState>, timeout_ms: u32) -> bool {
+    let mut g = sem.count.lock().unwrap();
+    if *g > 0 {
+        *g -= 1;
+        return true;
+    }
+    if timeout_ms == 0 {
+        return false;
+    }
+    if timeout_ms == INFINITE {
+        while *g <= 0 {
+            g = sem.cvar.wait(g).unwrap();
+        }
+        *g -= 1;
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    while *g <= 0 {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let (guard, timeout) = sem.cvar.wait_timeout(g, deadline - now).unwrap();
+        g = guard;
+        if *g > 0 {
+            break;
+        }
+        if timeout.timed_out() {
+            return false;
+        }
+    }
+    *g -= 1;
+    true
+}
+
+fn try_acquire_sem(sem: &std::sync::Arc<SemState>) -> bool {
+    let mut g = sem.count.lock().unwrap();
+    if *g > 0 {
+        *g -= 1;
+        true
+    } else {
+        false
+    }
+}
+
+/// `HANDLE CreateSemaphoreExW(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCWSTR name,
+/// DWORD flags, DWORD access)` — counting semaphore, never NULL on valid counts.
+pub unsafe extern "win64" fn CreateSemaphoreExW(
+    _attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    _name: *const u16,
+    _flags: u32,
+    _access: u32,
+) -> usize {
+    if max <= 0 || initial < 0 || initial > max {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    semaphores().lock().unwrap().insert(
+        id,
+        std::sync::Arc::new(SemState {
+            count: Mutex::new(initial),
+            max,
+            cvar: Condvar::new(),
+        }),
+    );
+    set_error(ERROR_SUCCESS);
+    id
+}
+
+/// `HANDLE CreateSemaphoreW(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCWSTR name)` —
+/// legacy spelling of the same semaphore.
+pub unsafe extern "win64" fn CreateSemaphoreW(
+    attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    name: *const u16,
+) -> usize {
+    CreateSemaphoreExW(attrs, initial, max, name, 0, 0)
+}
+
+/// `HANDLE CreateSemaphoreExA(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCSTR name,
+/// DWORD flags, DWORD access)` — ANSI (UTF-8 on Linux) twin.
+pub unsafe extern "win64" fn CreateSemaphoreExA(
+    attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    _name: *const u8,
+    flags: u32,
+    access: u32,
+) -> usize {
+    CreateSemaphoreExW(attrs, initial, max, std::ptr::null(), flags, access)
+}
+
+/// `HANDLE CreateSemaphoreA(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCSTR name)` —
+/// ANSI legacy spelling.
+pub unsafe extern "win64" fn CreateSemaphoreA(
+    attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    name: *const u8,
+) -> usize {
+    CreateSemaphoreExA(attrs, initial, max, name, 0, 0)
+}
+
+/// `BOOL ReleaseSemaphore(HANDLE, LONG count, LPLONG previous)` — adds `count` up to the
+/// maximum, reporting the previous count. Over-release fails without changing the count.
+pub unsafe extern "win64" fn ReleaseSemaphore(
+    handle: usize,
+    release: i32,
+    prev: *mut i32,
+) -> i32 {
+    let Some(sem) = is_sem(handle) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if release <= 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut g = sem.count.lock().unwrap();
+    let cur = *g;
+    let Some(next) = cur.checked_add(release) else {
+        set_error(ERROR_TOO_MANY_POSTS);
+        return 0;
+    };
+    if next > sem.max {
+        set_error(ERROR_TOO_MANY_POSTS);
+        return 0;
+    }
+    *g = next;
+    drop(g);
+    if !prev.is_null() {
+        *prev = cur;
+    }
+    if release == 1 {
+        sem.cvar.notify_one();
+    } else {
+        sem.cvar.notify_all();
+    }
+    set_error(ERROR_SUCCESS);
+    1
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1657,6 +1862,10 @@ pub unsafe extern "win64" fn WakeByAddressAll(addr: *const c_void) {
 
 pub unsafe extern "win64" fn CloseHandle(handle: usize) -> i32 {
     if events().lock().unwrap().remove(&handle).is_some() {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    if close_sem_handle(handle) {
         set_error(ERROR_SUCCESS);
         return 1;
     }
@@ -7552,6 +7761,11 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetSystemTimeAsFileTime", GetSystemTimeAsFileTime as usize),
         ("CreateEventW", CreateEventW as usize),
         ("CreateEventA", CreateEventA as usize),
+        ("CreateSemaphoreExW", CreateSemaphoreExW as usize),
+        ("CreateSemaphoreW", CreateSemaphoreW as usize),
+        ("CreateSemaphoreExA", CreateSemaphoreExA as usize),
+        ("CreateSemaphoreA", CreateSemaphoreA as usize),
+        ("ReleaseSemaphore", ReleaseSemaphore as usize),
         ("SetEvent", SetEvent as usize),
         ("ResetEvent", ResetEvent as usize),
         ("CloseHandle", CloseHandle as usize),
@@ -9124,6 +9338,69 @@ mod tests {
             // Closed timers are gone from every wait path.
             assert_eq!(WaitForSingleObject(t, 0), WAIT_FAILED);
             assert_eq!(CancelWaitableTimer(t), 0);
+        }
+    }
+
+    #[test]
+    fn semaphores_create_wait_release_and_close() {
+        unsafe {
+            // Bad counts fail with NULL, never a handle.
+            assert_eq!(CreateSemaphoreExW(std::ptr::null(), 0, 0, std::ptr::null(), 0, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(CreateSemaphoreExW(std::ptr::null(), 2, 1, std::ptr::null(), 0, 0), 0);
+            assert_eq!(CreateSemaphoreExW(std::ptr::null(), -1, 1, std::ptr::null(), 0, 0), 0);
+            // Zero initial: first wait times out, release wakes the next.
+            let s = CreateSemaphoreExW(std::ptr::null(), 0, 2, std::ptr::null(), 0, 0);
+            assert_ne!(s, 0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_TIMEOUT);
+            let mut prev = -1i32;
+            assert_eq!(ReleaseSemaphore(s, 1, &mut prev), 1);
+            assert_eq!(prev, 0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_TIMEOUT);
+            // Release of 2 wakes two counts; over-release fails without changing the count.
+            assert_eq!(ReleaseSemaphore(s, 2, &mut prev), 1);
+            assert_eq!(prev, 0);
+            assert_eq!(ReleaseSemaphore(s, 1, std::ptr::null_mut()), 0);
+            assert_eq!(GetLastError(), ERROR_TOO_MANY_POSTS);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_TIMEOUT);
+            // A releaser thread wakes a 5 s wait.
+            let w = CreateSemaphoreW(std::ptr::null(), 0, 1, std::ptr::null());
+            let setter = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                ReleaseSemaphore(w, 1, std::ptr::null_mut())
+            });
+            assert_eq!(WaitForSingleObject(w, 5000), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(w), 1);
+            assert_eq!(CloseHandle(s), 1);
+            // Multi-object: the semaphore wakes a wait-any alongside an event.
+            let both = CreateSemaphoreExW(std::ptr::null(), 1, 1, std::ptr::null(), 0, 0);
+            let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let pair = [both, ev];
+            assert_eq!(WaitForMultipleObjects(2, pair.as_ptr(), 0, 0), WAIT_OBJECT_0);
+            // Consumed: the event (still clear) is next only after a release.
+            assert_eq!(ReleaseSemaphore(both, 1, std::ptr::null_mut()), 1);
+            assert_eq!(WaitForMultipleObjects(2, pair.as_ptr(), 0, 0), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(both), 1);
+            assert_eq!(CloseHandle(ev), 1);
+            // Unknown handles fail instead of blocking forever.
+            assert_eq!(ReleaseSemaphore(0xDEAD_BEEF, 1, std::ptr::null_mut()), 0);
+            assert_eq!(WaitForSingleObject(0xDEAD_BEEF, 0), WAIT_FAILED);
+            setter.join().unwrap();
+            // Legacy W/A spellings agree.
+            let a = CreateSemaphoreA(std::ptr::null(), 1, 1, std::ptr::null());
+            assert_ne!(a, 0);
+            assert_eq!(WaitForSingleObject(a, 0), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(a), 1);
+            let e = CreateSemaphoreExA(std::ptr::null(), 0, 1, std::ptr::null(), 0, 0);
+            assert_ne!(e, 0);
+            assert_eq!(WaitForSingleObject(e, 10), WAIT_TIMEOUT);
+            assert_eq!(CloseHandle(e), 1);
+            // Closed semaphores are gone from every wait path.
+            assert_eq!(WaitForSingleObject(both, 0), WAIT_FAILED);
+            assert_eq!(ReleaseSemaphore(both, 1, std::ptr::null_mut()), 0);
         }
     }
 
