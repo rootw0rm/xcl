@@ -23,6 +23,8 @@ pub mod xgameruntime_linux;
 pub mod minuserx_linux;
 #[path = "hle/mfplat_linux.rs"]
 pub mod mfplat_linux;
+#[path = "hle/dstorage_linux.rs"]
+pub mod dstorage_linux;
 #[path = "hle/gameinput_linux.rs"]
 pub mod gameinput_linux;
 #[path = "hle/xtaskqueue_linux.rs"]
@@ -292,7 +294,16 @@ fn d3dcompiler47_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn xcrdapi_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![DStorageGetFactory]
+    let mut v = crate::hle_exports![DStorageGetFactory];
+    // Step-12g file-read subset: real code, not stub metadata.
+    for (name, addr) in dstorage_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn xg_exports() -> Vec<(&'static str, usize)> {
@@ -488,8 +499,9 @@ mod tests {
         // minuserx window slice, step 11n the headless GameInput slice, step 11o
         // the XTaskQueue + networking slice, step 11q the XAudio2 slice,
         // step 11r the D3D12.X null device, step 11s the XG texture
-        // computer + headless D3DCompile and step 12f the headless MFPlat
-        // manager, so those resolve as HLE.
+        // computer + headless D3DCompile, step 12f the headless MFPlat
+        // manager and step 12g the DirectStorage file-read subset,
+        // so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
@@ -504,6 +516,7 @@ mod tests {
                     || m.name == D3D12X
                     || m.name == XAUDIO2
                     || m.name == MFPLAT
+                    || m.name == XCRDAPI
                     || m.name == XG
                     || m.name == D3DCOMPILER47)
                     && addr != 0
@@ -792,6 +805,12 @@ mod tests {
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, MFPLAT);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-12g DirectStorage file-read subset: factory, not stub metadata.
+        for name in ["DStorageGetFactory"] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, XCRDAPI);
             assert_ne!(addr, 0, "{name} must be implemented");
         }
         // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.

@@ -2332,6 +2332,81 @@ unsafe fn copy_home_to(page: usize, dst: usize) -> bool {
     true
 }
 
+/// Resolve the live virtual addresses of the physical pages covering
+/// `offset..offset+len`. Caller must hold `AWAY` locked.
+fn resolve_physical_pages(
+    away: Option<&Away>,
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+) -> Option<Vec<usize>> {
+    if offset >= PHYS_PAGE {
+        return None;
+    }
+    let span = offset.checked_add(len)?;
+    let need = span.div_ceil(PHYS_PAGE);
+    if pages.len() < need {
+        return None;
+    }
+    let mut addrs = Vec::with_capacity(need);
+    for &p in &pages[..need] {
+        let home = page_home(p)?;
+        let addr = match away.and_then(|a| a.page.get(&p).copied()) {
+            Some(at) => at,
+            None => home,
+        };
+        addrs.push(addr);
+    }
+    Some(addrs)
+}
+
+/// Copy `dst.len()` bytes starting at `offset` within `pages` (each a 64 KiB physical
+/// page number from `AllocateTitlePhysicalPages`). Returns `false` if
+/// `offset >= PHYS_PAGE`, `pages` is too short, or any page is not a live allocation.
+pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return offset < PHYS_PAGE;
+    }
+    let g = away().lock().unwrap();
+    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, dst.len()) else {
+        return false;
+    };
+    let mut done = 0;
+    let mut page_off = offset;
+    for addr in addrs {
+        let chunk = (PHYS_PAGE - page_off).min(dst.len() - done);
+        unsafe {
+            std::ptr::copy_nonoverlapping((addr + page_off) as *const u8, dst.as_mut_ptr().add(done), chunk);
+        }
+        done += chunk;
+        page_off = 0;
+    }
+    true
+}
+
+/// Copy `src` into `pages` starting at `offset` within the first page. Validates every
+/// page before writing so the destination gets all bytes or nothing.
+pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -> bool {
+    if src.is_empty() {
+        return offset < PHYS_PAGE;
+    }
+    let g = away().lock().unwrap();
+    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, src.len()) else {
+        return false;
+    };
+    let mut done = 0;
+    let mut page_off = offset;
+    for addr in addrs {
+        let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (addr + page_off) as *mut u8, chunk);
+        }
+        done += chunk;
+        page_off = 0;
+    }
+    true
+}
+
 /// Map `n` pages at `base` (`arr` null unmaps). Returns `base` on success, null on failure.
 unsafe fn map_pages(base: usize, n: usize, pages: Option<Vec<usize>>) -> *mut c_void {
     if n == 0 || (base == 0 && pages.is_none()) {

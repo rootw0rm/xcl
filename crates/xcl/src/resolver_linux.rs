@@ -372,9 +372,10 @@ mod tests {
         // Every import routed to an HLE module is Stub metadata (address 0) but resolves
         // to a callable auto-stub thunk, never null. Step-10c file APIs are HLE now, so
         // they are covered by `kernelx_core_imports_resolve_to_hle` instead.
-        // Step-11r made d3d12_xs HLE, so the stub probe uses xcrdapi (still Stub).
+        // Steps 11r/12f/12g made d3d12_xs/mfplat/xcrdapi HLE, so the stub probe uses
+        // acphal (still Stub).
         for (dll, sym) in [
-            ("xcrdapi.dll", "DStorageGetFactory"),
+            ("acphal.dll", "AcpHalCreate"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert_eq!(src, Source::Stub, "{dll}!{sym}");
@@ -851,6 +852,37 @@ mod tests {
             let fake = 0x2000 as *mut std::ffi::c_void;
             assert_eq!(reset(mgr, fake, token.wrapping_add(1)), 0x8007_0057u32 as i32);
             assert_eq!(reset(mgr, fake, token), 0);
+        }
+    }
+
+    #[test]
+    fn dstorage_imports_resolve_to_hle() {
+        // Step 12g: DirectStorage file-read subset. `xcrdapi.dll` is routed HLE.
+        for (dll, sym) in [("xcrdapi.dll", "DStorageGetFactory")] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // Direct ABI: factory QI accepts the factory IID, refuses unknown IIDs.
+        let (addr, _) = resolve_inner(&dll_key("xcrdapi.dll"), &name("DStorageGetFactory"), 0);
+        let get: unsafe extern "win64" fn(*const u8, *mut *mut std::ffi::c_void) -> i32 =
+            unsafe { std::mem::transmute(addr) };
+        unsafe {
+            let mut f: *mut std::ffi::c_void = std::ptr::null_mut();
+            // IID_FACTORY bytes (little-endian fields, as the title passes them).
+            let iid: [u8; 16] = [
+                0xac, 0x54, 0x3b, 0xfb, 0x82, 0xbf, 0x3a, 0x46, 0xb7, 0x77, 0x73, 0x19, 0x58, 0x37,
+                0x86, 0x4d,
+            ];
+            assert_eq!(get(iid.as_ptr(), &mut f), 0);
+            assert!(!f.is_null());
         }
     }
 

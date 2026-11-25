@@ -991,3 +991,20 @@ Requirements: met — headless win64 `MFStartup` (any version/flags → idempote
 
 ## Follow-ups (minor, non-blocking)
 - `manager_open_device_handle` uses `1 as *mut c_void` as the fake handle, which trips `clippy::manual_dangling_ptr` (suggests `dangling_mut`). Value 1 is deliberate (observable fake handle, never dereferenced — the title only hands it back to `TestDevice`/`CloseDeviceHandle`, which ignore it), same headless-handle idiom as the other null objects; warning-only, no behavior issue. Revisit next time the function is touched.
+
+## Verification Notes — step-12g dstorage-read (Builder, 2026-11-25, `linux`)
+
+Task `task-1795567260-be32` (`linux:dstorage-read`, plan.md step 12g).
+Retail-smoke SKIPPED here: `/run/media/...` absent (no game files on host); synthetic title is the e2e gate.
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/hle/dstorage_linux.rs` (new): win64 `DStorageGetFactory` (factory + `IID_FACTORY_X1` accept, unknown IID → `E_NOINTERFACE`, NULL out → `E_POINTER`) + factory vtable (slots 3 `CreateQueue` 0x18 desc / 4 `OpenFile` via host `File::open` with Win32-mapped errors / 5 `CreateStatusArray` bounds-checked / 6-8 affinity/debug/staging no-op `S_OK` / 10 `CreateQueue1` 0x20 desc trailing-u64-ignored / 9 unknown fail-closed, rest `E_NOTIMPL` logging stubs — never NULL) + queue vtable (3 `EnqueueRequest` snapshot + `check`-style validation, 4 `EnqueueStatus`, 5 `EnqueueSignal` via null-device fence `Signal` slot 10, 6 `Submit` synchronous in-order, 7 `CancelRequestsWithTag` tag-mask filter, 8 `Close`, 9-11 error-event/record/query fail-closed, rest stubs) + file vtable (QI/AddRef/Release/`Close`/`GetId` real, `GetHandle`/unknown fail-closed) + status vtable (`IsComplete`/`GetHResult` real). `execute` covers title verbs only: uncompressed file→memory (512 B exe-prefix byte-compare), `DestinationIsPhysicalPages` via `kernelx_linux` page homes, `CancelRequestsWithTag` zero-preservation; zlib/BCPack/swizzle/memory-source/physical-source fail closed `E_DECOMPRESSION`/`E_SOURCE_TYPE`. `Submit` sets status `S_OK`/first-failure. Plus unit tests (factory QI accept/refuse, open-missing/status-bounds, create/enqueue/submit/signal flow with fake fence, cancel + phys pages, release).
+- `crates/xcl/src/hle/kernelx_linux.rs`: `read_physical_pages`/`write_physical_pages` public helpers (resolve via `page_home` + `AWAY` mappings, validate before write so destination gets all-or-nothing).
+- `crates/xcl/src/hle_linux.rs`: `dstorage_linux` module + merge into `xcrdapi_exports()` + `XCRDAPI` in implemented branch + `DStorageGetFactory` spot check.
+- `crates/xcl/src/resolver_linux.rs`: stub probe moved from `xcrdapi` to `acphal` (now HLE) + `dstorage_imports_resolve_to_hle` test (`xcrdapi.dll!DStorageGetFactory` → `Hle`, callable, non-stub + direct factory QI ABI check).
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib dstorage -- --test-threads=4` → 5 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 383 passed; 0 failed; 0 ignored (was 378; +4 dstorage +1 resolver).
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (pre-existing warnings only); `git diff --check` clean; `rustfmt --check` clean on new file.
+- Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/xcl-dst-fresh-game`, fresh `XCL_DATA_ROOT=/tmp/xcl-dst-fresh-data`): `XCL_DATA_ROOT=... timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `called_stubs: 29` with zero `xcrdapi` entries (was 30) and zero `[STUB] xcrdapi` lines. `[PASS] DirectStorage (xcrdapi)` (was FAIL), `[PASS] MFPlat` stays PASS. All 12 remaining FAILs are the known null-device D3D12 categories; no new failure. (Reused-dir rerun shows 14 fails with 2 first-run overlay quirks `files: delete` + `PLS drive root` — fresh-dir counts are the comparator per 12a notes.)
