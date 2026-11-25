@@ -788,6 +788,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_per_lane_compute_program_runs_on_the_gpu() {
         use super::super::{dxc, runner};
@@ -880,6 +881,7 @@ mod tests {
 
     /// Inline-constant, literal, and NULL mask operands in `v_add_co_ci_u32`, `v_cndmask_b32`,
     /// and mask SALU ops agree with HLSL on wave32 and wave64.
+    #[cfg(windows)]
     #[test]
     fn const_and_null_mask_operands_agree_with_hlsl_on_the_gpu() {
         if !gpu() {
