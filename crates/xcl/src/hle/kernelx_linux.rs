@@ -1149,13 +1149,6 @@ pub unsafe extern "win64" fn WaitForSingleObject(handle: usize, timeout_ms: u32)
             WAIT_TIMEOUT
         };
     }
-    if let Some(m) = is_mutex(handle) {
-        return if wait_mutex(&m, timeout_ms) {
-            WAIT_OBJECT_0
-        } else {
-            WAIT_TIMEOUT
-        };
-    }
     if let Some(t) = is_timer(handle) {
         return if wait_timer(&t, timeout_ms) {
             WAIT_OBJECT_0
@@ -1227,12 +1220,6 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         all = false;
                         break;
                     }
-                } else if let Some(mu) = is_mutex(h) {
-                    let g = mu.owner.lock().unwrap();
-                    if g.0 != 0 && g.0 != current_tid() {
-                        all = false;
-                        break;
-                    }
                 } else if joins().lock().unwrap().contains_key(&h) {
                     if join_if_finished(h).is_none() {
                         // `join_if_finished` consumes a finished join; re-check below.
@@ -1258,8 +1245,6 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         }
                     } else if let Some(s) = is_sem(h) {
                         try_acquire_sem(&s);
-                    } else if let Some(mu) = is_mutex(h) {
-                        try_acquire_mutex(&mu);
                     } else if let Some(t) = is_timer(h) {
                         if !t.manual {
                             *t.signaled.lock().unwrap() = false;
@@ -1288,10 +1273,6 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                     }
                 } else if let Some(s) = is_sem(h) {
                     if try_acquire_sem(&s) {
-                        return WAIT_OBJECT_0 + i as u32;
-                    }
-                } else if let Some(mu) = is_mutex(h) {
-                    if try_acquire_mutex(&mu) {
                         return WAIT_OBJECT_0 + i as u32;
                     }
                 } else if joins().lock().unwrap().contains_key(&h) {
@@ -1495,175 +1476,6 @@ pub unsafe extern "win64" fn ReleaseSemaphore(
         sem.cvar.notify_one();
     } else {
         sem.cvar.notify_all();
-    }
-    set_error(ERROR_SUCCESS);
-    1
-}
-
-// ---------------------------------------------------------------------------------------
-// Mutexes: Linux-backed blocking mutex objects with ownership + recursion.
-// ---------------------------------------------------------------------------------------
-//
-// `CreateMutexA` returning NULL (the old stub) fails the game's startup sync the same
-// way the semaphore stub did. Mutexes live in their own handle table (closed through
-// `CloseHandle`) and are waitable through `WaitForSingleObject`/`WaitForMultipleObjects`:
-// a wait acquires (reentrant for the owner), `ReleaseMutex` releases once. Abandonment
-// (an owner thread dying while holding) is not detected in this slice: thread exit
-// does not release mutexes, so a wait on a dead owner's mutex blocks until its timeout.
-// Names/security/inherit are accepted and ignored (no cross-process sharing on Linux).
-//
-// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
-
-struct MutexState {
-    /// (owner tid, recursion); `(0, 0)` is free.
-    owner: Mutex<(u32, u32)>,
-    cvar: Condvar,
-}
-
-static MUTEXES: OnceLock<Mutex<HashMap<usize, std::sync::Arc<MutexState>>>> = OnceLock::new();
-
-fn mutexes() -> &'static Mutex<HashMap<usize, std::sync::Arc<MutexState>>> {
-    MUTEXES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn is_mutex(handle: usize) -> Option<std::sync::Arc<MutexState>> {
-    mutexes().lock().unwrap().get(&handle).cloned()
-}
-
-fn close_mutex_handle(h: usize) -> bool {
-    if let Some(m) = mutexes().lock().unwrap().remove(&h) {
-        m.cvar.notify_all();
-        true
-    } else {
-        false
-    }
-}
-
-fn try_acquire_mutex(m: &std::sync::Arc<MutexState>) -> bool {
-    let me = current_tid();
-    let mut g = m.owner.lock().unwrap();
-    if g.0 == 0 {
-        *g = (me, 1);
-        true
-    } else if g.0 == me {
-        g.1 += 1;
-        true
-    } else {
-        false
-    }
-}
-
-fn wait_mutex(m: &std::sync::Arc<MutexState>, timeout_ms: u32) -> bool {
-    let me = current_tid();
-    let mut g = m.owner.lock().unwrap();
-    if g.0 == 0 {
-        *g = (me, 1);
-        return true;
-    }
-    if g.0 == me {
-        g.1 += 1;
-        return true;
-    }
-    if timeout_ms == 0 {
-        return false;
-    }
-    if timeout_ms == INFINITE {
-        while g.0 != 0 {
-            g = m.cvar.wait(g).unwrap();
-        }
-        *g = (me, 1);
-        return true;
-    }
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-    while g.0 != 0 {
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let (guard, timeout) = m.cvar.wait_timeout(g, deadline - now).unwrap();
-        g = guard;
-        if g.0 == 0 {
-            break;
-        }
-        if timeout.timed_out() {
-            return false;
-        }
-    }
-    *g = (me, 1);
-    true
-}
-
-/// `HANDLE CreateMutexExW(SECURITY_ATTRIBUTES*, BOOL owned, LPCWSTR name, DWORD flags,
-/// DWORD access)` — free unless `owned != 0` (owned once by the caller).
-pub unsafe extern "win64" fn CreateMutexExW(
-    _attrs: *const c_void,
-    owned: i32,
-    _name: *const u16,
-    _flags: u32,
-    _access: u32,
-) -> usize {
-    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let owner = if owned != 0 { (current_tid(), 1) } else { (0, 0) };
-    mutexes().lock().unwrap().insert(
-        id,
-        std::sync::Arc::new(MutexState {
-            owner: Mutex::new(owner),
-            cvar: Condvar::new(),
-        }),
-    );
-    set_error(ERROR_SUCCESS);
-    id
-}
-
-/// `HANDLE CreateMutexW(SECURITY_ATTRIBUTES*, BOOL owned, LPCWSTR name)` — legacy spelling.
-pub unsafe extern "win64" fn CreateMutexW(
-    attrs: *const c_void,
-    owned: i32,
-    name: *const u16,
-) -> usize {
-    CreateMutexExW(attrs, owned, name, 0, 0)
-}
-
-/// `HANDLE CreateMutexExA(SECURITY_ATTRIBUTES*, BOOL owned, LPCSTR name, DWORD flags,
-/// DWORD access)` — ANSI (UTF-8 on Linux) twin.
-pub unsafe extern "win64" fn CreateMutexExA(
-    attrs: *const c_void,
-    owned: i32,
-    _name: *const u8,
-    flags: u32,
-    access: u32,
-) -> usize {
-    CreateMutexExW(attrs, owned, std::ptr::null(), flags, access)
-}
-
-/// `HANDLE CreateMutexA(SECURITY_ATTRIBUTES*, BOOL owned, LPCSTR name)` — ANSI legacy spelling.
-pub unsafe extern "win64" fn CreateMutexA(
-    attrs: *const c_void,
-    owned: i32,
-    name: *const u8,
-) -> usize {
-    CreateMutexExA(attrs, owned, name, 0, 0)
-}
-
-const ERROR_NOT_OWNER: u32 = 288;
-
-/// `BOOL ReleaseMutex(HANDLE)` — the owner releases once; the last release wakes a
-/// waiter. A non-owner (or a free mutex) fails with `ERROR_NOT_OWNER`.
-pub unsafe extern "win64" fn ReleaseMutex(handle: usize) -> i32 {
-    let Some(m) = is_mutex(handle) else {
-        set_error(ERROR_INVALID_PARAMETER);
-        return 0;
-    };
-    let me = current_tid();
-    let mut g = m.owner.lock().unwrap();
-    if g.0 != me || g.1 == 0 {
-        set_error(ERROR_NOT_OWNER);
-        return 0;
-    }
-    g.1 -= 1;
-    if g.1 == 0 {
-        *g = (0, 0);
-        m.cvar.notify_one();
     }
     set_error(ERROR_SUCCESS);
     1
@@ -2221,10 +2033,6 @@ pub unsafe extern "win64" fn CloseHandle(handle: usize) -> i32 {
         return 1;
     }
     if close_sem_handle(handle) {
-        set_error(ERROR_SUCCESS);
-        return 1;
-    }
-    if close_mutex_handle(handle) {
         set_error(ERROR_SUCCESS);
         return 1;
     }
@@ -8248,11 +8056,6 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("CreateSemaphoreExA", CreateSemaphoreExA as usize),
         ("CreateSemaphoreA", CreateSemaphoreA as usize),
         ("ReleaseSemaphore", ReleaseSemaphore as usize),
-        ("CreateMutexExW", CreateMutexExW as usize),
-        ("CreateMutexW", CreateMutexW as usize),
-        ("CreateMutexExA", CreateMutexExA as usize),
-        ("CreateMutexA", CreateMutexA as usize),
-        ("ReleaseMutex", ReleaseMutex as usize),
         ("SetEvent", SetEvent as usize),
         ("ResetEvent", ResetEvent as usize),
         ("CloseHandle", CloseHandle as usize),
@@ -9885,83 +9688,6 @@ mod tests {
             // Closed timers are gone from every wait path.
             assert_eq!(WaitForSingleObject(t, 0), WAIT_FAILED);
             assert_eq!(CancelWaitableTimer(t), 0);
-        }
-    }
-
-    #[test]
-    fn mutexes_acquire_reentrantly_hand_off_and_release() {
-        unsafe {
-            // Free mutex: take, reenter, release twice; a third release is not-owned.
-            let m = CreateMutexA(std::ptr::null(), 0, std::ptr::null());
-            assert_ne!(m, 0);
-            assert_eq!(WaitForSingleObject(m, 0), WAIT_OBJECT_0);
-            assert_eq!(WaitForSingleObject(m, 0), WAIT_OBJECT_0);
-            assert_eq!(ReleaseMutex(m), 1);
-            assert_eq!(ReleaseMutex(m), 1);
-            assert_eq!(ReleaseMutex(m), 0);
-            assert_eq!(GetLastError(), ERROR_NOT_OWNER);
-            // Initially owned: the creator holds it once.
-            let owned = CreateMutexW(std::ptr::null(), 1, std::ptr::null());
-            assert_ne!(owned, 0);
-            assert_eq!(WaitForSingleObject(owned, 0), WAIT_OBJECT_0);
-            assert_eq!(ReleaseMutex(owned), 1);
-            assert_eq!(ReleaseMutex(owned), 1);
-            assert_eq!(CloseHandle(owned), 1);
-            // A holder thread hands off to a 5 s waiter on release.
-            assert_eq!(WaitForSingleObject(m, 0), WAIT_OBJECT_0);
-            let done = Arc::new(AtomicU32::new(0));
-            let waiter = std::thread::spawn({
-                let done = done.clone();
-                move || {
-                    assert_eq!(WaitForSingleObject(m, 5000), WAIT_OBJECT_0);
-                    done.store(1, Ordering::SeqCst);
-                    ReleaseMutex(m)
-                }
-            });
-            std::thread::sleep(Duration::from_millis(50));
-            assert_eq!(done.load(Ordering::SeqCst), 0);
-            assert_eq!(ReleaseMutex(m), 1);
-            waiter.join().unwrap();
-            assert_eq!(done.load(Ordering::SeqCst), 1);
-            // Contended with a zero timeout: the other thread's hold times out here.
-            assert_eq!(WaitForSingleObject(m, 0), WAIT_OBJECT_0);
-            let held = Arc::new(AtomicU32::new(0));
-            let contender = std::thread::spawn({
-                let held = held.clone();
-                move || {
-                    let r = WaitForSingleObject(m, 5000);
-                    held.store(1, Ordering::SeqCst);
-                    r
-                }
-            });
-            // The contender must be blocked before we release (else the test is vacuous):
-            // it records only after its wait resolves.
-            std::thread::sleep(Duration::from_millis(100));
-            assert_eq!(held.load(Ordering::SeqCst), 0);
-            assert_eq!(ReleaseMutex(m), 1);
-            assert_eq!(contender.join().unwrap(), WAIT_OBJECT_0);
-            // Whoever acquired it (the contender) released nothing: still owned once by it,
-            // so a zero-timeout take here fails and a release here is not-owned.
-            assert_eq!(WaitForSingleObject(m, 0), WAIT_TIMEOUT);
-            assert_eq!(ReleaseMutex(m), 0);
-            assert_eq!(GetLastError(), ERROR_NOT_OWNER);
-            // Multi-object: the free path takes the mutex slot.
-            let free = CreateMutexExA(std::ptr::null(), 0, std::ptr::null(), 0, 0);
-            let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            let pair = [free, ev];
-            assert_eq!(WaitForMultipleObjects(2, pair.as_ptr(), 0, 0), WAIT_OBJECT_0);
-            // Reentrant take through the multi path, then release back to free.
-            assert_eq!(WaitForMultipleObjects(2, pair.as_ptr(), 0, 0), WAIT_OBJECT_0);
-            assert_eq!(ReleaseMutex(free), 1);
-            assert_eq!(ReleaseMutex(free), 1);
-            assert_eq!(CloseHandle(free), 1);
-            assert_eq!(CloseHandle(ev), 1);
-            // Unknown handles fail instead of blocking forever.
-            assert_eq!(ReleaseMutex(0xDEAD_BEEF), 0);
-            assert_eq!(WaitForSingleObject(0xDEAD_BEEF, 0), WAIT_FAILED);
-            assert_eq!(CloseHandle(m), 1);
-            assert_eq!(WaitForSingleObject(m, 0), WAIT_FAILED);
-            assert_eq!(ReleaseMutex(m), 0);
         }
     }
 
