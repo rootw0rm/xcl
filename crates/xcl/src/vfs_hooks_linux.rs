@@ -306,6 +306,10 @@ mod tests {
         let outside = f.dir.join("outside.txt");
         std::fs::write(&outside, b"host secret").unwrap();
 
+        // Upstream #1170: an above-mount `..` clamps at the mount root, so
+        // these name the (missing) game file `outside.txt` — opens that miss
+        // fail `FILE_NOT_FOUND`, and creates land in the overlay. The host
+        // sibling is never touched either way.
         for path in [
             "G:\\..\\outside.txt".to_string(),
             "G:/../outside.txt".to_string(),
@@ -313,15 +317,26 @@ mod tests {
         ] {
             for (access, disposition) in [
                 (GENERIC_READ, OPEN_EXISTING),
-                (GENERIC_WRITE, CREATE_ALWAYS),
+                (GENERIC_WRITE, OPEN_EXISTING),
             ] {
                 assert_eq!(
                     open_with(&f.vfs, &path, access, disposition, 0).err(),
-                    Some(ERROR_ACCESS_DENIED),
+                    Some(ERROR_FILE_NOT_FOUND),
                     "{path}"
                 );
             }
         }
+        for path in [
+            "G:\\..\\outside.txt".to_string(),
+            "G:/../outside.txt".to_string(),
+            format!("{}\\GAME:\\..\\outside.txt", f.game.display()),
+        ] {
+            open_with(&f.vfs, &path, GENERIC_WRITE, CREATE_ALWAYS, 0).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(f.data.join("overlay").join("outside.txt")).unwrap(),
+            b""
+        );
 
         #[cfg(unix)]
         {

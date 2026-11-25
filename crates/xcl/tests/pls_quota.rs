@@ -127,7 +127,11 @@ fn disk_free_space_ex_reports_pls_quota() {
             0
         );
         assert_eq!(total, MIB);
-        for path in [&host, &wide(r"T:\"), &wide(r"S:\..\pls-other")] {
+        // a `..` stays at S:'s root (as at a drive's): it does not leave the quota
+        let up = wide(r"S:\..\");
+        assert_ne!(GetDiskFreeSpaceExW(up.as_ptr(), null_mut(), &mut total, null_mut()), 0);
+        assert_eq!(total, MIB);
+        for path in [&host, &wide(r"T:\")] {
             assert_ne!(
                 GetDiskFreeSpaceExW(path.as_ptr(), null_mut(), &mut total, null_mut()),
                 0

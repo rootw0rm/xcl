@@ -9179,8 +9179,10 @@ mod tests {
             );
             assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
 
-            // Adversarial paths never open host files.
-            for bad in ["Z:\\Windows\\notepad.exe", "G:\\..\\outside.txt"] {
+            // Adversarial paths never open host files. An above-mount `..`
+            // (upstream #1170) clamps at the mount root, so it names the
+            // missing game file `outside.txt`, exactly like any other miss.
+            for bad in ["Z:\\Windows\\notepad.exe"] {
                 let w = crate::util::wide(bad);
                 let h = CreateFileW(
                     w.as_ptr(),
@@ -9197,6 +9199,20 @@ mod tests {
                     e == ERROR_PATH_NOT_FOUND || e == ERROR_ACCESS_DENIED,
                     "{bad} err {e}"
                 );
+            }
+            for bad in ["G:\\..\\outside.txt"] {
+                let w = crate::util::wide(bad);
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                );
+                assert_eq!(h, INVALID_HANDLE_VALUE, "{bad}");
+                assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND, "{bad}");
             }
 
             // T: lands under title data, free space reports the host volume.

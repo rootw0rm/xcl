@@ -138,6 +138,27 @@ fn trim_sep(s: &str) -> String {
     s.trim_end_matches(['\\', '/']).to_string()
 }
 
+/// A `..` in a console path stops at its mount's root: resolve `.`/`..` inside
+/// the mount-relative rest, with `..` past the root clamped instead of escaping
+/// to the PC folder next to the game (upstream #1170).
+fn below_mount(target: &str, rest: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for s in rest.split('\\') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        target.to_string()
+    } else {
+        format!("{target}\\{}", parts.join("\\"))
+    }
+}
+
 /// Join a root folder and a VFS-relative path (`\` separated).
 fn join_rel(root: &str, rel: &str) -> String {
     if rel.is_empty() {
@@ -250,7 +271,10 @@ fn ensure_mount_contained(root: &Path, path: &Path) -> Result<(), u32> {
 
 #[cfg(not(windows))]
 fn checked_mount_path(root: &str, tail: &str) -> Result<String, u32> {
-    let path = normalize_host(Path::new(&join_rel(root, tail)));
+    // Clamp `..` at the mount root first, so an above-mount `..` stays in the
+    // mount (`Game`) while a genuine symlink escape still fails below.
+    let joined = below_mount(root, tail).replace('\\', "/");
+    let path = normalize_host(Path::new(&joined));
     ensure_mount_contained(Path::new(root), Path::new(&path))?;
     Ok(path)
 }
@@ -438,7 +462,7 @@ impl Vfs {
     #[cfg(windows)]
     fn apply_mounts(&self, p: &str) -> Option<String> {
         self.mount_match(p)
-            .map(|(target, tail)| join_rel(target, tail))
+            .map(|(target, tail)| below_mount(target, tail))
     }
 
     #[cfg(not(windows))]
@@ -1323,9 +1347,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dotdot_stops_at_mount_root() {
+        // Upstream #1170: a `..` that would leave the mount stops at the mount's
+        // root instead of escaping to the PC folder next to the game.
+        let f = Fixture::new("dotdot");
+        let v = &f.vfs;
+        assert_eq!(
+            v.classify("G:\\..\\data\\hello.txt"),
+            Target::Game { rel: "data\\hello.txt".into() }
+        );
+        assert_eq!(v.classify("G:\\.."), Target::Game { rel: String::new() });
+        assert_eq!(v.classify("G:\\..\\"), Target::Game { rel: String::new() });
+        assert_eq!(
+            v.classify("g:/../data/hello.txt"),
+            Target::Game { rel: "data\\hello.txt".into() }
+        );
+        assert_eq!(
+            v.classify("G:\\.\\data\\hello.txt"),
+            Target::Game { rel: "data\\hello.txt".into() }
+        );
+        assert_eq!(
+            v.classify("G:\\data\\..\\..\\data\\hello.txt"),
+            Target::Game { rel: "data\\hello.txt".into() }
+        );
+        // `S:\..\` stays at the S: root, so the PLS quota (not the host total)
+        // answers free-space queries there.
+        match v.classify("S:\\..\\") {
+            Target::Translated(p) => assert!(v.pls_root_for(&p).is_some(), "{p}"),
+            other => panic!("expected Translated, got {other:?}"),
+        }
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn linux_mount_traversal_cannot_escape_to_a_host_file() {
+        // Upstream #1170: an above-mount `..` clamps at the mount root instead
+        // of escaping, so these name the (missing) game file `outside.txt` —
+        // never the host sibling next to the game folder.
         let f = Fixture::new("traversal");
         let outside = f.dir.join("outside.txt");
         std::fs::write(&outside, b"host secret").unwrap();
@@ -1339,13 +1398,23 @@ mod tests {
             format!("\\\\?\\{}\\GAME:\\..\\outside.txt", f.game().display()),
             format!("{}\\GAME:\\..\\outside.txt", f.game().display()),
         ] {
-            assert_eq!(v.classify(&path), Target::Reject(ERROR_ACCESS_DENIED), "{path}");
             assert_eq!(
-                v.open_decision(&path, GENERIC_WRITE, OPEN_EXISTING, 0),
-                Decision::Fail(ERROR_ACCESS_DENIED),
+                v.classify(&path),
+                Target::Game { rel: "outside.txt".into() },
                 "{path}"
             );
-            assert_eq!(v.real_path_for_read(&path), None, "{path}");
+            assert_eq!(
+                v.open_decision(&path, GENERIC_WRITE, OPEN_EXISTING, 0),
+                Decision::Fail(ERROR_FILE_NOT_FOUND),
+                "{path}"
+            );
+            // Inside the mount (like any other missing game file) — never the
+            // host sibling.
+            let got = v.real_path_for_read(&path);
+            assert!(
+                matches!(&got, Some(p) if p.ends_with("game/outside.txt")),
+                "{path} -> {got:?}"
+            );
         }
 
         // Parent components that stay inside the mount are still normalised.
