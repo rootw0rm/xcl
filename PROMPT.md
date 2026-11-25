@@ -9,15 +9,20 @@ full work plan.
 
 ## Status snapshot (2026-11-24 — refresh this when a phase flips)
 
-- `linux` @ `40a47a2` (merge `5c61de1` of upstream `main` @ `7994cd1`, plus a Linux
-  gate fix; pushed to `origin/linux`).
+- `linux` @ `0f6c9e7` (merge of upstream `main` @ `fb32c87`, plus Linux
+  fixes; pushed to `origin/linux`).
   Verify with `git log --oneline -3; git status -sb`.
-  Upstream brought whole-wave native branches, TG_SIZE partial-wave fix
-  (`TRANSLATOR_VERSION` 8 — caches rehash via `pso.rs`), DXIL CSE fix
-  across discard, per-lane const-mask operands, round-denorm/NaN handling,
-  mesh-PSO triangle topology, PSO/mesh-shader caching. Two more
-  `lower_dxil.rs` GPU tests missed upstream's `cfg(windows)`; gated on
-  Linux. Previous syncs' notes still hold.
+  Upstream brought heap-windows-16 (UE-style 16-window heap tiers,
+  `TRANSLATOR_VERSION` bump in caches), detile 3D packed mip tails, texture
+  upload staging memory, BVH triangle types, whole-wave per-lane
+  predicates, DXIL CSE/view-id fixes, frexp/exp denorm + setreg-mode fixes.
+  Linux fixes in the merge: `miniz_oxide` simd taken, `retour` stays
+  Windows-only; new `recomp::cfg` module included (pure logic); Linux keeps
+  the shared `hle_routes::ROUTES` table (already had upstream's new routes);
+  `Pipelines` struct keeps its Linux `cfg(windows)` gate + upstream docs;
+  `gpu::uma` gets a 2-constant Linux shim (full heap port is Phase D);
+  5 more GPU/validator test modules gated `cfg(all(test, windows))`.
+  Previous syncs' notes still hold.
   A ralph loop is actively working the tree (uncommitted WIP) — do not
   touch its files or stash the workdir.
   NOTE: this machine has **no game files** — `/run/media/...` does not
@@ -25,7 +30,7 @@ full work plan.
   never block the loop on them.
 - **Phase A done.** `cargo check -p xcl --tests` and `cargo check --workspace`
   are green (0 errors) on `x86_64-unknown-linux-gnu`; `cargo test -p xcl --lib`
-  passes (385 passed, 0 failed, re-verified after the `7994cd1` sync).
+  passes (464 passed, 0 failed, 1 ignored; re-verified after the `fb32c87` sync).
   `target/debug/xcl` builds.
 - **Phase B done** (where game files exist). Offline tools run on the real
   paths, e.g. `xcl inspect .../game_scarlett_master.exe` reports 587 imports /
