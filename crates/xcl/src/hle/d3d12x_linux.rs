@@ -214,6 +214,8 @@ fn vtable(kind: Kind) -> *const usize {
     // and Vulkan lists implement the console memory methods for real.
     if kind == Kind::VulkanDevice {
         v[12] = Vulkan_CreateCommandList as usize;
+        v[13] = Vulkan_CheckFeatureSupport as usize;
+        v[18] = Vulkan_CreateShaderResourceView as usize;
         v[73] = Vulkan_CreateCommandListX as usize;
     }
     if kind == Kind::VulkanList {
@@ -226,6 +228,8 @@ fn vtable(kind: Kind) -> *const usize {
         v[72] = VulList_Wait64 as usize;
         v[89] = VulList_Write64Top as usize;
         v[93] = VulList_Kickoff as usize;
+        v[146] = Ret_Void as usize; // UAV barrier (single queue: already coherent)
+        v[148] = VulList_AllocUpload as usize;
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     g.push((kind, leaked.as_ptr() as usize));
@@ -795,6 +799,55 @@ unsafe extern "win64" fn Dma_CopyBufferRegion(
 }
 
 // ---------------------------------------------------------------------------------------
+// Vulkan device overrides (step 17): the raytracing surface the title probes.
+// Only slot 13 (feature support) and slot 18 (RTAS views) differ from the null
+// device; everything else still delegates.
+// ---------------------------------------------------------------------------------------
+
+/// `CheckFeatureSupport` on a Vulkan device: the null behavior (raytracing
+/// tier at +8 of `D3D12_FEATURE_D3D12_OPTIONS5`) plus zeroing the tail past
+/// the 12-byte struct — the console runtime zeroes it, and the title probes
+/// with a 16-byte struct filled with `0xAA` to check exactly that.
+unsafe extern "win64" fn Vulkan_CheckFeatureSupport(_t: *mut NullObj, feature: u32, data: *mut c_void, size: u32) -> HRESULT {
+    crate::xlog_debug!("D3D12.X Vulkan: CheckFeatureSupport({feature})");
+    if feature == 27 && !data.is_null() && size >= 12 {
+        let tier = crate::state::config().raytracing_tier_override().unwrap_or(0);
+        ((data as *mut u8).add(8) as *mut u32).write_unaligned(tier);
+        if size > 12 {
+            // oversized probe padding: zero it (4 KiB sanity cap — the title
+            // passes 16; a garbage size must not memset the address space)
+            let tail = ((size - 12) as usize).min(4096);
+            std::ptr::write_bytes((data as *mut u8).add(12), 0, tail);
+        }
+    }
+    S_OK
+}
+
+/// `CreateShaderResourceView(res, desc, dest)` on a Vulkan device: a
+/// raytracing-acceleration-structure view (dimension 11) writes the RDNA2 BVH
+/// descriptor words into the heap slot `dest` points at —
+/// `[(va >> 8), ((va >> 40) & 0xFF) | (1 << 31), u32::MAX, 0]` — the exact
+/// words the title reads back. Other view dimensions stay unmodelled (left
+/// untouched, like the null stub) until a caller needs them.
+unsafe extern "win64" fn Vulkan_CreateShaderResourceView(_t: *mut NullObj, _res: *mut c_void, desc: *const u8, dest: usize) {
+    const RTAS_DIM: u32 = 11;
+    if desc.is_null() || dest == 0 {
+        return;
+    }
+    // D3D12_SHADER_RESOURCE_VIEW_DESC: Format u32 @0, ViewDimension u32 @4,
+    // Shader4ComponentMapping u32 @8, union @16 (8-aligned: 4 bytes of
+    // padding after the three u32s; RTAS: Location u64 @16).
+    // Unaligned reads: the descriptor comes from console code as bytes.
+    if (desc.add(4) as *const u32).read_unaligned() != RTAS_DIM {
+        return;
+    }
+    let va = (desc.add(16) as *const u64).read_unaligned();
+    let words = [(va >> 8) as u32, (((va >> 40) as u32) & 0xFF) | (1 << 31), u32::MAX, 0];
+    // byte copy: the heap slot is host memory without alignment promises
+    std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, dest as *mut u8, 16);
+}
+
+// ---------------------------------------------------------------------------------------
 // Vulkan lists (step 17): console command-list memory methods on title memory.
 // The title's graphics memory is host memory (XMemAlloc), so writes, fills,
 // copies and the same-list write-then-wait apply immediately and synchronously;
@@ -955,6 +1008,26 @@ unsafe extern "win64" fn VulList_Wait64(_t: *mut NullObj, va: u64, func: u32, va
 /// `KickoffX()`: flushes recorded work to the GPU — every method above already
 /// applied synchronously, so there is nothing queued to flush.
 unsafe extern "win64" fn VulList_Kickoff(_t: *mut NullObj) {}
+
+/// `AllocateUploadMemoryX(size, alignment)` (slot 148): host upload memory —
+/// the title only needs it aligned and writable (it writes a tag word and
+/// reads it back). Zeroed, intentionally leaked like every null-device block;
+/// the pointer/size are remembered in the list's `mem` cell.
+unsafe extern "win64" fn VulList_AllocUpload(this: *mut NullObj, size: usize, align: usize) -> *mut u8 {
+    if this.is_null() || size == 0 {
+        return std::ptr::null_mut();
+    }
+    let align = align.max(std::mem::align_of::<usize>()).next_power_of_two();
+    let Ok(layout) = std::alloc::Layout::from_size_align(size, align) else {
+        return std::ptr::null_mut();
+    };
+    let p = std::alloc::alloc_zeroed(layout);
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    *(*this).mem.lock().unwrap() = (p as usize, size);
+    p
+}
 
 // ---------------------------------------------------------------------------------------
 // queue / fence / heap / resource / blob
@@ -1526,8 +1599,114 @@ mod tests {
         }
     }
 
-    /// Calls `f(this)` (Win64) the way console code does, with a writable pointer left in rdx.
-    #[cfg(all(target_arch = "x86_64", windows))]
+    #[test]
+    fn vulkan_raytracing_helpers_are_pure_and_safe() {
+        // Step-17 raytracing slice, pure logic (no device needed): the
+        // oversized OPTIONS5 probe gets its tail zeroed, an RTAS view writes
+        // the descriptor words the title asserts, other views stay untouched,
+        // nulls never fault, and upload memory comes back aligned + zeroed.
+        unsafe {
+            let this = std::ptr::null_mut();
+            // OPTIONS5 tail: 16-byte 0xAA probe, tier at +8, zeros at 12..16
+            let mut wide = [0xAAu8; 16];
+            assert_eq!(
+                Vulkan_CheckFeatureSupport(this, 27, wide.as_mut_ptr() as *mut c_void, 16),
+                S_OK
+            );
+            assert_eq!(&wide[12..16], &[0, 0, 0, 0]);
+            // other features / short structs pass through untouched
+            let mut narrow = [0xAAu8; 8];
+            assert_eq!(
+                Vulkan_CheckFeatureSupport(this, 7, narrow.as_mut_ptr() as *mut c_void, 8),
+                S_OK
+            );
+            assert_eq!(&narrow, &[0xAA; 8]);
+            // RTAS view descriptor words
+            let va = 0x5_6789_0ABC_DEF0u64;
+            let mut desc = [0u8; 24];
+            desc[4..8].copy_from_slice(&11u32.to_le_bytes());
+            desc[16..24].copy_from_slice(&va.to_le_bytes());
+            let mut slot = [0u32; 4];
+            Vulkan_CreateShaderResourceView(this, std::ptr::null_mut(), desc.as_ptr(), slot.as_mut_ptr() as usize);
+            assert_eq!(
+                slot,
+                [(va >> 8) as u32, (((va >> 40) as u32) & 0xFF) | (1 << 31), u32::MAX, 0]
+            );
+            // another dimension leaves the slot alone; nulls never fault
+            desc[4..8].copy_from_slice(&4u32.to_le_bytes());
+            slot = [0xDEAD_BEEF; 4];
+            Vulkan_CreateShaderResourceView(this, std::ptr::null_mut(), desc.as_ptr(), slot.as_mut_ptr() as usize);
+            assert_eq!(slot, [0xDEAD_BEEF; 4]);
+            Vulkan_CreateShaderResourceView(this, std::ptr::null_mut(), std::ptr::null(), slot.as_mut_ptr() as usize);
+            Vulkan_CreateShaderResourceView(this, std::ptr::null_mut(), desc.as_ptr(), 0);
+            // upload memory: aligned, zeroed, remembered in the list object
+            let o = new_obj(Kind::VulkanList);
+            let p = VulList_AllocUpload(o, 256, 256);
+            assert!(!p.is_null() && (p as usize).is_multiple_of(256));
+            assert_eq!(std::slice::from_raw_parts(p, 256), &[0u8; 256]);
+            assert_eq!(*(*o).mem.lock().unwrap(), (p as usize, 256));
+            assert!(VulList_AllocUpload(o, 0, 256).is_null());
+        }
+    }
+
+    #[test]
+    fn vulkan_device_serves_the_raytracing_surface() {
+        // Step-17 wiring on a real Vulkan device: CheckFeatureSupport zeroes
+        // the oversized OPTIONS5 tail, the AS SRV lands in the heap slot, and
+        // the list's AllocateUploadMemory + UAV barrier behave — the title's
+        // `raytracing_surface` asserts, end to end. Skips without a device.
+        unsafe {
+            match acquire() {
+                Some(st) => {
+                    let sel = Selection { backend: Backend::Vulkan, lane: None, reason: "test".into() };
+                    let mut dev = std::ptr::null_mut();
+                    assert_eq!(create_device_for(&sel, Some(st), &mut dev), S_OK);
+                    type Check = unsafe extern "win64" fn(*mut c_void, u32, *mut c_void, u32) -> HRESULT;
+                    let check: Check = std::mem::transmute(slot(dev, 13));
+                    let mut wide = [0xAAu8; 16];
+                    assert_eq!(check(dev, 27, wide.as_mut_ptr() as *mut c_void, 16), S_OK);
+                    assert_eq!(&wide[12..16], &[0, 0, 0, 0]);
+                    // SRV heap + RTAS view (slot 18 takes the handle by value)
+                    type MkHeap = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+                    let mkheap: MkHeap = std::mem::transmute(slot(dev, 14));
+                    let mut heap = std::ptr::null_mut();
+                    let hdesc = [6u32, 2, 1, 0]; // CBV_SRV_UAV, 2 slots, visible
+                    assert_eq!(mkheap(dev, hdesc.as_ptr() as *const c_void, std::ptr::null(), &mut heap), S_OK);
+                    type Start = unsafe extern "win64" fn(*mut c_void) -> usize;
+                    let start: Start = std::mem::transmute(slot(heap, 9));
+                    let cpu = start(heap);
+                    type Srv = unsafe extern "win64" fn(*mut c_void, *mut c_void, *const u8, usize);
+                    let srv: Srv = std::mem::transmute(slot(dev, 18));
+                    let va = 0x1_2345_6780u64;
+                    let mut desc = [0u8; 24];
+                    desc[4..8].copy_from_slice(&11u32.to_le_bytes());
+                    desc[16..24].copy_from_slice(&va.to_le_bytes());
+                    srv(dev, std::ptr::null_mut(), desc.as_ptr(), cpu);
+                    assert_eq!(
+                        std::slice::from_raw_parts(cpu as *const u32, 4),
+                        &[(va >> 8) as u32, (((va >> 40) as u32) & 0xFF) | (1 << 31), u32::MAX, 0]
+                    );
+                    // list upload memory + barrier (slots 148 / 146)
+                    type MkList = unsafe extern "win64" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+                    let mk: MkList = std::mem::transmute(slot(dev, 12));
+                    let mut l = std::ptr::null_mut();
+                    assert_eq!(mk(dev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+                    type AllocUp = unsafe extern "win64" fn(*mut c_void, usize, usize) -> *mut u8;
+                    let alloc_up: AllocUp = std::mem::transmute(slot(l, 148));
+                    let up = alloc_up(l, 256, 256);
+                    assert!(!up.is_null() && (up as usize).is_multiple_of(256));
+                    *(up as *mut u32) = 0x5A5A_1234;
+                    assert_eq!(*(up as *const u32), 0x5A5A_1234);
+                    type Barrier = unsafe extern "win64" fn(*mut c_void, u32, *const c_void);
+                    let barrier: Barrier = std::mem::transmute(slot(l, 146));
+                    barrier(l, 1, std::ptr::null());
+                }
+                None => crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan"),
+            }
+        }
+    }
+
+    /// Calls `f(this)` (Win64) the way console code does, with a writable pointer left in rdx.    #[cfg(all(target_arch = "x86_64", windows))]
     unsafe fn call_with_rdx(f: usize, this: *mut c_void, rdx: *mut u64) -> u64 {
         let ret: u64;
         // rsp is 16-aligned on entry to the asm block: 32 B of shadow space keep it so at the call
