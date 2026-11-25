@@ -583,6 +583,8 @@ mod tests {
             "FindNextFileW",
             "GetFileAttributesW",
             "GetDiskFreeSpaceExW",
+            // Retail abort 0x2237320: the title reads handle timestamps.
+            "GetFileTime",
             // Step-11c startup neighbors: FLS, std handles, module handles, environment.
             "FlsAlloc",
             "FlsFree",

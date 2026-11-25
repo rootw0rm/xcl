@@ -466,6 +466,9 @@ mod tests {
             // Step-11l file reads past stubs (Rust std + CRT through the VFS).
             ("kernel32.dll", "GetFileInformationByHandle"),
             ("kernel32.dll", "GetFileInformationByHandleEx"),
+            // Retail abort 0x2237320: the title reads handle timestamps.
+            ("kernel32.dll", "GetFileTime"),
+            ("api-ms-win-core-file-l1-1-0.dll", "GetFileTime"),
             ("ntdll.dll", "NtReadFile"),
             ("ntdll.dll", "RtlNtStatusToDosError"),
             ("kernel32.dll", "GetCurrentDirectoryW"),

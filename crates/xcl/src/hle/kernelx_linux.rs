@@ -4310,6 +4310,43 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(
     }
 }
 
+/// `BOOL GetFileTime(HANDLE, LPFILETIME creation, LPFILETIME access, LPFILETIME write)`.
+///
+/// Retail abort `0x2237320`: the title calls this as `GetFileTime(h,NULL,NULL,&ft)`
+/// from its `0x140F43800` wrapper (probed before the crashing append). Timestamps come
+/// from the same VFS `FILES` metadata as `GetFileInformationByHandle`; any NULL out
+/// pointer is skipped per the Windows contract, and unknown handles fail closed like
+/// the `ByHandle` neighbors (never a fabricated time).
+pub unsafe extern "win64" fn GetFileTime(
+    handle: usize,
+    creation: *mut FileTime,
+    access: *mut FileTime,
+    write: *mut FileTime,
+) -> i32 {
+    match by_handle_info_for(handle) {
+        Some(info) => {
+            if !creation.is_null() {
+                (*creation).low = info.creation_low;
+                (*creation).high = info.creation_high;
+            }
+            if !access.is_null() {
+                (*access).low = info.access_low;
+                (*access).high = info.access_high;
+            }
+            if !write.is_null() {
+                (*write).low = info.write_low;
+                (*write).high = info.write_high;
+            }
+            set_error(ERROR_SUCCESS);
+            1
+        }
+        None => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
 pub unsafe extern "win64" fn NtReadFile(
     handle: usize,
     _event: usize,
@@ -8470,6 +8507,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("WriteFile", WriteFile as usize),
         ("FlushFileBuffers", FlushFileBuffers as usize),
         ("GetFileSizeEx", GetFileSizeEx as usize),
+        ("GetFileTime", GetFileTime as usize),
         ("SetFilePointerEx", SetFilePointerEx as usize),
         ("SetEndOfFile", SetEndOfFile as usize),
         ("GetFileInformationByHandle", GetFileInformationByHandle as usize),
@@ -10039,6 +10077,55 @@ mod tests {
             // Status mapping covers the SUCCESS + INVALID_HANDLE round-trip.
             assert_eq!(RtlNtStatusToDosError(STATUS_SUCCESS), ERROR_SUCCESS);
             assert_eq!(RtlNtStatusToDosError(STATUS_INVALID_HANDLE), 6);
+        }
+    }
+
+    #[test]
+    fn get_file_time_reports_handle_timestamps() {
+        unsafe {
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const OPEN_EXISTING: u32 = 3;
+            const CREATE_ALWAYS: u32 = 2;
+            let _ = ensure_test_vfs();
+            // Retail abort 0x2237320: the title calls GetFileTime(h,NULL,NULL,&ft)
+            // from its 0x140F43800 wrapper; the write time must come from the
+            // same VFS metadata the ByHandle helpers report. Seed a pid-unique
+            // probe under T: (title scratch) like the NtReadFile test does, so
+            // parallel tests never share-lock the same fixture.
+            let name = format!("T:\\getfiletime_11m_{}.bin", std::process::id());
+            let w = crate::util::wide(&name);
+            let h = CreateFileW(
+                w.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                CREATE_ALWAYS,
+                0,
+                0,
+            );
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+            assert_eq!(CloseHandle(h), 1);
+            let h = open_w(&name, GENERIC_READ, OPEN_EXISTING);
+            let mut c: FileTime = std::mem::zeroed();
+            let mut a: FileTime = std::mem::zeroed();
+            let mut w: FileTime = std::mem::zeroed();
+            assert_eq!(GetFileTime(h, &mut c, &mut a, &mut w), 1);
+            assert_ne!((w.high, w.low), (0, 0));
+            // The game's wrapper pattern (creation/access NULL) reports the same write time.
+            let mut w2: FileTime = std::mem::zeroed();
+            assert_eq!(
+                GetFileTime(h, std::ptr::null_mut(), std::ptr::null_mut(), &mut w2),
+                1
+            );
+            assert_eq!((w2.high, w2.low), (w.high, w.low));
+            assert_eq!(CloseHandle(h), 1);
+            // Unknown handles fail closed, like the ByHandle neighbors.
+            let mut w3: FileTime = std::mem::zeroed();
+            assert_eq!(
+                GetFileTime(0xDEAD_BEEF, std::ptr::null_mut(), std::ptr::null_mut(), &mut w3),
+                0
+            );
         }
     }
 
