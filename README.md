@@ -241,6 +241,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Direct compute dispatches can split large programs into pipelines built in parallel.
+  `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
+  zero disables splitting). Loops stay in one piece. A strongly connected component over the
+  target gets its own piece, up to four times the target. Larger components and indirect
+  dispatches use the whole pipeline.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
@@ -255,7 +260,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   0x…`): its dispatches are skipped.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
-  those on which the GPU completed at least one operation.
+  those on which the GPU completed at least one operation. For each, it names the translated
+  pipeline bound at the last operation DRED saw complete and those bound after it, by their
+  console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.

@@ -1816,6 +1816,8 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 }
 
 fn forget_pso(pso: usize) {
+    super::dred::forget_pso(pso);
+    dispatch_chain::forget(pso);
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
@@ -2879,6 +2881,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("DrawInstanced", cl_draw_instanced as usize),
             ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
             ("SetPipelineState", cl_set_pipeline_state as usize),
+            ("SetMarker", cl_set_marker as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
@@ -2973,6 +2976,10 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::dred::reset(this);
+        if !initial_state.is_null() {
+            super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
+        }
     }
     hr
 }
@@ -4305,18 +4312,74 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
+    let record = crate::gpu::shader::fnv64(cs);
+    if let Some(plan) = compiled.dispatch_chain {
+        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
+            LAST_COMPUTE_RS.with(|c| c.set(rs));
+            note_pso_rs(*ppv, rs as *mut c_void);
+            super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+            if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+                PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+            }
+            note_translated_compute(0, ppv);
+            TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+            return Some(Ok(0));
+        }
+    }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
+    let (hr, in_driver, reused) = compute_container(this, f, d, rs, &dxil, record, riid, ppv, false);
+    if hr < 0 {
+        // A huge program's verdict in the log itself: `note_translation_error` goes to the
+        // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
+        // took an AMD driver 15 – 23 s and ~15 GB to refuse with E_OUTOFMEMORY in every run, and
+        // the log showed only its `driver compile finish` and the dispatches skipped after it.
+        if dxil.len() >= huge_pso_bytes() {
+            // (the record hash is the console program's, as in `driver compile start` and
+            // `xcl shaders --measure-pso`; the driver-cache name is the translated DXIL's)
+            crate::xlog_warn!(
+                "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
+                dxil.len(),
+                driver_cache::name(&dxil, d.Flags.0),
+                in_driver.as_millis()
+            );
+        }
+        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
+        return Some(Err(()));
+    }
+    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    note_pso_rs(*ppv, rs);
+    super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
+    note_translated_compute(hr, ppv);
+    crate::xlog_info!(
+        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+        dxil.len(),
+        in_driver.as_millis(),
+        if reused { ", the driver's blob of an earlier build" } else { "" }
+    );
+    Some(Ok(hr))
+}
+
+pub(super) mod dispatch_chain;
+pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+
+/// `chained`: built with the dispatch chain's root signature (`dispatch_chain`), whose driver blobs
+/// are kept apart on disk from the same DXIL's under the title's.
+unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
+    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, chained: bool) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.CS = bytecode(&dxil);
+    copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
-    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
+    let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(&dxil, copy.Flags.0);
+    let disk = driver_cache::path(dxil, copy.Flags.0).map(|p| if chained { p.with_extension("chain.pso") } else { p });
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -4325,7 +4388,6 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     // in the background, a few at a time and within the commit headroom the program asks for
-    let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
         dxil.len(),
@@ -4359,37 +4421,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     } else if reused && from_disk {
         driver_cache::note(true, None);
     }
-    if hr < 0 {
-        // A huge program's verdict in the log itself: `note_translation_error` goes to the
-        // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
-        // took an AMD driver 15 – 23 s and ~15 GB to refuse with E_OUTOFMEMORY in every run, and
-        // the log showed only its `driver compile finish` and the dispatches skipped after it.
-        if dxil.len() >= huge_pso_bytes() {
-            // (the record hash is the console program's, as in `driver compile start` and
-            // `xcl shaders --measure-pso`; the driver-cache name is the translated DXIL's)
-            crate::xlog_warn!(
-                "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
-                dxil.len(),
-                driver_cache::name(&dxil, copy.Flags.0),
-                in_driver.as_millis()
-            );
-        }
-        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
-        return Some(Err(()));
-    }
-    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    note_pso_rs(*ppv, rs);
-    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
-    }
-    note_translated_compute(hr, ppv);
-    crate::xlog_info!(
-        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
-        dxil.len(),
-        in_driver.as_millis(),
-        if reused { ", the driver's blob of an earlier build" } else { "" }
-    );
-    Some(Ok(hr))
+    (hr, in_driver, reused)
 }
 
 /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
@@ -5151,6 +5183,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
@@ -5890,6 +5923,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         return None;
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+    let console_ps = ps;
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -5943,7 +5977,11 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
+    if hr >= 0 {
+        super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
+    }
+    Some(hr)
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -6014,7 +6052,11 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    let hr = finish_two_pass(this, &out, tp, rs, "GS", riid, ppv);
+    if hr >= 0 {
+        super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
+    }
+    hr
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
@@ -6720,14 +6762,28 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    f(this, bound as *mut c_void);
+    super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
+}
+
+/// The title's markers are counted for `XCL_DRED=1`'s pipeline labels (`dred`).
+unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: *const c_void, size: u32) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetMarker")));
+    f(this, metadata, data, size);
+    super::dred::title_marker(this);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    f(this, bound as *mut c_void);
+    if !pso.is_null() {
+        super::dred::mark_pipeline(this, pso as usize, bound);
+    }
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
 }
@@ -6768,6 +6824,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     if n == 0 {
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
+        super::dred::forget_list(this);
     }
     n
 }
@@ -6785,6 +6842,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        dispatch_chain::allocator_reset(this as usize);
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
@@ -6795,7 +6853,9 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
-    f(raw)
+    let hr = f(raw);
+    if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
+    hr
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
@@ -6849,8 +6909,8 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
 /// (`DispatchMesh` sits at newer #129 after #126 RSSetShadingRate, #127 RSSetShadingRateImage,
-/// and #128 Scarlett-only shading-rate/color struct).
-const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 126), (139, 10)];
+/// and #128 Scarlett-only shading-rate/color struct; older #127, two slots before as the others).
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 127), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -7173,7 +7233,16 @@ pub fn log_device_removed() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
                 let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
-                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                let list = node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw());
+                let history: Vec<i32> = if node.pCommandHistory.is_null() { Vec::new() } else { std::slice::from_raw_parts(node.pCommandHistory, count).iter().map(|o| o.0).collect() };
+                let name = if node.pCommandListDebugNameW.is_null() { None } else { node.pCommandListDebugNameW.to_string().ok() };
+                let key = super::dred::node_list(list as usize, name.as_deref());
+                let mut bound = super::dred::bound_at(key, &history, done).map(|l| format!("; pipeline bound there: {l}")).unwrap_or_default();
+                let after = super::dred::bound_after(key, &history, done);
+                if !after.is_empty() {
+                    bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+                }
+                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
             });
         }
     }
@@ -7629,7 +7698,7 @@ mod queue_tests {
 
     #[test]
     fn newer_layout_maps_dispatch_mesh_to_slot_129_not_128() {
-        assert!(NEWER_LIST_SLOTS.contains(&(129, 126)), "DispatchMesh must map to newer slot #129");
+        assert!(NEWER_LIST_SLOTS.contains(&(129, 127)), "DispatchMesh must map to newer slot #129");
         assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, _)| newer == 128), "newer slot #128 must not map to DispatchMesh");
     }
 }

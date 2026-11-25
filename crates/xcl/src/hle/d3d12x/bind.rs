@@ -314,6 +314,17 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
+            if compute {
+                match super::real::dispatch_chain::whole(pso) {
+                    Ok(Some(whole)) => list.SetPipelineState(&whole),
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
+                        count(DISPATCHES_SKIPPED);
+                        return;
+                    }
+                }
+            }
             count(if gfx { DRAWS } else { DISPATCHES });
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
@@ -970,8 +981,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
-    list.Dispatch(x, y, z);
-    Ok(())
+    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept

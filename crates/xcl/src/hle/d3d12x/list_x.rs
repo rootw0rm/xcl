@@ -2687,6 +2687,12 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         },
     };
 
+    // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
+    super::dred::reset(next_pc);
+    if init_pso != 0 {
+        super::dred::mark_pipeline(next_pc, bound_pso, init_pso);
+    }
+
     let old_next = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
