@@ -175,6 +175,8 @@ const OP_FSUB: u16 = 131;
 const OP_IMUL: u16 = 132;
 const OP_FMUL: u16 = 133;
 const OP_SELECT: u16 = 169;
+const OP_I_EQUAL: u16 = 170;
+const OP_I_NOT_EQUAL: u16 = 171;
 const OP_U_LESS_THAN: u16 = 176;
 const OP_FORD_LESS_THAN: u16 = 184;
 const OP_SHIFT_R_LOGICAL: u16 = 194;
@@ -657,6 +659,11 @@ impl SpirvEm {
         self.emit_body(OP_STORE, &[var, val]);
     }
 
+    fn store_scc(&mut self, val: u32) {
+        let var = self.scc_home();
+        self.emit_body(OP_STORE, &[var, val]);
+    }
+
     fn code_value(&mut self, code: u64, lit: Option<u32>) -> Option<u32> {
         match code {
             0..=124 | 126 | 127 => Some(self.load_sgpr(code)),
@@ -742,6 +749,12 @@ impl SpirvEm {
             self.unsupported(d, "SDWA/DPP in the bring-up backend");
             return Ok(false);
         }
+        // Narrow VertexIndex-indexed select pattern (scalar-element only): VOP3 carries
+        // an explicit lane selector and V_CMPX writes EXEC, so both stay unsupported.
+        if name == "v_cndmask_b32" && d.enc.name != "ENC_VOP2" {
+            self.unsupported(d, "valu");
+            return Ok(false);
+        }
         match d.enc.name {
             "ENC_SOPP" => match name.as_str() {
                 "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Ok(true),
@@ -784,7 +797,7 @@ impl SpirvEm {
                 }
             }
         };
-        let src1 = if d.enc.name == "ENC_SOP2" {
+        let src1 = if d.enc.name == "ENC_SOP2" || d.enc.name == "ENC_SOPC" {
             match self.code_value(f("SSRC1"), d.literal) {
                 Some(s) => s,
                 None => {
@@ -796,6 +809,20 @@ impl SpirvEm {
             0
         };
         let uint_ty = self.uint_ty;
+        // Narrow VertexIndex-indexed select pattern: SOPC writes SCC (this encoding
+        // carries no SDST, so it must not fall through to the destination logic below).
+        if d.enc.name == "ENC_SOPC" {
+            if name != "s_cmp_eq_u32" {
+                self.unsupported(d, "salu");
+                return;
+            }
+            let cmp = self.tmp(self.bool_ty, OP_I_EQUAL, &[src0, src1]);
+            let one = self.uint_const(1);
+            let zero = self.uint_const(0);
+            let v = self.tmp(uint_ty, OP_SELECT, &[cmp, one, zero]);
+            self.store_scc(v);
+            return;
+        }
         let res: Option<u32> = match name {
             "s_mov_b32" => Some(src0),
             "s_movk_i32" => Some(self.uint_const(d.literal.unwrap_or(0))),
@@ -807,6 +834,13 @@ impl SpirvEm {
             "s_not_b32" => Some(self.tmp(uint_ty, OP_NOT, &[src0])),
             "s_min_u32" => Some(self.umin(src0, src1)),
             "s_max_u32" => Some(self.umax(src0, src1)),
+            // Codebase/GPU convention (lower.rs, emit.rs): SCC-true picks SSRC0.
+            "s_cselect_b32" => {
+                let scc = self.load_scc();
+                let zero = self.uint_const(0);
+                let cond = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[scc, zero]);
+                Some(self.tmp(uint_ty, OP_SELECT, &[cond, src0, src1]))
+            }
             _ => None,
         };
         match res {
@@ -861,6 +895,32 @@ impl SpirvEm {
     }
 
     fn valu(&mut self, d: &Decoded, name: &str) {
+        // Narrow VertexIndex-indexed select pattern (scalar-element only): V_CMP_EQ_U32
+        // in VOPC form writes the VCC homes (sgpr 106/107). The VOPC encoding carries no
+        // VDST, so this must not fall through to the destination logic below.
+        if name == "v_cmp_eq_u32" {
+            if d.enc.name != "ENC_VOPC" {
+                self.unsupported(d, "valu");
+                return;
+            }
+            let (_, ins) = Self::ops(d);
+            if ins.len() != 2 {
+                self.unsupported(d, "op");
+                return;
+            }
+            let (Some(a), Some(b)) = (self.read(d, &ins[0]), self.read(d, &ins[1])) else {
+                self.unsupported(d, "op");
+                return;
+            };
+            let cmp = self.tmp(self.bool_ty, OP_I_EQUAL, &[a, b]);
+            let all = self.uint_const(0xFFFF_FFFF);
+            let zero = self.uint_const(0);
+            let mask = self.tmp(self.uint_ty, OP_SELECT, &[cmp, all, zero]);
+            // Single-wave bring-up: the lane bit lives in VCC lo (sgpr 106); hi stays 0.
+            self.store_sgpr(106, mask);
+            self.store_sgpr(107, zero);
+            return;
+        }
         let (outs, ins) = Self::ops(d);
         let mut u = Vec::new();
         for o in &ins {
@@ -899,6 +959,13 @@ impl SpirvEm {
         let res: Option<u32> = match name {
             "v_mov_b32" | "v_mov_fed_b32" => Some(a),
             "v_not_b32" => Some(self.tmp(uint_ty, OP_NOT, &[a])),
+            // Codebase/GPU convention (lower.rs F32_COMPARES): VCC-true picks VSRC1.
+            "v_cndmask_b32" => {
+                let vcc = self.load_sgpr(106);
+                let zero = self.uint_const(0);
+                let cond = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[vcc, zero]);
+                Some(self.tmp(uint_ty, OP_SELECT, &[cond, b, a]))
+            }
             "v_and_b32" => Some(self.tmp(uint_ty, OP_BITWISE_AND, &[a, b])),
             "v_or_b32" => Some(self.tmp(uint_ty, OP_BITWISE_OR, &[a, b])),
             "v_xor_b32" => Some(self.tmp(uint_ty, OP_BITWISE_XOR, &[a, b])),
@@ -1496,6 +1563,293 @@ mod tests {
         let out_locs: BTreeSet<u32> = locs.into_iter().collect();
         assert!(out_locs.contains(&0), "param out location 0 missing");
         assert!(g.glsl.contains("gl_Position"), "{}", g.glsl);
+        assert!(g.glsl.contains("out_p0"), "{}", g.glsl);
+    }
+
+    /// Same interface as the blit gate (position + one param), but selected by
+    /// VertexIndex: the title `render_triangle` pattern (`p[id]` over constant corners).
+    fn triangle_code() -> Vec<u8> {
+        // v0 holds VertexIndex (bring-up init); y = is1 ? 0.5 : -0.5,
+        // x = is0 ? -0.5 : (is1 ? 0.0 : 0.5), z = 0, w = 1.
+        let mut code = Vec::new();
+        // Materialize float-bit constants (inline-constant operand codes).
+        for (vdst, src) in [
+            (1u64, 241u64), // -0.5
+            (2, 240u64),    // 0.5
+            (3, 128u64),    // 0.0
+            (4, 242u64),    // 1.0
+        ] {
+            code.extend(
+                encode(
+                    "V_MOV_B32",
+                    "ENC_VOP1",
+                    &[("VDST", vdst), ("SRC0", src)],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        // vcc = (vid == 1).
+        code.extend(
+            encode(
+                "V_CMP_EQ_U32",
+                "ENC_VOPC",
+                &[("SRC0", 129), ("VSRC1", 0)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v5 = vcc ? v2(0.5) : v1(-0.5)  → y.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 5), ("SRC0", 257), ("VSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v6 = vcc ? v3(0.0) : v2(0.5)  → x so far.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 6), ("SRC0", 258), ("VSRC1", 3)],
+                None,
+            )
+            .unwrap(),
+        );
+        // vcc = (vid == 0).
+        code.extend(
+            encode(
+                "V_CMP_EQ_U32",
+                "ENC_VOPC",
+                &[("SRC0", 128), ("VSRC1", 0)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v6 = vcc ? v1(-0.5) : v6  → x.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 6), ("SRC0", 262), ("VSRC1", 1)],
+                None,
+            )
+            .unwrap(),
+        );
+        // pos = param0 = (x, y, 0, 1).
+        for (tgt, done) in [(12u64, 0u64), (32, 1)] {
+            code.extend(
+                encode(
+                    "EXP",
+                    "ENC_EXP",
+                    &[
+                        ("TGT", tgt),
+                        ("EN", 0xF),
+                        ("VSRC0", 6),
+                        ("VSRC1", 5),
+                        ("VSRC2", 3),
+                        ("VSRC3", 4),
+                        ("DONE", done),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn triangle_vs() -> VsInterface {
+        VsInterface {
+            inputs: vec![],
+            outputs: vec![
+                sig("SV_Position", 0, 1, 3, 0, 0xF),
+                sig("COLOR", 0, 0, 3, 1, 0xF),
+            ],
+            attr_base: 4,
+            params: None,
+        }
+    }
+
+    /// SCC through the scalar pair: scc = (s0 == s1), sdst = scc ? ssrc0 : ssrc1.
+    fn scalar_select_code() -> Vec<u8> {
+        let mut code = Vec::new();
+        for (sdst, src) in [(0u64, 135u64), (1, 135u64), (2, 136u64)] {
+            code.extend(
+                encode(
+                    "S_MOV_B32",
+                    "ENC_SOP1",
+                    &[("SDST", sdst), ("SSRC0", src)],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        // s0 == s1 (7 == 7): scc = 1, s3 = scc ? s0(7) : s2(8).
+        code.extend(
+            encode(
+                "S_CMP_EQ_U32",
+                "ENC_SOPC",
+                &[("SSRC0", 0), ("SSRC1", 1)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(
+            encode(
+                "S_CSELECT_B32",
+                "ENC_SOP2",
+                &[("SDST", 3), ("SSRC0", 0), ("SSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        // s0 == s2 (7 == 8): scc = 0, s4 = scc ? s0(7) : s2(8).
+        code.extend(
+            encode(
+                "S_CMP_EQ_U32",
+                "ENC_SOPC",
+                &[("SSRC0", 0), ("SSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(
+            encode(
+                "S_CSELECT_B32",
+                "ENC_SOP2",
+                &[("SDST", 4), ("SSRC0", 0), ("SSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn scalar_compare_select_emits_select() {
+        let code = scalar_select_code();
+        let vs = blit_vs();
+        let t = SpirvVsBackend::translate_vs(&code, &vs, true).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        let w = &t.words;
+        let ops = word_ops(w);
+        let has =
+            |op: u16, pred: &dyn Fn(&[u32]) -> bool| ops.iter().any(|(o, a)| *o == op && pred(a));
+        // Two compares (OpIEqual on integers) feeding two SCC selects.
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_I_EQUAL).count() >= 2,
+            "missing integer compares"
+        );
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_SELECT).count() >= 4,
+            "missing SCC compare/select pairs"
+        );
+        assert!(
+            has(OP_DECORATE, &|a| a.len() == 3 && a[1] == DECOR_LOCATION),
+            "missing Location decoration for params"
+        );
+    }
+
+    #[test]
+    fn triangle_vertexindex_select_emits_valid_spirv() {
+        let code = triangle_code();
+        let vs = triangle_vs();
+        let t = SpirvVsBackend::translate_vs(&code, &vs, true).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        let w = &t.words;
+        assert!(w.len() > 5, "module too short");
+        assert_eq!(w[0], 0x0723_0203, "bad magic");
+        assert_eq!(w[1] >> 16, 1, "major version must be 1, got {:#x}", w[1]);
+        assert_eq!(w[4], 0, "schema must be 0");
+        let ops = word_ops(w);
+        let has =
+            |op: u16, pred: &dyn Fn(&[u32]) -> bool| ops.iter().any(|(o, a)| *o == op && pred(a));
+        assert!(
+            has(OP_ENTRY_POINT, &|a| !a.is_empty()
+                && a[0] == EXEC_MODEL_VERTEX),
+            "missing Vertex entry point"
+        );
+        assert!(
+            has(OP_DECORATE, &|a| a.len() == 3
+                && a[1] == DECOR_BUILT_IN
+                && a[2] == BUILT_IN_POSITION),
+            "missing Position builtin"
+        );
+        assert!(
+            has(OP_DECORATE, &|a| a.len() == 3
+                && a[1] == DECOR_BUILT_IN
+                && a[2] == BUILT_IN_VERTEX_INDEX),
+            "missing VertexIndex builtin"
+        );
+        // Two VertexIndex compares + three corner selects (VCC-true picks VSRC1).
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_I_EQUAL).count() >= 2,
+            "missing VertexIndex compares"
+        );
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_SELECT).count() >= 3,
+            "missing corner selects"
+        );
+        // Real `spirv-val` gate where available, else the structural checks gate.
+        let val = std::process::Command::new("spirv-val")
+            .arg("--version")
+            .output();
+        let Ok(which) = val else {
+            println!("spirv-val not available – skipping, structural checks gate");
+            return;
+        };
+        if !which.status.success() {
+            println!("spirv-val not available – skipping, structural checks gate");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-spirv-tri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spv = dir.join("tri.vert.spv");
+        let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(&spv, &bytes).unwrap();
+        let out = std::process::Command::new("spirv-val")
+            .arg(&spv)
+            .output()
+            .expect("spawn spirv-val");
+        assert!(
+            out.status.success(),
+            "spirv-val failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn triangle_matches_glsl_position_and_param_contract() {
+        use super::super::glsl::GlslVsBackend;
+        use super::super::VsBackend;
+        let code = triangle_code();
+        let vs = triangle_vs();
+        let g = GlslVsBackend::translate_vs(&code, &vs, true).unwrap();
+        assert!(g.complete(), "{:?}", g.unsupported);
+        let s = SpirvVsBackend::translate_vs(&code, &vs, true).unwrap();
+        assert!(s.complete(), "{:?}", s.unsupported);
+        // Same instruction count gated on both backends.
+        assert_eq!(s.instructions, g.instructions);
+        // SPIR-V declares one param output (COLOR) plus Position; GLSL declares
+        // one `out_p` plus `gl_Position` for the same interface.
+        let ops = word_ops(&s.words);
+        let locs: Vec<u32> = ops
+            .iter()
+            .filter(|(o, a)| *o == OP_DECORATE && a.len() == 3 && a[1] == DECOR_LOCATION)
+            .map(|(_, a)| a[2])
+            .collect();
+        assert!(!locs.is_empty(), "no Location decorations");
+        let out_locs: BTreeSet<u32> = locs.into_iter().collect();
+        assert!(out_locs.contains(&0), "param out location 0 missing");
+        assert!(g.glsl.contains("gl_Position"), "{}", g.glsl);
+        assert!(g.glsl.contains("gl_VertexIndex"), "{}", g.glsl);
         assert!(g.glsl.contains("out_p0"), "{}", g.glsl);
     }
 

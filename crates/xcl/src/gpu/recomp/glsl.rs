@@ -312,6 +312,12 @@ impl GlslEm {
             self.unsupported(d, "SDWA/DPP in the bring-up backend");
             return Ok(false);
         }
+        // Narrow VertexIndex-indexed select pattern (scalar-element only): VOP3 carries
+        // an explicit lane selector and V_CMPX writes EXEC, so both stay unsupported.
+        if name == "v_cndmask_b32" && d.enc.name != "ENC_VOP2" {
+            self.unsupported(d, "valu");
+            return Ok(false);
+        }
         match d.enc.name {
             "ENC_SOPP" => match name.as_str() {
                 "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Ok(true),
@@ -358,7 +364,7 @@ impl GlslEm {
                 }
             }
         };
-        let src1 = if d.enc.name == "ENC_SOP2" {
+        let src1 = if d.enc.name == "ENC_SOP2" || d.enc.name == "ENC_SOPC" {
             match self.code32(f("SSRC1"), d.literal) {
                 Some(s) => s,
                 None => {
@@ -369,6 +375,16 @@ impl GlslEm {
         } else {
             String::new()
         };
+        // Narrow VertexIndex-indexed select pattern: SOPC writes SCC (this encoding
+        // carries no SDST, so it must not fall through to the destination logic below).
+        if d.enc.name == "ENC_SOPC" {
+            if name != "s_cmp_eq_u32" {
+                self.unsupported(d, "salu");
+                return;
+            }
+            self.line(&format!("scc = (({src0} == {src1}) ? 1u : 0u);"));
+            return;
+        }
         let val: Option<String> = match name {
             "s_mov_b32" => Some(src0),
             "s_movk_i32" => Some(hex(d.literal.unwrap_or(0))),
@@ -380,6 +396,8 @@ impl GlslEm {
             "s_not_b32" => Some(format!("~{src0}")),
             "s_min_u32" => Some(format!("min({src0}, {src1})")),
             "s_max_u32" => Some(format!("max({src0}, {src1})")),
+            // Codebase/GPU convention (lower.rs, emit.rs): SCC-true picks SSRC0.
+            "s_cselect_b32" => Some(format!("((scc != 0u) ? {src0} : {src1})")),
             _ => None,
         };
         match val {
@@ -398,6 +416,31 @@ impl GlslEm {
     }
 
     fn valu(&mut self, d: &Decoded, name: &str) {
+        // Narrow VertexIndex-indexed select pattern (scalar-element only): V_CMP_EQ_U32
+        // in VOPC form writes the VCC homes (s106/s107). The VOPC encoding carries no
+        // VDST, so this must not fall through to the destination logic below.
+        if name == "v_cmp_eq_u32" {
+            if d.enc.name != "ENC_VOPC" {
+                self.unsupported(d, "valu");
+                return;
+            }
+            let (_, ins) = Self::ops(d);
+            if ins.len() != 2 {
+                self.unsupported(d, "op");
+                return;
+            }
+            let (a, b) = match (self.read(d, &ins[0]), self.read(d, &ins[1])) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    self.unsupported(d, "op");
+                    return;
+                }
+            };
+            // Single-wave bring-up: the lane bit lives in s106 (s107 stays 0).
+            self.line(&format!("s106 = (({a} == {b}) ? 0xFFFFFFFFu : 0u);"));
+            self.line("s107 = 0u;");
+            return;
+        }
         let (outs, ins) = Self::ops(d);
         let mut u = Vec::new();
         for o in &ins {
@@ -429,6 +472,8 @@ impl GlslEm {
         let res: Option<String> = match name {
             "v_mov_b32" | "v_mov_fed_b32" => Some(a.clone()),
             "v_not_b32" => Some(format!("~{a}")),
+            // Codebase/GPU convention (lower.rs F32_COMPARES): VCC-true picks VSRC1.
+            "v_cndmask_b32" => Some(format!("((s106 != 0u) ? {b} : {a})")),
             "v_and_b32" => Some(format!("{a} & {b}")),
             "v_or_b32" => Some(format!("{a} | {b}")),
             "v_xor_b32" => Some(format!("{a} ^ {b}")),
@@ -833,6 +878,261 @@ mod tests {
         );
     }
 
+    /// Same interface as the blit gate (position + one param), but selected by
+    /// VertexIndex: the title `render_triangle` pattern (`p[id]` over constant corners).
+    fn triangle_code() -> Vec<u8> {
+        // v0 holds VertexIndex (bring-up init); y = is1 ? 0.5 : -0.5,
+        // x = is0 ? -0.5 : (is1 ? 0.0 : 0.5), z = 0, w = 1.
+        let mut code = Vec::new();
+        // Materialize float-bit constants (inline-constant operand codes).
+        for (vdst, src) in [
+            (1u64, 241u64), // -0.5
+            (2, 240u64),    // 0.5
+            (3, 128u64),    // 0.0
+            (4, 242u64),    // 1.0
+        ] {
+            code.extend(
+                encode(
+                    "V_MOV_B32",
+                    "ENC_VOP1",
+                    &[("VDST", vdst), ("SRC0", src)],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        // vcc = (vid == 1).
+        code.extend(
+            encode(
+                "V_CMP_EQ_U32",
+                "ENC_VOPC",
+                &[("SRC0", 129), ("VSRC1", 0)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v5 = vcc ? v2(0.5) : v1(-0.5)  → y.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 5), ("SRC0", 257), ("VSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v6 = vcc ? v3(0.0) : v2(0.5)  → x so far.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 6), ("SRC0", 258), ("VSRC1", 3)],
+                None,
+            )
+            .unwrap(),
+        );
+        // vcc = (vid == 0).
+        code.extend(
+            encode(
+                "V_CMP_EQ_U32",
+                "ENC_VOPC",
+                &[("SRC0", 128), ("VSRC1", 0)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v6 = vcc ? v1(-0.5) : v6  → x.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 6), ("SRC0", 262), ("VSRC1", 1)],
+                None,
+            )
+            .unwrap(),
+        );
+        // pos = param0 = (x, y, 0, 1).
+        for (tgt, done) in [(12u64, 0u64), (32, 1)] {
+            code.extend(
+                encode(
+                    "EXP",
+                    "ENC_EXP",
+                    &[
+                        ("TGT", tgt),
+                        ("EN", 0xF),
+                        ("VSRC0", 6),
+                        ("VSRC1", 5),
+                        ("VSRC2", 3),
+                        ("VSRC3", 4),
+                        ("DONE", done),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn triangle_vs() -> VsInterface {
+        VsInterface {
+            inputs: vec![],
+            outputs: vec![
+                sig("SV_Position", 0, 1, 3, 0, 0xF),
+                sig("COLOR", 0, 0, 3, 1, 0xF),
+            ],
+            attr_base: 4,
+            params: None,
+        }
+    }
+
+    /// SCC through the scalar pair: scc = (s0 == s1), sdst = scc ? ssrc0 : ssrc1.
+    fn scalar_select_code() -> Vec<u8> {
+        let mut code = Vec::new();
+        for (sdst, src) in [(0u64, 135u64), (1, 135u64), (2, 136u64)] {
+            code.extend(
+                encode(
+                    "S_MOV_B32",
+                    "ENC_SOP1",
+                    &[("SDST", sdst), ("SSRC0", src)],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        // s0 == s1 (7 == 7): scc = 1, s3 = scc ? s0(7) : s2(8).
+        code.extend(
+            encode(
+                "S_CMP_EQ_U32",
+                "ENC_SOPC",
+                &[("SSRC0", 0), ("SSRC1", 1)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(
+            encode(
+                "S_CSELECT_B32",
+                "ENC_SOP2",
+                &[("SDST", 3), ("SSRC0", 0), ("SSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        // s0 == s2 (7 == 8): scc = 0, s4 = scc ? s0(7) : s2(8).
+        code.extend(
+            encode(
+                "S_CMP_EQ_U32",
+                "ENC_SOPC",
+                &[("SSRC0", 0), ("SSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(
+            encode(
+                "S_CSELECT_B32",
+                "ENC_SOP2",
+                &[("SDST", 4), ("SSRC0", 0), ("SSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn scalar_compare_select_completes() {
+        let code = scalar_select_code();
+        let vs = blit_vs();
+        let t = GlslVsBackend::translate_vs(&code, &vs, true).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported, t.glsl);
+        assert!(
+            t.glsl.contains("scc = ((s0 == s1) ? 1u : 0u);"),
+            "{}",
+            t.glsl
+        );
+        // Codebase convention (lower.rs, emit.rs): SCC-true picks SSRC0.
+        assert!(
+            t.glsl.contains("s3 = ((scc != 0u) ? s0 : s2);"),
+            "{}",
+            t.glsl
+        );
+        assert!(
+            t.glsl.contains("scc = ((s0 == s2) ? 1u : 0u);"),
+            "{}",
+            t.glsl
+        );
+        assert!(
+            t.glsl.contains("s4 = ((scc != 0u) ? s0 : s2);"),
+            "{}",
+            t.glsl
+        );
+    }
+
+    #[test]
+    fn triangle_vertexindex_select_emits_position() {
+        let code = triangle_code();
+        let vs = triangle_vs();
+        let t = GlslVsBackend::translate_vs(&code, &vs, true).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported, t.glsl);
+        assert!(t.glsl.contains("#version 450"), "{}", t.glsl);
+        assert!(t.glsl.contains("gl_Position"), "{}", t.glsl);
+        assert!(t.glsl.contains("gl_VertexIndex"), "{}", t.glsl);
+        assert!(t.glsl.contains("out_p0"), "{}", t.glsl);
+        // The compare writes the VCC homes; the selects read them.
+        assert!(
+            t.glsl.contains("s106 = ((1u == v0) ? 0xFFFFFFFFu : 0u);"),
+            "{}",
+            t.glsl
+        );
+        assert!(
+            t.glsl.contains("s106 = ((0u == v0) ? 0xFFFFFFFFu : 0u);"),
+            "{}",
+            t.glsl
+        );
+        assert!(t.glsl.contains("((s106 != 0u) ? v2 : v1)"), "{}", t.glsl);
+        // glslc bring-up check where available, else the structural assertions gate.
+        let Ok(which) = std::process::Command::new("glslc")
+            .arg("--version")
+            .output()
+        else {
+            println!("glslc not available – skipping compile, structural checks gate");
+            return;
+        };
+        if !which.status.success() {
+            println!("glslc not available – skipping compile, structural checks gate");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-glsl-tri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("tri.vert");
+        let spv = dir.join("tri.vert.spv");
+        std::fs::write(&src, &t.glsl).unwrap();
+        let out = std::process::Command::new("glslc")
+            .arg("-fshader-stage=vert")
+            .arg(&src)
+            .arg("-o")
+            .arg(&spv)
+            .output()
+            .expect("spawn glslc");
+        assert!(
+            out.status.success(),
+            "glslc failed: {}\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            t.glsl
+        );
+        assert!(
+            std::fs::metadata(&spv)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
+            "glslc produced no output"
+        );
+    }
+
     #[test]
     fn retail_blit_vs_glsl_opt_in() {
         let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else {
@@ -885,5 +1185,20 @@ mod tests {
             String::from_utf8_lossy(&out.stderr),
             t.glsl
         );
+    }
+
+    #[test]
+    fn shipped_path_spawns_no_compiler() {
+        // The shipped `translate_vs_glsl` must never spawn a process: no
+        // `Command` / `process` usage outside tests (tool names may appear in
+        // docs/comments, so only the spawn mechanism itself is gated).
+        let src = include_str!("glsl.rs");
+        let shipped = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for needle in ["Command::new", "std::process"] {
+            assert!(
+                !shipped.contains(needle),
+                "shipped GLSL path mentions {needle}"
+            );
+        }
     }
 }

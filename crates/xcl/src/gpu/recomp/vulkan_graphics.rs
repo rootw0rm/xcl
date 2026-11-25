@@ -345,7 +345,7 @@ pub fn green_fs_spv() -> Vec<u32> {
 /// Draw the title's `render_triangle` primitive offscreen: `vs_words` is the
 /// [`triangle_vs_spv`] Vertex words (entry `main`, `VertexIndex` input, no
 /// vertex buffers) and `fs_words` the [`green_fs_spv`] constant-green words.
-/// Same 64×64 image / render-pass / framebuffer / readback shape as
+/// Same 64x64 image / render-pass / framebuffer / readback shape as
 /// [`draw_offscreen`] but cleared to [`TRIANGLE_CLEAR`] blue and drawn with a
 /// bare 3-vertex `cmd_draw` (no vertex bindings). Center pixels prove the
 /// triangle rasterized, corners prove the clear survived.
@@ -363,6 +363,26 @@ pub fn draw_triangle_offscreen(
     if fs_words.len() < 5 || fs_words[0] != 0x0723_0203 {
         return Err("bad SPIR-V: missing magic (fs)".into());
     }
+    draw_common(vs_words, fs_words, None, TRIANGLE_CLEAR, "triangle")
+}
+
+/// Shared offscreen draw behind [`draw_offscreen`] and [`draw_triangle_offscreen`]:
+/// 64×64 `R8G8B8A8_UNORM` image + render pass (cleared to `clear_color`) +
+/// framebuffer, graphics pipeline from `vs_words` + `fs_words`, one draw, then
+/// image → host-visible readback. `vertices` supplies location-0 `vec4` vertex
+/// input (the blit path); `None` draws a bare 3-vertex triangle with no bindings
+/// (the `VertexIndex` path). `label` names the path in the log line only.
+///
+/// The wrappers above validate (`vs_words`/`fs_words` magic, 1..=1024 vertices);
+/// one draw; the fence wait is 5 s. Errors are `String`s, never panics; missing
+/// Vulkan / device errors start with `"no "`. No compiler, no process spawn.
+fn draw_common(
+    vs_words: &[u32],
+    fs_words: &[u32],
+    vertices: Option<&[[f32; 4]]>,
+    clear_color: [f32; 4],
+    label: &str,
+) -> Result<OffscreenPixels, String> {
     unsafe {
         let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
         let app = CString::new("xcl").unwrap();
@@ -382,7 +402,7 @@ pub fn draw_triangle_offscreen(
                 return Err(e);
             }
         };
-        eprintln!("vulkan: headless triangle on {name}");
+        eprintln!("vulkan: headless {label} on {name}");
         let fmt = ash::vk::Format::R8G8B8A8_UNORM;
         let fmt_props = instance.get_physical_device_format_properties(phys, fmt);
         let need = ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT
@@ -405,9 +425,11 @@ pub fn draw_triangle_offscreen(
             // Scoped teardown: every created handle is owned by `Scope` and
             // destroyed on drop, so an early `?` return cannot leak (same
             // pattern as the compute runner); `device` is destroyed by the
-            // outer closure after `Scope` drops, then `instance` below.
+            // outer closure below, then `instance` above.
             struct Scope<'a> {
                 device: &'a ash::Device,
+                vbuf: Option<ash::vk::Buffer>,
+                vbuf_mem: Option<ash::vk::DeviceMemory>,
                 img: Option<ash::vk::Image>,
                 img_mem: Option<ash::vk::DeviceMemory>,
                 view: Option<ash::vk::ImageView>,
@@ -465,12 +487,20 @@ pub fn draw_triangle_offscreen(
                         if let Some(m) = self.rbuf_mem.take() {
                             d.free_memory(m, None);
                         }
+                        if let Some(b) = self.vbuf.take() {
+                            d.destroy_buffer(b, None);
+                        }
+                        if let Some(m) = self.vbuf_mem.take() {
+                            d.free_memory(m, None);
+                        }
                     }
                 }
             }
             let out = (|| -> Result<OffscreenPixels, String> {
                 let mut scope = Scope {
                     device: &device,
+                    vbuf: None,
+                    vbuf_mem: None,
                     img: None,
                     img_mem: None,
                     view: None,
@@ -489,6 +519,40 @@ pub fn draw_triangle_offscreen(
                 let mem_props = instance.get_physical_device_memory_properties(phys);
                 let host_coherent = ash::vk::MemoryPropertyFlags::HOST_VISIBLE
                     | ash::vk::MemoryPropertyFlags::HOST_COHERENT;
+                // Vertex buffer: one location-0 vec4 per position, only when the
+                // caller supplies vertices; the VertexIndex path skips it.
+                if let Some(positions) = vertices {
+                    let vbytes = (positions.len() * 16) as u64;
+                    let vbuf_info = ash::vk::BufferCreateInfo::default()
+                        .size(vbytes)
+                        .usage(ash::vk::BufferUsageFlags::VERTEX_BUFFER)
+                        .sharing_mode(ash::vk::SharingMode::EXCLUSIVE);
+                    let vbuf = d
+                        .create_buffer(&vbuf_info, None)
+                        .map_err(|e| format!("create_buffer(vertex): {e}"))?;
+                    scope.vbuf = Some(vbuf);
+                    let vreq = d.get_buffer_memory_requirements(vbuf);
+                    let vmem_idx =
+                        find_memory_type(&mem_props, vreq.memory_type_bits, host_coherent)
+                            .ok_or_else(|| "no host-visible coherent memory type".to_string())?;
+                    let valloc = ash::vk::MemoryAllocateInfo::default()
+                        .allocation_size(vreq.size)
+                        .memory_type_index(vmem_idx);
+                    let vmem = d
+                        .allocate_memory(&valloc, None)
+                        .map_err(|e| format!("allocate_memory(vertex): {e}"))?;
+                    scope.vbuf_mem = Some(vmem);
+                    d.bind_buffer_memory(vbuf, vmem, 0)
+                        .map_err(|e| format!("bind_buffer_memory(vertex): {e}"))?;
+                    let vdst = d
+                        .map_memory(vmem, 0, vbytes, ash::vk::MemoryMapFlags::empty())
+                        .map_err(|e| format!("map_memory(vertex): {e}"))?
+                        as *mut f32;
+                    for (k, p) in positions.iter().enumerate() {
+                        std::ptr::copy_nonoverlapping(p.as_ptr(), vdst.add(k * 4), 4);
+                    }
+                    d.unmap_memory(vmem);
+                }
                 // Offscreen color image (device-local where available).
                 let img_info = ash::vk::ImageCreateInfo::default()
                     .image_type(ash::vk::ImageType::TYPE_2D)
@@ -544,7 +608,7 @@ pub fn draw_triangle_offscreen(
                     .create_image_view(&view_info, None)
                     .map_err(|e| format!("create_image_view: {e}"))?;
                 scope.view = Some(view);
-                // Render pass: clear to title blue, store for transfer-out.
+                // Render pass: clear the image, store it for transfer-out.
                 let attach = ash::vk::AttachmentDescription {
                     format: fmt,
                     samples: ash::vk::SampleCountFlags::TYPE_1,
@@ -580,8 +644,9 @@ pub fn draw_triangle_offscreen(
                     .create_framebuffer(&fbo_info, None)
                     .map_err(|e| format!("create_framebuffer: {e}"))?;
                 scope.fbo = Some(fbo);
-                // Graphics pipeline: caller VS words + caller FS words, no
-                // vertex input (bare `VertexIndex` draw), triangle list.
+                // Graphics pipeline: caller VS words + caller FS words; vertex
+                // input only when the caller supplies vertices, otherwise a
+                // bare `VertexIndex` draw with no bindings.
                 let layout_info = ash::vk::PipelineLayoutCreateInfo::default();
                 let layout = d
                     .create_pipeline_layout(&layout_info, None)
@@ -607,7 +672,26 @@ pub fn draw_triangle_offscreen(
                     .module(fs_mod)
                     .name(&entry_name);
                 let stages = [vs_stage, fs_stage];
-                let vi_info = ash::vk::PipelineVertexInputStateCreateInfo::default();
+                let binding = ash::vk::VertexInputBindingDescription {
+                    binding: 0,
+                    stride: 16,
+                    input_rate: ash::vk::VertexInputRate::VERTEX,
+                };
+                let attr = ash::vk::VertexInputAttributeDescription {
+                    location: 0,
+                    binding: 0,
+                    format: ash::vk::Format::R32G32B32A32_SFLOAT,
+                    offset: 0,
+                };
+                let vi_none = ash::vk::PipelineVertexInputStateCreateInfo::default();
+                let vi_some = ash::vk::PipelineVertexInputStateCreateInfo::default()
+                    .vertex_binding_descriptions(std::slice::from_ref(&binding))
+                    .vertex_attribute_descriptions(std::slice::from_ref(&attr));
+                let vi_info = if vertices.is_some() {
+                    &vi_some
+                } else {
+                    &vi_none
+                };
                 let ia_info = ash::vk::PipelineInputAssemblyStateCreateInfo::default()
                     .topology(ash::vk::PrimitiveTopology::TRIANGLE_LIST);
                 let vp = ash::vk::Viewport {
@@ -646,7 +730,7 @@ pub fn draw_triangle_offscreen(
                     .attachments(std::slice::from_ref(&blend_attach));
                 let pipe_info = ash::vk::GraphicsPipelineCreateInfo::default()
                     .stages(&stages)
-                    .vertex_input_state(&vi_info)
+                    .vertex_input_state(vi_info)
                     .input_assembly_state(&ia_info)
                     .viewport_state(&vp_info)
                     .rasterization_state(&rs_info)
@@ -703,7 +787,7 @@ pub fn draw_triangle_offscreen(
                     .map_err(|e| format!("begin_command_buffer: {e}"))?;
                 let clear = ash::vk::ClearValue {
                     color: ash::vk::ClearColorValue {
-                        float32: TRIANGLE_CLEAR,
+                        float32: clear_color,
                     },
                 };
                 let rp_begin = ash::vk::RenderPassBeginInfo::default()
@@ -719,7 +803,15 @@ pub fn draw_triangle_offscreen(
                     .clear_values(std::slice::from_ref(&clear));
                 d.cmd_begin_render_pass(cmds[0], &rp_begin, ash::vk::SubpassContents::INLINE);
                 d.cmd_bind_pipeline(cmds[0], ash::vk::PipelineBindPoint::GRAPHICS, pipes[0]);
-                d.cmd_draw(cmds[0], 3, 1, 0, 0);
+                match (vertices, scope.vbuf) {
+                    (Some(positions), Some(vbuf)) => {
+                        d.cmd_bind_vertex_buffers(cmds[0], 0, &[vbuf], &[0]);
+                        d.cmd_draw(cmds[0], positions.len() as u32, 1, 0, 0);
+                    }
+                    _ => {
+                        d.cmd_draw(cmds[0], 3, 1, 0, 0);
+                    }
+                }
                 d.cmd_end_render_pass(cmds[0]);
                 let barrier = ash::vk::ImageMemoryBarrier::default()
                     .src_access_mask(ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
@@ -829,501 +921,7 @@ pub fn draw_offscreen(vs_words: &[u32], positions: &[[f32; 4]]) -> Result<Offscr
         ));
     }
     let fs_words = trivial_fs_spv();
-    unsafe {
-        let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
-        let app = CString::new("xcl").unwrap();
-        let app_info = ash::vk::ApplicationInfo::default()
-            .application_name(&app)
-            .api_version(ash::vk::make_api_version(0, 1, 3, 0));
-        let create = ash::vk::InstanceCreateInfo::default().application_info(&app_info);
-        let instance = entry
-            .create_instance(&create, None)
-            .map_err(|e| format!("no Vulkan: create_instance: {e}"))?;
-        // One instance for the whole draw: `pick_graphics_device` reuses the
-        // runner's shared query, never a second throwaway instance.
-        let (phys, qfi, name, _subgroup) = match pick_graphics_device(&instance) {
-            Ok(v) => v,
-            Err(e) => {
-                instance.destroy_instance(None);
-                return Err(e);
-            }
-        };
-        eprintln!("vulkan: headless graphics on {name}");
-        let fmt = ash::vk::Format::R8G8B8A8_UNORM;
-        let fmt_props = instance.get_physical_device_format_properties(phys, fmt);
-        let need = ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT
-            | ash::vk::FormatFeatureFlags::TRANSFER_SRC;
-        if !fmt_props.optimal_tiling_features.contains(need) {
-            instance.destroy_instance(None);
-            return Err("no device: R8G8B8A8_UNORM lacks color-attachment+transfer-src".into());
-        }
-        let run = || -> Result<OffscreenPixels, String> {
-            let prio = [1.0f32];
-            let queue_info = ash::vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(qfi)
-                .queue_priorities(&prio);
-            let dev_info = ash::vk::DeviceCreateInfo::default()
-                .queue_create_infos(std::slice::from_ref(&queue_info));
-            let device = instance
-                .create_device(phys, &dev_info, None)
-                .map_err(|e| format!("create_device: {e}"))?;
-            let queue = device.get_device_queue(qfi, 0);
-            // Scoped teardown: every created handle is owned by `Scope` and
-            // destroyed on drop, so an early `?` return cannot leak (same
-            // pattern as the compute runner).
-            struct Scope<'a> {
-                device: &'a ash::Device,
-                vbuf: Option<ash::vk::Buffer>,
-                vbuf_mem: Option<ash::vk::DeviceMemory>,
-                img: Option<ash::vk::Image>,
-                img_mem: Option<ash::vk::DeviceMemory>,
-                view: Option<ash::vk::ImageView>,
-                rp: Option<ash::vk::RenderPass>,
-                fbo: Option<ash::vk::Framebuffer>,
-                layout: Option<ash::vk::PipelineLayout>,
-                vs_mod: Option<ash::vk::ShaderModule>,
-                fs_mod: Option<ash::vk::ShaderModule>,
-                pipe: Option<ash::vk::Pipeline>,
-                pool: Option<ash::vk::CommandPool>,
-                rbuf: Option<ash::vk::Buffer>,
-                rbuf_mem: Option<ash::vk::DeviceMemory>,
-                fence: Option<ash::vk::Fence>,
-            }
-            impl Drop for Scope<'_> {
-                fn drop(&mut self) {
-                    let d = self.device;
-                    unsafe {
-                        if let Some(f) = self.fence.take() {
-                            d.destroy_fence(f, None);
-                        }
-                        if let Some(p) = self.pool.take() {
-                            d.destroy_command_pool(p, None);
-                        }
-                        if let Some(p) = self.pipe.take() {
-                            d.destroy_pipeline(p, None);
-                        }
-                        if let Some(m) = self.fs_mod.take() {
-                            d.destroy_shader_module(m, None);
-                        }
-                        if let Some(m) = self.vs_mod.take() {
-                            d.destroy_shader_module(m, None);
-                        }
-                        if let Some(l) = self.layout.take() {
-                            d.destroy_pipeline_layout(l, None);
-                        }
-                        if let Some(f) = self.fbo.take() {
-                            d.destroy_framebuffer(f, None);
-                        }
-                        if let Some(r) = self.rp.take() {
-                            d.destroy_render_pass(r, None);
-                        }
-                        if let Some(v) = self.view.take() {
-                            d.destroy_image_view(v, None);
-                        }
-                        if let Some(i) = self.img.take() {
-                            d.destroy_image(i, None);
-                        }
-                        if let Some(m) = self.img_mem.take() {
-                            d.free_memory(m, None);
-                        }
-                        if let Some(b) = self.rbuf.take() {
-                            d.destroy_buffer(b, None);
-                        }
-                        if let Some(m) = self.rbuf_mem.take() {
-                            d.free_memory(m, None);
-                        }
-                        if let Some(b) = self.vbuf.take() {
-                            d.destroy_buffer(b, None);
-                        }
-                        if let Some(m) = self.vbuf_mem.take() {
-                            d.free_memory(m, None);
-                        }
-                    }
-                }
-            }
-            let out = (|| -> Result<OffscreenPixels, String> {
-                let mut scope = Scope {
-                    device: &device,
-                    vbuf: None,
-                    vbuf_mem: None,
-                    img: None,
-                    img_mem: None,
-                    view: None,
-                    rp: None,
-                    fbo: None,
-                    layout: None,
-                    vs_mod: None,
-                    fs_mod: None,
-                    pipe: None,
-                    pool: None,
-                    rbuf: None,
-                    rbuf_mem: None,
-                    fence: None,
-                };
-                let d = scope.device;
-                let mem_props = instance.get_physical_device_memory_properties(phys);
-                let host_coherent = ash::vk::MemoryPropertyFlags::HOST_VISIBLE
-                    | ash::vk::MemoryPropertyFlags::HOST_COHERENT;
-                // Vertex buffer: one location-0 vec4 per position.
-                let vbytes = (positions.len() * 16) as u64;
-                let vbuf_info = ash::vk::BufferCreateInfo::default()
-                    .size(vbytes)
-                    .usage(ash::vk::BufferUsageFlags::VERTEX_BUFFER)
-                    .sharing_mode(ash::vk::SharingMode::EXCLUSIVE);
-                let vbuf = d
-                    .create_buffer(&vbuf_info, None)
-                    .map_err(|e| format!("create_buffer(vertex): {e}"))?;
-                scope.vbuf = Some(vbuf);
-                let vreq = d.get_buffer_memory_requirements(vbuf);
-                let vmem_idx = find_memory_type(&mem_props, vreq.memory_type_bits, host_coherent)
-                    .ok_or_else(|| "no host-visible coherent memory type".to_string())?;
-                let valloc = ash::vk::MemoryAllocateInfo::default()
-                    .allocation_size(vreq.size)
-                    .memory_type_index(vmem_idx);
-                let vmem = d
-                    .allocate_memory(&valloc, None)
-                    .map_err(|e| format!("allocate_memory(vertex): {e}"))?;
-                scope.vbuf_mem = Some(vmem);
-                d.bind_buffer_memory(vbuf, vmem, 0)
-                    .map_err(|e| format!("bind_buffer_memory(vertex): {e}"))?;
-                let vdst = d
-                    .map_memory(vmem, 0, vbytes, ash::vk::MemoryMapFlags::empty())
-                    .map_err(|e| format!("map_memory(vertex): {e}"))?
-                    as *mut f32;
-                for (k, p) in positions.iter().enumerate() {
-                    std::ptr::copy_nonoverlapping(p.as_ptr(), vdst.add(k * 4), 4);
-                }
-                d.unmap_memory(vmem);
-                // Offscreen color image (device-local where available).
-                let img_info = ash::vk::ImageCreateInfo::default()
-                    .image_type(ash::vk::ImageType::TYPE_2D)
-                    .format(fmt)
-                    .extent(ash::vk::Extent3D {
-                        width: IMAGE_W,
-                        height: IMAGE_H,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(ash::vk::SampleCountFlags::TYPE_1)
-                    .tiling(ash::vk::ImageTiling::OPTIMAL)
-                    .usage(
-                        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
-                            | ash::vk::ImageUsageFlags::TRANSFER_SRC,
-                    )
-                    .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
-                    .initial_layout(ash::vk::ImageLayout::UNDEFINED);
-                let img = d
-                    .create_image(&img_info, None)
-                    .map_err(|e| format!("create_image: {e}"))?;
-                scope.img = Some(img);
-                let ireq = d.get_image_memory_requirements(img);
-                let idev_local = ash::vk::MemoryPropertyFlags::DEVICE_LOCAL;
-                let imem_idx = find_memory_type(&mem_props, ireq.memory_type_bits, idev_local)
-                    .or_else(|| {
-                        (0..mem_props.memory_type_count)
-                            .find(|i| ireq.memory_type_bits & (1 << i) != 0)
-                    })
-                    .ok_or_else(|| "no image memory type".to_string())?;
-                let ialloc = ash::vk::MemoryAllocateInfo::default()
-                    .allocation_size(ireq.size)
-                    .memory_type_index(imem_idx);
-                let imem = d
-                    .allocate_memory(&ialloc, None)
-                    .map_err(|e| format!("allocate_memory(image): {e}"))?;
-                scope.img_mem = Some(imem);
-                d.bind_image_memory(img, imem, 0)
-                    .map_err(|e| format!("bind_image_memory: {e}"))?;
-                let view_info = ash::vk::ImageViewCreateInfo::default()
-                    .image(img)
-                    .view_type(ash::vk::ImageViewType::TYPE_2D)
-                    .format(fmt)
-                    .subresource_range(ash::vk::ImageSubresourceRange {
-                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    });
-                let view = d
-                    .create_image_view(&view_info, None)
-                    .map_err(|e| format!("create_image_view: {e}"))?;
-                scope.view = Some(view);
-                // Render pass: clear the image, store it for transfer-out.
-                let attach = ash::vk::AttachmentDescription {
-                    format: fmt,
-                    samples: ash::vk::SampleCountFlags::TYPE_1,
-                    load_op: ash::vk::AttachmentLoadOp::CLEAR,
-                    store_op: ash::vk::AttachmentStoreOp::STORE,
-                    stencil_load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
-                    stencil_store_op: ash::vk::AttachmentStoreOp::DONT_CARE,
-                    initial_layout: ash::vk::ImageLayout::UNDEFINED,
-                    final_layout: ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    ..Default::default()
-                };
-                let color_ref = ash::vk::AttachmentReference {
-                    attachment: 0,
-                    layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                };
-                let subpass = ash::vk::SubpassDescription::default()
-                    .pipeline_bind_point(ash::vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(std::slice::from_ref(&color_ref));
-                let rp_info = ash::vk::RenderPassCreateInfo::default()
-                    .attachments(std::slice::from_ref(&attach))
-                    .subpasses(std::slice::from_ref(&subpass));
-                let rp = d
-                    .create_render_pass(&rp_info, None)
-                    .map_err(|e| format!("create_render_pass: {e}"))?;
-                scope.rp = Some(rp);
-                let fbo_info = ash::vk::FramebufferCreateInfo::default()
-                    .render_pass(rp)
-                    .attachments(std::slice::from_ref(&view))
-                    .width(IMAGE_W)
-                    .height(IMAGE_H)
-                    .layers(1);
-                let fbo = d
-                    .create_framebuffer(&fbo_info, None)
-                    .map_err(|e| format!("create_framebuffer: {e}"))?;
-                scope.fbo = Some(fbo);
-                // Graphics pipeline: caller VS words + trivial FS, one
-                // location-0 vec4 vertex input, triangle list, no culling.
-                let layout_info = ash::vk::PipelineLayoutCreateInfo::default();
-                let layout = d
-                    .create_pipeline_layout(&layout_info, None)
-                    .map_err(|e| format!("create_pipeline_layout: {e}"))?;
-                scope.layout = Some(layout);
-                let vs_info = ash::vk::ShaderModuleCreateInfo::default().code(vs_words);
-                let vs_mod = d
-                    .create_shader_module(&vs_info, None)
-                    .map_err(|e| format!("create_shader_module(vs): {e}"))?;
-                scope.vs_mod = Some(vs_mod);
-                let fs_info = ash::vk::ShaderModuleCreateInfo::default().code(&fs_words);
-                let fs_mod = d
-                    .create_shader_module(&fs_info, None)
-                    .map_err(|e| format!("create_shader_module(fs): {e}"))?;
-                scope.fs_mod = Some(fs_mod);
-                let entry_name = CString::new("main").unwrap();
-                let vs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
-                    .stage(ash::vk::ShaderStageFlags::VERTEX)
-                    .module(vs_mod)
-                    .name(&entry_name);
-                let fs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
-                    .stage(ash::vk::ShaderStageFlags::FRAGMENT)
-                    .module(fs_mod)
-                    .name(&entry_name);
-                let stages = [vs_stage, fs_stage];
-                let binding = ash::vk::VertexInputBindingDescription {
-                    binding: 0,
-                    stride: 16,
-                    input_rate: ash::vk::VertexInputRate::VERTEX,
-                };
-                let attr = ash::vk::VertexInputAttributeDescription {
-                    location: 0,
-                    binding: 0,
-                    format: ash::vk::Format::R32G32B32A32_SFLOAT,
-                    offset: 0,
-                };
-                let vi_info = ash::vk::PipelineVertexInputStateCreateInfo::default()
-                    .vertex_binding_descriptions(std::slice::from_ref(&binding))
-                    .vertex_attribute_descriptions(std::slice::from_ref(&attr));
-                let ia_info = ash::vk::PipelineInputAssemblyStateCreateInfo::default()
-                    .topology(ash::vk::PrimitiveTopology::TRIANGLE_LIST);
-                let vp = ash::vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: IMAGE_W as f32,
-                    height: IMAGE_H as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                };
-                let scissor = ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D { x: 0, y: 0 },
-                    extent: ash::vk::Extent2D {
-                        width: IMAGE_W,
-                        height: IMAGE_H,
-                    },
-                };
-                let vp_info = ash::vk::PipelineViewportStateCreateInfo::default()
-                    .viewports(std::slice::from_ref(&vp))
-                    .scissors(std::slice::from_ref(&scissor));
-                let rs_info = ash::vk::PipelineRasterizationStateCreateInfo::default()
-                    .polygon_mode(ash::vk::PolygonMode::FILL)
-                    .cull_mode(ash::vk::CullModeFlags::NONE)
-                    .front_face(ash::vk::FrontFace::COUNTER_CLOCKWISE)
-                    .line_width(1.0);
-                let ms_info = ash::vk::PipelineMultisampleStateCreateInfo::default()
-                    .rasterization_samples(ash::vk::SampleCountFlags::TYPE_1);
-                let blend_attach = ash::vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(
-                        ash::vk::ColorComponentFlags::R
-                            | ash::vk::ColorComponentFlags::G
-                            | ash::vk::ColorComponentFlags::B
-                            | ash::vk::ColorComponentFlags::A,
-                    );
-                let cb_info = ash::vk::PipelineColorBlendStateCreateInfo::default()
-                    .attachments(std::slice::from_ref(&blend_attach));
-                let pipe_info = ash::vk::GraphicsPipelineCreateInfo::default()
-                    .stages(&stages)
-                    .vertex_input_state(&vi_info)
-                    .input_assembly_state(&ia_info)
-                    .viewport_state(&vp_info)
-                    .rasterization_state(&rs_info)
-                    .multisample_state(&ms_info)
-                    .color_blend_state(&cb_info)
-                    .layout(layout)
-                    .render_pass(rp)
-                    .subpass(0);
-                let pipes = d
-                    .create_graphics_pipelines(ash::vk::PipelineCache::null(), &[pipe_info], None)
-                    .map_err(|e| format!("create_graphics_pipelines: {e:?}"))?;
-                scope.pipe = Some(pipes[0]);
-                // Readback buffer (host-visible + coherent so the fence wait
-                // publishes the copy).
-                let rbytes = (IMAGE_W * IMAGE_H * 4) as u64;
-                let rbuf_info = ash::vk::BufferCreateInfo::default()
-                    .size(rbytes)
-                    .usage(ash::vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(ash::vk::SharingMode::EXCLUSIVE);
-                let rbuf = d
-                    .create_buffer(&rbuf_info, None)
-                    .map_err(|e| format!("create_buffer(readback): {e}"))?;
-                scope.rbuf = Some(rbuf);
-                let rreq = d.get_buffer_memory_requirements(rbuf);
-                let rmem_idx = find_memory_type(&mem_props, rreq.memory_type_bits, host_coherent)
-                    .ok_or_else(|| "no host-visible coherent memory type".to_string())?;
-                let ralloc = ash::vk::MemoryAllocateInfo::default()
-                    .allocation_size(rreq.size)
-                    .memory_type_index(rmem_idx);
-                let rmem = d
-                    .allocate_memory(&ralloc, None)
-                    .map_err(|e| format!("allocate_memory(readback): {e}"))?;
-                scope.rbuf_mem = Some(rmem);
-                d.bind_buffer_memory(rbuf, rmem, 0)
-                    .map_err(|e| format!("bind_buffer_memory(readback): {e}"))?;
-                // Record: clear, draw, barrier, copy out.
-                let pool_info = ash::vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(qfi)
-                    .flags(ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-                let pool = d
-                    .create_command_pool(&pool_info, None)
-                    .map_err(|e| format!("create_command_pool: {e}"))?;
-                scope.pool = Some(pool);
-                let cmd_alloc = ash::vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(ash::vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1);
-                let cmds = d
-                    .allocate_command_buffers(&cmd_alloc)
-                    .map_err(|e| format!("allocate_command_buffers: {e}"))?;
-                let begin = ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                d.begin_command_buffer(cmds[0], &begin)
-                    .map_err(|e| format!("begin_command_buffer: {e}"))?;
-                let clear = ash::vk::ClearValue {
-                    color: ash::vk::ClearColorValue { float32: CLEAR },
-                };
-                let rp_begin = ash::vk::RenderPassBeginInfo::default()
-                    .render_pass(rp)
-                    .framebuffer(fbo)
-                    .render_area(ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D { x: 0, y: 0 },
-                        extent: ash::vk::Extent2D {
-                            width: IMAGE_W,
-                            height: IMAGE_H,
-                        },
-                    })
-                    .clear_values(std::slice::from_ref(&clear));
-                d.cmd_begin_render_pass(cmds[0], &rp_begin, ash::vk::SubpassContents::INLINE);
-                d.cmd_bind_pipeline(cmds[0], ash::vk::PipelineBindPoint::GRAPHICS, pipes[0]);
-                d.cmd_bind_vertex_buffers(cmds[0], 0, &[vbuf], &[0]);
-                d.cmd_draw(cmds[0], positions.len() as u32, 1, 0, 0);
-                d.cmd_end_render_pass(cmds[0]);
-                let barrier = ash::vk::ImageMemoryBarrier::default()
-                    .src_access_mask(ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
-                    .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(ash::vk::ImageSubresourceRange {
-                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    });
-                d.cmd_pipeline_barrier(
-                    cmds[0],
-                    ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    ash::vk::PipelineStageFlags::TRANSFER,
-                    ash::vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier],
-                );
-                let region = ash::vk::BufferImageCopy {
-                    buffer_offset: 0,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: ash::vk::ImageSubresourceLayers {
-                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    image_offset: ash::vk::Offset3D { x: 0, y: 0, z: 0 },
-                    image_extent: ash::vk::Extent3D {
-                        width: IMAGE_W,
-                        height: IMAGE_H,
-                        depth: 1,
-                    },
-                };
-                d.cmd_copy_image_to_buffer(
-                    cmds[0],
-                    img,
-                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    rbuf,
-                    &[region],
-                );
-                d.end_command_buffer(cmds[0])
-                    .map_err(|e| format!("end_command_buffer: {e}"))?;
-                let fence_info = ash::vk::FenceCreateInfo::default();
-                let fence = d
-                    .create_fence(&fence_info, None)
-                    .map_err(|e| format!("create_fence: {e}"))?;
-                scope.fence = Some(fence);
-                let submit =
-                    ash::vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmds[0]));
-                d.queue_submit(queue, &[submit], fence)
-                    .map_err(|e| format!("queue_submit: {e}"))?;
-                let waited = d.wait_for_fences(&[fence], true, 5_000_000_000);
-                if waited.is_ok() {
-                    let src = d
-                        .map_memory(rmem, 0, rbytes, ash::vk::MemoryMapFlags::empty())
-                        .map_err(|e| format!("map_memory(readback): {e}"))?
-                        as *const u8;
-                    let mut v = vec![0u8; rbytes as usize];
-                    std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), v.len());
-                    d.unmap_memory(rmem);
-                    Ok(OffscreenPixels {
-                        width: IMAGE_W,
-                        height: IMAGE_H,
-                        rgba: v,
-                    })
-                } else {
-                    Err(format!("wait_for_fences: {waited:?}"))
-                }
-                // `scope` drops here and destroys every handle above; `device`
-                // is destroyed by the outer closure below.
-            })();
-            device.destroy_device(None);
-            out
-        };
-        let out = run();
-        instance.destroy_instance(None);
-        out
-    }
+    draw_common(vs_words, &fs_words, Some(positions), CLEAR, "graphics")
 }
 
 #[cfg(test)]
@@ -1695,6 +1293,168 @@ mod tests {
         let vs = triangle_vs_spv();
         let fs = green_fs_spv();
         let px = match draw_triangle_offscreen(&vs, &fs) {
+            Ok(px) => px,
+            Err(e) if e.starts_with("no ") => {
+                skip_test("no GPU");
+                return;
+            }
+            Err(e) => panic!("draw_triangle_offscreen failed: {e}"),
+        };
+        assert_eq!((px.width, px.height), (IMAGE_W, IMAGE_H));
+        assert_eq!(px.rgba.len(), (IMAGE_W * IMAGE_H * 4) as usize);
+        let at = |x: u32, y: u32| -> [u8; 4] {
+            let k = ((y * IMAGE_W + x) * 4) as usize;
+            [px.rgba[k], px.rgba[k + 1], px.rgba[k + 2], px.rgba[k + 3]]
+        };
+        // Center: NDC ≈ (+0.0156, +0.0156) is inside
+        // (-0.5,-0.5)/(0,0.5)/(0.5,-0.5), so the constant-green FS paints it.
+        for (x, y) in [(32u32, 32u32), (31, 31), (33, 33), (32, 31)] {
+            assert_eq!(at(x, y), [0, 255, 0, 255], "center pixel ({x}, {y})");
+        }
+        // Corners: NDC (±1, ±1) sits outside the title triangle, so the blue
+        // clear shows through (the title's `corner == [0, 0, 255, 255]`).
+        for (x, y) in [(1u32, 1u32), (62, 1), (1, 62), (62, 62)] {
+            assert_eq!(at(x, y), [0, 0, 255, 255], "corner pixel ({x}, {y})");
+        }
+    }
+
+    /// Synthetic RDNA2 through the in-process SPIR-V backend (not hand-assembled
+    /// words): the same VertexIndex-indexed constant-select triangle the backend
+    /// gates cover — `y = is1 ? 0.5 : -0.5`, `x = is0 ? -0.5 : (is1 ? 0 : 0.5)`.
+    fn recomp_triangle_code() -> Vec<u8> {
+        // v0 holds VertexIndex (bring-up init); z = 0, w = 1.
+        let mut code = Vec::new();
+        // Materialize float-bit constants (inline-constant operand codes).
+        for (vdst, src) in [
+            (1u64, 241u64), // -0.5
+            (2, 240u64),    // 0.5
+            (3, 128u64),    // 0.0
+            (4, 242u64),    // 1.0
+        ] {
+            code.extend(
+                encode(
+                    "V_MOV_B32",
+                    "ENC_VOP1",
+                    &[("VDST", vdst), ("SRC0", src)],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        // vcc = (vid == 1).
+        code.extend(
+            encode(
+                "V_CMP_EQ_U32",
+                "ENC_VOPC",
+                &[("SRC0", 129), ("VSRC1", 0)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v5 = vcc ? v2(0.5) : v1(-0.5)  → y.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 5), ("SRC0", 257), ("VSRC1", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v6 = vcc ? v3(0.0) : v2(0.5)  → x so far.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 6), ("SRC0", 258), ("VSRC1", 3)],
+                None,
+            )
+            .unwrap(),
+        );
+        // vcc = (vid == 0).
+        code.extend(
+            encode(
+                "V_CMP_EQ_U32",
+                "ENC_VOPC",
+                &[("SRC0", 128), ("VSRC1", 0)],
+                None,
+            )
+            .unwrap(),
+        );
+        // v6 = vcc ? v1(-0.5) : v6  → x.
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP2",
+                &[("VDST", 6), ("SRC0", 262), ("VSRC1", 1)],
+                None,
+            )
+            .unwrap(),
+        );
+        // pos = (x, y, 0, 1), no params (the constant-green FS takes none).
+        code.extend(
+            encode(
+                "EXP",
+                "ENC_EXP",
+                &[
+                    ("TGT", 12),
+                    ("EN", 0xF),
+                    ("VSRC0", 6),
+                    ("VSRC1", 5),
+                    ("VSRC2", 3),
+                    ("VSRC3", 4),
+                    ("DONE", 1),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn recomp_triangle_vs() -> VsInterface {
+        VsInterface {
+            inputs: vec![],
+            outputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+            attr_base: 4,
+            params: None,
+        }
+    }
+
+    #[test]
+    fn recomp_triangle_draws_center_green_corner_blue() {
+        // The recompiler-driven title primitive: synthetic RDNA2 through the same
+        // in-process SPIR-V backend + interface the SPIR-V gate checks, executed
+        // through the bare `VertexIndex` path with the constant-green FS.
+        let code = recomp_triangle_code();
+        let vs = recomp_triangle_vs();
+        let t = SpirvVsBackend::translate_vs(&code, &vs, true).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        // Position-output/coverage equivalent of the GLSL gate: a Vertex entry,
+        // Position + VertexIndex builtins, two compares, three corner selects.
+        let ops = word_ops(&t.words);
+        let has =
+            |op: u16, pred: &dyn Fn(&[u32]) -> bool| ops.iter().any(|(o, a)| *o == op && pred(a));
+        assert!(
+            has(OP_ENTRY_POINT, &|a| !a.is_empty()
+                && a[0] == EXEC_MODEL_VERTEX),
+            "missing Vertex entry point"
+        );
+        assert!(
+            has(OP_DECORATE, &|a| a.len() == 3
+                && a[1] == DECOR_BUILTIN
+                && a[2] == BUILTIN_POSITION),
+            "missing Position builtin"
+        );
+        assert!(
+            has(OP_DECORATE, &|a| a.len() == 3
+                && a[1] == DECOR_BUILTIN
+                && a[2] == BUILTIN_VERTEX_INDEX),
+            "missing VertexIndex builtin"
+        );
+        let fs = green_fs_spv();
+        let px = match draw_triangle_offscreen(&t.words, &fs) {
             Ok(px) => px,
             Err(e) if e.starts_with("no ") => {
                 skip_test("no GPU");

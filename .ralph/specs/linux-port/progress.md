@@ -1696,3 +1696,54 @@ pass: plan.md 17c marked LANDED + new 17d section + Plan Changes entry; context.
 DEC-027 recorded. Full step-17 present stays provisional after 17d (windowed smoke cannot execute on this
 headless host). Steps 17-21 stay chained behind SKIPPED step-12; Phase E/F remain blocked per §4.7. No code
 changes in this planner pass.
+
+## Builder — step-17d recomp-triangle (2026-11-25, `linux` @ `b19f554` + this change)
+
+Task `task-1795573726-6781` (`linux:recomp-triangle`, DEC-027). Narrow compare +
+cndmask/select extension in both recompiler backends (scalar-element only), driven by a
+synthetic RDNA2 VertexIndex-indexed triangle (no retail, no game files):
+
+- `glsl.rs`: `S_CMP_EQ_U32` (SOPC → `scc`), `S_CSELECT_B32` (SOP2, SCC-true picks
+  SSRC0 per the GPU-verified lower.rs/emit.rs convention), `V_CMP_EQ_U32` (VOPC →
+  VCC homes `s106`/`s107`), `V_CNDMASK_B32` (VOP2 only, VCC-true picks VSRC1 per
+  lower.rs F32_COMPARES; VOP3/CMPX/SDWA/DPP stay recorded-unsupported). New tests:
+  scalar-pair completes, triangle completes with `gl_Position` + `gl_VertexIndex` +
+  VCC-home asserts + real `glslc` gate, shipped-path no-spawn audit.
+- `spirv.rs`: same four arms (`OpIEqual`/`OpINotEqual` + `OpSelect`; VCC lo mask in
+  sgpr 106, hi 0; SCC as uint 0/1). New tests: scalar-pair structural (`OpIEqual` +
+  `OpSelect` counts), triangle structural + real `spirv-val` gate, GLSL/SPIR-V parity
+  (instruction counts, param Location 0, `gl_Position`/`out_p0` contract).
+- `vulkan_graphics.rs`: folded the 17c duplication follow-up — `draw_offscreen` +
+  `draw_triangle_offscreen` are now thin wrappers (original validation strings kept)
+  over a unified `draw_common` (image/render-pass/framebuffer/readback + optional
+  vertex input); net −403 lines. New test `recomp_triangle_draws_center_green_corner_blue`:
+  synthetic RDNA2 → `translate_vs_spirv` → bare-`VertexIndex` draw + `green_fs_spv`,
+  center-green/corner-blue exact asserts (tolerance-band follow-up stays deferred).
+- No `TRANSLATOR_SOURCES` change (backends outside the hash list; `git diff` on
+  `build.rs`/`mod.rs`/`Cargo.toml`/`Cargo.lock` empty), no new deps (ash only), shipped
+  path spawns nothing (all `Command`/`process` under `#[cfg(test)]`).
+
+Verification (isolated worktree at `b19f554` + this diff only — a concurrent upstream-sync
+merge held the shared tree mid-merge during the build, so all compilation ran isolated;
+shared-tree files byte-identical to the verified worktree):
+- `cargo test -p xcl --lib gpu::recomp::` → 174 passed, 0 failed, 1 ignored (glsl 5,
+  spirv 7, graphics 10 passed — real Arc A770 dispatch, subgroupSize 32, real
+  `glslc`/`spirv-val` gates, no skip).
+- `cargo test -p xcl --lib` → 490 passed, 0 failed, 1 ignored (upstream sync added 9).
+- `cargo check --workspace` → 0 errors; `cargo clippy -p xcl --lib` → 0 errors.
+- `rustfmt --check` clean on `glsl.rs` + `spirv.rs` + `vulkan_graphics.rs`;
+  `git diff --check` clean.
+- Cross-built synthetic title (prebuilt Nov-24 PEs — testtitle sources untouched by this
+  slice or the sync; fresh `/tmp/17d-game`, fresh `XCL_DATA_ROOT` per run):
+  `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `exit_code: 12`,
+  `crash: null`, `called_stubs: 29` (28 `d3d12_xs` + `XclDefinitelyMissingFunction`
+  probe, zero `mfplat`/`xcrdapi`/`FormatMessage`), `[PASS] DirectStorage` +
+  `[PASS] MFPlat` (+ XAudio2) hold — matches the 12g/13/14/15/16/17a/17b/17c baseline.
+  `XCL_VULKAN_BACKEND=vulkan` → single `split-32 lane path` line, still 12/0xc/29
+  (null device returned); `XCL_VULKAN_BACKEND=bogus` → null, 12/0xc/29.
+
+## Follow-ups (minor, no new task)
+- The scalar pair is exercised only on SGPR constants; a future slice routing a real
+  fetch-shader SGPR through `S_CMP`/`S_CSELECT` (or rejecting it) can extend the gate.
+- `VsBackend` still lives beside `HlslVsBackend` in `mod.rs` (step-13 review note);
+  revisit when the fourth backend or the PSO cache lands.
