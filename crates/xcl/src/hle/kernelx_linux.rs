@@ -3898,6 +3898,73 @@ unsafe fn ansi_str(p: *const u8) -> Option<String> {
     from_ansi_ptr(p)
 }
 
+/// Crash-safe read of `out.len()` guest bytes at `addr` through
+/// `pread(/proc/self/mem)`: the OS checks the caller-supplied guest address, so
+/// an unmapped or unreadable range fails instead of faulting this process.
+/// Same syscall-only discipline as `crate::eh`'s `copy_stack`/`code_at`.
+fn guest_read_exact(addr: usize, out: &mut [u8]) -> bool {
+    if out.is_empty() {
+        return true;
+    }
+    const PATH: &[u8] = b"/proc/self/mem\0";
+    let fd =
+        unsafe { libc::open(PATH.as_ptr() as *const libc::c_char, libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return false;
+    }
+    let mut off = 0usize;
+    while off < out.len() {
+        let r = unsafe {
+            libc::pread(
+                fd,
+                out.as_mut_ptr().add(off) as *mut libc::c_void,
+                out.len() - off,
+                addr.wrapping_add(off) as libc::off_t,
+            )
+        };
+        if r == 0 {
+            break;
+        }
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        off += r as usize;
+    }
+    unsafe { libc::close(fd) };
+    off == out.len()
+}
+
+/// Read-only fields covered by `CREATEFILE2_EXTENDED_PARAMETERS::dwSize`.
+///
+/// Linux twin of `vfs_hooks::create_file_2_flags` (upstream #1433): NULL means
+/// flags 0; otherwise the guest `dwSize` must cover the 12-byte
+/// `{ dwSize, dwFileAttributes, dwFileFlags }` prefix and the whole prefix must
+/// be readable. `None` means a short or unreadable structure (Linux rejects
+/// with `ERROR_INVALID_PARAMETER`; Windows passes the call through to orig).
+fn create_file_2_flags(params: *const c_void) -> Option<u32> {
+    if params.is_null() {
+        return Some(0);
+    }
+    let addr = params as usize;
+    let mut data = [0u8; 12];
+    if !guest_read_exact(addr, &mut data[..4]) {
+        return None;
+    }
+    if u32::from_le_bytes(data[..4].try_into().unwrap()) < 12 {
+        return None;
+    }
+    // Re-read the full prefix, as upstream does, in case the caller unmapped
+    // the source after the first read.
+    if !guest_read_exact(addr, &mut data) {
+        return None;
+    }
+    Some(u32::from_le_bytes(data[8..12].try_into().unwrap()))
+}
+
 pub unsafe extern "win64" fn CreateFileW(
     name: *const u16,
     access: u32,
@@ -3953,11 +4020,12 @@ pub unsafe extern "win64" fn CreateFile2(
         set_error(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     };
-    // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }.
-    let flags = if params.is_null() {
-        0
-    } else {
-        unsafe { *((params as *const u8).add(8) as *const u32) }
+    // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }:
+    // never read past what the caller sized (upstream #1433). NULL means flags 0;
+    // a short or unreadable structure fails instead of reading unowned guest memory.
+    let Some(flags) = create_file_2_flags(params) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
     };
     match create_file_impl(&path, access, disposition, flags) {
         Ok(h) => h,
@@ -9434,6 +9502,16 @@ mod tests {
             let w3 = crate::util::wide(&path);
             assert_eq!(RemoveDirectoryW(w3.as_ptr()), 1, "{path}");
         }
+    }
+
+    #[test]
+    fn createfile2_flags_require_a_readable_sized_structure() {
+        assert_eq!(create_file_2_flags(std::ptr::null()), Some(0));
+        let short = 4u32;
+        assert_eq!(create_file_2_flags((&short as *const u32).cast()), None);
+        assert_eq!(create_file_2_flags(1usize as *const c_void), None);
+        let params = [12u32, 0x1234, 0x5678];
+        assert_eq!(create_file_2_flags(params.as_ptr().cast()), Some(0x5678));
     }
 
     #[test]

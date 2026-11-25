@@ -133,12 +133,35 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     )
 }
 
+/// Read only fields covered by CREATEFILE2_EXTENDED_PARAMETERS::dwSize.
+fn create_file_2_flags(params: *const c_void) -> Option<u32> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if params.is_null() {
+        return Some(0);
+    }
+    let mut data = [0u8; 12];
+    let mut read = 0usize;
+    // SAFETY: data is writable; the OS checks the caller's source pointer.
+    if unsafe { ReadProcessMemory(GetCurrentProcess(), params, data.as_mut_ptr().cast(), 4, &mut read) } == 0 || read != 4 {
+        return None;
+    }
+    if u32::from_le_bytes(data[..4].try_into().unwrap()) < 12 {
+        return None;
+    }
+    // SAFETY: as above, including if the caller unmapped the source after the first read.
+    if unsafe { ReadProcessMemory(GetCurrentProcess(), params, data.as_mut_ptr().cast(), 12, &mut read) } == 0 || read != 12 {
+        return None;
+    }
+    Some(u32::from_le_bytes(data[8..12].try_into().unwrap()))
+}
+
 unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, disp: u32, params: *const c_void) -> HANDLE {
     let orig = orig!(O_CREATE_FILE_2 as FnCreateFile2);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, disp, params) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, disp, params) };
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
-    let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
+    let Some(flags) = create_file_2_flags(params) else { return orig(n, acc, sh, disp, params) };
     log_open("CreateFile2", &path, flags);
     apply_open_decision(
         v.open_decision(&path, acc, disp, flags),
@@ -1703,6 +1726,17 @@ mod tests {
             FindClose(h);
         }
         out
+    }
+
+    #[test]
+    fn createfile2_flags_require_a_readable_sized_structure() {
+        use super::*;
+        assert_eq!(create_file_2_flags(std::ptr::null()), Some(0));
+        let short = 4u32;
+        assert_eq!(create_file_2_flags((&short as *const u32).cast()), None);
+        assert_eq!(create_file_2_flags(1usize as *const c_void), None);
+        let params = [12u32, 0x1234, 0x5678];
+        assert_eq!(create_file_2_flags(params.as_ptr().cast()), Some(0x5678));
     }
 
     #[test]
