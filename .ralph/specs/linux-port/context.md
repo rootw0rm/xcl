@@ -316,3 +316,32 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
   the 17b fmt/teardown follow-ups where touched. One commit, synthetic
   verification. Full step-17 present stays provisional after 17c; steps 17-21 stay
   chained behind SKIPPED step-12; Phase E/F remain blocked per PROMPT 4.7.
+
+## Current state (planner revise, 2026-11-25, `linux` @ `5b38ca3`)
+
+- Steps 1-11 closed (11a-11s HLE slices, CRT forwarding + follow-ups, report parity);
+  12a-12g closed with review; 13 (`linux:glsl-backend`, `6c09624`), 14
+  (`linux:spirv-inproc`, `d64f32c`), 15 (`linux:vulkan-runner`, `a157022`), 16
+  (`linux:subgroup-width`, `baf36be`), 17a (`linux:vulkan-backend`, `f0bc0d8`),
+  17b (`linux:vulkan-graphics-headless`, `10d6bdf`), and 17c
+  (`linux:vulkan-triangle-vertexid`, `8e2d38b`) closed with review
+  (481 lib tests, title reaches `ExitProcess(0xc)` with 12 known null-device
+  failures; 17c review re-verified 9 graphics + 167 recomp + 13 selector/runner
+  tests green, real Arc A770 `VertexIndex` triangle split-32, `spirv-val 2026.4`
+  gates, shipped path spawns nothing, no new deps).
+- No game files on this host: step-12 retail-smoke is SKIPPED here (`/run/media/anon`
+  absent); the synthetic title is the e2e target. Fresh triage here
+  (`gpu::recomp::vulkan_graphics` → 9 passed, `hle::vulkan_linux` → 8 passed,
+  `vulkan_runner` → 5 passed, no skip; `vulkaninfo` still Arc A770 / RTX 3090 Ti /
+  Raphael; fresh title run → `ExitProcess(0xc)`/12 fails/`called_stubs: 29`): the
+  offscreen triangle is proven but only with hand-assembled SPIR-V — the
+  recompiler backends still cover just the blit subset (no compare/select arms at
+  RDNA2 level), so the title's `VertexIndex`-indexed constant-select pattern has
+  never translated through them.
+- Next slice is plan.md step 17d (`linux:recomp-triangle`, DEC-027):
+  synthetic-RDNA2 `VertexIndex`-indexed triangle through both backends with
+  GLSL/SPIR-V parity + offscreen draw asserting the title pixel contract; folds
+  the 17c draw-duplication follow-up (third draw factors the common helpers),
+  tolerance-band follow-up stays deferred. One commit, synthetic verification.
+  Full step-17 present stays provisional after 17d; steps 17-21 stay chained
+  behind SKIPPED step-12; Phase E/F remain blocked per PROMPT 4.7.

@@ -1660,3 +1660,39 @@ no trust in builder notes:
   untouched). If a third headless draw lands, factor the common image+readback helpers out.
 - Center-green asserts are exact `[0, 255, 0, 255]` (correct for a constant FS, but a future
   recompiler-emitted VS with interpolation should use a tolerance band like the 17b blit gate).
+
+## Planner revise — recomp-triangle triage (2026-11-25, `linux` @ `5b38ca3`)
+
+Event `plan.revise`: `linux:vulkan-triangle-vertexid` (17c) passed review and closed (481 lib tests, title
+`ExitProcess(0xc)`/12 fails, `called_stubs: 29`, 9 graphics + 167 recomp + 13 selector/runner tests green,
+real Arc A770 `VertexIndex` triangle split-32, `spirv-val 2026.4` gates, shipped path spawns nothing,
+no new deps). Queue: 9 open (stable-key steps 13-21 chained behind SKIPPED step-12, steps 13-16 + 17a/17b/17c
+already landed as side tasks `6c09624`/`d64f32c`/`a157022`/`baf36be`/`f0bc0d8`/`10d6bdf`/`8e2d38b`);
+`task ready --all` is empty, so the next behavior slice needs a new unblocked side task (stable-key chain
+left intact per DEC-020/021/022/023/024/025/026).
+
+Triage (evidence, no code change): `cargo test -p xcl --lib gpu::recomp::vulkan_graphics` → 9 passed;
+`hle::vulkan_linux` → 8 passed; `vulkan_runner` → 5 passed, no skip (real device);
+`vulkaninfo` still Arc A770 / RTX 3090 Ti / Raphael (headless surface available, no display);
+`/run/media/anon` absent so retail stays SKIPPED. Fresh title run (fresh temp game + fresh
+`XCL_DATA_ROOT`): `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json`
+`exit_code: 12`, `crash: null`, `called_stubs: 29` — the 12 FAILs are the known null-device D3D12
+categories (triangle/Present/command-list/sparse/coherent/descriptor/depth-bias/raytracing/XG-textures);
+DirectStorage + MFPlat PASS hold. Code survey: both recompiler backends cover only the blit subset
+(SALU/VALU mov/add/sub/logic/min/max + `s_endpgm`; `grep` shows no `v_cmp`/`v_cndmask`/`s_cmp`/`s_cselect`
+arms at RDNA2 level, only internal SPIR-V `OpSelect` for min/max/fma) — so the title's
+`VertexIndex`-indexed constant-select pattern has never translated through the recompiler; 17c proved it
+only with hand-assembled SPIR-V. PROMPT §5 orders the recompiler-emission proof before mesh/GS, the full
+pack, or present routing. The 17c review's two minors split: draw-duplication folds into 17d work (third
+draw factors the common helpers), tolerance-band stays deferred (constant FS keeps exact asserts) — not
+new tasks.
+
+New task `linux:recomp-triangle` (plan.md step 17d, recorded as DEC-027): synthetic-RDNA2
+`VertexIndex`-indexed triangle through both backends (narrow compare + cndmask/select extension, scalar
+form only) with GLSL/SPIR-V parity + offscreen draw asserting the title pixel contract; `glslc`/`spirv-val`
+gates where present else structural checks, `SKIPPED` + `XCL_REQUIRE_GPU` when no device. No D3D12.X routing
+change, no `winit`/swapchain/window, no `TRANSLATOR_SOURCES` change, no new deps. Docs updated in the same
+pass: plan.md 17c marked LANDED + new 17d section + Plan Changes entry; context.md current-state refresh;
+DEC-027 recorded. Full step-17 present stays provisional after 17d (windowed smoke cannot execute on this
+headless host). Steps 17-21 stay chained behind SKIPPED step-12; Phase E/F remain blocked per §4.7. No code
+changes in this planner pass.

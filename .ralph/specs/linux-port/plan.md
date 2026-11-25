@@ -419,6 +419,28 @@ Windows behavior unchanged.
   step-17 present stays provisional after 17c. Steps 17-21 stay chained behind
   SKIPPED step-12; Phase E/F remain blocked per §4.7.
 
+- Planner revise (2026-11-25, `linux` @ `5b38ca3`, no game files on host): step 17c
+  (`linux:vulkan-triangle-vertexid`, `8e2d38b`) closed with review (481 lib tests, title
+  `ExitProcess(0xc)`/12 fails, `called_stubs: 29`, real Arc A770 `VertexIndex`
+  triangle + `spirv-val 2026.4` gates, shipped path spawns nothing, no new deps).
+  Fresh triage here re-ran the focused suites (`gpu::recomp::vulkan_graphics` → 9
+  passed, `hle::vulkan_linux` → 8 passed, `vulkan_runner` → 5 passed, no skip;
+  `vulkaninfo` still Arc A770 / RTX 3090 Ti / Raphael; `/run/media/anon` absent so
+  retail stays SKIPPED) plus a fresh title run (`ExitProcess(0xc)`/12 fails, the 12
+  known null-device D3D12 categories, `called_stubs: 29`): the offscreen triangle
+  path is proven but only with hand-assembled SPIR-V — the recompiler backends
+  (`glsl.rs`/`spirv.rs`) still cover just the blit subset (SALU/VALU mov/add/sub/
+  logic/min/max, no compare/select arms at RDNA2 level), so the title's
+  `VertexIndex`-indexed constant-select pattern has never translated through them.
+  PROMPT §5 orders the recompiler emission proof before mesh/GS, the full pack, or
+  present routing. New step 17d (`linux:recomp-triangle`) is the unblocked next
+  task: synthetic-RDNA2 `VertexIndex`-indexed triangle through both backends with
+  parity + offscreen draw asserting the title pixel contract; folds the 17c
+  draw-duplication follow-up (third draw factors the common helpers) while the
+  tolerance-band follow-up stays deferred (constant FS keeps exact asserts). Full
+  step-17 present stays provisional after 17d. Steps 17-21 stay chained behind
+  SKIPPED step-12; Phase E/F remain blocked per §4.7.
+
 ## Phase C frontier — next CRT family
 
 12a. **CRT copy/concat** — `linux:crt-copy` — LANDED (`38f95fd`).
@@ -579,6 +601,10 @@ Windows behavior unchanged.
       Outcome: Linux-only headless offscreen graphics execution for the blit-class VS (new `gpu/recomp/vulkan_graphics.rs` reusing the runner's shared `pick_graphics_device` query, no second throwaway instance): 64×64 `R8G8B8A8_UNORM` offscreen image + render pass + framebuffer, pipeline from `translate_vs_spirv` Vertex words + hand-assembled trivial fragment passthrough, one location-0 `vec4` vertex input (fullscreen triangle via vertex buffer, not bare `VertexIndex` — deliberate deviation, documented: the blit VS is a fetch passthrough so unbound inputs would make coverage driver-dependent), image → host-coherent readback with 5 s fence wait. `SKIPPED` + `XCL_REQUIRE_GPU` when no device. No `winit`/swapchain/window, no D3D12.X routing change beyond the cached selector query, no `TRANSLATOR_SOURCES` change, no new deps. Folded the 17a per-`create_device` probe-spam follow-up (`select_cached()` via `OnceLock`).
       Acceptance (met): 5 graphics tests (synthetic blit fullscreen-triangle coverage + center-pixel/interpolation asserts on Arc A770 split-32, trivial-FS `spirv-val` gate, fail-closed, no-spawn, retail opt-in) + 8 selector + 5 runner tests green, `gpu::recomp` 163 passed, full lib 477 passed, workspace check 0 errors, clippy 0 errors, shipped-path no-`Command`/`process` audit clean, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` with DirectStorage + MFPlat PASS holding (default, `vulkan`, and bogus override all 12/0xc/29; `vulkan` now a single backend line). One commit, Linux-only files + progress.md, no refactors.
 
-  17c. **vulkan headless triangle (VertexIndex + constant-green FS)** — `linux:vulkan-triangle-vertexid` — NEXT.
+  17c. **vulkan headless triangle (VertexIndex + constant-green FS)** — `linux:vulkan-triangle-vertexid` — LANDED (`8e2d38b`).
       Outcome: Linux-only headless offscreen draw of the exact primitive the synthetic title's `render_triangle` needs, still with no D3D12.X routing change: hand-assembled `triangle_vs_spv` (Vertex `main` reading `VertexIndex`, no vertex input, emitting the title's NDC positions `(-0.5,-0.5)/(0.0,0.5)/(0.5,-0.5)` with `w = 1`) + hand-assembled `green_fs_spv` (location-0 constant `(0,1,0,1)` passthrough, no uniform/input dependency) drawn into the existing 64×64 offscreen image path (same render pass/framebuffer/readback shape as 17b, fullscreen coverage not required — the title triangle covers the center, not the corners), asserting the title's pixel contract (center green, corner blue). Reuses the runner's instance/device/pick path; `SKIPPED <test>: <reason>` + `XCL_REQUIRE_GPU` fast-fail when no device, mirroring 17b. No `winit`, no swapchain, no window, no D3D12.X routing change beyond the existing cached selector query, no `TRANSLATOR_SOURCES` change, no new deps (ash only). Folds the 17b fmt/mod-order + teardown-order follow-ups where those lines are touched.
-      Acceptance: triangle test passes on the real device (Arc A770) with center-green/corner-blue asserts + structural magic/entry/decoration gates for both new word sets; `vulkan_graphics` 17b blit + `glsl`/`spirv` + runner lane-agreement gates still green; full `cargo test -p xcl --lib` counts + workspace check + clippy; shipped-path no-`Command`/`process` audit clean; cross-built synthetic title still reaches `ExitProcess(0xc)` with 12 known null-device failures and `called_stubs: 29` (DirectStorage + MFPlat PASS holding). One commit, Linux-only files + progress.md, no refactors.
+      Acceptance: triangle test passes on the real device (Arc A770) with center-green/corner-blue asserts + structural magic/entry/decoration gates for both new word sets; `vulkan_graphics` 17b blit + `glsl`/`spirv` + runner lane-agreement gates still green; full `cargo test -p xcl --lib` counts + workspace check + clippy; shipped-path no-`Command`/`process` audit clean; cross-built synthetic title still reaches `ExitProcess(0xc)` with 12 known null-device failures and `called_stubs: 29` (DirectStorage + MFPlat PASS holding). One commit, Linux-only files + progress.md, no refactors. (LANDED `8e2d38b`: 481 lib tests, 9 graphics + 167 recomp + 13 selector/runner green, real Arc A770 split-32 triangle, real `spirv-val 2026.4` gates, shipped path spawns nothing, no new deps; review confirmed both 17b fmt follow-ups folded and teardown-order folded by construction.)
+
+  17d. **recompiler-driven VertexIndex triangle** — `linux:recomp-triangle` — NEXT.
+      Outcome: the title-triangle `VertexIndex`-indexed constant-select pattern expressed as a synthetic RDNA2 program (built with the existing `encode` helpers, no retail) that translates *completely* through the shared blit-subset decode in both `gpu/recomp/glsl.rs` and `gpu/recomp/spirv.rs` (narrow compare + cndmask/select extension, scalar form only; everything else stays recorded-unsupported as before), with GLSL/SPIR-V position/param parity, drawn through the offscreen path with the title's center-green/corner-blue asserts. Folds the 17c duplication follow-up (third headless draw factors the common image/render-pass/framebuffer/readback helpers out of `draw_offscreen`/`draw_triangle_offscreen`); exact-green asserts stay exact (constant FS — the tolerance-band follow-up stays deferred for a future interpolated recompiler VS). `glslc`/`spirv-val` gates where present else structural checks; `SKIPPED` + `XCL_REQUIRE_GPU` when no device. No D3D12.X routing change, no `winit`/swapchain/window, no `TRANSLATOR_SOURCES` change, no new deps (ash only).
+      Acceptance: new tests (both backends complete on the synthetic triangle RDNA2 + real `glslc`/`spirv-val` gates + parity + on-device center-green/corner-blue draw + no-spawn audit + retail opt-in skip) + existing 9 graphics + 8 selector + 5 runner + `glsl`/`spirv` gates still green; full `cargo test -p xcl --lib` counts + workspace check + clippy; shipped-path no-`Command`/`process` audit clean; cross-built synthetic title still reaches `ExitProcess(0xc)` with 12 known null-device failures and `called_stubs: 29` (DirectStorage + MFPlat PASS holding). One commit, Linux-only files + progress.md, no refactors.
