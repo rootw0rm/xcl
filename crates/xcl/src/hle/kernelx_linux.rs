@@ -5017,6 +5017,40 @@ pub unsafe extern "win64" fn FindFirstFileA(name: *const u8, data: *mut FindData
     }
 }
 
+pub unsafe extern "win64" fn FindFirstFileExA(
+    name: *const u8,
+    level: i32,
+    data: *mut c_void,
+    op: i32,
+    _filter: *const c_void,
+    _flags: u32,
+) -> usize {
+    // Linux twin of upstream #1264 (`hk_find_first_ex_a`): Windows' ExA calls
+    // neither ExW nor A, so it gets its own entry. Only the common info
+    // levels/ops are virtualised (mirroring ExW); exotic values are rejected
+    // with INVALID_PARAMETER — Linux has no original to pass through to, and
+    // this matches the existing ExW level gate. ANSI callers read the wide
+    // layout through the same struct (UTF-8 on Linux), like `FindFirstFileA`.
+    if level > 1 || op > 1 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    let Some(path) = ansi_str(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    };
+    match find_first_impl(&path, data as *mut FindDataW) {
+        Ok(h) => {
+            set_error(ERROR_SUCCESS);
+            h
+        }
+        Err(e) => {
+            set_error(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
 pub unsafe extern "win64" fn FindNextFileW(handle: usize, data: *mut FindDataW) -> i32 {
     if data.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
@@ -8578,6 +8612,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("FindFirstFileExW", FindFirstFileExW as usize),
         ("FindFirstFileW", FindFirstFileW as usize),
         ("FindFirstFileA", FindFirstFileA as usize),
+        ("FindFirstFileExA", FindFirstFileExA as usize),
         ("FindNextFileW", FindNextFileW as usize),
         ("FindNextFileA", FindNextFileA as usize),
         ("FindClose", FindClose as usize),
@@ -9289,6 +9324,87 @@ mod tests {
         );
         assert_eq!(tree_hash(global_game), global_before);
         let _ = data;
+    }
+
+    #[test]
+    fn find_first_file_ex_a_lists_the_merged_game_folder() {
+        // Linux twin of upstream #1264 (`hk_find_first_ex_a`): the ANSI Ex entry
+        // must return the same merged overlay view as `FindFirstFileA`, for both
+        // common info levels, and reject exotic level/op values.
+        let _ = ensure_test_vfs();
+        let gv = crate::vfs::get().expect("global VFS initialised");
+        let global_game = std::path::Path::new(gv.game_root());
+        let probe = format!("exa_probe_{}.txt", std::process::id());
+        std::fs::create_dir_all(global_game.join("data")).ok();
+        std::fs::write(global_game.join("data").join(&probe), b"exa").ok();
+        unsafe fn collect_anchors(pat: *const u8, level: i32) -> Vec<String> {
+            let mut data: FindDataW = std::mem::zeroed();
+            let fh = FindFirstFileExA(
+                pat,
+                level,
+                &mut data as *mut _ as *mut c_void,
+                0,
+                std::ptr::null(),
+                0,
+            );
+            assert_ne!(
+                fh,
+                INVALID_HANDLE_VALUE,
+                "ExA level {level} failed err {}",
+                GetLastError()
+            );
+            let mut names = Vec::new();
+            let wname = |d: &FindDataW| {
+                let n = d.name.iter().position(|&c| c == 0).unwrap_or(d.name.len());
+                String::from_utf16_lossy(&d.name[..n])
+            };
+            names.push(wname(&data));
+            loop {
+                let mut next: FindDataW = std::mem::zeroed();
+                if FindNextFileW(fh, &mut next) == 0 {
+                    break;
+                }
+                names.push(wname(&next));
+            }
+            assert_eq!(FindClose(fh), 1);
+            names
+        }
+        unsafe {
+            let pat = std::ffi::CString::new("G:\\data\\*").unwrap();
+            for level in [0, 1] {
+                let names = collect_anchors(pat.as_ptr() as *const u8, level);
+                assert!(
+                    names.iter().any(|n| n == &probe),
+                    "level {level}: missing {probe} in {names:?}"
+                );
+            }
+            // Exotic level/op values have no virtualised meaning: reject like ExW.
+            let mut data: FindDataW = std::mem::zeroed();
+            assert_eq!(
+                FindFirstFileExA(
+                    pat.as_ptr() as *const u8,
+                    2,
+                    &mut data as *mut _ as *mut c_void,
+                    0,
+                    std::ptr::null(),
+                    0
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(
+                FindFirstFileExA(
+                    pat.as_ptr() as *const u8,
+                    0,
+                    &mut data as *mut _ as *mut c_void,
+                    2,
+                    std::ptr::null(),
+                    0
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        }
     }
 
     #[test]
