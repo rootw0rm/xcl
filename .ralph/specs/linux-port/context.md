@@ -87,17 +87,19 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
 - Next slice is plan.md step 12a (`linux:crt-copy`): copy/concat CRT family, one commit,
   synthetic verification. Phase D/E/F tasks stay chained behind step-12.
 
-## Current state (planner revise, 2026-11-25, `linux` @ `24d6820`)
+## Current state (planner revise, 2026-11-25, `linux` @ `13b679b`)
 
 - Steps 1–11 closed (11a–11s HLE slices, CRT forwarding + follow-ups, report parity);
-  12a (`linux:crt-copy`), 12b (`linux:crt-search-dup`), and 12c
-  (`linux:crt-convert-onexit`) closed with review (373 lib tests, title reaches
-  `ExitProcess` with only known null-device failures).
+  12a (`linux:crt-copy`), 12b (`linux:crt-search-dup`), 12c
+  (`linux:crt-convert-onexit`), and 12d (`linux:crt-vfprintf`, `b4956ba`) closed with
+  review (374 lib tests, title reaches `ExitProcess(0xe)` with only known null-device
+  failures; 12d review re-verified 0 MISS UCRT imports in both synthetic binaries).
 - No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic title
   (`tests/testtitle` + `testgamedll`, `gnullvm`/`gnu` targets installed) is the e2e target.
-- Next slice is plan.md step 12d (`linux:crt-vfprintf`): `__stdio_common_vfprintf` win64
-  `va_list` format engine writing into `CrtFile` — the only remaining MISS UCRT import in
-  both synthetic binaries per the 12c audit. One commit, synthetic verification.
+- Next slice is plan.md step 12e (`linux:format-message`): `FormatMessageW` in
+  `kernelx_linux` — the only `kernel32` stub the title calls (triage run here:
+  `ExitProcess(0xe)`/14 fails, `called_stubs: 34`, remaining stubs are Phase-D D3D12
+  slots plus `DStorage`/`MFPlat`). One commit, synthetic verification.
   Phase D/E/F tasks stay chained behind step-12.
 
 ## Integration points

@@ -278,3 +278,23 @@ Template for each entry:
   to hook; (c) is not needed for the VFS acceptance and stays deferred to the e2e slice.
 - **Reversibility:** high — additive exports behind the registry/resolver seam.
 - **Timestamp:** 2026-11-24T14:20:00Z
+
+## DEC-016 — Next CRT slice is convert/onexit from the synthetic binaries' actual imports
+
+- **Decision:** After 12b, implement `mbrtowc`/`wcrtomb` + `_execute_onexit_table` (step 12c), leaving `__stdio_common_vfprintf` provisional.
+- **Chosen Option:** triage the next CRT family from `llvm-readobj --coff-imports` on the cross-built `xcl_testtitle.exe` + `testgame_mw.dll` diffed against `crt_linux.rs` exports, not from PROMPT's example list (`errno`/`math`, `qsort`/`bsearch` — already covered or not imported).
+- **Confidence:** 85
+- **Alternatives Considered:** (a) `qsort`/`bsearch` next (PROMPT example, but nothing imports them); (b) bundle `__stdio_common_vfprintf` into the same slice (needs a win64 `va_list` format engine, too big for one reviewable commit).
+- **Reasoning:** §4.7b orders families by what the exe actually imports. The audit shows exactly 4 MISS UCRT imports; three are small and real (UTF-8 convert pair, onexit no-op consistent with existing register/initialize successes), while vfprintf needs its own design.
+- **Reversibility:** high — additive exports behind the existing registry/resolver seam.
+- **Timestamp:** 2026-11-25T00:00:00Z
+
+## DEC-017 — Next slice is FormatMessageW from the title's actual stub list
+
+- **Decision:** After 12d, implement `FormatMessageW` in `kernelx_linux` (step 12e), leaving D3D12/DStorage/MFPlat stubs for later slices.
+- **Chosen Option:** triage the next family from the synthetic title's fresh `report.json` `called_stubs` (34 entries at `ExitProcess(0xe)`/14 known fails, 0 MISS UCRT per the 12d `llvm-readobj` re-verification), not from PROMPT's CRT examples (`qsort`/`bsearch`, math — nothing imports them).
+- **Confidence:** 80
+- **Alternatives Considered:** (a) `qsort`/`bsearch`+math next (PROMPT example, but zero importers in either synthetic binary); (b) DStorage/MFPlat/D3D12 command-list slots next (most of the 34 stubs, but each is a larger multi-function family needing its own design).
+- **Reasoning:** §4.7b orders families by what the exe actually calls. `FormatMessageW` is the only `kernel32` stub the title calls (1 call; the rest of the non-GPU stubs are `DStorageGetFactory` x1 and `MF*` x3, each a bigger integration). It is small, has a clear Win32 contract (FROM_SYSTEM/FROM_STRING/inserts/ALLOCATE_BUFFER/truncation), and its disappearance from `called_stubs` is a checkable e2e signal.
+- **Reversibility:** high — additive export behind the existing registry/resolver seam.
+- **Timestamp:** 2026-11-25T00:00:00Z

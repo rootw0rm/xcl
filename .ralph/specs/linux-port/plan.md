@@ -248,15 +248,16 @@ Windows behavior unchanged.
   Further CRT families follow one-per-commit after triage; Phase D stays blocked until the
   synthetic title runs to `ExitProcess` on Linux. Installed targets now include
   `x86_64-pc-windows-gnu` and `-gnullvm`, so the Builder can cross-build the title e2e here.
-- Planner revise (2026-11-25, `linux` @ `24d6820`, no game files on host): steps 12a
-  (`linux:crt-copy`, `38f95fd`), 12b (`linux:crt-search-dup`, `761c59a`), and 12c
-  (`linux:crt-convert-onexit`, `24d6820`) are closed with independent review (373 lib
-  tests, title reaches `ExitProcess` with only known null-device failures). The 12c
-  review's `llvm-readobj` audit confirms the only remaining MISS UCRT import in both
-  synthetic binaries is `__stdio_common_vfprintf`; new step 12d
-  (`linux:crt-vfprintf`) is the unblocked next task (win64 `va_list` format-string
-  engine writing into `CrtFile`; `%n` never honored). Steps 13–21 stay chained behind
-  SKIPPED step-12; Phase D/E/F remain blocked per §4.7.
+- Planner revise (2026-11-25, `linux` @ `13b679b`, no game files on host): steps 12a
+  (`linux:crt-copy`, `38f95fd`), 12b (`linux:crt-search-dup`, `761c59a`), 12c
+  (`linux:crt-convert-onexit`, `24d6820`), and 12d (`linux:crt-vfprintf`, `b4956ba`)
+  are closed with independent review (374 lib tests, title reaches `ExitProcess` with
+  only known null-device failures). The 12d review's `llvm-readobj` audit confirms
+  0 MISS UCRT imports in both synthetic binaries. New step 12e
+  (`linux:format-message`) is the unblocked next task: `FormatMessageW` is the only
+  `kernel32` stub the synthetic title calls (1 call in the 34-entry `called_stubs`;
+  the rest are Phase-D D3D12 slots plus `DStorage`/`MFPlat`). Steps 13–21 stay chained
+  behind SKIPPED step-12; Phase D/E/F remain blocked per §4.7.
 
 ## Phase C frontier — next CRT family
 
@@ -289,7 +290,7 @@ Windows behavior unchanged.
     workspace check, and the cross-built synthetic title still reaches `ExitProcess`
     with the 14–16 known null-device failures (no retail needed). One commit, no refactors.
 
-12d. **CRT stdio vfprintf** — `linux:crt-vfprintf` (next, ready).
+12d. **CRT stdio vfprintf** — `linux:crt-vfprintf` — LANDED (`b4956ba`).
     Outcome: win64 `__stdio_common_vfprintf(options, stream, format, locale, arglist)`
     in `hle/crt_linux.rs` — a small format-string engine over the win64 `va_list`
     (`char*` to 8-byte stack slots) writing into `CrtFile` via the existing
@@ -306,4 +307,29 @@ Windows behavior unchanged.
     check, and the cross-built synthetic title still reaches `ExitProcess` with the
     14–16 known null-device failures (no retail needed). One commit, no refactors.
     This closes the last MISS UCRT import in both synthetic binaries per the 12c
-    `llvm-readobj` audit.
+    `llvm-readobj` audit (12d review re-verified 0 MISS in both binaries).
+
+12e. **kernelx FormatMessageW** — `linux:format-message` (next, ready).
+    Outcome: win64 `FormatMessageW` (plus `FormatMessageA` only if it is a trivial
+    wrapper over the same core) in `hle/kernelx_linux.rs`, wired through `exports()`
+    so the `kernel32.dll` route resolves it as `Hle(kernelx)` instead of a stub.
+    Semantics: `FORMAT_MESSAGE_FROM_SYSTEM` maps the caller's `GetLastError`-style
+    code to a message (at least the Win32 codes the title/host can produce, with a
+    sane fallback for unknown codes); `FORMAT_MESSAGE_FROM_STRING` formats the
+    caller's template with `%1..%n` inserts from the win64 `va_list`
+    (`FORMAT_MESSAGE_ARGUMENT_ARRAY` passes the array pointer directly);
+    `FORMAT_MESSAGE_ALLOCATE_BUFFER` allocates via the process heap path and writes
+    the pointer back; `FORMAT_MESSAGE_IGNORE_INSERTS` skips substitution; language
+    is accepted and documented as C-locale. Truncation/`nSize` overflow fails closed
+    with `ERROR_INSUFFICIENT_BUFFER` / `ERROR_NOT_ENOUGH_MEMORY`, never a crash;
+    NULL output with no `ALLOCATE_BUFFER` is an error return. Plus a `kernelx` unit
+    test (system-code message, FROM_STRING inserts incl. argument array, allocate
+    buffer, truncation, unknown code, NULL args).
+    Acceptance: focused `kernelx` tests, full `cargo test -p xcl --lib` counts,
+    workspace check, and the cross-built synthetic title still reaches `ExitProcess`
+    with the 14 known null-device failures while `FormatMessageW` disappears from
+    `report.json` `called_stubs` (no retail needed). One commit, no refactors.
+    Rationale: fresh triage run here reaches `ExitProcess(0xe)` with 14 fails and
+    `called_stubs: 34` — `FormatMessageW` is the only `kernel32` stub the title
+    calls (1 call); the remaining stubs are Phase-D D3D12 slots plus
+    `DStorage`/`MFPlat`, all larger families for later slices.
