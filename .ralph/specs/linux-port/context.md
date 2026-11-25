@@ -218,3 +218,26 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
   caller-supplied SPIR-V compute words with an embedded trivial-kernel gate and the
   existing SKIPPED pattern when no device. One commit, synthetic verification.
   Steps 16-21 stay chained behind SKIPPED step-12; Phase E/F remain blocked per PROMPT 4.7.
+
+## Current state (planner revise, 2026-11-25, `linux` @ `a157022`)
+
+- Steps 1-11 closed (11a-11s HLE slices, CRT forwarding + follow-ups, report parity);
+  12a-12g closed with review; 13 (`linux:glsl-backend`, `6c09624`), 14
+  (`linux:spirv-inproc`, `d64f32c`), and 15 (`linux:vulkan-runner`, `a157022`)
+  closed with review (394 lib tests, title reaches `ExitProcess(0xc)` with 12 known
+  null-device failures; 15 review re-verified `called_stubs: 29` with zero
+  `xcrdapi`/`mfplat`/`FormatMessage`, real Arc A770 dispatch `0..64` → `*2+1`
+  with `subgroupSize 32` logged, shipped path spawns nothing, `ash` MIT +
+  `libloading` ISC with runtime `dlopen` only).
+- No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic
+  title (`tests/testtitle` + `testgamedll`) is the e2e target. Fresh triage here
+  (`cargo test -p xcl --lib gpu::recomp::vulkan_runner` → 3 passed; `vulkaninfo`
+  `subgroupSize 32`, `subgroupSizeControl = true`): the runner pins 64 work-items
+  and only logs `subgroupSize` — no 32/64 lane selection exists yet.
+- Next slice is plan.md step 16 (`linux:subgroup-width`, DEC-023): subgroup-width-aware
+  dispatch in `vulkan_runner` (device `subgroupSize` via `VK_EXT_subgroup_size_control`
+  where available, mirror `upper_lanes`/`x64_masks`/`mesh_wave` 64-vs-split-32
+  selection; deterministic forced-both-widths unit test). Step-15 review follow-ups
+  (`skip_test` arms, teardown leak, unused `_entry`) fold into this slice. One commit,
+  synthetic verification. Steps 17-21 stay chained behind SKIPPED step-12; Phase E/F
+  remain blocked per PROMPT 4.7.

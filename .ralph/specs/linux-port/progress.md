@@ -1140,3 +1140,56 @@ Verification (this host, real Vulkan devices present):
 - `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (532 pre-existing warnings); `git diff --check` clean; `rustfmt --check` clean on new file + 2-line `mod.rs` hunk.
 - Shipped-path shell-out audit: `grep -rn "Command::new\|std::process" crates/xcl/src/gpu/recomp/vulkan_runner.rs` → only the `glslc` mention in a doc comment, no spawn; `TRANSLATOR_SOURCES` untouched (no disk cache).
 - Synthetic title (fresh `/tmp/vk-fresh2-game` from `tests/data/testgame` + prebuilt exes, fresh `XCL_DATA_ROOT=/tmp/vk-fresh2-data`): `XCL_DATA_ROOT=... timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `called_stubs: 29` (28 `d3d12_xs` console slots + probe, zero `xcrdapi`/`mfplat`/`FormatMessage`) — matches the 12g/13/14 baseline; `[PASS] DirectStorage`, `[PASS] MFPlat` hold. No new failure.
+
+## Critic review — step-15 vulkan-runner (Fresh-Eyes, 2026-11-25, `linux` @ `a157022`)
+
+Task `task-1795569389-dcf9` (`linux:vulkan-runner`) — PASS, closed.
+
+Independent re-verification (this host, real Vulkan devices present, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib gpu::recomp::vulkan_runner -- --nocapture` → 3 passed; 0 failed (`vulkan: Intel(R) Arc(tm) A770 Graphics (DG2) subgroupSize 32`, trivial `0..64` → `*2+1` passes on-device, no skip).
+- `cargo test -p xcl --lib -- --test-threads=4` → 394 passed; 0 failed; 0 ignored (matches Builder; +3 over step-14 391).
+- `cargo check --workspace` → 0 errors; `cargo clippy -p xcl --lib` → 0 errors (532 pre-existing warnings); `git diff --check` clean; `rustfmt --check` clean on `vulkan_runner.rs`.
+- License/static-link audit: `cargo metadata` → `ash 0.38.0+1.3.281` `MIT OR Apache-2.0` (used under MIT), `libloading 0.8.9` `ISC`; `Entry::load` is the only Vulkan entry (2 sites, both in `dispatch_compute`/`adapter_name` shipped paths as the intended runtime `dlopen`); `ldd target/debug/xcl` shows no vulkan link, `nm -D` shows no `vkCreate*` — static exe ships no `.so`.
+- Shipped-path shell-out audit: `grep -rn "Command::new\|std::process"` in `vulkan_runner.rs` → only the `glslc` mention in a doc comment, no spawn. `TRANSLATOR_SOURCES` untouched (no disk cache) — correct. `mod.rs` hunk is the 2-line `#[cfg(target_os = "linux")] pub mod vulkan_runner;` only.
+- Synthetic title (fresh `/tmp/vk-critic-game` from `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll`, fresh `XCL_DATA_ROOT=/tmp/vk-critic-data`, `timeout 120 ./target/debug/xcl run "$GAME" -- --hello`) → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `crash: null`, `called_stubs: 29` (28 `d3d12_xs` console slots + expected `XclDefinitelyMissingFunction` probe; zero `xcrdapi`/`mfplat`/`FormatMessage`) — matches the 12g/13/14 baseline; no new failure. `[PASS] DirectStorage`, `[PASS] MFPlat`, `[PASS] XAudio2` hold.
+
+Requirements: met — `ash` compute dispatch for caller-supplied SPIR-V words (instance/physical-device/compute-queue pick, storage-buffer descriptor set 0/binding 0, compute pipeline, one group of 64 work-items pinned, 5 s fence wait, host-visible/coherent readback) + `adapter_name()` + `skip_test()` mirroring `runner::skip_test` (`SKIPPED <test>: <reason>`, `XCL_REQUIRE_GPU` fast-fail) + `subgroupSize` logged (32/64 selection stays step-16) + embedded trivial copy/add kernel gate + fail-closed bad-words/short-input paths. One commit (`a157022`), Linux-only runner + 2-line `mod.rs` + `ash` dep + progress.md, no refactors, no window/graphics/routing change.
+
+## Follow-ups (minor, non-blocking)
+- `skip_test` collapses the `runner.rs` arms (`"wave64" | "mesh" => reason != "no mesh shaders"` vs upstream `"wave64" => ... "no mesh shaders"` / `"mesh" => ... "no wave64"`). Identical for every reason this module emits (`no Vulkan`/`no device`/`no GPU` all panic under either `XCL_REQUIRE_GPU` value); differs only for hypothetical `no wave64` reasons it never emits. Align arms when step-16 touches this file.
+- Error-path teardown: early `?` returns inside the `run` closure (e.g. `create_buffer`/`allocate_memory` fail) skip `destroy_device`/`destroy_instance` cleanup. Rare (device already selected) and test-lifetime only; add scoped cleanup if this runner grows more fallible steps.
+- `pick_device` takes `_entry` (unused); drop the parameter or prefix-use it when step-16 adds subgroup-size selection.
+
+## Planner revise — subgroup-width triage (2026-11-25, `linux` @ `a157022`)
+
+Event `plan.revise`: `linux:vulkan-runner` passed review and closed (394 lib tests, title
+`ExitProcess(0xc)`/12 fails, `called_stubs: 29`, real Arc A770 `0..64` → `*2+1`
+dispatch with `subgroupSize 32` logged). Queue: 1 in_progress (step-12 retail-smoke,
+SKIPPED here — `/run/media/...` absent) + 8 open (stable-key steps 13–21 chained
+behind step-12, steps 13–15 already landed as side tasks `6c09624`/`d64f32c`/
+`a157022`); `task ready --all` is empty, so the next behavior slice needs a new
+unblocked side task (stable-key chain left intact per DEC-020/021/022).
+
+Triage (evidence, not speculation): `cargo test -p xcl --lib
+gpu::recomp::vulkan_runner` → 3 passed here (no skip, real device);
+`vulkaninfo` reports `subgroupSize 32` + `subgroupSizeControl = true` on this host.
+The runner pins `WORK_ITEMS = 64` / `local_size_x = 64` and only `eprintln!`-logs
+`subgroupSize` in `pick_device` — no 32/64 lane selection exists yet, and the
+recompiler already owns the 64-vs-split-32 decision (`upper_lanes` shadow analysis,
+`x64_masks` exchange liveness, `mesh_wave` requirements, Windows
+`runner::split_for`/`split_wave64`/`pso::graphics_wave32`). The step-15 review's
+three minors (`skip_test` arm collapse, early-`?` teardown leak, unused `_entry`)
+are all inside `vulkan_runner.rs`, so they fold into step-16 work, not new tasks.
+
+New task `linux:subgroup-width` (plan.md step 16, recorded as DEC-023):
+subgroup-width-aware dispatch in `vulkan_runner` — read
+`VkPhysicalDeviceSubgroupProperties::subgroupSize` (via
+`VK_EXT_subgroup_size_control` where available), mirror the existing
+64-vs-split-32 selection for the compute path, keep `WORK_ITEMS = 64` shaping but
+select the lane path from the device; deterministic unit test forces both widths
+(32 and 64) even though this host reports only 32. No window, no graphics
+pipeline, no D3D12.X routing change, no `TRANSLATOR_SOURCES` change. Docs updated
+in the same pass: plan.md step 15 marked LANDED + 15 LANDED detail + Plan Changes
+entry; context.md current-state refresh; DEC-023 recorded. Steps 17–21 stay chained
+behind SKIPPED step-12; Phase E/F remain blocked per §4.7. No code changes in this
+planner pass.

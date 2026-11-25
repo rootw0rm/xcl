@@ -62,3 +62,16 @@
 - 14 closed with review (391 lib tests, title ExitProcess(0xc)/12 fails, called_stubs 29, real spirv-val 2026.4 gate, shipped path spawns nothing, no new deps). Queue otherwise blocked behind SKIPPED retail-smoke, `task ready` empty.
 - Triage (fresh run here, no code change): title reaches `ExitProcess(0xc)`/12 fails, `called_stubs: 29` = 28 d3d12_xs console slots + XclDefinitelyMissingFunction probe (expected), zero non-GPU calls. All 12 FAILs are null-device D3D12 categories; stub-triage loop exhausted. Host has real Vulkan devices (Arc A770 / RTX 3090 Ti / Raphael, vulkaninfo 1.4.363, subgroupSize 32) so compute dispatch can run for real.
 - New task `linux:vulkan-runner` (plan.md step 15, DEC-022): ash compute runner for caller-supplied SPIR-V compute words (embedded trivial copy/add kernel gate, not VS Vertex words; Kernel-mode recompiler emission deferred as follow-up), SKIPPED pattern when no device, 64 work-items pinned with subgroupSize logged (32/64 selection stays step-16), no window/graphics/routing change. Docs (plan/context/decisions) updated; `tasks.ready` next.
+
+## 2026-11-25 builder (vulkan-runner 15)
+- task-1795569389-dcf9 DONE, commit a157022. ash compute runner for caller-supplied SPIR-V words (embedded trivial copy/add kernel gate, 64 work-items pinned, subgroupSize logged).
+- Verify: vulkan_runner 3 passed (real Arc A770 dispatch, subgroupSize 32), full lib 394 passed, workspace check 0 errors, clippy 0 errors, title ExitProcess(0xc)/12 fails/called_stubs 29 with DirectStorage + MFPlat PASS.
+
+## 2026-11-25 critic review (vulkan-runner 15)
+- task-1795569389-dcf9 PASS, closed. Re-verified: vulkan_runner 3 passed (real Arc A770 dispatch, subgroupSize 32), full lib 394 passed, workspace check 0 errors, clippy 0 errors, rustfmt/diff clean, ash MIT + libloading ISC with runtime dlopen only (ldd/nm clean), shipped path spawns nothing, title ExitProcess(0xc)/12 fails/called_stubs 29 (28 d3d12_xs + probe) with DirectStorage + MFPlat PASS.
+- No blocking findings; three minors filed as progress.md follow-ups (skip_test arm collapse, error-path teardown leak, unused _entry param). Queue: `task ready` empty (remaining open tasks chained behind SKIPPED retail-smoke, no game files on host), so next is planner triage (plan.revise).
+
+## 2026-11-25 planner revise (subgroup-width 16)
+- 15 closed with review (394 tests, title ExitProcess(0xc)/12 fails, called_stubs 29, real Arc A770 0..64→*2+1 with subgroupSize 32 logged). Queue otherwise blocked behind SKIPPED retail-smoke, `task ready --all` empty.
+- Triage (fresh run here, no code change): `cargo test -p xcl --lib gpu::recomp::vulkan_runner` → 3 passed; `vulkaninfo` subgroupSize 32 + subgroupSizeControl true. Runner pins WORK_ITEMS=64 and only logs subgroupSize — no lane selection yet. Recompiler already owns the 64-vs-split-32 decision (upper_lanes/x64_masks/mesh_wave, runner::split_for/split_wave64).
+- New task `linux:subgroup-width` (task-1795570615-1ff3, plan.md step 16, DEC-023): subgroup-width-aware dispatch in vulkan_runner (device subgroupSize via VK_EXT_subgroup_size_control where available, mirror 64-vs-split-32 selection, forced-both-widths unit test) + fold 15 review follow-ups (skip_test arms, teardown leak, unused _entry). Docs (plan/context/decisions/progress) updated; `tasks.ready` next.

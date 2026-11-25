@@ -179,11 +179,14 @@ Windows behavior unchanged.
     Acceptance: SPIR-V module validates (`spirv-val` if present, else structural unit tests)
     and matches the GLSL-backed position/param contract; no process spawn in the shipped path.
 
-15. **Vulkan compute runner** — `code-assist:linux-port:step-15:vulkan-runner`.
-    Outcome: `ash` compute dispatch replaces D3D12 `runner.rs`; kernel-mode translations run on
-    the real device with the existing `SKIPPED <test>: <reason>` pattern when no Vulkan device.
-    Acceptance: one instruction-semantics kernel and the blit VS produce expected output on a
-    device; the no-device path skips cleanly with the reason printed.
+15. **Vulkan compute runner** — `linux:vulkan-runner` — LANDED (`a157022`).
+    Outcome: `ash` compute dispatch for caller-supplied SPIR-V compute words
+    (embedded trivial copy/add kernel as the gate, not VS Vertex words which
+    need a graphics pipeline); 64 work-items pinned, `subgroupSize` logged,
+    32/64 selection stays step-16. No window/graphics/routing change.
+    Acceptance: trivial kernel `0..64` → `*2+1` passes on the real device
+    (Arc A770 `subgroupSize 32`), `SKIPPED` + `XCL_REQUIRE_GPU` when no
+    device, no shell-out, `TRANSLATOR_SOURCES` untouched.
 
 16. **subgroup width** — `code-assist:linux-port:step-16:subgroup-width`.
     Outcome: path selection from `VkPhysicalDeviceSubgroupProperties::subgroupSize`
@@ -335,6 +338,27 @@ Windows behavior unchanged.
   recompiler SPIR-V emission stays a follow-up if too large for one reviewable slice).
   Steps 16-21 stay chained behind SKIPPED step-12; Phase E/F remain blocked per §4.7.
 
+- Planner revise (2026-11-25, `linux` @ `a157022`, no game files on host): step 15
+  (`linux:vulkan-runner`, `a157022`) closed with review (394 lib tests, title
+  `ExitProcess(0xc)`/12 fails, `called_stubs: 29` with zero `xcrdapi`/`mfplat`/
+  `FormatMessage` entries, real Arc A770 dispatch `0..64` → `*2+1` with
+  `subgroupSize 32` logged, shipped path spawns nothing, `ash` MIT + `libloading`
+  ISC with runtime `dlopen` only). Fresh triage (`cargo test -p xcl --lib
+  gpu::recomp::vulkan_runner` → 3 passed here; `vulkaninfo` `subgroupSize 32`,
+  `subgroupSizeControl = true` on this host): the runner pins 64 work-items and
+  only logs `subgroupSize` — no 32/64 lane selection exists yet. The 15 review
+  left three minors as `progress.md` follow-ups (collapsed `skip_test` arms,
+  error-path teardown leak, unused `_entry` param) — all inside `vulkan_runner.rs`,
+  so they fold into step-16 work, not new tasks. New step 16
+  (`linux:subgroup-width`) is the unblocked next task: subgroup-width-aware
+  dispatch in `vulkan_runner` (read `VkPhysicalDeviceSubgroupProperties::
+  subgroupSize` via `VK_EXT_subgroup_size_control` where available, mirror the
+  existing `upper_lanes`/`x64_masks`/`mesh_wave` 64-vs-split-32 selection for the
+  compute path, keep `WORK_ITEMS = 64` shaping but select the lane path from the
+  device; deterministic unit test forces both widths even though this host
+  reports only 32). Steps 17-21 stay chained behind SKIPPED step-12; Phase E/F
+  remain blocked per §4.7.
+
 ## Phase C frontier — next CRT family
 
 12a. **CRT copy/concat** — `linux:crt-copy` — LANDED (`38f95fd`).
@@ -478,3 +502,7 @@ Windows behavior unchanged.
   14. **spirv-inproc** — `linux:spirv-inproc` — LANDED (`d64f32c`).
       Outcome: hand-rolled in-process SPIR-V backend in new `gpu/recomp/spirv.rs` (no new deps, no license/static-musl audit): `SpirvVsBackend` behind the shared `VsBackend` contract (`mod.rs` now owns the trait + `HlslVsBackend`; `glsl.rs` reuses it, no behavior change) + `translate_vs_spirv` straight-line blit subset (decode, branch rejection, SALU/VALU blit ops, `exp pos0` to Position, `exp param N` to ranked Location outs, `s_endpgm` ends; full-EXEC documented; rest recorded + skipped, never a crash). Hand-assembled SPIR-V 1.0 words (Shader capability, Logical GLSL450, Vertex entry, Position builtin + ranked Location outs, VertexIndex/InstanceIndex builtins; core int/float/bitcast/convert/compare/select only, min/max via compare+select, fma as mul+add, no GLSL.std.450 import). `spirv-val`/`spirv-dis` only under `#[cfg(test)]`; shipped path builds words only. No `TRANSLATOR_SOURCES` change (no disk cache, same as GLSL).
       Acceptance (met): synthetic-blit structural + real `spirv-val 2026.4` gate (no skip), GLSL-parity position/param contract, shipped-path no-Command/process audit, `XCL_SAMPLE_RPF` opt-in skip, 391 lib tests, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` matching the 12g/13 baseline with DirectStorage + MFPlat PASS holding. One commit, no refactors.
+
+  15. **vulkan-runner** — `linux:vulkan-runner` — LANDED (`a157022`).
+      Outcome: Linux-only `ash` compute runner in new `gpu/recomp/vulkan_runner.rs` (MIT OR Apache-2.0 used under MIT + `libloading` ISC, runtime `dlopen` only, `ldd`/`nm -D` clean): instance/physical-device/compute-queue pick, storage-buffer set 0/binding 0, compute pipeline from caller-supplied SPIR-V words, one group of 64 work-items pinned (`WORK_ITEMS = 64`, `local_size_x = 64`), 5 s fence wait, host-visible/coherent readback; `adapter_name()` + `skip_test()` mirroring `runner::skip_test` (`SKIPPED <test>: <reason>`, `XCL_REQUIRE_GPU` fast-fail); `subgroupSize` logged via `eprintln!` (32/64 selection stays step-16); embedded trivial copy/add kernel gate + fail-closed bad-words/short-input paths. No `TRANSLATOR_SOURCES` change (no disk cache).
+      Acceptance (met): `vulkan_runner` 3 passed on the real Arc A770 (`subgroupSize 32`, trivial `0..64` → `*2+1`), full lib 394 passed, workspace check 0 errors, clippy 0 errors, license/static-link + no-spawn audits clean, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` matching the 12g/13/14 baseline with DirectStorage + MFPlat PASS holding. One commit, no refactors.
