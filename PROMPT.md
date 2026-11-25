@@ -30,9 +30,15 @@ first (short contract); this file is the work plan. Details live in
   lib tests 502 passed). Stream A2 landed the GDK-thunk protocol
   (`98139c6`, lib tests 511 passed): the 4 xgameruntime resolves work,
   retail now completes GDK init and traps at `exe+0x2237179` (config-
-  selection abort on an all-zero heap struct, no stub implicated —
-  plausibly needs real device creation). Remaining for the 12 GPU FAILs:
-  route D3D12.X device creation to the Vulkan backend (rest of step 17).
+  selection abort on an all-zero heap struct, no stub implicated).
+  Stream E landed device routing (`150d8ef`, lib tests 517 passed):
+  console device creation routes to Vulkan under the env override (null
+  default; fixed an ash `Entry`-drop `dlclose` segfault); Vulkan command
+  lists implement console slots #60/#61/#69-#72/#89/#93; raytracing
+  surface slots 13/18/146/148. Title on Vulkan backend: 12→10 FAILs
+  (command-list memory + raytracing surface flipped); remaining 10 need
+  a real renderer. Retail unmoved at `0x2237179` with zero d3d12 calls —
+  next retail step is game-RE on that abort, not more device stubs.
 - **Game files are PRESENT on this host** (the drive is mounted):
   `/run/media/anon/12TB_B/torrents/GTA6.Xbox.v1.0.2.1-CYBERLEEK/`
   (`game_scarlett_master.exe`, 120 MB, + `MicrosoftGame.Config`) and
