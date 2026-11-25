@@ -6868,7 +6868,7 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     }
 }
 
-/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for).
+/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
     cl_set_pipeline_state(this, pso)
@@ -6877,7 +6877,7 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    let bound = super::pso_async::resolve(pso as usize);
     f(this, bound as *mut c_void);
     super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
@@ -7198,8 +7198,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
             mapped.push(pc);
-        } else if !super::title_list::push_segments(l, &mut mapped) {
-            mapped.push(l);
+        } else {
+            super::list_x::record_deferred(l);
+            if !super::title_list::push_segments(l, &mut mapped) {
+                mapped.push(l);
+            }
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);

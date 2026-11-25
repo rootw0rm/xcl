@@ -121,6 +121,22 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     console_list::hold_until_reset(old, blocks);
 }
 
+/// A submit is about to wait for the pipeline `this` has bound.
+pub(super) fn want_bound(this: *mut c_void) {
+    super::pso_async::want(with(this, |s| s.pso));
+}
+
+/// A put-off dispatch that could not be recorded.
+pub(super) fn dispatch_dropped() {
+    count(DISPATCHES_SKIPPED);
+}
+
+/// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
+pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
+    let arena = with(from, |s| std::mem::take(&mut s.arena));
+    with(to, |s| s.arena = arena);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
@@ -254,6 +270,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
+    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
+    if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+        return super::pso_async::need_by_submit(raw_pso);
+    }
     let pso = super::pso_async::resolve_wait(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -850,7 +870,11 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let pso = with(this, |s| s.pso);
+    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+        return super::pso_async::need_by_submit(pso);
+    }
+    let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -1021,7 +1045,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
