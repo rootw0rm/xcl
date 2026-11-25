@@ -1470,6 +1470,756 @@ pub unsafe extern "win64" fn ftell(stream: *mut u8) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// `__stdio_common_vfprintf` (Phase C step-12d): narrow formatted output over a win64
+// `va_list`, writing into `CrtFile` through the `fwrite` path above.
+//
+// UCRT signature: `int __stdio_common_vfprintf(unsigned __int64 options, FILE*
+// stream, const char* format, _locale_t locale, va_list arglist)`. On win64 a
+// `va_list` is a `char*` to 8-byte stack slots: every argument (int, pointer,
+// `double`) occupies one slot, which is what the reader below assumes. `options`
+// carries `_CRT_INTERNAL_PRINTF_*` flags (legacy null termination, positional
+// parameters, …) and `locale` is a `_locale_t` (`NULL` = global C locale); both are
+// documented here and otherwise ignored — output is always C-locale narrow text.
+// `%n` (in every length form) consumes its pointer slot and writes nothing, so a
+// stray or hostile `%n` can never scribble guest memory. `NULL` stream/format (or
+// a `NULL` arglist when the format needs an argument) is an error return (`-1`),
+// never a crash; unknown verbs are an error return too. A lone trailing `%`
+// emits nothing further (the prefix still counts). Non-finite floats print C99
+// `nan`/`inf` (UCRT legacy spells `1.#QNAN0`/`1.#INF00`; not emulated), `%a`
+// truncates rather than rounds to the requested precision, and `%ls` precision
+// counts wide units.
+// ---------------------------------------------------------------------------------------
+
+/// `int __stdio_common_vfprintf(options, stream, format, locale, arglist)` —
+/// format `format` with `arglist` into `stream`; returns bytes written or `-1`.
+pub unsafe extern "win64" fn __stdio_common_vfprintf(
+    _options: u64,
+    stream: *mut u8,
+    format: *const u8,
+    _locale: usize,
+    arglist: *const u8,
+) -> i32 {
+    if stream.is_null() || format.is_null() {
+        return -1;
+    }
+    let slots = if arglist.is_null() {
+        None
+    } else {
+        Some(arglist as *const u64)
+    };
+    let out = match render_narrow_format(format, slots) {
+        Some(v) => v,
+        None => return -1,
+    };
+    if out.len() > i32::MAX as usize {
+        return -1;
+    }
+    if out.is_empty() {
+        return 0;
+    }
+    let n = fwrite(out.as_ptr() as *const c_void, 1, out.len(), stream);
+    if n == out.len() {
+        out.len() as i32
+    } else {
+        -1
+    }
+}
+
+/// Width/precision fields larger than this are rejected (the renderer fails, hence
+/// `-1`) instead of allocating blindly for a hostile `%999999999d`.
+const MAX_FIELD: usize = 1_000_000;
+
+/// Integer length modifiers. Windows sizes: `l` is 32-bit (`long`), `ll` and the
+/// `j`/`z`/`t`/bare-`I`/`I64` forms are 64-bit, `I32` is 32-bit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntLen {
+    Def,
+    Hh,
+    H,
+    L,
+    Ll,
+}
+
+impl IntLen {
+    fn signed(self, slot: u64) -> i64 {
+        match self {
+            IntLen::Hh => (slot as u8) as i8 as i64,
+            IntLen::H => (slot as u16) as i16 as i64,
+            IntLen::Def | IntLen::L => (slot as u32) as i32 as i64,
+            IntLen::Ll => slot as i64,
+        }
+    }
+
+    fn unsigned(self, slot: u64) -> u64 {
+        match self {
+            IntLen::Hh => (slot as u8) as u64,
+            IntLen::H => (slot as u16) as u64,
+            IntLen::Def | IntLen::L => (slot as u32) as u64,
+            IntLen::Ll => slot,
+        }
+    }
+}
+
+/// Win64 `va_list` cursor over 8-byte slots. A `NULL` list fails every fetch, so
+/// formats needing arguments report an error instead of faulting.
+struct VaReader {
+    cur: *const u64,
+    exhausted: bool,
+}
+
+impl VaReader {
+    fn next(&mut self) -> Option<u64> {
+        if self.exhausted {
+            return None;
+        }
+        unsafe {
+            let v = *self.cur;
+            self.cur = self.cur.add(1);
+            Some(v)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FmtSpec {
+    left: bool,
+    plus: bool,
+    space: bool,
+    alt: bool,
+    zero: bool,
+    width: Option<usize>,
+    prec: Option<usize>,
+}
+
+/// Render a NUL-terminated narrow format with `args` into bytes. `None` means the
+/// format needs an argument the (NULL) list cannot supply, a field is unbounded,
+/// or the verb is unknown — the caller reports `-1` and writes nothing.
+unsafe fn render_narrow_format(format: *const u8, args: Option<*const u64>) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut ap = VaReader {
+        cur: args.unwrap_or(std::ptr::null()),
+        exhausted: args.is_none(),
+    };
+    let mut i = 0usize;
+    loop {
+        let b = *format.add(i);
+        if b == 0 {
+            break;
+        }
+        if b != b'%' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if *format.add(i) == 0 {
+            // Truncated: a lone `%` at the end emits nothing further.
+            break;
+        }
+        if *format.add(i) == b'%' {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        render_one_spec(format, &mut i, &mut ap, &mut out)?;
+    }
+    Some(out)
+}
+
+/// Render one `%`-spec starting at `*pos` (first spec byte); advances `*pos` past
+/// the verb. A NUL where the verb belongs is a truncated format: emit nothing and
+/// stop (the outer loop sees the NUL and ends the string).
+unsafe fn render_one_spec(
+    format: *const u8,
+    pos: &mut usize,
+    ap: &mut VaReader,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let mut spec = FmtSpec {
+        left: false,
+        plus: false,
+        space: false,
+        alt: false,
+        zero: false,
+        width: None,
+        prec: None,
+    };
+    loop {
+        match *format.add(*pos) {
+            b'-' => spec.left = true,
+            b'+' => spec.plus = true,
+            b' ' => spec.space = true,
+            b'#' => spec.alt = true,
+            b'0' => spec.zero = true,
+            _ => break,
+        }
+        *pos += 1;
+    }
+    if *format.add(*pos) == b'*' {
+        *pos += 1;
+        let w = ap.next()? as u32 as i32;
+        if w < 0 {
+            spec.left = true;
+            let mag = (w as i64).unsigned_abs() as usize;
+            if mag > MAX_FIELD {
+                return None;
+            }
+            spec.width = Some(mag);
+        } else {
+            let wu = w as usize;
+            if wu > MAX_FIELD {
+                return None;
+            }
+            spec.width = Some(wu);
+        }
+    } else {
+        let mut w = 0usize;
+        let mut any = false;
+        while (*format.add(*pos)).is_ascii_digit() {
+            any = true;
+            w = w
+                .saturating_mul(10)
+                .saturating_add((*format.add(*pos) - b'0') as usize);
+            if w > MAX_FIELD {
+                return None;
+            }
+            *pos += 1;
+        }
+        if any {
+            spec.width = Some(w);
+        }
+    }
+    if *format.add(*pos) == b'.' {
+        *pos += 1;
+        if *format.add(*pos) == b'*' {
+            *pos += 1;
+            let p = ap.next()? as u32 as i32;
+            if p >= 0 {
+                let pu = p as usize;
+                if pu > MAX_FIELD {
+                    return None;
+                }
+                spec.prec = Some(pu);
+            }
+        } else {
+            let mut p = 0usize;
+            while (*format.add(*pos)).is_ascii_digit() {
+                p = p
+                    .saturating_mul(10)
+                    .saturating_add((*format.add(*pos) - b'0') as usize);
+                if p > MAX_FIELD {
+                    return None;
+                }
+                *pos += 1;
+            }
+            spec.prec = Some(p);
+        }
+    }
+    // Lengths: `hh`/`h`/`ll`/`l`/`j`/`z`/`t`/`L`, plus MS `I`/`I32`/`I64`. A lone
+    // `l` also marks `%ls`/`%lc` as wide (integer verbs ignore the flag).
+    let mut len = IntLen::Def;
+    let mut wide = false;
+    match *format.add(*pos) {
+        b'h' => {
+            *pos += 1;
+            if *format.add(*pos) == b'h' {
+                *pos += 1;
+                len = IntLen::Hh;
+            } else {
+                len = IntLen::H;
+            }
+        }
+        b'l' => {
+            *pos += 1;
+            if *format.add(*pos) == b'l' {
+                *pos += 1;
+                len = IntLen::Ll;
+            } else {
+                len = IntLen::L;
+                wide = true;
+            }
+        }
+        b'j' | b'z' | b't' => {
+            *pos += 1;
+            len = IntLen::Ll;
+        }
+        b'L' => {
+            // Windows `long double` == `double`; only the int width matters.
+            *pos += 1;
+            len = IntLen::Ll;
+        }
+        b'I' => {
+            *pos += 1;
+            if *format.add(*pos) == b'3' && *format.add(*pos + 1) == b'2' {
+                *pos += 2;
+                len = IntLen::L;
+            } else if *format.add(*pos) == b'6' && *format.add(*pos + 1) == b'4' {
+                *pos += 2;
+                len = IntLen::Ll;
+            } else {
+                // Bare `I` is pointer-sized (64-bit here).
+                len = IntLen::Ll;
+            }
+        }
+        _ => {}
+    }
+    let verb = *format.add(*pos);
+    if verb == 0 {
+        // Truncated inside the spec (`"%5"`, `"%-"` …): emit nothing further.
+        return Some(());
+    }
+    *pos += 1;
+    match verb {
+        b'd' | b'i' => push_signed(out, len.signed(ap.next()?), &spec),
+        b'u' => push_unsigned(out, len.unsigned(ap.next()?), 10, false, &spec, false),
+        b'o' => push_unsigned(out, len.unsigned(ap.next()?), 8, false, &spec, false),
+        b'x' => push_unsigned(out, len.unsigned(ap.next()?), 16, false, &spec, false),
+        b'X' => push_unsigned(out, len.unsigned(ap.next()?), 16, true, &spec, false),
+        b'p' => push_unsigned(out, ap.next()?, 16, false, &spec, true),
+        b'c' => {
+            if wide {
+                push_wchar(out, ap.next()? as u16, &spec);
+            } else {
+                push_padded_str(out, &[(ap.next()? & 0xFF) as u8], &spec);
+            }
+        }
+        b'C' => push_wchar(out, ap.next()? as u16, &spec),
+        b's' => {
+            if wide {
+                push_wide_str(out, ap.next()? as *const u16, &spec);
+            } else {
+                push_narrow_str(out, ap.next()? as *const u8, &spec);
+            }
+        }
+        b'S' => push_wide_str(out, ap.next()? as *const u16, &spec),
+        b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+            push_float(out, f64::from_bits(ap.next()?), verb, &spec)
+        }
+        // Never honored: consume the pointer slot, write nothing.
+        b'n' => {
+            ap.next()?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Render `v` in `radix` (8/10/16); `upper` selects hex case. `0` yields `"0"`.
+fn uint_digits(mut v: u64, radix: u32, upper: bool) -> Vec<u8> {
+    if v == 0 {
+        return vec![b'0'];
+    }
+    let mut rev = Vec::new();
+    while v != 0 {
+        let d = (v % radix as u64) as u8;
+        rev.push(if d < 10 {
+            b'0' + d
+        } else {
+            (if upper { b'A' } else { b'a' }) + d - 10
+        });
+        v /= radix as u64;
+    }
+    rev.reverse();
+    rev
+}
+
+/// Join sign/prefix/digits with `width` padding: `0`-pad goes between prefix and
+/// digits (a precision cancels it for integers), otherwise spaces; `left` pads
+/// on the right.
+fn emit_number(out: &mut Vec<u8>, sign: &[u8], prefix: &[u8], digits: &[u8], spec: &FmtSpec) {
+    let width = spec.width.unwrap_or(0).min(MAX_FIELD + 1);
+    let body = sign.len() + prefix.len() + digits.len();
+    if spec.left {
+        out.extend_from_slice(sign);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(digits);
+        for _ in body..width {
+            out.push(b' ');
+        }
+    } else if spec.zero && spec.prec.is_none() {
+        out.extend_from_slice(sign);
+        out.extend_from_slice(prefix);
+        for _ in body..width {
+            out.push(b'0');
+        }
+        out.extend_from_slice(digits);
+    } else {
+        for _ in body..width {
+            out.push(b' ');
+        }
+        out.extend_from_slice(sign);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(digits);
+    }
+}
+
+/// Decimal signed integer; `#` has no effect on `%d`/`%i`, as in C.
+fn push_signed(out: &mut Vec<u8>, v: i64, spec: &FmtSpec) {
+    let (sign, mag): (&[u8], u64) = if v < 0 {
+        (b"-", (v as u64).wrapping_neg())
+    } else if spec.plus {
+        (b"+", v as u64)
+    } else if spec.space {
+        (b" ", v as u64)
+    } else {
+        (b"", v as u64)
+    };
+    let digits = if mag == 0 && spec.prec == Some(0) {
+        Vec::new()
+    } else {
+        let mut d = uint_digits(mag, 10, false);
+        if let Some(p) = spec.prec {
+            while d.len() < p {
+                d.insert(0, b'0');
+            }
+        }
+        d
+    };
+    emit_number(out, sign, &[], &digits, spec);
+}
+
+/// Unsigned integer (`pointer` forces the `0x` prefix for `%p`). `+`/space have
+/// no effect on unsigned conversions, as in C.
+fn push_unsigned(
+    out: &mut Vec<u8>,
+    v: u64,
+    radix: u32,
+    upper: bool,
+    spec: &FmtSpec,
+    pointer: bool,
+) {
+    let mut digits = if v == 0 && spec.prec == Some(0) && !pointer {
+        Vec::new()
+    } else {
+        let mut d = uint_digits(v, radix, upper);
+        if let Some(p) = spec.prec {
+            while d.len() < p {
+                d.insert(0, b'0');
+            }
+        }
+        d
+    };
+    let mut prefix: &[u8] = &[];
+    if pointer {
+        prefix = b"0x";
+    } else if spec.alt {
+        if radix == 8 {
+            if digits.is_empty() {
+                digits.push(b'0');
+            } else if digits[0] != b'0' {
+                digits.insert(0, b'0');
+            }
+        } else if radix == 16 && v != 0 {
+            prefix = if upper { b"0X" } else { b"0x" };
+        }
+    }
+    emit_number(out, &[], prefix, &digits, spec);
+}
+
+/// Strings/chars pad with spaces only (the `0` flag is ignored, as in C).
+fn push_padded_str(out: &mut Vec<u8>, bytes: &[u8], spec: &FmtSpec) {
+    let width = spec.width.unwrap_or(0).min(MAX_FIELD + 1);
+    if spec.left {
+        out.extend_from_slice(bytes);
+        for _ in bytes.len()..width {
+            out.push(b' ');
+        }
+    } else {
+        for _ in bytes.len()..width {
+            out.push(b' ');
+        }
+        out.extend_from_slice(bytes);
+    }
+}
+
+/// Narrow `%s`: `NULL` prints `(null)`; precision caps the bytes.
+fn push_narrow_str(out: &mut Vec<u8>, s: *const u8, spec: &FmtSpec) {
+    let bytes: &[u8] = if s.is_null() {
+        b"(null)"
+    } else {
+        unsafe {
+            let n = strlen(s);
+            std::slice::from_raw_parts(s, n)
+        }
+    };
+    let end = spec.prec.map_or(bytes.len(), |p| p.min(bytes.len()));
+    push_padded_str(out, &bytes[..end], spec);
+}
+
+/// Wide `%s`/`%S`: UTF-16 guest units re-encoded as UTF-8 (`NULL` prints `(null)`;
+/// lone surrogates become U+FFFD); precision caps the wide units read.
+fn push_wide_str(out: &mut Vec<u8>, s: *const u16, spec: &FmtSpec) {
+    if s.is_null() {
+        let end = spec.prec.map_or(6, |p| p.min(6));
+        push_padded_str(out, &b"(null)"[..end], spec);
+        return;
+    }
+    let mut tmp = Vec::new();
+    unsafe {
+        push_utf16_as_utf8(&mut tmp, s, spec.prec);
+    }
+    push_padded_str(out, &tmp, spec);
+}
+
+/// Single wide char (`%lc`/`%C`): re-encoded as UTF-8 (a surrogate becomes U+FFFD).
+fn push_wchar(out: &mut Vec<u8>, w: u16, spec: &FmtSpec) {
+    let mut tmp = [0u8; 3];
+    let n = if (0xD800..0xE000).contains(&w) {
+        tmp[0] = 0xEF;
+        tmp[1] = 0xBF;
+        tmp[2] = 0xBD;
+        3
+    } else if w < 0x80 {
+        tmp[0] = w as u8;
+        1
+    } else if w < 0x800 {
+        tmp[0] = (0xC0 | (w >> 6)) as u8;
+        tmp[1] = (0x80 | (w & 0x3F)) as u8;
+        2
+    } else {
+        tmp[0] = (0xE0 | (w >> 12)) as u8;
+        tmp[1] = (0x80 | ((w >> 6) & 0x3F)) as u8;
+        tmp[2] = (0x80 | (w & 0x3F)) as u8;
+        3
+    };
+    push_padded_str(out, &tmp[..n], spec);
+}
+
+/// Append UTF-8 for `cp` (a full code point).
+fn push_utf8(out: &mut Vec<u8>, cp: u32) {
+    if cp < 0x80 {
+        out.push(cp as u8);
+    } else if cp < 0x800 {
+        out.push((0xC0 | (cp >> 6)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else if cp < 0x10000 {
+        out.push((0xE0 | (cp >> 12)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else {
+        out.push((0xF0 | (cp >> 18)) as u8);
+        out.push((0x80 | ((cp >> 12) & 0x3F)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    }
+}
+
+/// Copy NUL-terminated UTF-16 at `s` as UTF-8, reading at most `max_units` units
+/// (`None` = to the NUL). Surrogate pairs combine; lone halves become U+FFFD.
+unsafe fn push_utf16_as_utf8(out: &mut Vec<u8>, s: *const u16, max_units: Option<usize>) {
+    let mut i = 0usize;
+    loop {
+        if let Some(m) = max_units {
+            if i >= m {
+                break;
+            }
+        }
+        let w = *s.add(i);
+        if w == 0 {
+            break;
+        }
+        i += 1;
+        if (0xD800..0xDC00).contains(&w) {
+            let in_range = match max_units {
+                Some(m) => i < m,
+                None => true,
+            };
+            let lo = *s.add(i);
+            if in_range && (0xDC00..0xE000).contains(&lo) {
+                i += 1;
+                push_utf8(
+                    out,
+                    0x10000 + ((w as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00),
+                );
+            } else {
+                push_utf8(out, 0xFFFD);
+            }
+        } else if (0xDC00..0xE000).contains(&w) {
+            push_utf8(out, 0xFFFD);
+        } else {
+            push_utf8(out, w as u32);
+        }
+    }
+}
+
+fn float_sign(v: f64, spec: &FmtSpec) -> &'static str {
+    if v.is_sign_negative() {
+        "-"
+    } else if spec.plus {
+        "+"
+    } else if spec.space {
+        " "
+    } else {
+        ""
+    }
+}
+
+/// `%f`: exactly `prec` digits after the dot (`#` forces the dot when `prec == 0`).
+fn float_fixed(a: f64, prec: usize, alt: bool) -> Vec<u8> {
+    let mut s = format!("{a:.prec$}");
+    if alt && prec == 0 && !s.contains('.') {
+        s.push('.');
+    }
+    s.into_bytes()
+}
+
+/// `%e`: one digit, dot, `prec` digits, then `e±dd` (at least two exponent digits).
+fn float_sci(a: f64, prec: usize, alt: bool, upper: bool) -> Vec<u8> {
+    let s = format!("{a:.prec$e}");
+    let cut = s.find('e').unwrap_or(s.len());
+    let (mant, exp) = s.split_at(cut);
+    let mut mant = mant.to_string();
+    if alt && prec == 0 && !mant.contains('.') {
+        mant.push('.');
+    }
+    let exp: i32 = exp[1..].parse().unwrap_or(0);
+    let mut body = mant.into_bytes();
+    body.push(if upper { b'E' } else { b'e' });
+    body.extend_from_slice(format!("{exp:+03}").as_bytes());
+    body
+}
+
+/// Strip trailing fraction zeros (then a bare dot) from a `%g` body, leaving any
+/// `e±dd` exponent intact.
+fn strip_float_zeros(body: &mut Vec<u8>) {
+    let epos = body.iter().position(|&b| b == b'e' || b == b'E');
+    let end = epos.unwrap_or(body.len());
+    if let Some(d) = body[..end].iter().position(|&b| b == b'.') {
+        let mut cut = end;
+        while cut > d + 1 && body[cut - 1] == b'0' {
+            cut -= 1;
+        }
+        if cut == d + 1 {
+            cut = d;
+        }
+        body.drain(cut..end);
+    }
+}
+
+/// `%g`: `prec` significant digits (default 6, `0` means 1); scientific when the
+/// decimal exponent is `< -4` or `>= prec`, else fixed; trailing zeros (and the
+/// dot) are stripped unless `#` is set.
+fn float_general(a: f64, prec: usize, alt: bool, upper: bool) -> Vec<u8> {
+    let sig = if prec == 0 { 1 } else { prec };
+    if a == 0.0 {
+        if alt {
+            let mut body = vec![b'0', b'.'];
+            for _ in 1..sig {
+                body.push(b'0');
+            }
+            return body;
+        }
+        return b"0".to_vec();
+    }
+    // Exact decimal exponent from Rust's own scientific spelling (no `log10` drift).
+    let probe = format!("{a:e}");
+    let exp: i32 = probe
+        .split('e')
+        .nth(1)
+        .and_then(|e| e.parse().ok())
+        .unwrap_or(0);
+    let mut body = if exp < -4 || exp >= sig as i32 {
+        float_sci(a, sig - 1, true, upper)
+    } else {
+        let frac = (sig as i32 - 1 - exp).max(0) as usize;
+        float_fixed(a, frac, true)
+    };
+    if !alt {
+        strip_float_zeros(&mut body);
+    }
+    body
+}
+
+/// `%a`: C hex float `0xh.hhhhp±d` (`prec` = hex digits after the dot; default
+/// strips trailing zeros). Truncation (no rounding) on a short `prec` is a
+/// documented HLE approximation.
+fn float_hex(a: f64, prec: Option<usize>, alt: bool, upper: bool) -> Vec<u8> {
+    let bits = a.to_bits();
+    let exp_bits = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
+    let (int_digit, exp_out) = if a == 0.0 {
+        (b'0', 0)
+    } else if exp_bits == 0 {
+        (b'0', -1022)
+    } else {
+        (b'1', exp_bits - 1023)
+    };
+    let mut digits = format!("{frac:013x}").into_bytes();
+    match prec {
+        Some(p) => {
+            let p = p.min(MAX_FIELD);
+            if digits.len() > p {
+                digits.truncate(p);
+            }
+            while digits.len() < p {
+                digits.push(b'0');
+            }
+        }
+        None => {
+            while digits.last() == Some(&b'0') {
+                digits.pop();
+            }
+        }
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(b"0x");
+    body.push(int_digit);
+    if !digits.is_empty() || alt {
+        body.push(b'.');
+        body.extend_from_slice(&digits);
+    }
+    body.push(b'p');
+    body.extend_from_slice(format!("{exp_out:+}").as_bytes());
+    if upper {
+        body.make_ascii_uppercase();
+    }
+    body
+}
+
+fn push_float(out: &mut Vec<u8>, v: f64, verb: u8, spec: &FmtSpec) {
+    if v.is_nan() || v.is_infinite() {
+        let body = if v.is_nan() {
+            if verb.is_ascii_uppercase() {
+                "NAN"
+            } else {
+                "nan"
+            }
+        } else if verb.is_ascii_uppercase() {
+            "INF"
+        } else {
+            "inf"
+        };
+        // Non-finite values pad with spaces (a `0` flag would mislead).
+        let mut plain = *spec;
+        plain.zero = false;
+        emit_number(out, float_sign(v, spec).as_bytes(), &[], body.as_bytes(), &plain);
+        return;
+    }
+    let neg = v < 0.0 || (v == 0.0 && v.is_sign_negative());
+    let a = v.abs();
+    let sign: &[u8] = if neg {
+        b"-"
+    } else if spec.plus {
+        b"+"
+    } else if spec.space {
+        b" "
+    } else {
+        b""
+    };
+    let prec = spec.prec.unwrap_or(6).min(MAX_FIELD);
+    let mut body: Vec<u8> = match verb {
+        b'f' | b'F' => float_fixed(a, prec, spec.alt),
+        b'e' | b'E' => float_sci(a, prec, spec.alt, verb == b'E'),
+        b'g' | b'G' => float_general(a, prec, spec.alt, verb == b'G'),
+        _ => float_hex(a, spec.prec, spec.alt, verb == b'A'),
+    };
+    if matches!(verb, b'F' | b'E' | b'G') {
+        body.make_ascii_uppercase();
+    }
+    emit_number(out, sign, &[], &body, spec);
+}
+
 /// Export table: name → real code address (never `0`/stub metadata).
 pub fn exports() -> Vec<(&'static str, usize)> {
     vec![
@@ -1581,6 +2331,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("fclose", fclose as usize),
         ("fseek", fseek as usize),
         ("ftell", ftell as usize),
+        ("__stdio_common_vfprintf", __stdio_common_vfprintf as usize),
     ]
 }
 
@@ -2140,6 +2891,168 @@ mod tests {
             let miss = dir.join("missing.txt");
             let cmiss = format!("{}\0", miss.display());
             assert!(fopen(cmiss.as_ptr(), b"rb\0".as_ptr()).is_null());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn vfprintf_formats_into_crt_files() {
+        let dir = std::env::temp_dir().join(format!("xcl_crt_12d_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Format `fmt` with `slots` (win64 va_list: one u64 per argument) into a
+        // fresh file; returns the HLE return code plus the file bytes.
+        let run = |name: &str, fmt: &[u8], slots: &[u64]| -> (i32, Vec<u8>) {
+            unsafe {
+                let path = dir.join(name);
+                let cpath = format!("{}\0", path.display());
+                let f = fopen(cpath.as_ptr(), b"wb\0".as_ptr());
+                assert!(!f.is_null());
+                let arglist = if slots.is_empty() {
+                    std::ptr::null()
+                } else {
+                    slots.as_ptr() as *const u8
+                };
+                let rc = __stdio_common_vfprintf(0, f, fmt.as_ptr(), 0, arglist);
+                assert_eq!(fclose(f), 0);
+                (rc, std::fs::read(&path).unwrap())
+            }
+        };
+        unsafe {
+            // Integers, strings, pointers, chars, lengths, literal percent.
+            let hello = b"val\0";
+            let slots = [
+                hello.as_ptr() as u64,
+                (-42i32) as u32 as u64,
+                42u64,
+                0xdead_beefu64,
+                0xdead_beefu64,
+                0o17u64,
+                b'A' as u64,
+                0x1234u64,
+                0x1122_3344_5566_7788u64,
+            ];
+            let (rc, bytes) = run(
+                "ints.txt",
+                b"%s=%d %u %x %X %o %c %% %p %llx\0",
+                &slots,
+            );
+            assert_eq!(
+                bytes,
+                b"val=-42 42 deadbeef DEADBEEF 17 A % 0x1234 1122334455667788"
+            );
+            assert_eq!(rc as usize, bytes.len());
+            // Width, precision, `*`, signs, floats.
+            let two5 = 2.5f64;
+            let slots = [3u64, 3, 7, 7, 7, 7, 7, 6, 7, 2, two5.to_bits()];
+            let (rc, bytes) = run(
+                "width.txt",
+                b"[%+d][% d][%5d][%-5d][%05d][%.3d][%8.3d][%*d][%.*f]\0",
+                &slots,
+            );
+            assert_eq!(
+                bytes,
+                b"[+3][ 3][    7][7    ][00007][007][     007][     7][2.50]"
+            );
+            assert_eq!(rc as usize, bytes.len());
+            // Float verbs, including the title's `%g` and a big-exponent switch.
+            let one5 = 1.5f64;
+            let big = 1_234_567.0f64;
+            let slots = [
+                one5.to_bits(),
+                one5.to_bits(),
+                one5.to_bits(),
+                one5.to_bits(),
+                big.to_bits(),
+            ];
+            let (rc, bytes) = run("floats.txt", b"%f|%e|%g|%a|%g\0", &slots);
+            assert_eq!(bytes, b"1.500000|1.500000e+00|1.5|0x1.8p+0|1.23457e+06");
+            assert_eq!(rc as usize, bytes.len());
+            // Windows lengths: `l` stays 32-bit, `ll`/`z` are 64-bit.
+            let slots = [
+                0x1FFu64,
+                0x1FFFFu64,
+                0xFFFF_FFFFu64,
+                0xFFFF_FFFF_FFFF_FFFFu64,
+                0xFFFF_FFFF_FFFF_FFFFu64,
+                0x1ABu64,
+                0x1ABCDu64,
+                0x1DEAD_BEEFu64,
+                0x1122_3344_5566_7788u64,
+                0x1122_3344_5566_7788u64,
+            ];
+            let (rc, bytes) = run(
+                "lengths.txt",
+                b"%hhd %hd %ld %lld %zd %hhx %hx %lx %llx %zx\0",
+                &slots,
+            );
+            assert_eq!(
+                bytes,
+                b"-1 -1 -1 -1 -1 ab abcd deadbeef 1122334455667788 1122334455667788"
+            );
+            assert_eq!(rc as usize, bytes.len());
+            // Wide strings re-encode as UTF-8; NULL narrow strings print `(null)`.
+            let w: [u16; 3] = [0x48, 0x69, 0];
+            let slots = [w.as_ptr() as u64, 0u64];
+            let (rc, bytes) = run("wide.txt", b"%ls|%s\0", &slots);
+            assert_eq!(bytes, b"Hi|(null)");
+            assert_eq!(rc as usize, bytes.len());
+            // `%n` consumes its slot and writes nothing (sentinel untouched).
+            let mut sentinel: u32 = 0x1234_5678;
+            let p = &mut sentinel as *mut u32 as u64;
+            let (rc, bytes) = run("n.txt", b"AB%nCD\0", &[p]);
+            assert_eq!(bytes, b"ABCD");
+            assert_eq!(rc, 4);
+            assert_eq!(sentinel, 0x1234_5678);
+            // Truncated formats stop at the `%` without crashing.
+            let (rc, bytes) = run("trunc.txt", b"abc%\0", &[]);
+            assert_eq!(bytes, b"abc");
+            assert_eq!(rc, 3);
+            let (rc, bytes) = run("trunc2.txt", b"abc%5\0", &[]);
+            assert_eq!(bytes, b"abc");
+            assert_eq!(rc, 3);
+            // Unknown verbs and missing arguments are error returns.
+            let (rc, _) = run("unknown.txt", b"%q\0", &[]);
+            assert_eq!(rc, -1);
+            let path = dir.join("nullargs.txt");
+            let cpath = format!("{}\0", path.display());
+            let f = fopen(cpath.as_ptr(), b"wb\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(
+                __stdio_common_vfprintf(0, f, b"%d\0".as_ptr(), 0, std::ptr::null()),
+                -1
+            );
+            assert_eq!(fclose(f), 0);
+            // NULL stream/format are error returns, never faults.
+            assert_eq!(
+                __stdio_common_vfprintf(
+                    0,
+                    std::ptr::null_mut(),
+                    b"x\0".as_ptr(),
+                    0,
+                    std::ptr::null()
+                ),
+                -1
+            );
+            let path = dir.join("nullfmt.txt");
+            let cpath = format!("{}\0", path.display());
+            let f = fopen(cpath.as_ptr(), b"wb\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(
+                __stdio_common_vfprintf(0, f, std::ptr::null(), 0, std::ptr::null()),
+                -1
+            );
+            assert_eq!(fclose(f), 0);
+            // Options/locale are accepted and ignored (C-locale narrow output).
+            let path = dir.join("ignored.txt");
+            let cpath = format!("{}\0", path.display());
+            let f = fopen(cpath.as_ptr(), b"wb\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(
+                __stdio_common_vfprintf(0xDEAD, f, b"hi\0".as_ptr(), 0x12345, std::ptr::null()),
+                2
+            );
+            assert_eq!(fclose(f), 0);
+            assert_eq!(std::fs::read(&path).unwrap(), b"hi");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

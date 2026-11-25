@@ -690,6 +690,7 @@ mod tests {
             "fwrite",
             "fclose",
             "fflush",
+            "__stdio_common_vfprintf",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, UCRT);

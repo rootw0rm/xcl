@@ -835,3 +835,31 @@ New task `linux:crt-vfprintf` (`task-1795565262-e15d`, plan.md step 12d) is the 
 task. Docs updated in the same pass: plan.md 12c marked LANDED + new 12d section; context.md
 current-state refresh. Steps 13–21 stay chained behind SKIPPED step-12; Phase D/E/F remain blocked
 per PROMPT §4.7. No code changes in this planner pass.
+
+## Verification Notes — step-12d crt-vfprintf (Builder, 2026-11-25, `linux`)
+
+Task `task-1795565262-e15d` (`linux:crt-vfprintf`, plan.md step 12d).
+Retail-smoke SKIPPED here: `/run/media/...` absent (no game files on host); synthetic title is the e2e gate.
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/hle/crt_linux.rs`: win64 `__stdio_common_vfprintf(options, stream,
+  format, locale, arglist)` — format engine over win64 `va_list` (`char*` to 8-byte
+  slots) writing into `CrtFile` via the `fwrite` path. Verbs `%s`/`%c`/`%d`/`%i`/`%u`/
+  `%x`/`%X`/`%o`/`%p`/`%%` with width/precision/`*` and `ll`/`l`/`h`/`hh`/`z`/`j`/`t`/
+  `I32`/`I64` lengths (Windows sizes: `l` is 32-bit), float `%f`/`%e`/`%g`/`%a` (+upper)
+  reading `double` slots, `%ls`/`%S`/`%lc`/`%C` wide re-encoded as UTF-8. `%n` consumes
+  its slot and writes nothing; `options`/`locale` accepted and ignored (C locale);
+  NULL stream/format (or NULL arglist with args needed) and unknown verbs return `-1`;
+  lone trailing `%` emits the prefix. Plus `vfprintf_formats_into_crt_files` unit test
+  (ints/width/star/signs/floats/lengths/wide/NULL-string, `%n` no-write with sentinel,
+  truncated formats, unknown verb, NULL stream/format/arglist, ignored options/locale).
+- `crates/xcl/src/hle_linux.rs`: 1 new name in the CRT spot list.
+- `crates/xcl/src/resolver_linux.rs`: `api-ms-win-crt-stdio` contract check and
+  `vcruntime140`/`msvcp140` bundled-DLL forwarding checks.
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib crt -- --test-threads=4` → 21 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 374 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (only pre-existing `missing_safety_doc`/style warnings); `git diff --check` clean.
+- Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh temp game dir, fresh `XCL_DATA_ROOT`, `XCL_DUMP_SHADERS=1`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `crash: null`, `exit_code: 14`, `called_stubs: 34` (same known GPU/null-device + `FormatMessageW`/`XclDefinitelyMissingFunction`/DirectStorage/MFPlat set; no CRT stub), `imports_by_source` includes `hle-cross:ucrtbase.dll: 75`. All 14 FAILs are the known null-device categories; no CRT regression.
+- `llvm-readobj --coff-imports` on both synthetic binaries vs the 109 `crt_linux` export names: 0 MISS UCRT imports — this closes the last MISS from the 12c audit.
