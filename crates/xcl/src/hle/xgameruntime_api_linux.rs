@@ -200,14 +200,31 @@ unsafe impl Send for Obj {}
 
 const SLOTS: usize = 96;
 
+const IID_IUNKNOWN: Guid = g(0x0000_0000_0000_0000_c000_0000_0000_0046);
+
 unsafe extern "win64" fn query_interface(this: *const Obj, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() || iid.is_null() {
         return E_INVALIDARG;
     }
     let f = &(*this).iface;
-    if *iid == f.clsid || f.iids.contains(&*iid) || (f.main && own(&f.clsid, &*iid).is_some_and(|o| std::ptr::eq(o, this))) {
+    if *iid == IID_IUNKNOWN {
+        // COM identity rule: every interface on one class must return the same canonical
+        // IUnknown pointer (the class's main object, or `this` for standalone fallback objects).
+        let canonical = objects().iter().copied()
+            .find(|o| o.iface.clsid == f.clsid && o.iface.main)
+            .map_or(this, |o| o as *const Obj);
+        *out = canonical as *mut c_void;
+        return S_OK;
+    }
+    if *iid == f.clsid || f.iids.contains(&*iid) {
         *out = this as *mut c_void;
         return S_OK;
+    }
+    if let Some(other) = own(&f.clsid, &*iid) {
+        if other.iface.iids.contains(&*iid) || (f.main && std::ptr::eq(other, this)) {
+            *out = other as *const Obj as *mut c_void;
+            return S_OK;
+        }
     }
     *out = std::ptr::null_mut();
     // a title asserting on this (a newer interface version of the class?) ends without a trace otherwise
@@ -1231,6 +1248,87 @@ mod tests {
             assert!(!std::ptr::eq(gt as *const Obj, u as *const Obj));
             let (_, later) = query(XUSER, g(0x26f3c674_a2fe_44fa_b6c4_a323bc94ff53));
             assert!(std::ptr::eq(later as *const Obj, u as *const Obj));
+        }
+    }
+
+    #[test]
+    fn query_interface_accepts_iunknown_and_sibling_interfaces() {
+        unsafe {
+            type Qi = unsafe extern "win64" fn(*const Obj, *const Guid, *mut *mut c_void) -> HRESULT;
+            let qi = |o: *mut c_void, iid: &Guid| {
+                let f: Qi = slot(o, 0);
+                let mut p = std::ptr::null_mut();
+                (f(o as *const Obj, iid, &mut p), p)
+            };
+            // QI(IUnknown) from two different interfaces: one canonical pointer (the main object).
+            let (_, u) = query(XUSER, XUSER);
+            let (_, gt) = query(XUSER, XUSER_GAMERTAG_IID);
+            assert!(!std::ptr::eq(gt as *const Obj, u as *const Obj));
+            let (hru, iu) = qi(u, &IID_IUNKNOWN);
+            let (hrg, ig) = qi(gt, &IID_IUNKNOWN);
+            assert_eq!((hru, hrg), (S_OK, S_OK));
+            assert!(!iu.is_null());
+            assert!(std::ptr::eq(iu as *const Obj, ig as *const Obj));
+            assert!(std::ptr::eq(iu as *const Obj, u as *const Obj));
+            // sibling QI succeeds: main reaches the gamertag vtable, the alias reaches main's V2.
+            let (hrs, s) = qi(u, &XUSER_GAMERTAG_IID);
+            assert_eq!(hrs, S_OK);
+            assert!(std::ptr::eq(s as *const Obj, gt as *const Obj));
+            let (hrv, v) = qi(gt, &XUSER_V2_IID);
+            assert_eq!(hrv, S_OK);
+            assert!(std::ptr::eq(v as *const Obj, u as *const Obj));
+            // legacy console vtables share the class identity too.
+            let p1 = own(&XPACKAGE, &XPACKAGE_V1_IID).expect("XPackage v1");
+            let (_, pm) = query(XPACKAGE, XPACKAGE);
+            let (hrp, ip) = qi(p1 as *const Obj as *mut c_void, &IID_IUNKNOWN);
+            assert_eq!(hrp, S_OK);
+            assert!(std::ptr::eq(ip as *const Obj, pm as *const Obj));
+            // failures null the out-pointer; nulls are rejected.
+            // (a non-main alias stays isolated: an iid it does not hold is refused, not
+            // routed to the main object.)
+            let mut bad = 0x1 as *mut c_void;
+            let f: Qi = slot(gt, 0);
+            assert_eq!(f(gt as *const Obj, &g(0xdeadbeef_0000_4000_8000_0123456789ab), &mut bad), E_NOINTERFACE);
+            assert!(bad.is_null());
+            assert_eq!(f(gt as *const Obj, std::ptr::null(), &mut bad), E_INVALIDARG);
+            assert_eq!(f(gt as *const Obj, &XUSER, std::ptr::null_mut()), E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn query_api_impl_isolates_forwarding_alias() {
+        // No PC runtime on Linux: unknown interface versions share the immutable main
+        // vtable, so there is no per-alias forwarding state to poison — every alias keeps
+        // the one class identity through QI(IUnknown), and an alias answers only what it holds.
+        unsafe {
+            type Qi = unsafe extern "win64" fn(*const Obj, *const Guid, *mut *mut c_void) -> HRESULT;
+            let qi = |o: *mut c_void, iid: &Guid| {
+                let f: Qi = slot(o, 0);
+                let mut p = std::ptr::null_mut();
+                (f(o as *const Obj, iid, &mut p), p)
+            };
+            let unknown_a = g(0x11111111_2222_4333_8444_555555555555);
+            let unknown_b = g(0x66666666_7777_4888_8999_aaaaaaaaaaaa);
+            let (_, o1) = query(XGAMEUI, unknown_a);
+            let (_, o2) = query(XGAMEUI, unknown_b);
+            let (_, main) = query(XGAMEUI, XGAMEUI);
+            assert!(!o1.is_null());
+            assert!(std::ptr::eq(o1 as *const Obj, main as *const Obj));
+            assert!(std::ptr::eq(o2 as *const Obj, main as *const Obj));
+            let (_, iu1) = qi(o1, &IID_IUNKNOWN);
+            let (_, iu2) = qi(o2, &IID_IUNKNOWN);
+            assert!(std::ptr::eq(iu1 as *const Obj, iu2 as *const Obj));
+            assert!(std::ptr::eq(iu1 as *const Obj, main as *const Obj));
+            // the alias answers its own class version, but a non-main alias stays isolated
+            // from iids it does not hold (refused + nulled, not routed to main).
+            let (hrs, s) = qi(o1, &XGAMEUI);
+            assert_eq!(hrs, S_OK);
+            assert!(std::ptr::eq(s as *const Obj, o1 as *const Obj));
+            let (_, gt) = query(XUSER, XUSER_GAMERTAG_IID);
+            let mut p = 0x1 as *mut c_void;
+            let gtf: Qi = slot(gt, 0);
+            assert_eq!(gtf(gt as *const Obj, &XGAMEUI, &mut p), E_NOINTERFACE);
+            assert!(p.is_null());
         }
     }
 
