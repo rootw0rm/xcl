@@ -1234,3 +1234,81 @@ Verification (this host, no game files — retail SKIPPED):
   (Two interim runs without `XCL_DATA_ROOT` showed 14 fails from the reused
   default data dir — files-delete + PLS EEXIST — not a code regression; fresh
   root matches the 12g/13/14/15 baseline exactly.)
+
+## Critic review — step-16 subgroup-width (Fresh-Eyes, 2026-11-25, `linux` @ `baf36be`)
+
+Task `task-1795570615-1ff3` / plan.md step 16 (`linux:subgroup-width`, DEC-023).
+
+Requirements: met — `LanePath::{Native64, Split32}` + pure `lane_path_for`
+(64 → native, else split-32 incl. 0/unknown fail-closed) + `requires_split`
+mirroring `runner::split_wave64`; `pick_device` reads core `subgroupSize` plus
+`VK_EXT_subgroup_size_control` min/max where reported and logs
+`subgroupSize (min/max) -> native-64|split-32`; `WORK_ITEMS=64` kept for both
+paths (one wave64 natively, two subgroups of 32 on split); `device_subgroup_size` /
+`device_lane_path` query the real device; all three step-15 follow-ups folded
+(`skip_test` arms now byte-identical to `runner.rs`, `_entry` dropped, scoped
+`Scope` Drop owns every handle so early `?` cannot leak). No window/graphics/
+routing change, no `TRANSLATOR_SOURCES` change, no new deps.
+
+Re-verified (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib gpu::recomp::vulkan_runner` → 5 passed, 0 failed
+  (pure both-widths gate + on-device agreement + trivial `0..64→*2+1` on Arc A770
+  `subgroupSize 32 (min 8 max 32) -> split-32`).
+- `cargo test -p xcl --lib` → 396 passed, 0 failed, 0 ignored.
+- `cargo check --workspace` → 0 errors; `cargo clippy -p xcl --lib` → 0 errors
+  (`-D warnings` fails on 533 pre-existing warnings, same as baseline).
+- `git diff --check` clean; `rustfmt --check` clean on `vulkan_runner.rs`
+  (whole-tree `cargo fmt --check` drift is pre-existing `build.rs` only).
+- Shipped-path audit: `grep Command/process` in `vulkan_runner.rs` → Vulkan
+  `cmd_*` only, no `std::process`; `ash`/`libloading` stay Linux-only
+  runtime-`dlopen` (MIT/ISC), `ldd` shows no Vulkan link.
+- Synthetic title (fresh `/tmp/subw-critic-game`, fresh
+  `XCL_DATA_ROOT=/tmp/subw-critic-data`): `xcl_testtitle: done, failures: 12`,
+  `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `crash: null`,
+  `called_stubs: 29` (28 `d3d12_xs` + `XclDefinitelyMissingFunction` probe, zero
+  `mfplat`/`FormatMessage`/`xcrdapi`), `[PASS] DirectStorage` + `[PASS] MFPlat`
+  hold. Matches the 12g/13/14/15 baseline; no new failure.
+
+No blocking findings.
+
+## Follow-ups (minor, non-blocking)
+- `dispatch_compute` computes `let _lane = lane_path_for(subgroup)` but never
+  logs/uses it beyond `pick_device`'s `eprintln!`; both paths dispatch identically
+  by design (one group of 64 is valid either way), so this is dead selection state
+  today. Either log it at dispatch or drop the binding when the recompiler-emission
+  side (step-17+) consumes `device_lane_path()`.
+- `device_subgroup_size()` builds a throwaway Vulkan instance just to read one
+  `u32`; fine for a test helper, but a future caller that already owns an instance
+  should take the `pick_device`-style path instead of a second `create_instance`.
+
+## Planner revise — vulkan-backend triage (2026-11-25, `linux` @ `baf36be`)
+
+Event `plan.revise`: `linux:subgroup-width` passed review and closed (396 lib tests, title
+`ExitProcess(0xc)`/12 fails, `called_stubs: 29`, pure both-widths gate + on-device
+agreement on Arc A770 `subgroupSize 32 (min 8 max 32) -> split-32`). Queue: 9 open
+(stable-key steps 13-21 chained behind SKIPPED step-12, steps 13-16 already landed as
+side tasks `6c09624`/`d64f32c`/`a157022`/`baf36be`); `task ready --all` is empty, so the
+next behavior slice needs a new unblocked side task (stable-key chain left intact per
+DEC-020/021/022/023).
+
+Triage (evidence, not speculation): `cargo test -p xcl --lib
+gpu::recomp::vulkan_runner` → 5 passed here (no skip, real device);
+`vulkaninfo` still reports Arc A770 / RTX 3090 Ti / Raphael. The runner now selects
+`Native64` vs `Split32` from the device and the step-15 follow-ups are folded. The
+step-16 review's two minors (dead `_lane` binding at dispatch, throwaway instance in
+`device_subgroup_size`) are both inside `vulkan_runner.rs`, so they fold into step-17a
+work, not new tasks. Full step-17 present (`winit` window + swapchain + D3D12.X
+routing) is too large for one reviewable slice and its windowed smoke cannot execute
+for real on this headless host — so the next slice is a selector skeleton, not present.
+
+New task `linux:vulkan-backend` (plan.md step 17a, recorded as DEC-024): Vulkan backend
+selector in front of the null D3D12.X device — `Backend::{Null, Vulkan}` + `select()`
+(env override, null stays the headless default, no-device falls back to null with a
+logged reason, never a panic); D3D12.X creation queries the selector but still returns
+the null device (no title behavior change); consumes `device_lane_path()` at selection
+(fixes dead-`_lane` follow-up) and reuses the `pick_device`-style query where practical
+(second follow-up). No `winit`/swapchain/window/graphics-pipeline change, no
+`TRANSLATOR_SOURCES` change, no new deps. Docs updated in the same pass: plan.md step 16
+marked LANDED + 16 LANDED detail + new 17a section + Plan Changes entry; context.md
+current-state refresh; DEC-024 recorded. Steps 17-21 stay chained behind SKIPPED step-12;
+Phase E/F remain blocked per §4.7. No code changes in this planner pass.
