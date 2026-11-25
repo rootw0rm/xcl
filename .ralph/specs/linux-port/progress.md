@@ -863,3 +863,21 @@ Verification (this host, no game files — retail SKIPPED):
 - `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (only pre-existing `missing_safety_doc`/style warnings); `git diff --check` clean.
 - Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh temp game dir, fresh `XCL_DATA_ROOT`, `XCL_DUMP_SHADERS=1`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `crash: null`, `exit_code: 14`, `called_stubs: 34` (same known GPU/null-device + `FormatMessageW`/`XclDefinitelyMissingFunction`/DirectStorage/MFPlat set; no CRT stub), `imports_by_source` includes `hle-cross:ucrtbase.dll: 75`. All 14 FAILs are the known null-device categories; no CRT regression.
 - `llvm-readobj --coff-imports` on both synthetic binaries vs the 109 `crt_linux` export names: 0 MISS UCRT imports — this closes the last MISS from the 12c audit.
+
+## Critic review — step-12d crt-vfprintf (Fresh-Eyes, 2026-11-25, `linux` @ `b4956ba`)
+
+Task `task-1795565262-e15d` (`linux:crt-vfprintf`) — PASS, closed.
+
+Independent re-verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib crt -- --test-threads=4` → 21 passed; 0 failed (includes `vfprintf_formats_into_crt_files` + both resolver forwarding tests with the new stdio entry).
+- `cargo test -p xcl --lib -- --test-threads=4` → 374 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors, 6 pre-existing warnings; `cargo clippy -p xcl --lib` → 0 errors (513 pre-existing warnings only); `git diff HEAD~1 HEAD --check` clean.
+- Synthetic title (fresh temp game dir from `tests/data/testgame` + prebuilt exes, fresh `XCL_DATA_ROOT`, `XCL_DUMP_SHADERS=1`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `crash: null`, `exit_code: 14`, `called_stubs: 34` incl. `XclDefinitelyMissingFunction`, `hle-cross:ucrtbase.dll: 75`. All 14 FAILs are the known null-device categories; no CRT regression.
+- `llvm-readobj --coff-imports` audit re-run here: 46 CRT imports (exe) + 29 (dll) vs 109 `crt_linux` export names → 0 MISS UCRT imports in both binaries. Last MISS from the 12c audit is closed.
+- Abuse coverage is in-tree (no temp test needed): truncated `abc%`/`abc%5` → prefix only, `%q` → `-1`, `%d` with NULL arglist → `-1`, NULL stream/format → `-1`, `%n` with live sentinel `0x12345678` → bytes `ABCD`, rc 4, sentinel untouched.
+
+Requirements: met — win64 `__stdio_common_vfprintf` (8-byte slot `VaReader`, NULL-list fails closed; width/precision/`*` with `MAX_FIELD` guard; `ll`/`l`(32-bit)/`h`/`hh`/`z`/`j`/`t`/`I32`/`I64` lengths; `%d/%i/%u/%x/%X/%o/%p/%c/%s/%%` + float `%f/%e/%g/%a` (+upper) via `double` slots + wide `%ls/%S/%lc/%C` as UTF-8; `%n` consumes slot and writes nothing; options/locale accepted-ignored; NULL stream/format and unknown verbs → `-1`; lone `%` emits prefix) writing through the `fwrite` path, wired through `exports()` + HLE spot list + `api-ms-win-crt-stdio` contract and `vcruntime140`/`msvcp140` bundled-DLL checks + unit test. One commit (`b4956ba`), no refactors, Linux-only files so Windows untouched.
+
+## Follow-ups (minor, non-blocking)
+- Unknown-verb failure discards the already-rendered prefix (returns `-1`, writes nothing); real UCRT would report `-1` having streamed the prefix. Safe HLE simplification, but worth documenting if a caller depends on partial output.
+- Unit test covers `hhd/hd/ld/lld/zd/hhx/hx/lx/llx/zx` but not bare-`I`/`I32`/`I64` spellings; routing is shared (`Ll`/`L`) so risk is low — cover them next time the file is touched.
