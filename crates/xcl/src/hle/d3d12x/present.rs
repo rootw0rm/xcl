@@ -519,6 +519,96 @@ fn ensure_window() -> Option<HWND> {
 // presenter
 // ---------------------------------------------------------------------------------------
 
+/// Number of in-flight present command allocators (`XCL_PRESENT_SYNC=1` drops to 1).
+const PRESENT_SLOTS: usize = 2;
+/// Swap chain buffer count (triple buffered so frame N copies into a free buffer while frame N-1
+/// finishes on the GPU and an earlier buffer scans out).
+const SWAP_BUFFERS: u32 = 3;
+
+/// Pipelined fence ring tracking which submitted present fence owns each command-allocator slot.
+/// With `slots == 2`, presenting frame `N` waits only for frame `N - 2` (overlapping CPU/GPU work
+/// across frames `N - 1` and `N`), while resize, queue switch, and `XCL_FRAME_DUMP` readbacks
+/// drain all slots cleanly.
+struct PresentRing {
+    slot_fences: Vec<u64>,
+    cur: usize,
+    recorded_value: u64,
+}
+
+impl PresentRing {
+    fn new(slots: usize) -> Self {
+        Self { slot_fences: vec![0; slots.max(1)], cur: 0, recorded_value: 0 }
+    }
+
+    /// Observe `presenter_value` (`Presenter.value`) before starting the next present.
+    /// If a new submission occurred since our last call (`presenter_value > recorded_value`),
+    /// attaches `presenter_value` to the previous slot, rotates to the next slot, and returns
+    /// `(slot_to_use, fence_to_wait, rotated_from_prev)`.
+    fn begin_present(&mut self, presenter_value: u64) -> (usize, u64, Option<usize>) {
+        if presenter_value > self.recorded_value {
+            let prev = self.cur;
+            self.slot_fences[prev] = presenter_value;
+            self.recorded_value = presenter_value;
+            let next = (prev + 1) % self.slot_fences.len();
+            self.cur = next;
+            let rotated = (next != prev).then_some(prev);
+            return (next, self.slot_fences[next], rotated);
+        }
+        (self.cur, self.slot_fences[self.cur], None)
+    }
+
+    fn mark_slot_reusable(&mut self, slot: usize) {
+        self.slot_fences[slot] = 0;
+    }
+
+    /// Mark all slots idle after draining up to `drained_value` (resize / queue switch / dump).
+    fn mark_all_drained(&mut self, drained_value: u64) {
+        self.slot_fences.fill(0);
+        if drained_value > self.recorded_value {
+            self.recorded_value = drained_value;
+        }
+    }
+}
+
+fn present_slot_count() -> usize {
+    if std::env::var("XCL_PRESENT_SYNC").is_ok_and(|v| v.trim() == "1") {
+        1
+    } else {
+        PRESENT_SLOTS
+    }
+}
+
+unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Result<(), FenceError> {
+    let (slot, wait_val, rotated) = p.ring.begin_present(p.value);
+    if let Some(prev) = rotated {
+        p.slot_sources[prev] = p.copy_source.take();
+        // If frame N-1 had an XCL_FRAME_DUMP wait timeout, keep its readback buffers alive on
+        // slot `prev` until that slot's fence completes (preventing GPU UAF).
+        p.slot_dumps[prev] = std::mem::take(&mut p.dumps);
+        if let Some(spare) = p.spare_alloc.as_mut() {
+            std::mem::swap(&mut p.alloc, spare);
+        }
+    }
+    if wait_val > 0 {
+        let timeout_ms = if is_present_x { 2000 } else { 100 };
+        fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), timeout_ms)?;
+        p.ring.mark_slot_reusable(slot);
+        p.slot_sources[slot] = None;
+        p.slot_dumps[slot].clear();
+    }
+    Ok(())
+}
+
+fn mark_pipe_drained(p: &mut Presenter) {
+    p.ring.mark_all_drained(p.value);
+    for s in &mut p.slot_sources {
+        *s = None;
+    }
+    for d in &mut p.slot_dumps {
+        d.clear();
+    }
+}
+
 struct Presenter {
     queue: usize,
     dev: ID3D12Device,
@@ -527,6 +617,10 @@ struct Presenter {
     h: u32,
     fmt: DXGI_FORMAT,
     alloc: ID3D12CommandAllocator,
+    spare_alloc: Option<ID3D12CommandAllocator>,
+    ring: PresentRing,
+    slot_sources: Vec<Option<ID3D12Resource>>,
+    slot_dumps: Vec<Vec<FrameDump>>,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
@@ -568,23 +662,41 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let dev_raw = super::real::device_raw();
     let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+    let spare_alloc = if present_slot_count() > 1 {
+        dev.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()
+    } else {
+        None
+    };
+    let actual_slots = if spare_alloc.is_some() { 2 } else { 1 };
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
     list.Close().ok()?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
-        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
+        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+        alloc, spare_alloc, ring: PresentRing::new(actual_slots),
+        slot_sources: vec![None; actual_slots], slot_dumps: (0..actual_slots).map(|_| Vec::new()).collect(),
+        list, fence,
         copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
 
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
-    if let Some(sc) = &p.sc {
+    if let Some(sc) = p.sc.clone() {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+        // Drain every in-flight present before ResizeBuffers so no GPU copy references old buffers.
+        if p.value > 0 {
+            if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+                p.disabled = matches!(&e, FenceError::Removed(_));
+                crate::xlog_error!("present: drain before resize: {e}");
+                return false;
+            }
+            mark_pipe_drained(p);
+        }
+        if sc.ResizeBuffers(SWAP_BUFFERS, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -602,7 +714,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         Format: fmt,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
+        BufferCount: SWAP_BUFFERS,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
@@ -674,8 +786,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
-    // wait for the previous copy so the allocator can be reused
-    if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
+    // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
+    if let Err(e) = prepare_pipelined_slot(p, frame.is_some()) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
@@ -757,6 +869,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
                 for dump in p.dumps.drain(..) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
+                mark_pipe_drained(p);
+                p.copy_source = None;
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
@@ -994,6 +1108,9 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
 impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
+            if !self.disabled && self.value > 0 {
+                let _ = fence::wait(&self.fence, self.value, &self.dev, Some(self.event), 1000);
+            }
             let _ = CloseHandle(self.event);
         }
     }
@@ -1002,6 +1119,39 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
+        let mut ring = PresentRing::new(PRESENT_SLOTS);
+        // Frame 1 (p.value == 0) -> slot 0, no wait, no rotation.
+        assert_eq!(ring.begin_present(0), (0, 0, None));
+
+        // Frame 2 (p.value == 1 after frame 1 submitted) -> rotates 0 -> 1, no wait (overlaps frame 1).
+        assert_eq!(ring.begin_present(1), (1, 0, Some(0)));
+
+        // Frame 3 (p.value == 2 after frame 2 submitted) -> rotates 1 -> 0, waits only for frame 1 (N-2).
+        assert_eq!(ring.begin_present(2), (0, 1, Some(1)));
+        // Retry on timeout (p.value still 2) stays on slot 0 without rotating again.
+        assert_eq!(ring.begin_present(2), (0, 1, None));
+        ring.mark_slot_reusable(0);
+        assert_eq!(ring.begin_present(2), (0, 0, None));
+
+        // Frame 4 (p.value == 3 after frame 3 submitted) -> rotates 0 -> 1, waits only for frame 2 (N-2).
+        assert_eq!(ring.begin_present(3), (1, 2, Some(0)));
+        ring.mark_slot_reusable(1);
+
+        // Drain after frame 4 submitted (e.g. XCL_FRAME_DUMP / ResizeBuffers) clears all slots.
+        ring.mark_all_drained(4);
+        assert_eq!(ring.begin_present(4), (1, 0, None));
+        assert_eq!(ring.begin_present(5), (0, 0, Some(1)));
+
+        // 1-slot sync mode waits on every previous frame N-1 without rotating.
+        let mut sync = PresentRing::new(1);
+        assert_eq!(sync.begin_present(0), (0, 0, None));
+        assert_eq!(sync.begin_present(1), (0, 1, None));
+        sync.mark_slot_reusable(0);
+        assert_eq!(sync.begin_present(2), (0, 2, None));
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {

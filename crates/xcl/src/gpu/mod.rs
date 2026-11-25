@@ -10,6 +10,7 @@ pub mod bvh;
 pub mod desc;
 pub mod dxbc;
 pub mod dxil;
+pub mod effects;
 #[cfg(windows)]
 pub(crate) mod fence;
 pub mod pack;
