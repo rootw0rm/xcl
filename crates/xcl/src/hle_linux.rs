@@ -21,6 +21,8 @@ pub mod crt_linux;
 pub mod xgameruntime_linux;
 #[path = "hle/minuserx_linux.rs"]
 pub mod minuserx_linux;
+#[path = "hle/mfplat_linux.rs"]
+pub mod mfplat_linux;
 #[path = "hle/gameinput_linux.rs"]
 pub mod gameinput_linux;
 #[path = "hle/xtaskqueue_linux.rs"]
@@ -253,7 +255,16 @@ fn xaudio2_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn mfplat_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![MFResetDXGIDeviceManagerX]
+    let mut v = crate::hle_exports![MFResetDXGIDeviceManagerX];
+    // Step-12f headless manager: real code, not stub metadata.
+    for (name, addr) in mfplat_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn dxcompiler_exports() -> Vec<(&'static str, usize)> {
@@ -476,8 +487,9 @@ mod tests {
         // startup slice, step 11i the xgameruntime identity slice, step 11m the
         // minuserx window slice, step 11n the headless GameInput slice, step 11o
         // the XTaskQueue + networking slice, step 11q the XAudio2 slice,
-        // step 11r the D3D12.X null device and step 11s the XG texture
-        // computer + headless D3DCompile, so those resolve as HLE.
+        // step 11r the D3D12.X null device, step 11s the XG texture
+        // computer + headless D3DCompile and step 12f the headless MFPlat
+        // manager, so those resolve as HLE.
         let mut total = 0;
         let mut implemented = 0;
         for m in &r.modules {
@@ -491,6 +503,7 @@ mod tests {
                     || m.name == GAMEINPUT
                     || m.name == D3D12X
                     || m.name == XAUDIO2
+                    || m.name == MFPLAT
                     || m.name == XG
                     || m.name == D3DCOMPILER47)
                     && addr != 0
@@ -770,6 +783,17 @@ mod tests {
             assert_ne!(addr, 0, "{name} must be implemented");
         }
         assert_eq!(r.hle_for("d3dcompiler_47.dll").map(|m| m.name), None);
+        // Step-12f headless MFPlat manager: startup + device manager, not stub metadata.
+        for name in [
+            "MFStartup",
+            "MFShutdown",
+            "MFCreateDXGIDeviceManager",
+            "MFResetDXGIDeviceManagerX",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, MFPLAT);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
         // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.
         // Step-11p XUser/XAsync/save/PLS slice: sign-in + storage are real.
         for name in [

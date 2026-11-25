@@ -931,3 +931,46 @@ Requirements: met — win64 `FormatMessageW` + `FormatMessageA` (ANSI twin over 
 
 ## Follow-ups (minor, non-blocking)
 - `format_truncate_at_terminator` scans raw bytes for `%0` before `%%` unescaping, so `"%%0"` truncates to `"%"` instead of rendering `"%0"`. Safe direction (shorter string, still NUL-terminated, no crash) on unrealistic input; fix next time the function is touched.
+
+## Planner revise — mfplat triage (2026-11-25, `linux` @ `6473823`)
+
+Event `plan.revise`: `linux:format-message` passed review and closed (375 lib tests, title
+reaches `ExitProcess(0xe)` with only known null-device failures, `called_stubs: 33`
+with zero `FormatMessage` entries vs 34 before). Queue: 1 in_progress
+(step-12 retail-smoke, SKIPPED here — `/run/media/...` absent) + 9 open (steps 13–21 chained
+behind step-12); `task ready` is empty, so the next behavior slice needs a new unblocked task.
+
+Triage (evidence, not speculation): fresh title run here
+(`XCL_DATA_ROOT=/tmp/fmt-critic/data ./target/debug/xcl run /tmp/fmt-critic/game`;
+`report.json` `exit_code: 14`, `called_stubs: 33`) plus `xcl.log` `[STUB]` lines shows
+the only non-GPU, non-probe stubs the title actually calls are `mfplat`
+(`MFStartup`/`MFCreateDXGIDeviceManager`/`MFShutdown` x1 each — `MFCreate` stub
+returns `S_OK` with a null manager so the title fails before `Reset`, which is
+imported but never reached) and `xcrdapi` `DStorageGetFactory` x1, plus the expected
+`XclDefinitelyMissingFunction` probe x1; the other ~27 are Phase-D D3D12 console
+slots. Kernel32 (`CreateFileMappingA`, `WriteConsoleW`, …) and `oleaut32` names sit
+in `stubbed_imports` with zero `called_stubs` entries — per §4.7b they stay stubs.
+
+New task `linux:mfplat-headless` (plan.md step 12f, recorded as DEC-018): headless
+`MFStartup`/`MFShutdown`/`MFCreateDXGIDeviceManager`/`MFResetDXGIDeviceManagerX` +
+manager vtable in `mfplat_linux.rs` (GameInput/XAudio2 null-object pattern), one
+commit, synthetic verification only. `DStorageGetFactory` stays provisional after
+12f (larger factory/queue/status/fence surface, own slice). Docs updated in the same
+pass: plan.md 12e marked LANDED + new 12f section + Plan Changes entry; context.md
+current-state refresh; DEC-018 recorded.
+
+## Verification Notes — step-12f mfplat-headless (Builder, 2026-11-25, `linux`)
+
+Task `task-1795566796-4e2a` (`linux:mfplat-headless`, plan.md step 12f).
+Retail-smoke SKIPPED here: `/run/media/...` absent (no game files on host); synthetic title is the e2e gate.
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/hle/mfplat_linux.rs` (new): headless win64 `MFStartup` (any version/flags → `S_OK`, idempotent) + `MFShutdown` (`S_OK`) + `MFCreateDXGIDeviceManager` (NULL → `E_POINTER`; else fresh token via monotonic counter + static manager object) + `MFResetDXGIDeviceManagerX` (NULL → `E_POINTER`, foreign manager/stale token → `E_INVALIDARG`, current token → records device + `S_OK`). Static manager vtable (12 slots, `Release` clamped at 1 like GameInput, `OpenDeviceHandle`/`CloseDeviceHandle`/`TestDevice` `S_OK` at title slots 6/3/8, QI/AddRef real, rest `E_NOTIMPL` logging stubs via `make_stub_info` — never NULL). Plus unit test (idempotency, NULL closed, stale vs current token, second-create invalidates first, open/test/close, release clamp, stub slot non-null).
+- `crates/xcl/src/hle_linux.rs`: `mfplat_linux` module + merge into `mfplat_exports()` (4 real addresses, not stub metadata) + `MFPLAT` in the implemented branch + `MFStartup`/`MFShutdown`/`MFCreateDXGIDeviceManager`/`MFResetDXGIDeviceManagerX` spot checks.
+- `crates/xcl/src/resolver_linux.rs`: `mfplat_imports_resolve_to_hle` test (all four names via `mfplat.dll` resolve `Hle`, callable, non-stub + direct create/reset ABI check).
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib mfplat -- --test-threads=4` → 3 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 378 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (pre-existing warnings only); `git diff --check` clean.
+- Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/mfplat-fresh2/game`, fresh `XCL_DATA_ROOT=/tmp/mfplat-fresh2/data`, `XCL_DUMP_SHADERS=1`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 13`, `ExitProcess(0xd)`, `report.json` `called_stubs: 30` with zero `mfplat` entries (was 33) and zero `[STUB] mfplat` lines (log shows `MFStartup`/`MFCreateDXGIDeviceManager`/`MFResetDXGIDeviceManagerX bound`/`MFShutdown` INFO). `[PASS] MFPlat` (was FAIL). All 13 remaining FAILs are the known null-device categories (D3D12 slots + DStorage + probe); no new failure. (A run missing `testgame_mw.dll` in the game dir keeps `mw_attached` as a stub and reports 31/14 — game-dir setup, not HLE.)

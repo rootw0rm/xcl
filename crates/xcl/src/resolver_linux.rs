@@ -816,6 +816,45 @@ mod tests {
     }
 
     #[test]
+    fn mfplat_imports_resolve_to_hle() {
+        // Step 12f: headless MFPlat manager. `mfplat.dll` is routed HLE.
+        for (dll, sym) in [
+            ("mfplat.dll", "MFStartup"),
+            ("mfplat.dll", "MFShutdown"),
+            ("mfplat.dll", "MFCreateDXGIDeviceManager"),
+            ("mfplat.dll", "MFResetDXGIDeviceManagerX"),
+        ] {
+            let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
+            assert!(
+                matches!(src, Source::Hle(_) | Source::HleOther(_)),
+                "{dll}!{sym} must be HLE, got {src:?}"
+            );
+            assert_ne!(addr, 0, "{dll}!{sym} must be callable");
+            assert!(
+                stubs::info_of_stub(addr).is_none(),
+                "{dll}!{sym} must not be a stub thunk"
+            );
+        }
+        // Direct ABI: create hands out a manager whose title slots work.
+        let (addr, _) = resolve_inner(&dll_key("mfplat.dll"), &name("MFCreateDXGIDeviceManager"), 0);
+        let create: unsafe extern "win64" fn(*mut u32, *mut *mut std::ffi::c_void) -> i32 =
+            unsafe { std::mem::transmute(addr) };
+        let (raddr, _) = resolve_inner(&dll_key("mfplat.dll"), &name("MFResetDXGIDeviceManagerX"), 0);
+        let reset: unsafe extern "win64" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32) -> i32 =
+            unsafe { std::mem::transmute(raddr) };
+        unsafe {
+            let mut token: u32 = 0;
+            let mut mgr: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(create(&mut token, &mut mgr), 0);
+            assert_ne!(token, 0);
+            assert!(!mgr.is_null());
+            let fake = 0x2000 as *mut std::ffi::c_void;
+            assert_eq!(reset(mgr, fake, token.wrapping_add(1)), 0x8007_0057u32 as i32);
+            assert_eq!(reset(mgr, fake, token), 0);
+        }
+    }
+
+    #[test]
     fn xtaskqueue_imports_resolve_to_hle() {
         // Step 11o: manual/delayed/pool dispatch + composite + networking + LSA probe.
         for (dll, sym) in [
