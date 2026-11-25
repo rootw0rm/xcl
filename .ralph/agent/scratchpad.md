@@ -84,3 +84,9 @@
 - 16 closed with review (396 tests, title ExitProcess(0xc)/12 fails, called_stubs 29, Arc A770 subgroupSize 32 -> split-32). Queue otherwise blocked behind SKIPPED retail-smoke, `task ready --all` empty.
 - Triage (fresh run here, no code change): `cargo test -p xcl --lib gpu::recomp::vulkan_runner` → 5 passed, no skip; `vulkaninfo` still Arc A770 / RTX 3090 Ti / Raphael. Runner selects Native64 vs Split32; step-15 follow-ups folded. Full step-17 present too large + windowed smoke unrunnable headless, so next is selector skeleton.
 - New task `linux:vulkan-backend` (plan.md step 17a, DEC-024): Backend::{Null,Vulkan} + select() in front of null D3D12.X device (env override, null default, no-device fallback, consumes device_lane_path(), folds both step-16 follow-ups; no winit/swapchain/window/graphics change, no new deps). Docs (plan/context/decisions/progress) updated; commit + `tasks.ready` next.
+
+## 2026-11-25 critic review (vulkan-backend 17a)
+- task-1795571368-affd PASS, already closed. Re-verified: vulkan_linux 7 passed, vulkan_runner 5 passed, full lib 471 passed, workspace check 0 errors, clippy 0 errors, diff-check/rustfmt clean, no new deps, shipped path spawns nothing.
+- Title (fresh game + fresh data): default 12 fails/ExitProcess(0xc)/called_stubs 29 with DirectStorage + MFPlat PASS; XCL_VULKAN_BACKEND=vulkan → split-32 lane on Arc A770, still 12/0xc/29 (null device returned); bogus → stays null, 12/0xc/29.
+- No blocking findings; two minors filed as progress.md follow-ups (per-create_device probe spam, fresh-XCL_DATA_ROOT methodology note).
+- Queue: `task ready` and `task ready --all` both empty; remaining open tasks are code-assist step-13..20 stubs chained behind SKIPPED retail-smoke. Next is planner triage (plan.revise).

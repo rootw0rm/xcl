@@ -1363,3 +1363,36 @@ Verification (this host, no game files — retail SKIPPED):
   → `vulkan backend: vulkan backend (device split-32 lane path)` on Arc A770,
   still `failures: 12`/`ExitProcess(0xc)`/`called_stubs: 29` (null device
   returned); `XCL_VULKAN_BACKEND=bogus` → stays null, same 12/0xc/29.
+
+## Critic review — step-17a vulkan-backend PASS (2026-11-25, independent re-verify)
+Task `task-1795571368-affd` (already closed by builder; commit `f0bc0d8`).
+Re-ran everything from scratch, no trust in builder notes:
+- `cargo test -p xcl --lib hle::vulkan_linux` → 7 passed; 0 failed.
+- `cargo test -p xcl --lib gpu::recomp::vulkan_runner` → 5 passed.
+- `cargo test -p xcl --lib` → 471 passed; 0 failed; 1 ignored (matches builder).
+- `cargo check --workspace` → 0 errors; `cargo clippy -p xcl --lib` → 0 errors
+  (pre-existing warnings only); `git diff --check` clean;
+  `rustfmt --check` clean on `vulkan_linux.rs`.
+- No new deps (`ash 0.38` pre-existing, runtime dlopen only);
+  `TRANSLATOR_SOURCES`/build.rs untouched; no `Command`/`process` in the new
+  module — shipped path spawns nothing.
+- Synthetic title, fresh game + fresh data dirs (this host, no game files):
+  default → `failures: 12`, `ExitProcess(0xc)`, `exit_code: 12`, `crash: null`,
+  `called_stubs: 29` (28 `d3d12_xs` + `XclDefinitelyMissingFunction` probe,
+  zero mfplat/xcrdapi/FormatMessage), `[PASS] DirectStorage` + `[PASS] MFPlat`
+  hold — matches 12g/13/14/15/16 baseline.
+- `XCL_VULKAN_BACKEND=vulkan` → `vulkan backend: ... (device split-32 lane
+  path)` on Arc A770, still 12/0xc/29 (null device returned, no behavior
+  change). `XCL_VULKAN_BACKEND=bogus` → stays null, no vulkan lines, 12/0xc/29.
+- No blocking findings. Step-16 follow-ups confirmed folded (`_lane` consumed
+  with eprintln; selector probes once per `select()` via `device_lane_path`,
+  no second throwaway instance).
+
+## Follow-ups (minor, no new task)
+- `select()` probes the device on every `create_device` call, so with
+  `XCL_VULKAN_BACKEND=vulkan` the title run logs ~10 `vulkan backend: ...`
+  lines and creates+destroys one instance per device creation. Cache or
+  `OnceLock` the selection when the real backend lands (step-17 full).
+- Methodology: reusing an `XCL_DATA_ROOT` across two title runs produced a
+  one-off `failures: 14`/`ExitProcess(0xe)` artifact; fresh data dirs give the
+  stable 12/0xc/29. Always use a fresh `XCL_DATA_ROOT` per e2e run.
