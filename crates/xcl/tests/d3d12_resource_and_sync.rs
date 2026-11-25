@@ -1,3 +1,6 @@
+#![cfg(windows)]
+// Windows-only integration surface (D3D12 driver objects, retour hooks); the Linux port
+// gets its own e2e when the Vulkan backend lands (Phase D).
 //! Host-driver parity and console ABI/contract tests for `ID3D12Resource` (`Map`, `Unmap`,
 //! `GetGPUVirtualAddress`, `WriteToSubresource`, `Release`), `ID3D12DescriptorHeap` handle-start
 //! slots (#9 / #10), `ID3D12CommandAllocator::Reset`, `ID3D12Fence` (`Signal`, console #12
