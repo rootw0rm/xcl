@@ -196,3 +196,25 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
 - `panic = "unwind"` stays; `eh.rs`/C++ unwinding depends on it.
 - Final exe is `x86_64-unknown-linux-musl`; system Vulkan/ALSA are runtime-`dlopen`ed, never
   bundled or linked.
+
+## Current state (planner revise, 2026-11-25, `linux` @ `d64f32c`)
+
+- Steps 1-11 closed (11a-11s HLE slices, CRT forwarding + follow-ups, report parity);
+  12a (`linux:crt-copy`), 12b (`linux:crt-search-dup`), 12c
+  (`linux:crt-convert-onexit`), 12d (`linux:crt-vfprintf`), 12e
+  (`linux:format-message`), 12f (`linux:mfplat-headless`), 12g
+  (`linux:dstorage-read`), 13 (`linux:glsl-backend`, `6c09624`), and 14
+  (`linux:spirv-inproc`, `d64f32c`) closed with review (391 lib tests, title reaches
+  `ExitProcess(0xc)` with 12 known null-device failures; 14 review re-verified
+  `called_stubs: 29` with zero `xcrdapi`/`mfplat`/`FormatMessage`, real `spirv-val`
+  gate, shipped path spawns nothing, no new deps).
+- No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic
+  title (`tests/testtitle` + `testgamedll`) is the e2e target. Fresh triage here
+  re-ran the title (`ExitProcess(0xc)`/12 fails/`called_stubs: 29` = 28 `d3d12_xs`
+  console slots + expected probe, zero non-GPU calls). Host has real Vulkan devices
+  (Arc A770 / RTX 3090 Ti / Raphael, `vulkaninfo` 1.4.363) so step-15 compute dispatch
+  can execute for real.
+- Next slice is plan.md step 15 (`linux:vulkan-runner`): `ash` compute runner for
+  caller-supplied SPIR-V compute words with an embedded trivial-kernel gate and the
+  existing SKIPPED pattern when no device. One commit, synthetic verification.
+  Steps 16-21 stay chained behind SKIPPED step-12; Phase E/F remain blocked per PROMPT 4.7.

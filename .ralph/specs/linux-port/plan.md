@@ -170,11 +170,14 @@ Windows behavior unchanged.
     Acceptance: translated output passes `glslc -fshader-stage=vert` and the position-output
     expectation test.
 
-14. **in-process SPIR-V** — `code-assist:linux-port:step-14:spirv-inproc`.
-    Outcome: `rspirv`-based backend produces valid SPIR-V words for the same VS with no
-    external compiler; `compile(compute_source) -> spirv_words` trait replaces `dxc` on Linux.
+14. **in-process SPIR-V** — `linux:spirv-inproc` — LANDED (`d64f32c`).
+    Outcome: hand-rolled in-process SPIR-V backend (no new deps) produces valid SPIR-V words
+    for the same blit VS with no external compiler; `spirv-val` where present else structural
+    word checks; no process spawn in the shipped path. The provisional `rspirv` option was
+    rejected in favor of the hand-rolled blit-subset assembler reusing the `glsl.rs` decode
+    shape.
     Acceptance: SPIR-V module validates (`spirv-val` if present, else structural unit tests)
-    and matches the GLSL-backed image; no process spawn in the shipped path.
+    and matches the GLSL-backed position/param contract; no process spawn in the shipped path.
 
 15. **Vulkan compute runner** — `code-assist:linux-port:step-15:vulkan-runner`.
     Outcome: `ash` compute dispatch replaces D3D12 `runner.rs`; kernel-mode translations run on
@@ -316,6 +319,22 @@ Windows behavior unchanged.
    structural checks, no shell-out in the shipped path). Steps 15–21 stay chained
    behind SKIPPED step-12; Phase E/F remain blocked per §4.7.
 
+- Planner revise (2026-11-25, `linux` @ `d64f32c`, no game files on host): step 14
+  (`linux:spirv-inproc`, `d64f32c`) closed with review (391 lib tests, title
+  `ExitProcess(0xc)`/12 fails, `called_stubs: 29` with zero `xcrdapi`/`mfplat`/
+  `FormatMessage` entries, real `spirv-val 2026.4` gate passed, shipped path
+  spawns nothing, no new deps). Fresh triage here re-ran the title
+  (`ExitProcess(0xc)`, 12 fails, `called_stubs: 29` = 28 Phase-D `d3d12_xs` console
+  slots + expected `XclDefinitelyMissingFunction` probe, zero non-GPU calls; every
+  remaining FAIL is a null-device D3D12 category needing the real Vulkan backend).
+  Host has real Vulkan devices (Intel Arc A770 / NVIDIA RTX 3090 Ti / AMD Raphael,
+  `vulkaninfo` 1.4.363, `subgroupSize 32` observed) so step 15 can execute for real.
+  New step 15 (`linux:vulkan-runner`) is the unblocked next task: `ash` compute
+  runner for caller-supplied SPIR-V compute words (embedded trivial copy/add kernel
+  as the gate, not the VS Vertex words which need a graphics pipeline; Kernel-mode
+  recompiler SPIR-V emission stays a follow-up if too large for one reviewable slice).
+  Steps 16-21 stay chained behind SKIPPED step-12; Phase E/F remain blocked per §4.7.
+
 ## Phase C frontier — next CRT family
 
 12a. **CRT copy/concat** — `linux:crt-copy` — LANDED (`38f95fd`).
@@ -455,3 +474,7 @@ Windows behavior unchanged.
 
  13. **glsl-backend** — `linux:glsl-backend` — LANDED (`6c09624`).
      Outcome: backend-neutral `VsBackend` trait + `translate_vs_glsl` straight-line blit subset in new `gpu/recomp/glsl.rs` (one-line `pub mod glsl`). Acceptance (met): synthetic-blit structural + real `glslc -fshader-stage=vert` gate, `XCL_SAMPLE_RPF` opt-in skip, 387 lib tests, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` matching the 12g baseline. One commit, no refactors.
+
+  14. **spirv-inproc** — `linux:spirv-inproc` — LANDED (`d64f32c`).
+      Outcome: hand-rolled in-process SPIR-V backend in new `gpu/recomp/spirv.rs` (no new deps, no license/static-musl audit): `SpirvVsBackend` behind the shared `VsBackend` contract (`mod.rs` now owns the trait + `HlslVsBackend`; `glsl.rs` reuses it, no behavior change) + `translate_vs_spirv` straight-line blit subset (decode, branch rejection, SALU/VALU blit ops, `exp pos0` to Position, `exp param N` to ranked Location outs, `s_endpgm` ends; full-EXEC documented; rest recorded + skipped, never a crash). Hand-assembled SPIR-V 1.0 words (Shader capability, Logical GLSL450, Vertex entry, Position builtin + ranked Location outs, VertexIndex/InstanceIndex builtins; core int/float/bitcast/convert/compare/select only, min/max via compare+select, fma as mul+add, no GLSL.std.450 import). `spirv-val`/`spirv-dis` only under `#[cfg(test)]`; shipped path builds words only. No `TRANSLATOR_SOURCES` change (no disk cache, same as GLSL).
+      Acceptance (met): synthetic-blit structural + real `spirv-val 2026.4` gate (no skip), GLSL-parity position/param contract, shipped-path no-Command/process audit, `XCL_SAMPLE_RPF` opt-in skip, 391 lib tests, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` matching the 12g/13 baseline with DirectStorage + MFPlat PASS holding. One commit, no refactors.
