@@ -5761,6 +5761,222 @@ pub unsafe extern "win64" fn FormatMessageA(
 }
 
 // ---------------------------------------------------------------------------------------
+// String conversion: MultiByteToWideChar / WideCharToMultiByte (retail abort 0x2237179)
+// ---------------------------------------------------------------------------------------
+//
+// The abort at `exe+0x2237179` reads an all-zero path buffer (VMA `0x1474539F6`):
+// the lookup predicate `sub_140643C90` wants an absolute path (leading `/` or `\`,
+// else a `:` via `strchr`), but the buffer was never written. The game's narrow->wide
+// wrapper at `exe+0x113492c` converts UTF-8 (`CodePage 0xFDE9` = `CP_UTF8`) into a
+// caller wide buffer; the auto-stub returned 0 and left every such buffer empty.
+// These shims implement the real Win32 contract with UTF-8 as the ANSI code page
+// (the same choice `write_ansi_out`/`from_ansi_ptr` make on Linux), so a successful
+// conversion writes a real absolute path and the predicate can pass.
+//
+// `CP_ACP`/`CP_OEMCP` are UTF-8 on Linux; `CP_UTF7`/UTF-16 code pages stay
+// `ERROR_INVALID_PARAMETER` (never silently mis-decoded). `MB_ERR_INVALID_CHARS` /
+// `WC_ERR_INVALID_CHARS` fail with `ERROR_NO_UNICODE_TRANSLATION` on bad input;
+// without them the input is lossy (`U+FFFD` on decode, `'?'` on unpaired surrogates).
+
+const CP_ACP: u32 = 0;
+const CP_OEMCP: u32 = 1;
+const CP_UTF7: u32 = 65000;
+const CP_UTF8: u32 = 65001;
+
+const MB_PRECOMPOSED: u32 = 0x1;
+const MB_ERR_INVALID_CHARS: u32 = 0x8;
+const WC_ERR_INVALID_CHARS: u32 = 0x80;
+
+const ERROR_NO_UNICODE_TRANSLATION: u32 = 1113;
+const ERROR_INVALID_FLAGS: u32 = 1004;
+
+fn mb_codepage_is_utf8(code_page: u32) -> bool {
+    matches!(code_page, CP_ACP | CP_OEMCP | CP_UTF8)
+}
+
+unsafe fn mb_input_bytes(mb_ptr: *const u8, mb_len: i32) -> Option<(Vec<u8>, bool)> {
+    if mb_ptr.is_null() {
+        return None;
+    }
+    if mb_len == -1 {
+        let mut n = 0usize;
+        while *mb_ptr.add(n) != 0 {
+            n += 1;
+        }
+        let slice = std::slice::from_raw_parts(mb_ptr, n);
+        Some((slice.to_vec(), true))
+    } else if mb_len > 0 {
+        let slice = std::slice::from_raw_parts(mb_ptr, mb_len as usize);
+        Some((slice.to_vec(), false))
+    } else {
+        None
+    }
+}
+
+unsafe fn wc_input_units(wc_ptr: *const u16, wc_len: i32) -> Option<(Vec<u16>, bool)> {
+    if wc_ptr.is_null() {
+        return None;
+    }
+    if wc_len == -1 {
+        let mut n = 0usize;
+        while *wc_ptr.add(n) != 0 {
+            n += 1;
+        }
+        let slice = std::slice::from_raw_parts(wc_ptr, n);
+        Some((slice.to_vec(), true))
+    } else if wc_len > 0 {
+        let slice = std::slice::from_raw_parts(wc_ptr, wc_len as usize);
+        Some((slice.to_vec(), false))
+    } else {
+        None
+    }
+}
+
+/// `int MultiByteToWideChar(UINT, DWORD, LPCCH, int, LPWSTR, int)` — UTF-8 (and the
+/// UTF-8 aliases `CP_ACP`/`CP_OEMCP`) to UTF-16. Query with `wc_len == 0` returns the
+/// required `wchar` count (including the terminator for `mb_len == -1`); conversion
+/// fails with `ERROR_INSUFFICIENT_BUFFER` when the buffer is too small.
+pub unsafe extern "win64" fn MultiByteToWideChar(
+    code_page: u32,
+    flags: u32,
+    mb_ptr: *const u8,
+    mb_len: i32,
+    wc_buf: *mut u16,
+    wc_len: i32,
+) -> i32 {
+    if !mb_codepage_is_utf8(code_page) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if flags & !(MB_PRECOMPOSED | MB_ERR_INVALID_CHARS) != 0 {
+        set_error(ERROR_INVALID_FLAGS);
+        return 0;
+    }
+    let Some((bytes, nul_terminated)) = mb_input_bytes(mb_ptr, mb_len) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let strict = flags & MB_ERR_INVALID_CHARS != 0;
+    let text: String = if strict {
+        match std::str::from_utf8(&bytes) {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                set_error(ERROR_NO_UNICODE_TRANSLATION);
+                return 0;
+            }
+        }
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let required: usize = if nul_terminated { wide.len() + 1 } else { wide.len() };
+    let Ok(required_i32) = i32::try_from(required) else {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    };
+    if required == 0 {
+        // Empty explicit-length input: success, nothing to write (matches Win32).
+        set_error(ERROR_SUCCESS);
+        return 0;
+    }
+    if wc_len == 0 {
+        set_error(ERROR_SUCCESS);
+        return required_i32;
+    }
+    if wc_buf.is_null() || wc_len < 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (wc_len as usize) < required {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if nul_terminated {
+        wide.push(0);
+    }
+    std::ptr::copy_nonoverlapping(wide.as_ptr(), wc_buf, required);
+    set_error(ERROR_SUCCESS);
+    required_i32
+}
+
+/// `int WideCharToMultiByte(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL)` —
+/// UTF-16 to UTF-8 (and the UTF-8 aliases `CP_ACP`/`CP_OEMCP`). Unpaired surrogates
+/// fail with `ERROR_NO_UNICODE_TRANSLATION` under `WC_ERR_INVALID_CHARS`, else map to
+/// `'?'`. For UTF-8 targets the default-char slots must be null, as on Windows.
+pub unsafe extern "win64" fn WideCharToMultiByte(
+    code_page: u32,
+    flags: u32,
+    wc_ptr: *const u16,
+    wc_len: i32,
+    mb_buf: *mut u8,
+    mb_len: i32,
+    default_char: *const u8,
+    used_default: *mut i32,
+) -> i32 {
+    if !mb_codepage_is_utf8(code_page) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if flags & !WC_ERR_INVALID_CHARS != 0 {
+        set_error(ERROR_INVALID_FLAGS);
+        return 0;
+    }
+    if !default_char.is_null() || !used_default.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some((units, nul_terminated)) = wc_input_units(wc_ptr, wc_len) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let strict = flags & WC_ERR_INVALID_CHARS != 0;
+    let mut text = String::new();
+    let mut invalid = false;
+    for r in char::decode_utf16(units.iter().copied()) {
+        match r {
+            Ok(c) => text.push(c),
+            Err(_) => {
+                if strict {
+                    set_error(ERROR_NO_UNICODE_TRANSLATION);
+                    return 0;
+                }
+                invalid = true;
+                text.push('?');
+            }
+        }
+    }
+    let _ = invalid;
+    let bytes = text.as_bytes();
+    let required: usize = if nul_terminated { bytes.len() + 1 } else { bytes.len() };
+    let Ok(required_i32) = i32::try_from(required) else {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    };
+    if required == 0 {
+        set_error(ERROR_SUCCESS);
+        return 0;
+    }
+    if mb_len == 0 {
+        set_error(ERROR_SUCCESS);
+        return required_i32;
+    }
+    if mb_buf.is_null() || mb_len < 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (mb_len as usize) < required {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), mb_buf, bytes.len());
+    if nul_terminated {
+        *mb_buf.add(bytes.len()) = 0;
+    }
+    set_error(ERROR_SUCCESS);
+    required_i32
+}
+
+// ---------------------------------------------------------------------------------------
 // Startup: command line, process heap, module file names (Phase C step 11b)
 // ---------------------------------------------------------------------------------------
 //
@@ -5892,6 +6108,72 @@ pub unsafe extern "win64" fn GetCommandLineA() -> *const u8 {
     let p = immortal_ansi(&src);
     *g = Some((src, p as usize));
     p
+}
+
+/// `char* _get_narrow_winmain_command_line(void)` — the CRT narrow command line
+/// (retail abort 0x2237179: the game's CRT init at `exe+0x56A1E46` passes this to
+/// its argv builder; the auto-stub returned NULL, leaving `argv` empty so the
+/// dump-dir init that derives from `argv[0]` never populated `0x1474539F6`).
+/// Same process-lifetime buffer as `GetCommandLineA` (UTF-8 on Linux).
+pub unsafe extern "win64" fn _get_narrow_winmain_command_line() -> *const u8 {
+    GetCommandLineA()
+}
+
+#[repr(C)]
+struct StartupInfoW {
+    cb: u32,
+    _pad: u32,
+    lp_reserved: *const u16,
+    lp_desktop: *const u16,
+    lp_title: *const u16,
+    dw_x: u32,
+    dw_y: u32,
+    dw_x_size: u32,
+    dw_y_size: u32,
+    dw_x_count_chars: u32,
+    dw_y_count_chars: u32,
+    dw_fill_attribute: u32,
+    dw_flags: u32,
+    w_show_window: u16,
+    cb_reserved2: u16,
+    lp_reserved2: *const u8,
+    h_std_input: usize,
+    h_std_output: usize,
+    h_std_error: usize,
+}
+
+/// `void GetStartupInfoW(LPSTARTUPINFOW)` — default console startup info
+/// (retail abort 0x2237179: the CRT entry at `exe+0x55E9B14` reads `dwFlags` at
+/// `+0x5C` and `wShowWindow` at `+0x60`; the auto-stub left the memset-zeroed
+/// struct untouched, which happens to match these defaults, but the explicit
+/// fill documents the contract and hands out real std handles).
+pub unsafe extern "win64" fn GetStartupInfoW(info: *mut StartupInfoW) {
+    if info.is_null() {
+        return;
+    }
+    let si = StartupInfoW {
+        cb: 104,
+        _pad: 0,
+        lp_reserved: std::ptr::null(),
+        lp_desktop: std::ptr::null(),
+        lp_title: std::ptr::null(),
+        dw_x: 0,
+        dw_y: 0,
+        dw_x_size: 0,
+        dw_y_size: 0,
+        dw_x_count_chars: 0,
+        dw_y_count_chars: 0,
+        dw_fill_attribute: 0,
+        dw_flags: 0,
+        w_show_window: 1,
+        cb_reserved2: 0,
+        lp_reserved2: std::ptr::null(),
+        h_std_input: std_handle_value(STD_INPUT_HANDLE),
+        h_std_output: std_handle_value(STD_OUTPUT_HANDLE),
+        h_std_error: std_handle_value(STD_ERROR_HANDLE),
+    };
+    std::ptr::write_unaligned(info, si);
+    set_error(ERROR_SUCCESS);
 }
 
 // Process heap: a single libc-backed heap; private heaps alias to it.
@@ -8115,6 +8397,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         // Step-11b startup: command line, process heap, module file names.
         ("GetCommandLineW", GetCommandLineW as usize),
         ("GetCommandLineA", GetCommandLineA as usize),
+        ("_get_narrow_winmain_command_line", _get_narrow_winmain_command_line as usize),
+        ("GetStartupInfoW", GetStartupInfoW as usize),
         ("GetProcessHeap", GetProcessHeap as usize),
         ("HeapCreate", HeapCreate as usize),
         ("HeapDestroy", HeapDestroy as usize),
@@ -8224,6 +8508,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetDiskFreeSpaceA", GetDiskFreeSpaceA as usize),
         ("FormatMessageW", FormatMessageW as usize),
         ("FormatMessageA", FormatMessageA as usize),
+        ("MultiByteToWideChar", MultiByteToWideChar as usize),
+        ("WideCharToMultiByte", WideCharToMultiByte as usize),
     ]
 }
 
@@ -8957,6 +9243,35 @@ mod tests {
     }
 
     #[test]
+    fn startup_info_and_narrow_cmdline_match_the_wide_line() {
+        let _serial = CMDLINE_TEST_SERIAL.lock().unwrap();
+        let prev = game_args();
+        set_game_args(&[]);
+        unsafe {
+            // Narrow CRT line is the same text as the ANSI line.
+            let a = GetCommandLineA();
+            let narrow = _get_narrow_winmain_command_line();
+            assert!(!narrow.is_null());
+            assert_eq!(narrow, a);
+            assert!(!crate::util::from_cstr_ptr(narrow).unwrap().is_empty());
+            // Startup info: 104-byte struct, zeroed with real std handles.
+            let mut si = std::mem::MaybeUninit::<StartupInfoW>::zeroed();
+            GetStartupInfoW(si.as_mut_ptr());
+            let si = si.assume_init();
+            assert_eq!(si.cb, 104);
+            assert_eq!(si.dw_flags, 0);
+            assert_eq!(si.dw_x, 0);
+            assert!(si.lp_desktop.is_null() && si.lp_title.is_null());
+            assert_eq!(si.h_std_input, std_handle_value(STD_INPUT_HANDLE));
+            assert_eq!(si.h_std_output, std_handle_value(STD_OUTPUT_HANDLE));
+            assert_eq!(si.h_std_error, std_handle_value(STD_ERROR_HANDLE));
+            // NULL is a no-op (never a fault), matching the stub's tolerance.
+            GetStartupInfoW(std::ptr::null_mut());
+        }
+        set_game_args(&prev);
+    }
+
+    #[test]
     fn process_heap_allocs_frees_and_resizes() {
         unsafe {
             assert_eq!(GetProcessHeap(), PROCESS_HEAP);
@@ -9151,6 +9466,101 @@ mod tests {
             assert!(an > 0);
             let sa2 = String::from_utf8_lossy(&abuf[..an as usize]);
             assert!(sa2.contains("cannot find the file"), "{sa2}");
+        }
+    }
+
+    #[test]
+    fn multibyte_and_widechar_convert_utf8_with_win32_contracts() {
+        unsafe {
+            // ASCII round-trips; query mode counts the terminator for -1.
+            let src = b"D:\\LocalDumps\0";
+            let need = MultiByteToWideChar(CP_UTF8, 0, src.as_ptr(), -1, std::ptr::null_mut(), 0);
+            assert_eq!(need, 14); // 13 chars + NUL
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+            let mut w = [0u16; 14];
+            let n = MultiByteToWideChar(CP_UTF8, 0, src.as_ptr(), -1, w.as_mut_ptr(), 14);
+            assert_eq!(n, 14);
+            assert_eq!(w[13], 0);
+            assert_eq!(String::from_utf16_lossy(&w[..13]), "D:\\LocalDumps");
+            // The abort predicate sees an absolute path: first byte not NUL, contains ':'.
+            assert_ne!(w[0], 0);
+            // Explicit length: no implicit terminator.
+            let need2 = MultiByteToWideChar(CP_UTF8, 0, src.as_ptr(), 2, std::ptr::null_mut(), 0);
+            assert_eq!(need2, 2);
+            let mut w2 = [0u16; 2];
+            assert_eq!(MultiByteToWideChar(CP_UTF8, 0, src.as_ptr(), 2, w2.as_mut_ptr(), 2), 2);
+            assert_eq!(String::from_utf16_lossy(&w2), "D:");
+            // Multi-byte UTF-8 (emoji) becomes a surrogate pair.
+            let snow = "a☃\0".as_bytes();
+            let need3 = MultiByteToWideChar(CP_UTF8, 0, snow.as_ptr(), -1, std::ptr::null_mut(), 0);
+            assert_eq!(need3, 3); // 'a' + U+2603 + NUL
+            let mut w3 = [0u16; 3];
+            assert_eq!(MultiByteToWideChar(CP_UTF8, 0, snow.as_ptr(), -1, w3.as_mut_ptr(), 3), 3);
+            assert_eq!(w3[1], 0x2603);
+            // CP_ACP is the same UTF-8 bytes on Linux.
+            let mut wa = [0u16; 14];
+            assert_eq!(MultiByteToWideChar(CP_ACP, 0, src.as_ptr(), -1, wa.as_mut_ptr(), 14), 14);
+            assert_eq!(wa, w);
+            // Invalid UTF-8: strict fails, lossy replaces with U+FFFD.
+            let bad = [0x61u8, 0xFF, 0x00];
+            assert_eq!(
+                MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bad.as_ptr(), -1, w.as_mut_ptr(), 14),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_NO_UNICODE_TRANSLATION);
+            let nl = MultiByteToWideChar(CP_UTF8, 0, bad.as_ptr(), -1, w.as_mut_ptr(), 14);
+            assert_eq!(nl, 3); // 'a' + U+FFFD + NUL
+            assert_eq!(w[1], 0xFFFD);
+            // Small buffer fails without writing a partial result.
+            let mut tiny = [0xBEEFu16; 4];
+            assert_eq!(MultiByteToWideChar(CP_UTF8, 0, src.as_ptr(), -1, tiny.as_mut_ptr(), 4), 0);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            // Bad code page / flags / pointers fail cleanly.
+            assert_eq!(MultiByteToWideChar(CP_UTF7, 0, src.as_ptr(), -1, w.as_mut_ptr(), 14), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(MultiByteToWideChar(CP_UTF8, 0x40, src.as_ptr(), -1, w.as_mut_ptr(), 14), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_FLAGS);
+            assert_eq!(MultiByteToWideChar(CP_UTF8, 0, std::ptr::null(), -1, w.as_mut_ptr(), 14), 0);
+            assert_eq!(MultiByteToWideChar(CP_UTF8, 0, src.as_ptr(), 0, w.as_mut_ptr(), 14), 0);
+
+            // Wide -> narrow mirrors the contract.
+            let wsrc = crate::util::wide("D:\\LocalDumps");
+            let mneed = WideCharToMultiByte(
+                CP_UTF8, 0, wsrc.as_ptr(), -1, std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null_mut(),
+            );
+            assert_eq!(mneed, 14);
+            let mut mb = [0u8; 14];
+            let mn = WideCharToMultiByte(
+                CP_UTF8, 0, wsrc.as_ptr(), -1, mb.as_mut_ptr(), 14, std::ptr::null(), std::ptr::null_mut(),
+            );
+            assert_eq!(mn, 14);
+            assert_eq!(&mb[..13], b"D:\\LocalDumps");
+            // Unpaired surrogate: strict fails, lossy maps to '?'.
+            let lone = [0x44u16, 0xD800, 0x00];
+            let mut mb2 = [0u8; 8];
+            assert_eq!(
+                WideCharToMultiByte(
+                    CP_UTF8, WC_ERR_INVALID_CHARS, lone.as_ptr(), -1,
+                    mb2.as_mut_ptr(), 8, std::ptr::null(), std::ptr::null_mut(),
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_NO_UNICODE_TRANSLATION);
+            let ml = WideCharToMultiByte(
+                CP_UTF8, 0, lone.as_ptr(), -1, mb2.as_mut_ptr(), 8, std::ptr::null(), std::ptr::null_mut(),
+            );
+            assert_eq!(ml, 3); // 'D' + '?' + NUL
+            assert_eq!(&mb2[..3], b"D?\0");
+            // UTF-8 targets must have null default-char slots.
+            let dc = b"?\0";
+            assert_eq!(
+                WideCharToMultiByte(
+                    CP_UTF8, 0, wsrc.as_ptr(), -1, mb.as_mut_ptr(), 14,
+                    dc.as_ptr(), std::ptr::null_mut(),
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
         }
     }
 

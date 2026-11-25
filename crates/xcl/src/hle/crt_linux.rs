@@ -1001,6 +1001,30 @@ pub unsafe extern "win64" fn wcschr(s: *const u16, c: i32) -> *mut u16 {
     }
 }
 
+/// `wchar_t* wcsrchr(s, c)` — last `c` (as `u16`) in `s` including NUL; NULL when
+/// absent (retail abort 0x2237179: the game's path split at `exe+0x55E2974`
+/// looks for a separator in the module path to derive the dump dir; the
+/// auto-stub always reported "not found").
+pub unsafe extern "win64" fn wcsrchr(s: *const u16, c: i32) -> *mut u16 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    let target = c as u16;
+    let mut last: *mut u16 = std::ptr::null_mut();
+    let mut i = 0;
+    loop {
+        let w = *s.add(i);
+        if w == target {
+            last = s.add(i) as *mut u16;
+        }
+        if w == 0 {
+            break;
+        }
+        i += 1;
+    }
+    last
+}
+
 /// `wchar_t* wcsstr(haystack, needle)` — first wide `needle`; NULL when absent.
 /// Empty `needle` returns `haystack`, as on Windows.
 pub unsafe extern "win64" fn wcsstr(haystack: *const u16, needle: *const u16) -> *mut u16 {
@@ -1033,6 +1057,78 @@ pub unsafe extern "win64" fn wcsdup_impl(s: *const u16) -> *mut u16 {
     let p = malloc((n + 1) * 2) as *mut u16;
     std::ptr::copy_nonoverlapping(s, p, n + 1);
     p
+}
+
+/// `char* strtok_s(str, delim, ctx)` — re-entrant tokenization (retail abort
+/// 0x2237179: the config-table init at `exe+0x162B780` splits a `;`-separated
+/// string; the auto-stub returned NULL so the table count stayed 0 and the
+/// later lookup bailed before the dump-path check). `NULL` delim/ctx fails
+/// cleanly; a `NULL` `str` continues from `*ctx`.
+pub unsafe extern "win64" fn strtok_s(
+    s: *mut u8,
+    delim: *const u8,
+    ctx: *mut *mut u8,
+) -> *mut u8 {
+    if delim.is_null() || ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut cur = if !s.is_null() { s } else { *ctx };
+    if cur.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Skip leading delimiters.
+    loop {
+        let b = *cur;
+        if b == 0 {
+            *ctx = cur;
+            return std::ptr::null_mut();
+        }
+        let mut d = 0;
+        let mut is_delim = false;
+        loop {
+            let db = *delim.add(d);
+            if db == 0 {
+                break;
+            }
+            if b == db {
+                is_delim = true;
+                break;
+            }
+            d += 1;
+        }
+        if !is_delim {
+            break;
+        }
+        cur = cur.add(1);
+    }
+    let start = cur;
+    // Run to the next delimiter or NUL.
+    loop {
+        let b = *cur;
+        if b == 0 {
+            *ctx = cur;
+            return start;
+        }
+        let mut d = 0;
+        let mut is_delim = false;
+        loop {
+            let db = *delim.add(d);
+            if db == 0 {
+                break;
+            }
+            if b == db {
+                is_delim = true;
+                break;
+            }
+            d += 1;
+        }
+        if is_delim {
+            *cur = 0;
+            *ctx = cur.add(1);
+            return start;
+        }
+        cur = cur.add(1);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2220,6 +2316,620 @@ fn push_float(out: &mut Vec<u8>, v: f64, verb: u8, spec: &FmtSpec) {
     emit_number(out, sign, &[], &body, spec);
 }
 
+// ---------------------------------------------------------------------------------------
+// `__stdio_common_vswprintf_s` / `__stdio_common_vswprintf` (retail abort 0x2237179)
+// ---------------------------------------------------------------------------------------
+//
+// The fault function reads a dump-path buffer through the config lookup whose format
+// table lives at `exe+0x678D1BB` (`%llu`, `D:\LocalDumps`, `D:/LocalDumps`, `%s%s`,
+// `%s\%s`, `upload_file_minidump`, `%lc%d%lc%n`, ...). The game's wrapper at
+// `exe+0x5B8A5C0` formats into caller buffers through `vswprintf_s`; the auto-stub
+// returned 0 and left every such buffer empty, so the absolute-path predicate
+// (`sub_140643C90`: leading `/`/`\` or a `:`) never passed. This implements the real
+// Win32 wide formatter over a win64 `va_list` (one u64 slot per argument, as for
+// `vfprintf` above), C-locale output, `%n` consuming its slot but writing nothing
+// (never scribbling guest memory, matching the narrow renderer).
+//
+// Wide verbs: `%s`/`%ls`/`%ws` read UTF-16 guest strings (re-encoded as UTF-16
+// output; lone surrogates become U+FFFD; precision caps wide units), `%hs`/`%S`
+// read UTF-8 guest strings, `%c`/`%lc`/`%C` are wide chars, `%hc` narrow chars.
+// Integers, `%p`, floats and `%n` mirror the narrow contract above.
+
+fn wlen(p: *const u16) -> usize {
+    unsafe {
+        let mut n = 0usize;
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+        n
+    }
+}
+
+unsafe fn guest_wide_to_string_capped(s: *const u16, max_units: Option<usize>) -> String {
+    if s.is_null() {
+        return "(null)".to_string();
+    }
+    let mut units: Vec<u16> = Vec::new();
+    let mut i = 0usize;
+    loop {
+        if let Some(m) = max_units {
+            if i >= m {
+                break;
+            }
+        }
+        let w = *s.add(i);
+        if w == 0 {
+            break;
+        }
+        units.push(w);
+        i += 1;
+    }
+    String::from_utf16_lossy(&units)
+}
+
+unsafe fn guest_narrow_to_string_capped(s: *const u8, max_bytes: Option<usize>) -> String {
+    if s.is_null() {
+        return "(null)".to_string();
+    }
+    let n = strlen(s);
+    let end = max_bytes.map_or(n, |p| p.min(n));
+    String::from_utf8_lossy(std::slice::from_raw_parts(s, end)).into_owned()
+}
+
+fn push_u16_str(out: &mut Vec<u16>, text: &str, spec: &FmtSpec) {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let width = spec.width.unwrap_or(0).min(MAX_FIELD + 1);
+    if spec.left {
+        out.extend_from_slice(&wide);
+        for _ in wide.len()..width {
+            out.push(' ' as u16);
+        }
+    } else {
+        for _ in wide.len()..width {
+            out.push(' ' as u16);
+        }
+        out.extend_from_slice(&wide);
+    }
+}
+
+fn push_u16_number(out: &mut Vec<u16>, sign: &[u8], prefix: &[u8], digits: &[u8], spec: &FmtSpec) {
+    let mut tmp: Vec<u8> = Vec::new();
+    emit_number(&mut tmp, sign, prefix, digits, spec);
+    out.extend(tmp.iter().map(|&b| b as u16));
+}
+
+fn push_signed_w(out: &mut Vec<u16>, v: i64, spec: &FmtSpec) {
+    let (sign, mag): (&[u8], u64) = if v < 0 {
+        (b"-", (v as u64).wrapping_neg())
+    } else if spec.plus {
+        (b"+", v as u64)
+    } else if spec.space {
+        (b" ", v as u64)
+    } else {
+        (b"", v as u64)
+    };
+    let digits = if mag == 0 && spec.prec == Some(0) {
+        Vec::new()
+    } else {
+        let mut d = uint_digits(mag, 10, false);
+        if let Some(p) = spec.prec {
+            while d.len() < p {
+                d.insert(0, b'0');
+            }
+        }
+        d
+    };
+    push_u16_number(out, sign, &[], &digits, spec);
+}
+
+fn push_unsigned_w(out: &mut Vec<u16>, v: u64, radix: u32, upper: bool, spec: &FmtSpec, pointer: bool) {
+    let mut digits = if v == 0 && spec.prec == Some(0) && !pointer {
+        Vec::new()
+    } else {
+        let mut d = uint_digits(v, radix, upper);
+        if let Some(p) = spec.prec {
+            while d.len() < p {
+                d.insert(0, b'0');
+            }
+        }
+        d
+    };
+    let mut prefix: &[u8] = &[];
+    if pointer {
+        prefix = b"0x";
+    } else if spec.alt {
+        if radix == 8 {
+            if digits.is_empty() {
+                digits.push(b'0');
+            } else if digits[0] != b'0' {
+                digits.insert(0, b'0');
+            }
+        } else if radix == 16 && v != 0 {
+            prefix = if upper { b"0X" } else { b"0x" };
+        }
+    }
+    push_u16_number(out, &[], prefix, &digits, spec);
+}
+
+fn push_float_w(out: &mut Vec<u16>, v: f64, verb: u16, spec: &FmtSpec) {
+    let vb = (verb & 0xFF) as u8;
+    if v.is_nan() || v.is_infinite() {
+        let body = if v.is_nan() {
+            if (vb as char).is_ascii_uppercase() { "NAN" } else { "nan" }
+        } else if (vb as char).is_ascii_uppercase() { "INF" } else { "inf" };
+        let mut plain = *spec;
+        plain.zero = false;
+        let sign: &[u8] = if v.is_sign_negative() {
+            b"-"
+        } else if spec.plus {
+            b"+"
+        } else if spec.space {
+            b" "
+        } else {
+            b""
+        };
+        let mut tmp: Vec<u8> = Vec::new();
+        emit_number(&mut tmp, sign, &[], body.as_bytes(), &plain);
+        out.extend(tmp.iter().map(|&b| b as u16));
+        return;
+    }
+    let neg = v < 0.0 || (v == 0.0 && v.is_sign_negative());
+    let a = v.abs();
+    let sign: &[u8] = if neg {
+        b"-"
+    } else if spec.plus {
+        b"+"
+    } else if spec.space {
+        b" "
+    } else {
+        b""
+    };
+    let prec = spec.prec.unwrap_or(6).min(MAX_FIELD);
+    let mut body: Vec<u8> = match vb {
+        0x66 | 0x46 => float_fixed(a, prec, spec.alt),
+        0x65 | 0x45 => float_sci(a, prec, spec.alt, vb == 0x45),
+        0x67 | 0x47 => float_general(a, prec, spec.alt, vb == 0x47),
+        _ => float_hex(a, spec.prec, spec.alt, vb == 0x41),
+    };
+    if matches!(vb, 0x46 | 0x45 | 0x47) {
+        body.make_ascii_uppercase();
+    }
+    let mut tmp: Vec<u8> = Vec::new();
+    emit_number(&mut tmp, sign, &[], &body, spec);
+    out.extend(tmp.iter().map(|&b| b as u16));
+}
+
+/// Render a NUL-terminated wide format with `args` into UTF-16 units. `None` means
+/// the format needs an argument the (NULL) list cannot supply, a field is
+/// unbounded, or the verb is unknown.
+unsafe fn render_wide_format(format: *const u16, args: Option<*const u64>) -> Option<Vec<u16>> {
+    let mut out: Vec<u16> = Vec::new();
+    let mut ap = VaReader {
+        cur: args.unwrap_or(std::ptr::null()),
+        exhausted: args.is_none(),
+    };
+    let mut i = 0usize;
+    loop {
+        let w = *format.add(i);
+        if w == 0 {
+            break;
+        }
+        if w != '%' as u16 {
+            out.push(w);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if *format.add(i) == 0 {
+            break;
+        }
+        if *format.add(i) == '%' as u16 {
+            out.push('%' as u16);
+            i += 1;
+            continue;
+        }
+        render_one_wspec(format, &mut i, &mut ap, &mut out)?;
+    }
+    Some(out)
+}
+
+unsafe fn render_one_wspec(
+    format: *const u16,
+    pos: &mut usize,
+    ap: &mut VaReader,
+    out: &mut Vec<u16>,
+) -> Option<()> {
+    let mut spec = FmtSpec {
+        left: false,
+        plus: false,
+        space: false,
+        alt: false,
+        zero: false,
+        width: None,
+        prec: None,
+    };
+    loop {
+        match *format.add(*pos) {
+            0x2D => spec.left = true,   // '-'
+            0x2B => spec.plus = true,   // '+'
+            0x20 => spec.space = true,  // ' '
+            0x23 => spec.alt = true,    // '#'
+            0x30 => spec.zero = true,   // '0'
+            _ => break,
+        }
+        *pos += 1;
+    }
+    if *format.add(*pos) == '*' as u16 {
+        *pos += 1;
+        let w = ap.next()? as u32 as i32;
+        if w < 0 {
+            spec.left = true;
+            let mag = (w as i64).unsigned_abs() as usize;
+            if mag > MAX_FIELD {
+                return None;
+            }
+            spec.width = Some(mag);
+        } else {
+            let wu = w as usize;
+            if wu > MAX_FIELD {
+                return None;
+            }
+            spec.width = Some(wu);
+        }
+    } else {
+        let mut w = 0usize;
+        let mut any = false;
+        while (*format.add(*pos) as u8).is_ascii_digit() && *format.add(*pos) < 0x80 {
+            any = true;
+            w = w
+                .saturating_mul(10)
+                .saturating_add((*format.add(*pos) - '0' as u16) as usize);
+            if w > MAX_FIELD {
+                return None;
+            }
+            *pos += 1;
+        }
+        if any {
+            spec.width = Some(w);
+        }
+    }
+    if *format.add(*pos) == '.' as u16 {
+        *pos += 1;
+        if *format.add(*pos) == '*' as u16 {
+            *pos += 1;
+            let p = ap.next()? as u32 as i32;
+            if p >= 0 {
+                let pu = p as usize;
+                if pu > MAX_FIELD {
+                    return None;
+                }
+                spec.prec = Some(pu);
+            }
+        } else {
+            let mut p = 0usize;
+            while (*format.add(*pos) as u8).is_ascii_digit() && *format.add(*pos) < 0x80 {
+                p = p
+                    .saturating_mul(10)
+                    .saturating_add((*format.add(*pos) - '0' as u16) as usize);
+                if p > MAX_FIELD {
+                    return None;
+                }
+                *pos += 1;
+            }
+            spec.prec = Some(p);
+        }
+    }
+    let mut len = IntLen::Def;
+    let mut wide_flag = false;
+    let mut narrow_flag = false;
+    match *format.add(*pos) {
+        0x68 => {
+            // 'h'
+            *pos += 1;
+            if *format.add(*pos) == 0x68 {
+                *pos += 1;
+                len = IntLen::Hh;
+            } else {
+                len = IntLen::H;
+            }
+            // `%hs` = narrow string/char in wide output; `%hhd` etc. keep int width.
+            if *format.add(*pos) == 's' as u16 || *format.add(*pos) == 'c' as u16 {
+                narrow_flag = true;
+            }
+        }
+        0x6C => {
+            // 'l'
+            *pos += 1;
+            if *format.add(*pos) == 0x6C {
+                *pos += 1;
+                len = IntLen::Ll;
+            } else {
+                len = IntLen::L;
+                wide_flag = true;
+            }
+        }
+        0x77 => {
+            // 'w' (`%ws` = wide string, Windows extension)
+            *pos += 1;
+            wide_flag = true;
+        }
+        0x6A | 0x7A | 0x74 => {
+            // 'j' | 'z' | 't'
+            *pos += 1;
+            len = IntLen::Ll;
+        }
+        0x4C => {
+            // 'L'
+            *pos += 1;
+            len = IntLen::Ll;
+        }
+        0x49 => {
+            // 'I'
+            *pos += 1;
+            if *format.add(*pos) == '3' as u16 && *format.add(*pos + 1) == '2' as u16 {
+                *pos += 2;
+                len = IntLen::L;
+            } else if *format.add(*pos) == '6' as u16 && *format.add(*pos + 1) == '4' as u16 {
+                *pos += 2;
+                len = IntLen::Ll;
+            } else {
+                len = IntLen::Ll;
+            }
+        }
+        _ => {}
+    }
+    let _ = wide_flag;
+    let verb = *format.add(*pos);
+    if verb == 0 {
+        return Some(());
+    }
+    *pos += 1;
+    match verb {
+        0x64 | 0x69 => push_signed_w(out, len.signed(ap.next()?), &spec), // d,i
+        0x75 => push_unsigned_w(out, len.unsigned(ap.next()?), 10, false, &spec, false), // u
+        0x6F => push_unsigned_w(out, len.unsigned(ap.next()?), 8, false, &spec, false), // o
+        0x78 => push_unsigned_w(out, len.unsigned(ap.next()?), 16, false, &spec, false), // x
+        0x58 => push_unsigned_w(out, len.unsigned(ap.next()?), 16, true, &spec, false), // X
+        0x70 => push_unsigned_w(out, ap.next()?, 16, false, &spec, true), // p
+        0x63 | 0x43 => {
+            // c,C: wide unless `%hc`
+            if narrow_flag {
+                let b = (ap.next()? & 0xFF) as u8;
+                push_u16_str(out, &(b as char).to_string(), &spec);
+            } else {
+                let w = ap.next()? as u16;
+                if (0xD800..0xE000).contains(&w) {
+                    push_u16_str(out, "\u{FFFD}", &spec);
+                } else {
+                    let s = String::from_utf16_lossy(&[w]);
+                    push_u16_str(out, &s, &spec);
+                }
+            }
+        }
+        0x73 | 0x53 => {
+            // s,S: wide unless `%hs` (narrow); bare `%S` is narrow in wprintf.
+            let is_narrow = narrow_flag || verb == 0x53;
+            if is_narrow {
+                let s = guest_narrow_to_string_capped(ap.next()? as *const u8, spec.prec);
+                push_u16_str(out, &s, &spec);
+            } else {
+                let s = guest_wide_to_string_capped(ap.next()? as *const u16, spec.prec);
+                push_u16_str(out, &s, &spec);
+            }
+        }
+        0x66 | 0x46 | 0x65 | 0x45 | 0x67 | 0x47 | 0x61 | 0x41 => {
+            push_float_w(out, f64::from_bits(ap.next()?), verb, &spec)
+        }
+        0x6E => {
+            // Never honored: consume the pointer slot, write nothing.
+            ap.next()?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// `int __stdio_common_vswprintf_s(options, buffer, count, format, locale, args)` —
+/// secure wide format; `-1` on any failure (buffer emptied), else chars written.
+pub unsafe extern "win64" fn __stdio_common_vswprintf_s(
+    _options: u64,
+    buffer: *mut u16,
+    count: usize,
+    format: *const u16,
+    _locale: usize,
+    arglist: *const u8,
+) -> i32 {
+    if format.is_null() {
+        if !buffer.is_null() && count > 0 {
+            *buffer = 0;
+        }
+        return -1;
+    }
+    if buffer.is_null() && count != 0 {
+        return -1;
+    }
+    if count == 0 {
+        // Zero-size secure buffer: nothing to write, but aBAB empty format succeeds.
+        if wlen(format) == 0 {
+            return 0;
+        }
+        return -1;
+    }
+    let slots = if arglist.is_null() {
+        None
+    } else {
+        Some(arglist as *const u64)
+    };
+    let rendered = match render_wide_format(format, slots) {
+        Some(v) => v,
+        None => {
+            *buffer = 0;
+            return -1;
+        }
+    };
+    if rendered.len() > i32::MAX as usize {
+        *buffer = 0;
+        return -1;
+    }
+    if rendered.len() + 1 > count {
+        *buffer = 0;
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, rendered.len());
+    *buffer.add(rendered.len()) = 0;
+    rendered.len() as i32
+}
+
+/// `int __stdio_common_vswprintf(options, buffer, count, format, locale, args)` —
+/// sized wide format; truncates to `count` (NUL-included) and returns `-1` when the
+/// output does not fit, else chars written.
+pub unsafe extern "win64" fn __stdio_common_vswprintf(
+    _options: u64,
+    buffer: *mut u16,
+    count: usize,
+    format: *const u16,
+    _locale: usize,
+    arglist: *const u8,
+) -> i32 {
+    if format.is_null() || (buffer.is_null() && count != 0) {
+        return -1;
+    }
+    let slots = if arglist.is_null() {
+        None
+    } else {
+        Some(arglist as *const u64)
+    };
+    let rendered = match render_wide_format(format, slots) {
+        Some(v) => v,
+        None => return -1,
+    };
+    if rendered.len() > i32::MAX as usize {
+        return -1;
+    }
+    if count == 0 {
+        return if rendered.is_empty() { 0 } else { -1 };
+    }
+    if count == usize::MAX {
+        if buffer.is_null() {
+            return -1;
+        }
+        std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, rendered.len());
+        *buffer.add(rendered.len()) = 0;
+        return rendered.len() as i32;
+    }
+    if rendered.len() + 1 > count {
+        if count > 0 && !buffer.is_null() {
+            let keep = count - 1;
+            std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, keep.min(rendered.len()));
+            *buffer.add(keep) = 0;
+        }
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, rendered.len());
+    *buffer.add(rendered.len()) = 0;
+    rendered.len() as i32
+}
+
+/// `int __stdio_common_vsprintf_s(options, buffer, count, format, locale, args)` —
+/// secure narrow format; `-1` on any failure (buffer emptied), else bytes written.
+pub unsafe extern "win64" fn __stdio_common_vsprintf_s(
+    _options: u64,
+    buffer: *mut u8,
+    count: usize,
+    format: *const u8,
+    _locale: usize,
+    arglist: *const u8,
+) -> i32 {
+    if format.is_null() {
+        if !buffer.is_null() && count > 0 {
+            *buffer = 0;
+        }
+        return -1;
+    }
+    if buffer.is_null() && count != 0 {
+        return -1;
+    }
+    if count == 0 {
+        if *format == 0 {
+            return 0;
+        }
+        return -1;
+    }
+    let slots = if arglist.is_null() {
+        None
+    } else {
+        Some(arglist as *const u64)
+    };
+    let rendered = match render_narrow_format(format, slots) {
+        Some(v) => v,
+        None => {
+            *buffer = 0;
+            return -1;
+        }
+    };
+    if rendered.len() > i32::MAX as usize {
+        *buffer = 0;
+        return -1;
+    }
+    if rendered.len() + 1 > count {
+        *buffer = 0;
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, rendered.len());
+    *buffer.add(rendered.len()) = 0;
+    rendered.len() as i32
+}
+
+/// `int __stdio_common_vsprintf(options, buffer, count, format, locale, args)` —
+/// sized narrow format; truncates to `count` (NUL-included) and returns `-1` when
+/// the output does not fit, else bytes written. `(size_t)-1` means unbounded.
+pub unsafe extern "win64" fn __stdio_common_vsprintf(
+    _options: u64,
+    buffer: *mut u8,
+    count: usize,
+    format: *const u8,
+    _locale: usize,
+    arglist: *const u8,
+) -> i32 {
+    if format.is_null() || (buffer.is_null() && count != 0 && count != usize::MAX) {
+        return -1;
+    }
+    let slots = if arglist.is_null() {
+        None
+    } else {
+        Some(arglist as *const u64)
+    };
+    let rendered = match render_narrow_format(format, slots) {
+        Some(v) => v,
+        None => return -1,
+    };
+    if rendered.len() > i32::MAX as usize {
+        return -1;
+    }
+    if count == 0 {
+        return if rendered.is_empty() { 0 } else { -1 };
+    }
+    if count == usize::MAX {
+        if buffer.is_null() {
+            return -1;
+        }
+        std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, rendered.len());
+        *buffer.add(rendered.len()) = 0;
+        return rendered.len() as i32;
+    }
+    if rendered.len() + 1 > count {
+        if count > 0 && !buffer.is_null() {
+            let keep = count - 1;
+            std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, keep.min(rendered.len()));
+            *buffer.add(keep) = 0;
+        }
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(rendered.as_ptr(), buffer, rendered.len());
+    *buffer.add(rendered.len()) = 0;
+    rendered.len() as i32
+}
+
 /// Export table: name → real code address (never `0`/stub metadata).
 pub fn exports() -> Vec<(&'static str, usize)> {
     vec![
@@ -2313,9 +3023,11 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("wmemmove", wmemmove as usize),
         ("strstr", strstr as usize),
         ("strrchr", strrchr as usize),
+        ("strtok_s", strtok_s as usize),
         ("strdup", strdup as usize),
         ("_strdup", strdup as usize),
         ("wcschr", wcschr as usize),
+        ("wcsrchr", wcsrchr as usize),
         ("wcsstr", wcsstr as usize),
         ("_wcsdup", wcsdup_impl as usize),
         ("wcsdup", wcsdup_impl as usize),
@@ -2332,6 +3044,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("fseek", fseek as usize),
         ("ftell", ftell as usize),
         ("__stdio_common_vfprintf", __stdio_common_vfprintf as usize),
+        ("__stdio_common_vswprintf_s", __stdio_common_vswprintf_s as usize),
+        ("__stdio_common_vswprintf", __stdio_common_vswprintf as usize),
+        ("__stdio_common_vsprintf_s", __stdio_common_vsprintf_s as usize),
+        ("__stdio_common_vsprintf", __stdio_common_vsprintf as usize),
     ]
 }
 
@@ -2719,6 +3435,23 @@ mod tests {
                 hay.as_ptr().add(11) as *mut u8
             );
             assert!(strrchr(hay.as_ptr(), b'z' as i32).is_null());
+            // strtok_s splits on any delimiter, skips runs, NUL-terminates tokens.
+            let mut text = *b"a;b;;c\0";
+            let delim = b";\0";
+            let mut ctx: *mut u8 = std::ptr::null_mut();
+            let t1 = strtok_s(text.as_mut_ptr(), delim.as_ptr(), &mut ctx);
+            assert_eq!(t1, text.as_mut_ptr());
+            assert_eq!(strlen(t1), 1);
+            let t2 = strtok_s(std::ptr::null_mut(), delim.as_ptr(), &mut ctx);
+            assert_eq!(crate::util::from_cstr_ptr(t2).unwrap(), "b");
+            let t3 = strtok_s(std::ptr::null_mut(), delim.as_ptr(), &mut ctx);
+            assert_eq!(crate::util::from_cstr_ptr(t3).unwrap(), "c");
+            assert!(strtok_s(std::ptr::null_mut(), delim.as_ptr(), &mut ctx).is_null());
+            // NULL delim/ctx fails cleanly; NULL start with NULL context ends.
+            assert!(strtok_s(text.as_mut_ptr(), std::ptr::null(), &mut ctx).is_null());
+            assert!(strtok_s(text.as_mut_ptr(), delim.as_ptr(), std::ptr::null_mut()).is_null());
+            let mut ctx2: *mut u8 = std::ptr::null_mut();
+            assert!(strtok_s(std::ptr::null_mut(), delim.as_ptr(), &mut ctx2).is_null());
             // strdup/_strdup return an owned equal copy at a different address.
             for dup in [strdup as unsafe extern "win64" fn(*const u8) -> *mut u8] {
                 let p = dup(hay.as_ptr());
@@ -2738,6 +3471,16 @@ mod tests {
                 whay.as_ptr().add(11) as *mut u16
             );
             assert!(wcschr(whay.as_ptr(), 0x7A as i32).is_null());
+            assert_eq!(
+                wcsrchr(whay.as_ptr(), 0x6C as i32),
+                whay.as_ptr().add(9) as *mut u16
+            );
+            assert_eq!(
+                wcsrchr(whay.as_ptr(), 0),
+                whay.as_ptr().add(11) as *mut u16
+            );
+            assert!(wcsrchr(whay.as_ptr(), 0x7A as i32).is_null());
+            assert!(wcsrchr(std::ptr::null(), 0x61 as i32).is_null());
             assert_eq!(
                 wcsstr(whay.as_ptr(), [0x77, 0x6F, 0x72, 0x6C, 0x64, 0].as_ptr()),
                 whay.as_ptr().add(6) as *mut u16
@@ -3054,6 +3797,125 @@ mod tests {
             assert_eq!(fclose(f), 0);
             assert_eq!(std::fs::read(&path).unwrap(), b"hi");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn common_vsprintf_family_formats_buffers() {
+        unsafe {
+            fn wide(s: &str) -> Vec<u16> {
+                s.encode_utf16().chain(std::iter::once(0)).collect()
+            }
+            // Wide secure: the dump-table `%s\%s` join used by the retail wrapper.
+            let base = wide("D:\\LocalDumps");
+            let leaf = wide("crash");
+            let fmt = wide("%s\\%s");
+            let slots = [base.as_ptr() as u64, leaf.as_ptr() as u64];
+            let mut buf = [0u16; 32];
+            let n = __stdio_common_vswprintf_s(
+                0,
+                buf.as_mut_ptr(),
+                32,
+                fmt.as_ptr(),
+                0,
+                slots.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 19);
+            assert_eq!(String::from_utf16_lossy(&buf[..19]), "D:\\LocalDumps\\crash");
+            // `%llu` + `%s%s` + `%lc%d%lc` + `%n` (consumed, never written).
+            let fmt2 = wide("%llu|%s%s|%lc%d%lc%n");
+            let wmid = wide("AB");
+            let mut count_slot: u32 = 0xDEAD_BEEF;
+            let slots2 = [
+                123456789012345u64,
+                wmid.as_ptr() as u64,
+                wmid.as_ptr() as u64,
+                0x41u64,
+                42u64,
+                0x42u64,
+                &mut count_slot as *mut u32 as u64,
+            ];
+            let mut buf2 = [0u16; 64];
+            let m = __stdio_common_vswprintf_s(
+                0,
+                buf2.as_mut_ptr(),
+                64,
+                fmt2.as_ptr(),
+                0,
+                slots2.as_ptr() as *const u8,
+            );
+            assert!(m > 0);
+            assert_eq!(
+                String::from_utf16_lossy(&buf2[..m as usize]),
+                "123456789012345|ABAB|A42B"
+            );
+            assert_eq!(count_slot, 0xDEAD_BEEF);
+            // `%hs` reads a narrow guest string into wide output.
+            let narrow = b"narrow\0";
+            let fmt3 = wide("[%hs]");
+            let slots3 = [narrow.as_ptr() as u64];
+            let mut buf3 = [0u16; 16];
+            let k = __stdio_common_vswprintf_s(
+                0,
+                buf3.as_mut_ptr(),
+                16,
+                fmt3.as_ptr(),
+                0,
+                slots3.as_ptr() as *const u8,
+            );
+            assert_eq!(k, 8);
+            assert_eq!(String::from_utf16_lossy(&buf3[..8]), "[narrow]");
+            // Secure truncation empties the buffer and returns -1.
+            let mut tiny = [0xBEEFu16; 4];
+            assert_eq!(
+                __stdio_common_vswprintf_s(0, tiny.as_mut_ptr(), 4, fmt.as_ptr(), 0, slots.as_ptr() as *const u8),
+                -1
+            );
+            assert_eq!(tiny[0], 0);
+            // Unknown verbs and NULL format fail without touching the caller.
+            assert_eq!(
+                __stdio_common_vswprintf_s(0, buf.as_mut_ptr(), 32, wide("%q").as_ptr(), 0, std::ptr::null()),
+                -1
+            );
+            assert_eq!(
+                __stdio_common_vswprintf_s(0, buf.as_mut_ptr(), 32, std::ptr::null(), 0, std::ptr::null()),
+                -1
+            );
+            // Narrow secure twin agrees on the same join.
+            let mut mb = [0u8; 32];
+            let fmt_n = b"%s\\%s\0";
+            let bbase = b"D:\\LocalDumps\0";
+            let slots_n = [bbase.as_ptr() as u64, b"crash\0".as_ptr() as u64];
+            let q = __stdio_common_vsprintf_s(
+                0,
+                mb.as_mut_ptr(),
+                32,
+                fmt_n.as_ptr(),
+                0,
+                slots_n.as_ptr() as *const u8,
+            );
+            assert_eq!(q, 19);
+            assert_eq!(&mb[..19], b"D:\\LocalDumps\\crash");
+            assert_eq!(
+                __stdio_common_vsprintf_s(0, mb.as_mut_ptr(), 4, fmt_n.as_ptr(), 0, slots_n.as_ptr() as *const u8),
+                -1
+            );
+            assert_eq!(mb[0], 0);
+            // Non-secure twins truncate (wide) / go unbounded (narrow -1 count).
+            let mut wtr = [0u16; 4];
+            assert_eq!(
+                __stdio_common_vswprintf(0, wtr.as_mut_ptr(), 4, fmt.as_ptr(), 0, slots.as_ptr() as *const u8),
+                -1
+            );
+            assert_eq!(String::from_utf16_lossy(&wtr[..3]), "D:\\");
+            let mut mbu = [0u8; 32];
+            assert_eq!(
+                __stdio_common_vsprintf(
+                    0, mbu.as_mut_ptr(), usize::MAX, fmt_n.as_ptr(), 0, slots_n.as_ptr() as *const u8,
+                ),
+                19
+            );
+            assert_eq!(&mbu[..19], b"D:\\LocalDumps\\crash");
         }
     }
 }

@@ -419,6 +419,11 @@ mod tests {
             ("kernel32.dll", "HeapFree"),
             ("kernel32.dll", "HeapReAlloc"),
             ("kernel32.dll", "GetModuleFileNameW"),
+            // Retail abort 0x2237179: CRT entry reads startup info + narrow cmdline.
+            ("kernel32.dll", "GetStartupInfoW"),
+            ("kernel32.dll", "_get_narrow_winmain_command_line"),
+            ("api-ms-win-core-processthreads-l1-1-0.dll", "GetStartupInfoW"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_get_narrow_winmain_command_line"),
             // Step 11c startup neighbors: FLS, std handles, module handles, environment.
             ("kernel32.dll", "FlsAlloc"),
             ("kernel32.dll", "FlsSetValue"),
@@ -480,6 +485,11 @@ mod tests {
             ("kernel32.dll", "FormatMessageW"),
             ("kernel32.dll", "FormatMessageA"),
             ("api-ms-win-core-localization-l1-2-0.dll", "FormatMessageW"),
+            // Retail abort 0x2237179: narrow<->wide dump-path conversion (UTF-8 on Linux).
+            ("kernel32.dll", "MultiByteToWideChar"),
+            ("kernel32.dll", "WideCharToMultiByte"),
+            ("api-ms-win-core-string-l1-1-0.dll", "MultiByteToWideChar"),
+            ("api-ms-win-core-string-l1-1-0.dll", "WideCharToMultiByte"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
@@ -523,6 +533,12 @@ mod tests {
             ("api-ms-win-crt-stdio-l1-1-0.dll", "fclose"),
             ("api-ms-win-crt-stdio-l1-1-0.dll", "fflush"),
             ("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfprintf"),
+            // Retail abort 0x2237179: the dump-path table (`%s%s`, `%llu`, ...) is
+            // formatted through the secure wide common routine (and its twins).
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf_s"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsprintf_s"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsprintf"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strcmp"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strncmp"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strcpy"),
@@ -537,8 +553,10 @@ mod tests {
             ("api-ms-win-crt-string-l1-1-0.dll", "wmemmove"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strstr"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strrchr"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strtok_s"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strdup"),
             ("api-ms-win-crt-string-l1-1-0.dll", "wcschr"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "wcsrchr"),
             ("api-ms-win-crt-string-l1-1-0.dll", "wcsstr"),
             ("api-ms-win-crt-string-l1-1-0.dll", "_wcsdup"),
             ("api-ms-win-crt-string-l1-1-0.dll", "wcsdup"),
