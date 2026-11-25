@@ -1396,3 +1396,34 @@ Re-ran everything from scratch, no trust in builder notes:
 - Methodology: reusing an `XCL_DATA_ROOT` across two title runs produced a
   one-off `failures: 14`/`ExitProcess(0xe)` artifact; fresh data dirs give the
   stable 12/0xc/29. Always use a fresh `XCL_DATA_ROOT` per e2e run.
+
+## Planner revise — vulkan-graphics-headless triage (2026-11-25, `linux` @ `54b0c79`)
+
+Event `plan.revise`: `linux:vulkan-backend` (17a) passed review and closed (471 lib tests, title
+`ExitProcess(0xc)`/12 fails, `called_stubs: 29`, 7 selector + 5 runner tests green, env
+override verified). Queue: 9 open (stable-key steps 13-21 chained behind SKIPPED step-12,
+steps 13-16 + 17a already landed as side tasks `6c09624`/`d64f32c`/`a157022`/`baf36be`/
+`f0bc0d8`); `task ready --all` was empty, so the next behavior slice needs a new unblocked
+side task (stable-key chain left intact per DEC-020/021/022/023/024).
+
+Triage (evidence, no code change): `cargo test -p xcl --lib hle::vulkan_linux` → 7 passed;
+`cargo test -p xcl --lib gpu::recomp::vulkan_runner` → 5 passed, no skip (real device);
+`vulkaninfo` still Arc A770 / RTX 3090 Ti / Raphael; `/run/media/anon` absent so retail
+stays SKIPPED. The selector routes nothing to Vulkan yet and steps 13/14 VS words have
+never executed on a GPU (compute runner covers only caller-supplied compute words; VS
+Vertex words need a graphics pipeline). PROMPT §5 mandates the cheapest GPU proof as a
+blit VS position-output run before mesh/GS or the full pack. The 17a review's two minors
+are methodology (fresh `XCL_DATA_ROOT` per run) plus per-`create_device` probe spam — the
+latter folds into 17b work (selection caching where the graphics path creates devices),
+not a new task.
+
+New task `linux:vulkan-graphics-headless` (plan.md step 17b, recorded as DEC-025):
+headless offscreen graphics execution of the same blit VS (render pass + framebuffer +
+VS+trivial-FS pipeline, `VertexIndex` fullscreen triangle, image readback;
+`SKIPPED` + `XCL_REQUIRE_GPU` when no device). No `winit`/swapchain/window/graphics
+routing change beyond the selector query, no `TRANSLATOR_SOURCES` change, no new deps.
+Docs updated in the same pass: plan.md 17a marked LANDED + new 17b section + Plan Changes
+entry; context.md current-state refresh; DEC-025 recorded. Full step-17 present stays
+provisional after 17b (windowed smoke cannot execute on this headless host). Steps 17-21
+stay chained behind SKIPPED step-12; Phase E/F remain blocked per §4.7. No code changes
+in this planner pass.

@@ -379,6 +379,27 @@ Windows behavior unchanged.
   after 17a. Steps 17-21 stay chained behind SKIPPED step-12; Phase E/F remain
   blocked per §4.7.
 
+- Planner revise (2026-11-25, `linux` @ `54b0c79`, no game files on host): step 17a
+  (`linux:vulkan-backend`, `f0bc0d8`) closed with review (471 lib tests, title
+  `ExitProcess(0xc)`/12 fails, `called_stubs: 29`, 7 selector + 5 runner tests
+  green, env override `vulkan` → split-32 lane on Arc A770 still 12/0xc/29 and
+  bogus → null, shipped path spawns nothing, no new deps). Fresh triage here
+  re-ran the focused suites (`hle::vulkan_linux` → 7 passed, `vulkan_runner` → 5
+  passed, no skip; `vulkaninfo` still Arc A770 / RTX 3090 Ti / Raphael;
+  `/run/media/anon` absent so retail stays SKIPPED): the selector routes nothing
+  to Vulkan yet and steps 13/14 VS words have still never executed on a GPU
+  (compute runner covers only caller-supplied compute words; VS Vertex words need
+  a graphics pipeline). PROMPT §5 mandates the cheapest GPU proof as a blit VS
+  position-output run before mesh/GS or the full pack. New step 17b
+  (`linux:vulkan-graphics-headless`) is the unblocked next task: headless
+  offscreen graphics execution of the same blit VS (render pass + framebuffer +
+  VS+trivial-FS pipeline, `VertexIndex` fullscreen triangle, image readback;
+  `SKIPPED` + `XCL_REQUIRE_GPU` when no device; folds the 17a per-`create_device`
+  probe-spam follow-up via selection caching). Full step-17 present (`winit` +
+  swapchain + window + D3D12.X routing) stays provisional after 17b because its
+  windowed smoke cannot execute on this headless host. Steps 17-21 stay chained
+  behind SKIPPED step-12; Phase E/F remain blocked per §4.7.
+
 ## Phase C frontier — next CRT family
 
 12a. **CRT copy/concat** — `linux:crt-copy` — LANDED (`38f95fd`).
@@ -531,6 +552,10 @@ Windows behavior unchanged.
       Outcome: subgroup-width-aware dispatch in `gpu/recomp/vulkan_runner.rs`: `LanePath::{Native64, Split32}` + pure `lane_path_for` (64 → native, else split-32 incl. 0/unknown fail-closed) + `requires_split` mirroring `runner::split_wave64`; `device_subgroup_size()` / `device_lane_path()` query the real device; `pick_device` reads core `subgroupSize` plus `VK_EXT_subgroup_size_control` min/max where reported and logs `subgroupSize (min/max) -> lane`. `WORK_ITEMS = 64` shaping kept for both paths. All three step-15 review follow-ups folded (`skip_test` arms byte-identical to `runner.rs`, `_entry` dropped, scoped `Scope` Drop owns every handle). No window/graphics/routing change, no `TRANSLATOR_SOURCES` change, no new deps.
       Acceptance (met): pure both-widths gate (64 + 32 + 0/16, no device) + on-device agreement + trivial `0..64→*2+1` on Arc A770 `subgroupSize 32 (min 8 max 32) -> split-32` (5 passed, no skip), full lib 396 passed, workspace check 0 errors, clippy 0 errors, shipped-path no-`Command`/`process` audit clean, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` matching the 12g/13/14/15 baseline with DirectStorage + MFPlat PASS holding. One commit, no refactors.
 
-  17a. **vulkan-backend selector skeleton** — `linux:vulkan-backend` — NEXT.
-      Outcome: Linux-only Vulkan backend selector in front of the null D3D12.X device (new `hle/vulkan_linux.rs` or `hle/vulkan/` module): `Backend::{Null, Vulkan}` + `select()` (explicit env override such as `XCL_VULKAN_BACKEND`, null stays the headless/CI default; real-Vulkan selection requires a usable device or it falls back to null with a logged reason, never a panic); D3D12.X creation queries the selector but still returns the existing null device in this slice (no vtable/behavior change for the title); consumes `device_lane_path()` at the selection point (resolves the step-16 dead-`_lane` follow-up) and reuses the `pick_device`-style query path instead of a second throwaway instance where practical (step-16 second follow-up). No `winit`, no swapchain, no window, no graphics pipeline, no `TRANSLATOR_SOURCES` change, no new deps.
-      Acceptance: backend-selection unit tests (forced null, forced Vulkan with no-device fallback, env override, lane agreement with the runner) + full `cargo test -p xcl --lib` counts + workspace check + clippy, and the cross-built synthetic title still reaches `ExitProcess(0xc)` with 12 known null-device failures and `called_stubs: 29` (DirectStorage + MFPlat PASS holding). One commit, Linux-only files + progress.md, no refactors.
+  17a. **vulkan-backend selector skeleton** — `linux:vulkan-backend` — LANDED (`f0bc0d8`).
+      Outcome: Linux-only Vulkan backend selector in front of the null D3D12.X device (new `hle/vulkan_linux.rs`): `Backend::{Null, Vulkan}` + `select()` (explicit `XCL_VULKAN_BACKEND` override, null stays the headless default; real-Vulkan selection requires a usable device or it falls back to null with a logged reason, never a panic); D3D12.X creation queries the selector but still returns the existing null device (no vtable/behavior change); consumes `device_lane_path()` at selection (step-16 dead-`_lane` follow-up) and reuses the `pick_device`-style query (second follow-up). No `winit`, no swapchain, no window, no graphics pipeline, no `TRANSLATOR_SOURCES` change, no new deps.
+      Acceptance (met): 7 backend-selection unit tests + 5 runner tests, full lib 471 passed, workspace check 0 errors, clippy 0 errors, shipped-path no-spawn audit clean, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` with DirectStorage + MFPlat PASS holding (default, `vulkan`, and bogus override all 12/0xc/29; `vulkan` logs split-32 lane on Arc A770). One commit, no refactors.
+
+  17b. **vulkan headless graphics smoke (blit VS offscreen)** — `linux:vulkan-graphics-headless` — NEXT.
+      Outcome: Linux-only headless Vulkan graphics execution for the same blit-class VS steps 13/14 cover (new `gpu/recomp/vulkan_graphics.rs` or `vulkan_runner` extension reusing its instance/device/pick path, no second throwaway instance): offscreen color image + render pass + framebuffer, graphics pipeline from `translate_vs_spirv` Vertex words + a trivial fragment shader, fullscreen-triangle draw driven by `VertexIndex` (no vertex input), readback of the rendered image checking the position-output/coverage equivalent the GLSL gate asserts. `SKIPPED <test>: <reason>` + `XCL_REQUIRE_GPU` fast-fail when no device, mirroring the runner. No `winit`, no swapchain, no window, no D3D12.X routing change beyond the existing selector query, no `TRANSLATOR_SOURCES` change, no new deps (ash only; verify license before adding anything else). Folds the step-17a per-`create_device` probe-spam follow-up (cache/`OnceLock` the selection where the graphics path creates devices repeatedly).
+      Acceptance: graphics smoke passes on the real device (Arc A770) + forced-both-widths lane agreement still green; `glsl`/`spirv` structural + `spirv-val` gates still pass; full `cargo test -p xcl --lib` counts + workspace check + clippy; shipped-path no-`Command`/`process` audit clean; cross-built synthetic title still reaches `ExitProcess(0xc)` with 12 known null-device failures and `called_stubs: 29` (DirectStorage + MFPlat PASS holding). One commit, Linux-only files + progress.md, no refactors.

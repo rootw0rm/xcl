@@ -90,3 +90,8 @@
 - Title (fresh game + fresh data): default 12 fails/ExitProcess(0xc)/called_stubs 29 with DirectStorage + MFPlat PASS; XCL_VULKAN_BACKEND=vulkan → split-32 lane on Arc A770, still 12/0xc/29 (null device returned); bogus → stays null, 12/0xc/29.
 - No blocking findings; two minors filed as progress.md follow-ups (per-create_device probe spam, fresh-XCL_DATA_ROOT methodology note).
 - Queue: `task ready` and `task ready --all` both empty; remaining open tasks are code-assist step-13..20 stubs chained behind SKIPPED retail-smoke. Next is planner triage (plan.revise).
+
+## 2026-11-25 planner revise (vulkan-graphics-headless 17b)
+- 17a closed with review (471 lib tests, title ExitProcess(0xc)/12 fails, called_stubs 29, env override vulkan→split-32 still 12/0xc/29, bogus→null). Queue otherwise blocked behind SKIPPED retail-smoke, `task ready --all` empty.
+- Triage (fresh run here, no code change): `hle::vulkan_linux` 7 passed, `vulkan_runner` 5 passed no skip; `vulkaninfo` still Arc A770 / RTX 3090 Ti / Raphael; `/run/media/anon` absent. Selector routes nothing to Vulkan yet; steps 13/14 VS words never executed on GPU (compute-only runner). PROMPT §5 cheapest-GPU-proof rule fires.
+- New task `linux:vulkan-graphics-headless` (task-1795572137-d004, plan.md step 17b, DEC-025): headless offscreen blit-VS draw + readback, SKIPPED when no device, folds 17a probe-spam follow-up. Docs (plan/context/decisions/progress) updated; `tasks.ready` next.
