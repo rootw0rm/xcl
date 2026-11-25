@@ -1747,3 +1747,61 @@ shared-tree files byte-identical to the verified worktree):
   fetch-shader SGPR through `S_CMP`/`S_CSELECT` (or rejecting it) can extend the gate.
 - `VsBackend` still lives beside `HlslVsBackend` in `mod.rs` (step-13 review note);
   revisit when the fourth backend or the PSO cache lands.
+
+## Builder — step-17 windowed present (2026-11-25, `linux` @ `dd7e1e1` + this change)
+
+Task `linux:vulkan-present` slice (c): windowed present of the recompiler-driven
+triangle. New Linux-only `gpu/recomp/vulkan_present.rs` (+2-line `mod.rs` gate):
+`present_triangle_windowed(vs_words, fs_words)` opens a 64×64 X11 window with no new
+crates — X11 client calls (`XOpenDisplay`/`XCreateSimpleWindow`/`XMapWindow`/`XSync`/
+destroy/close) resolved at runtime via `libc::dlopen`/`dlsym` (`libX11.so.6`, fallback
+`libX11.so`), the sanctioned runtime-dlopen pattern, so the static exe links no X11 —
+then creates a `VK_KHR_xlib_surface` surface + `VK_KHR_swapchain` swapchain on the
+shared graphics pick (graphics+present queue, `R8G8B8A8` preferred with host-side BGRA
+swizzle on readback so the pixel contract stays RGBA-ordered; sRGB endpoints are exact,
+no tolerance band), renders the recompiler VS + constant-green FS with a bare
+`VertexIndex` draw, copies the image to a host buffer *before* `queue_present`, and
+tears everything down through a scoped `Scope` + surface guard + window guard (Drop
+order: swapchain-owned handles → device → surface → instance → window → dlclose).
+Fail-closed `"no "` errors (no display/WSI/device/present-queue) skip via the
+established pattern; shipped path spawns nothing. No D3D12.X routing change (null
+device still returned; selector untouched), no `winit` (Apache-2.0-only, banned by the
+branch dep rule — raw X11 via `libc` instead), no `TRANSLATOR_SOURCES` change (present
+module outside the hash list), no new deps (`libc` + `ash` only, MIT grant).
+
+Review-critical fix inside this slice: the first draft probed extension presence with
+the global `enumerate_instance/device_extension_properties` queries; running the
+`vulkan` subset in parallel segfaulted the harness inside the system loader
+(`vkEnumerateInstanceExtensionProperties` racing concurrent `vkCreateInstance` from
+other tests — gdb backtrace on the test thread). The probes are gone: extensions are
+enabled unconditionally and absence fails closed at create time
+(`ERROR_EXTENSION_NOT_PRESENT` → `"no WSI"` skip, other errors stay hard), keeping
+every concurrent loader call in the same `Entry::load` + `create_instance` shape the
+offscreen draws already run in parallel.
+
+Verification (this worktree; `/tmp` 75% before/after, artifacts cleaned):
+- `cargo test -p xcl --lib vulkan` → 29 passed, 0 failed (present 6: 3 pure
+  format/extent/alpha gates always on + fail-closed + no-spawn audit + windowed
+  recompiler-triangle present on the real Arc A770, `B8G8R8A8_SRGB` surface picked,
+  host-swizzled readback asserting center-green/corner-blue; selector 8 + runner 5 +
+  graphics 10 + glsl/spirv gates still green, no skip).
+- `cargo test -p xcl --lib` → 496 passed, 0 failed, 1 ignored (490 baseline + 6 new),
+  4 consecutive full-suite passes on 24 threads + 3 consecutive `vulkan`-subset passes.
+- `cargo check -p xcl --tests` + `cargo check --workspace` → 0 errors;
+  `cargo clippy -p xcl --lib` → 0 errors (one remaining style lint in the new file,
+  `chunks_exact_mut`, matches the pre-existing `vulkan_graphics.rs` pattern).
+- `rustfmt --check` clean on `vulkan_present.rs` (+ the 2-line `mod.rs` hunk);
+  `git diff --check` clean; `Cargo.toml`/`Cargo.lock` untouched (no new deps).
+- Cross-built synthetic title (prebuilt Nov-24 PEs; fresh game copy + fresh
+  `XCL_DATA_ROOT` per run, `--hello` title arg): `xcl_testtitle: done, failures: 12`,
+  `ExitProcess(0xc)`, `exit_code: 12`, `crash: null`, `called_stubs: 29`
+  (DirectStorage + MFPlat + XAudio2 PASS hold). `XCL_VULKAN_BACKEND=vulkan` → 12,
+  `bogus` → 12 (null device still returned, no routing change).
+
+## Follow-ups (minor, no new task)
+- The present path requires a display + `B8G8R8A8`/`R8G8B8A8` surface format; other
+  formats fail closed to skip. A future slice can add a headless-surface
+  (`VK_EXT_headless_surface`) swapchain variant for display-less CI GPU proof.
+- `XWindow` does not call `XInitThreads`: only the presenting thread ever touches
+  the single `Display`, so no X-internal sharing exists; revisit if a second
+  display connection ever lands.
