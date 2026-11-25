@@ -3114,13 +3114,27 @@ unsafe fn check_feature_support_pc(f: CheckFeatureSupportFn, this: *mut c_void, 
     hr2
 }
 
+thread_local! {
+    /// A `creator!` method is inside the runtime's own call: what it creates through the device
+    /// (D3D12Core's DRED breadcrumb buffers, made with the debug layer on) is the runtime's, not
+    /// the title's
+    static IN_CREATOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Device creation methods ending in (REFIID riid, void** ppv).
 macro_rules! creator {
     ($name:ident, $method:literal, $kind:expr, [$($a:ident),*]) => {
         pub(super) unsafe extern "system" fn $name(this: *mut c_void, $($a: usize,)* riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
             type F = unsafe extern "system" fn(*mut c_void, $(as_usize!($a),)* *const GUID, *mut *mut c_void) -> HRESULT;
             let f: F = std::mem::transmute(orig_fn(this, slot_of(this, $method)));
+            // the runtime calls the device's public methods from inside another one (a command
+            // list's DRED breadcrumb buffer, made through CreatePlacedResource): that object
+            // is still being made – asking it for interfaces to adopt it crashes D3D12Core
+            if IN_CREATOR.with(|c| c.replace(true)) {
+                return f(this, $($a,)* riid, ppv);
+            }
             let mut hr = f(this, $($a,)* riid, ppv);
+            IN_CREATOR.with(|c| c.set(false));
             if hr == E_NOINTERFACE {
                 let iid = pc_iid($kind);
                 hr = f(this, $($a,)* &iid, ppv);
