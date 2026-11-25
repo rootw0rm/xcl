@@ -39,6 +39,11 @@ pub enum Kind {
     CommandQueue,
     CommandAllocator,
     CommandList,
+    /// A command list from a Vulkan device (step 17): the graphics recording
+    /// slots stay logging stubs like [`Kind::CommandList`], but the console
+    /// memory methods (#60/#61/#69–#72/#89/#93) run for real on host memory.
+    /// The object's `value` holds the creator device object.
+    VulkanList,
     Fence,
     DescriptorHeap,
     Resource,
@@ -61,7 +66,7 @@ impl Kind {
             Kind::Device | Kind::VulkanDevice => "ID3D12Device",
             Kind::CommandQueue => "ID3D12CommandQueue",
             Kind::CommandAllocator => "ID3D12CommandAllocator",
-            Kind::CommandList => "ID3D12GraphicsCommandList",
+            Kind::CommandList | Kind::VulkanList => "ID3D12GraphicsCommandList",
             Kind::Fence => "ID3D12Fence",
             Kind::DescriptorHeap => "ID3D12DescriptorHeap",
             Kind::Resource | Kind::PlacedResource => "ID3D12Resource",
@@ -175,7 +180,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[18] = Hidden_ZeroDesc16 as usize; // GetDesc
         }
         Kind::CommandAllocator => v[8] = Ret_S_OK as usize, // Reset
-        Kind::CommandList => {
+        Kind::CommandList | Kind::VulkanList => {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
             v[9] = Ret_S_OK as usize; // Close
             v[10] = Ret_S_OK as usize; // Reset
@@ -203,6 +208,24 @@ fn vtable(kind: Kind) -> *const usize {
         Kind::Heap => v[8] = Hidden_ZeroDesc40 as usize,
         Kind::PipelineState => v[8] = Ret_E_NOTIMPL as usize, // GetCachedBlob
         _ => {}
+    }
+    // Step-17 Vulkan overrides: creation slots on the Vulkan device hand out
+    // Vulkan lists (the null device keeps the plain ones — no default change),
+    // and Vulkan lists implement the console memory methods for real.
+    if kind == Kind::VulkanDevice {
+        v[12] = Vulkan_CreateCommandList as usize;
+        v[73] = Vulkan_CreateCommandListX as usize;
+    }
+    if kind == Kind::VulkanList {
+        v[7] = VulkanList_GetDevice as usize;
+        v[60] = VulList_CopyMemory as usize;
+        v[61] = VulList_Fill32 as usize;
+        v[69] = VulList_Write32Bottom as usize;
+        v[70] = VulList_TimestampBottom as usize;
+        v[71] = VulList_Wait32 as usize;
+        v[72] = VulList_Wait64 as usize;
+        v[89] = VulList_Write64Top as usize;
+        v[93] = VulList_Kickoff as usize;
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     g.push((kind, leaked.as_ptr() as usize));
@@ -772,6 +795,168 @@ unsafe extern "win64" fn Dma_CopyBufferRegion(
 }
 
 // ---------------------------------------------------------------------------------------
+// Vulkan lists (step 17): console command-list memory methods on title memory.
+// The title's graphics memory is host memory (XMemAlloc), so writes, fills,
+// copies and the same-list write-then-wait apply immediately and synchronously;
+// waits poll the cell until the comparison passes (another thread or the GPU
+// would write it on the console) with a 5 s fail-closed deadline like the
+// fence waits, and KickoffX has nothing left to flush. Null addresses return
+// silently instead of faulting.
+// ---------------------------------------------------------------------------------------
+
+/// Create a Vulkan command list on `creator` (slot 12 / 73): like the null one,
+/// but the object's `value` remembers the creator device for `GetDevice`.
+unsafe fn new_vulkan_list(creator: *mut NullObj, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return S_FALSE;
+    }
+    let o = new_obj(Kind::VulkanList);
+    (*o).value.store(creator as u64, Ordering::Relaxed);
+    *ppv = o as *mut c_void;
+    S_OK
+}
+
+unsafe extern "win64" fn Vulkan_CreateCommandList(
+    this: *mut NullObj,
+    _mask: u32,
+    _ty: u32,
+    _alloc: *mut c_void,
+    _pso: *mut c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    new_vulkan_list(this, ppv)
+}
+
+unsafe extern "win64" fn Vulkan_CreateCommandListX(
+    this: *mut NullObj,
+    _desc: *const u32,
+    _alloc: *mut c_void,
+    _state: *mut c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    new_vulkan_list(this, ppv)
+}
+
+unsafe extern "win64" fn VulkanList_GetDevice(this: *mut NullObj, _riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return E_INVALIDARG;
+    }
+    // the creator device (stored at creation); the null device when detached
+    let d = (*this).value.load(Ordering::Relaxed) as *mut c_void;
+    *ppv = if d.is_null() { device() as *mut c_void } else { d };
+    S_OK
+}
+
+/// `Write32BitValueBottomOfPipeX(va, value, _, _)`: an immediate host write.
+unsafe extern "win64" fn VulList_Write32Bottom(_t: *mut NullObj, va: u64, val: u32, _a: u32, _b: u32) {
+    if va == 0 {
+        return;
+    }
+    *(va as *mut u32) = val;
+}
+
+/// `Write64BitValueTopOfPipeX(va, value, _)`: an immediate host write.
+unsafe extern "win64" fn VulList_Write64Top(_t: *mut NullObj, va: u64, val: u64, _a: u32) {
+    if va == 0 {
+        return;
+    }
+    *(va as *mut u64) = val;
+}
+
+/// `Write64BitValueBottomOfPipeX(va, _, _, timestamp)`: the title passes it a
+/// zero value and reads back a GPU timestamp — the monotonic clock in ns.
+unsafe extern "win64" fn VulList_TimestampBottom(_t: *mut NullObj, va: u64, _a: u64, _b: u32, _c: u32) {
+    if va == 0 {
+        return;
+    }
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let ns = if libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) == 0 {
+        let ts = ts.assume_init();
+        (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+    } else {
+        1
+    };
+    *(va as *mut u64) = ns.max(1);
+}
+
+/// `FillMemoryWith32BitValueX(va, bytes, value)`: `bytes` (a multiple of 4 in
+/// every title call) of the u32 pattern, guard zones untouched.
+unsafe extern "win64" fn VulList_Fill32(_t: *mut NullObj, va: u64, bytes: u64, val: u32) {
+    if va == 0 || bytes == 0 {
+        return;
+    }
+    let words = (bytes as usize) / 4;
+    for i in 0..words {
+        *((va as *mut u32).add(i)) = val;
+    }
+}
+
+/// `CopyMemoryToMemoryX(dst, src, bytes, _)`: an immediate host `memcpy`.
+unsafe extern "win64" fn VulList_CopyMemory(_t: *mut NullObj, dst: u64, src: u64, bytes: u64, _f: u32) {
+    if dst == 0 || src == 0 || bytes == 0 {
+        return;
+    }
+    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes as usize);
+}
+
+/// `D3D12_COMPARISON_FUNC` codes the title's waits use (3 = EQUAL,
+/// 7 = GREATER_EQUAL); anything else falls back to equality.
+fn wait_passes(func: u32, cur: u64, val: u64) -> bool {
+    match func {
+        1 => false, // NEVER
+        2 => cur < val,
+        3 => cur == val,
+        4 => cur <= val,
+        5 => cur > val,
+        6 => cur != val,
+        7 => cur >= val,
+        8 => true, // ALWAYS
+        _ => cur == val,
+    }
+}
+
+/// Poll `*va` (volatile: written concurrently by another thread) until the
+/// masked comparison passes, or the deadline expires — then return anyway so
+/// a stuck cell can never hang the title past a GPU-timeout-style wait.
+unsafe fn poll_until(va: u64, func: u32, val: u64, mask: u64, bits: u32) {
+    if va == 0 || func == 8 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let cur = if bits == 32 {
+            std::ptr::read_volatile(va as *const u32) as u64
+        } else {
+            std::ptr::read_volatile(va as *const u64)
+        };
+        if wait_passes(func, cur & mask, val & mask) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::xlog_debug!("D3D12.X Vulkan list: wait at {va:#x} timed out (func {func})");
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// `Wait32BitValueX(va, func, value, mask, _)`.
+unsafe extern "win64" fn VulList_Wait32(_t: *mut NullObj, va: u64, func: u32, val: u32, mask: u32, _tmo: u32) {
+    poll_until(va, func, val as u64, mask as u64, 32);
+}
+
+/// `Wait64BitValueX(va, func, value, mask, _)`.
+unsafe extern "win64" fn VulList_Wait64(_t: *mut NullObj, va: u64, func: u32, val: u64, mask: u64, _tmo: u32) {
+    poll_until(va, func, val, mask, 64);
+}
+
+/// `KickoffX()`: flushes recorded work to the GPU — every method above already
+/// applied synchronously, so there is nothing queued to flush.
+unsafe extern "win64" fn VulList_Kickoff(_t: *mut NullObj) {}
+
+// ---------------------------------------------------------------------------------------
 // queue / fence / heap / resource / blob
 // ---------------------------------------------------------------------------------------
 
@@ -1237,6 +1422,107 @@ mod tests {
             // a null out-pointer stays S_FALSE on every path
             assert_eq!(create_device_for(&null_sel, acquire(), std::ptr::null_mut()), S_FALSE);
             assert_eq!(create_device_for(&vulkan_sel, None, std::ptr::null_mut()), S_FALSE);
+        }
+    }
+
+    #[test]
+    fn vulkan_list_memory_methods_act_on_host_memory() {
+        // Step-17 list slice, pure logic (no device needed): writes, fill,
+        // copy and timestamp land in host memory; waits return on a satisfied
+        // cell and on a cross-thread write like the title's; null addresses
+        // never fault. Mirrors the title's `console_list_methods` asserts.
+        unsafe {
+            let this = std::ptr::null_mut();
+            let mut mem = vec![0u8; 0x1000];
+            let base = mem.as_mut_ptr() as u64;
+            let r32 = |o: usize| (mem.as_ptr().add(o) as *const u32).read();
+            let r64 = |o: usize| (mem.as_ptr().add(o) as *const u64).read();
+            VulList_Write32Bottom(this, base, 0x1234_5678, 0, 0);
+            assert_eq!(r32(0), 0x1234_5678);
+            VulList_Write64Top(this, base + 8, 0x1122_3344_5566_7788, 0);
+            assert_eq!(r64(8), 0x1122_3344_5566_7788);
+            VulList_TimestampBottom(this, base + 0x10, 0, 0, 1);
+            assert_ne!(r64(0x10), 0);
+            VulList_Fill32(this, base + 0x100, 0x100, 0xABCD_EF01);
+            assert!((0..64).all(|i| r32(0x100 + 4 * i) == 0xABCD_EF01));
+            assert_eq!(r32(0x200), 0);
+            for i in 0..64 {
+                *mem.as_mut_ptr().add(i) = i as u8 ^ 0x5A;
+            }
+            VulList_CopyMemory(this, base + 0x200, base, 64, 0);
+            assert!((0..64).all(|i| *mem.as_ptr().add(0x200 + i) == i as u8 ^ 0x5A));
+            assert_eq!(*mem.as_ptr().add(0x240), 0);
+            // pre-satisfied waits return at once
+            VulList_Wait32(this, base, 3, 0x1234_5678, u32::MAX, 0);
+            VulList_Wait64(this, base + 8, 7, 0x1122_3344_5566_7788, u64::MAX, 0);
+            // cross-thread masked EQUAL wait resolves like the title's
+            let cell = base + 0x300;
+            *(cell as *mut u32) = 0;
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                *(cell as *mut u32) = 0xDEAD_00AA;
+            });
+            let t0 = std::time::Instant::now();
+            VulList_Wait32(this, cell, 3, 0xAA, 0xFF, 0);
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+            writer.join().unwrap();
+            assert_eq!(*(cell as *const u32), 0xDEAD_00AA);
+            // kickoff is a silent no-op; null addresses never fault
+            VulList_Kickoff(this);
+            VulList_Write32Bottom(this, 0, 1, 0, 0);
+            VulList_Write64Top(this, 0, 1, 0);
+            VulList_TimestampBottom(this, 0, 0, 0, 1);
+            VulList_Fill32(this, 0, 64, 1);
+            VulList_CopyMemory(this, 0, base, 64, 0);
+            VulList_CopyMemory(this, base, 0, 64, 0);
+            VulList_Wait32(this, 0, 3, 1, u32::MAX, 0);
+            VulList_Wait64(this, 0, 7, 1, u64::MAX, 0);
+        }
+    }
+
+    #[test]
+    fn vulkan_device_creates_vulkan_lists() {
+        // Step-17 wiring: a Vulkan device's slot 12 (PC CreateCommandList)
+        // and slot 73 (CreateCommandListX) hand out Vulkan lists that remember
+        // their device; the null device keeps plain lists. Skips without a
+        // Vulkan device; the null half always runs.
+        unsafe {
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut ndev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&null_sel, None, &mut ndev), S_OK);
+            type MkList = unsafe extern "win64" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: MkList = std::mem::transmute(slot(ndev, 12));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(mk(ndev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            assert_eq!((*(l as *mut NullObj)).kind, Kind::CommandList);
+            match acquire() {
+                Some(st) => {
+                    let vulkan_sel = Selection { backend: Backend::Vulkan, lane: None, reason: "test".into() };
+                    let mut dev = std::ptr::null_mut();
+                    assert_eq!(create_device_for(&vulkan_sel, Some(st), &mut dev), S_OK);
+                    assert_eq!((*(dev as *mut NullObj)).kind, Kind::VulkanDevice);
+                    // PC slot 12
+                    let mk: MkList = std::mem::transmute(slot(dev, 12));
+                    let mut l = std::ptr::null_mut();
+                    assert_eq!(mk(dev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+                    assert_eq!((*(l as *mut NullObj)).kind, Kind::VulkanList);
+                    // GetDevice (slot 7) hands back the Vulkan device
+                    type GetDev = unsafe extern "win64" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+                    let get: GetDev = std::mem::transmute(slot(l, 7));
+                    let mut d = std::ptr::null_mut();
+                    assert_eq!(get(l, std::ptr::null(), &mut d), S_OK);
+                    assert_eq!(d, dev);
+                    // console slot 73 (CreateCommandListX)
+                    type MkListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+                    let mkx: MkListX = std::mem::transmute(slot(dev, 73));
+                    let mut lx = std::ptr::null_mut();
+                    let desc = [0x10u32, 0, 1, 0];
+                    assert_eq!(mkx(dev, desc.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut lx), S_OK);
+                    assert_eq!((*(lx as *mut NullObj)).kind, Kind::VulkanList);
+                    assert_eq!((*(lx as *mut NullObj)).value.load(Ordering::Relaxed), dev as u64);
+                }
+                None => crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan"),
+            }
         }
     }
 
