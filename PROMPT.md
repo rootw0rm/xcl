@@ -9,25 +9,23 @@ full work plan.
 
 ## Status snapshot (2026-11-24 — refresh this when a phase flips)
 
-- `linux` @ `a8f6e7e` (merge `fb14aba` of upstream `main` @ `62265d3`
-  plus a Linux gate fix; pushed to `origin/linux`).
+- `linux` @ `40a47a2` (merge `5c61de1` of upstream `main` @ `7994cd1`, plus a Linux
+  gate fix; pushed to `origin/linux`).
   Verify with `git log --oneline -3; git status -sb`.
-  Upstream brought per-lane mixed-mask work (SCC tracking, `v_cmpx` EXEC
-  bridging, fast-boot env vars, coherent-UMA `VirtualQuery` skip, Bink HLE
-  additions) — `lane_masks.rs`/`lower.rs`/`lower_dxil.rs` are already in
-  `PER_LANE_SOURCES`, so the per-lane cache rehashes automatically. Two new
-  GPU tests in `lower_dxil.rs` missed upstream's `cfg(windows)` and broke
-  the Linux build; gated (`a8f6e7e`). Previous sync's notes still hold:
-  direct-DXIL follow-up (`TRANSLATOR_VERSION` 7), 4 GPU test modules
-  `cfg(all(test, windows))` on Linux.
-  A ralph loop is actively working CRT copies (`crt_linux.rs` WIP,
-  uncommitted) — do not touch those files or stash the workdir.
+  Upstream brought whole-wave native branches, TG_SIZE partial-wave fix
+  (`TRANSLATOR_VERSION` 8 — caches rehash via `pso.rs`), DXIL CSE fix
+  across discard, per-lane const-mask operands, round-denorm/NaN handling,
+  mesh-PSO triangle topology, PSO/mesh-shader caching. Two more
+  `lower_dxil.rs` GPU tests missed upstream's `cfg(windows)`; gated on
+  Linux. Previous syncs' notes still hold.
+  A ralph loop is actively working the tree (uncommitted WIP) — do not
+  touch its files or stash the workdir.
   NOTE: this machine has **no game files** — `/run/media/...` does not
   exist here. Retail-dependent steps are SKIPPED on this host (see §4.7);
   never block the loop on them.
 - **Phase A done.** `cargo check -p xcl --tests` and `cargo check --workspace`
   are green (0 errors) on `x86_64-unknown-linux-gnu`; `cargo test -p xcl --lib`
-  passes (370 passed, 0 failed, re-verified after the `62265d3` sync).
+  passes (385 passed, 0 failed, re-verified after the `7994cd1` sync).
   `target/debug/xcl` builds.
 - **Phase B done** (where game files exist). Offline tools run on the real
   paths, e.g. `xcl inspect .../game_scarlett_master.exe` reports 587 imports /
