@@ -632,6 +632,8 @@ impl Lw {
 }
 
 #[cfg(test)]
+// GPU-backed translation test; runner/validate are Windows-only until the SPIR-V backend lands.
+#[cfg(windows)]
 #[test]
 fn dispatch_chain_native_wave64_builds_whole() {
     use crate::gpu::recomp::runner;

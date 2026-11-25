@@ -239,6 +239,9 @@ impl Shader {
         let refused = |e: String| crate::xlog_warn!("compute split: piece {} of {} refused, the program stays whole: {}",
             stage + 1, plan.blocks.len(), e.lines().next().unwrap_or_default());
         let blob = dst.try_finish(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
+        // Validator check: Windows-only (validate is Windows-only until the SPIR-V
+        // backend lands); on Linux the piece goes through unvalidated.
+        #[cfg(windows)]
         crate::gpu::dxil::validate::validate(&blob).map_err(refused).ok()?;
         Some(blob)
     }
@@ -647,8 +650,11 @@ impl Module {
 mod tests {
     use crate::gpu::{
         dxil::{kernel::{Entry, KernelOptions}, lower::Lw, module::{BinOp, CastOp, Pred}},
-        recomp::{runner, CsInterface},
+        recomp::CsInterface,
     };
+    // GPU-backed translation tests; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
+    use crate::gpu::recomp::runner;
 
     #[test]
     fn oversized_loop_occupies_one_piece_up_to_the_hard_ceiling() {
@@ -698,6 +704,8 @@ mod tests {
         assert!(m.dispatch_plan(4).is_none());
     }
 
+    // GPU-backed helper; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     fn compare(threads: u32, extra_adds: u32) {
         if !runner::wave32_supported().unwrap_or(false) {
             runner::skip_test("no wave32 GPU");
@@ -790,6 +798,8 @@ mod tests {
         assert_eq!(result, reference);
     }
 
+    // GPU-backed helper; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     fn check_persistent_payload(reuse_hole: bool) {
         use super::Value;
 
@@ -910,18 +920,28 @@ mod tests {
         assert!(chain.pieces.len() >= 2);
     }
 
+    // GPU-backed translation test; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     #[test]
     fn dispatch_chain_payload_skips_middle_piece() { check_persistent_payload(false); }
 
+    // GPU-backed translation test; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     #[test]
     fn dispatch_chain_payload_survives_reused_edge_slot() { check_persistent_payload(true); }
 
+    // GPU-backed translation test; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     #[test]
     fn dispatch_chain_wave32_live_loops() { compare(32, 0); }
 
     /// A guest wave64 split across two hardware wave32s.
+    // GPU-backed translation test; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     #[test]
     fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64, 0); }
+    // GPU-backed translation test; runner/validate are Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     #[test]
     fn dispatch_chain_oversized_loop_matches_whole() {
         compare(32, 48);
@@ -930,6 +950,8 @@ mod tests {
 
     /// Early exits and forward skips retain their own continuation tags; group
     /// indexing must keep every lane separate across all three dispatch axes.
+    // GPU-backed translation test; runner is Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     #[test]
     fn dispatch_chain_divergent_forward_edges_3d() {
         if !runner::wave32_supported().unwrap_or(false) {

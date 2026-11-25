@@ -875,6 +875,9 @@ mod tests {
         }
     }
 
+    // `dxil_*` are only consumed by the Windows-only halves below (validate/disassemble/GPU
+    // dispatch); on Linux the test still proves both programs translate.
+    #[cfg_attr(not(windows), allow(unused_variables))]
     #[test]
     fn split_wave64_dead_scc_skips_exchange_barrier() {
         let mut cs = compute_cs();
