@@ -1,4 +1,6 @@
-﻿//! Invariants over the generated D3D12 interface table (`hle/d3d12_layout.rs`) and its
+#![cfg(windows)]
+// Windows-only integration surface (real D3D12 driver objects / console-slot contracts); the Linux port gets its own e2e when the Vulkan backend covers this surface (Phase D).
+//! Invariants over the generated D3D12 interface table (`hle/d3d12_layout.rs`) and its
 //! lookup helpers (`hle/d3d12x/layout.rs`). A generator regression (bad IID, duplicated
 //! or missing method, a non-versioned sibling leaking into a chain) would silently
 //! misalign slots in the D3D12.X device shim.

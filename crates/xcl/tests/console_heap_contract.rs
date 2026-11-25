@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (real D3D12 driver objects / console-slot contracts); the Linux port gets its own e2e when the Vulkan backend covers this surface (Phase D).
 //! The console descriptor heaps' public contract, pinned from outside: register / start /
 //! slot / words_at / copy_words / unregister. The inline tests cover one happy path each; this
 //! covers the arithmetic they imply (window-0 placement, slot math, T# / buffer V# / sampler

@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (real D3D12 driver objects / console-slot contracts); the Linux port gets its own e2e when the Vulkan backend covers this surface (Phase D).
 //! Contract tests for `xcl::hle::d3d12x::guard` x64 thunks (`make_guard`, `make_split`,
 //! `make_layout_split`, `make_tracer`, and `make_call_tracer`) under both mapped game-image
 //! callers and non-game (runtime) callers.

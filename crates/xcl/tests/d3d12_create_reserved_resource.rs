@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (real D3D12 driver objects / console-slot contracts); the Linux port gets its own e2e when the Vulkan backend covers this surface (Phase D).
 //! Host-driver parity checks for `ID3D12Device::CreateReservedResource` (Part of #480).
 //!
 //! Compares XCL's hooked `CreateReservedResource` (vtable slot 30) against a raw host

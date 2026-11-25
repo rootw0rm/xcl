@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (real D3D12 driver objects / console-slot contracts); the Linux port gets its own e2e when the Vulkan backend covers this surface (Phase D).
 //! Host D3D12 driver parity tests for `ID3D12Device::CreateCommittedResource` (slot 27,
 //! part of #480): compares XCL's hooked console path directly against the unhooked PC driver
 //! on the same adapter without requiring game files or console DLLs.

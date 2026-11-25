@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (real D3D12 driver objects / console-slot contracts); the Linux port gets its own e2e when the Vulkan backend covers this surface (Phase D).
 //! Verify XCL's `CreateHeap` hook (`d3d12x::real::dev_create_heap`) against the host PC D3D12
 //! driver on the same adapter, with no console files or game data.
 //!

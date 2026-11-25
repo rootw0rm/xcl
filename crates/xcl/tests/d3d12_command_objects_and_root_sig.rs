@@ -1,3 +1,5 @@
+#![cfg(windows)]
+// Windows-only integration surface (real D3D12 driver objects / console-slot contracts); the Linux port gets its own e2e when the Vulkan backend covers this surface (Phase D).
 //! Host D3D12 driver parity tests for `CreateCommandQueue` (slot 8), `CreateCommandAllocator`
 //! (slot 9), `CreateCommandList` (slot 12), `CreateCommandList1` (slot 51), and
 //! `CreateRootSignature` (slot 16), part of #480: compares XCL's hooked path directly against
