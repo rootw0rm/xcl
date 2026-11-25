@@ -9,29 +9,19 @@ full work plan.
 
 ## Status snapshot (2026-11-24 — refresh this when a phase flips)
 
-- `linux` @ `b799e14` (merge of upstream `main` @ `cbc296a`, plus Linux
+- `linux` @ `5fc2e8c` (merge of upstream `main` @ `6987e49`, plus Linux
   fixes; pushed to `origin/linux`).
   Verify with `git log --oneline -3; git status -sb`.
-  Upstream brought the direct-compact shader path, null-device struct
-  returns, `-O0`-without-debug-nops, huge-compile verdict logging, GS
-  preservation on stale PSO blobs, per-lane WQM/LDS tests, disasm e2e
-  suite, sparse-VRAM tests, d3d12 resource+sync contract tests.
-  Linux fixes in the merge (2 commits): `compact_tests` + `pops_rov_tests`
-  + `heap_bounds_tests` + `cmp64_tests` + 3 `lower_dxil.rs` GPU tests gated
-  `cfg(all(test, windows))`; `used_compute`/new `precompile`/`--used-only`
-  test gated (they need `d3d12x::real`); Linux `precompile` stub + the
-  `--used-only` call site take `None` on Linux; new
-  `d3d12_resource_and_sync` e2e gets the file-top `#![cfg(windows)]`.
-  Previous syncs' notes still hold.
+  Upstream `cbc296a` → `6987e49` is README-only (Discord link formatting) —
+  no code, no Linux fallout. Previous syncs' notes still hold.
   A ralph loop is actively working the tree (glsl/spirv/vulkan_graphics WIP,
-  uncommitted and currently not compiling) — do not touch its files or
-  stash the workdir; merge verification happens in an isolated worktree.
+  uncommitted) — do not touch its files or stash the workdir.
   NOTE: this machine has **no game files** — `/run/media/...` does not
   exist here. Retail-dependent steps are SKIPPED on this host (see §4.7);
   never block the loop on them.
 - **Phase A done.** `cargo check -p xcl --tests` and `cargo check --workspace`
   are green (0 errors) on `x86_64-unknown-linux-gnu`; `cargo test -p xcl --lib`
-  passes (483 passed, 0 failed, 1 ignored; re-verified after the `cbc296a` sync).
+  passes (490 passed, 0 failed, 1 ignored; re-verified after the `6987e49` sync).
   `target/debug/xcl` builds.
 - **Phase B done** (where game files exist). Offline tools run on the real
   paths, e.g. `xcl inspect .../game_scarlett_master.exe` reports 587 imports /
