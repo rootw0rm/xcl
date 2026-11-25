@@ -942,6 +942,17 @@ impl Vfs {
     }
 
     fn prepare_write_unlocked(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        // Linux first: reject traversals/absolute rels with the containment error
+        // before the parent check below can shadow it as PATH_NOT_FOUND.
+        #[cfg(not(windows))]
+        Self::checked_rel(rel)?;
+        // Win32 fails a create-write with ERROR_PATH_NOT_FOUND when the parent folder
+        // does not exist; do not conjure missing parents (same check as `stage_write`).
+        if let Some((parent_rel, _)) = rel.rsplit_once('\\') {
+            if !self.is_dir(parent_rel) {
+                return Err(ERROR_PATH_NOT_FOUND);
+            }
+        }
         #[cfg(windows)]
         let ov = self.overlay_path(rel);
         #[cfg(not(windows))]
@@ -1959,5 +1970,36 @@ mod tests {
         assert!(!v.is_whiteout("data\\hello.txt"));
         assert!(v.is_whiteout("data\\gone.txt"));
         assert!(v.is_whiteout("data\\sub\\deep.txt"));
+    }
+
+    #[test]
+    fn write_below_a_missing_parent_fails_without_creating_it() {
+        let f = Fixture::new("noparent");
+        let v = &f.vfs;
+        // Win32: CreateFileW CREATE_ALWAYS under a folder that exists in neither layer
+        // fails with ERROR_PATH_NOT_FOUND (3); it does not conjure the folder.
+        assert_eq!(v.prepare_write("nodir\\f.bin", true), Err(ERROR_PATH_NOT_FOUND));
+        assert!(!Path::new(&v.overlay_path("nodir")).exists());
+    }
+
+    #[test]
+    fn write_below_a_removed_dir_does_not_resurrect_it() {
+        let f = Fixture::new("norez");
+        let v = &f.vfs;
+        std::fs::create_dir(f.game().join("empty")).unwrap();
+        assert_eq!(v.remove_dir("empty"), Ok(()));
+        assert_eq!(v.prepare_write("empty\\f.bin", true), Err(ERROR_PATH_NOT_FOUND));
+        assert!(!Path::new(&v.overlay_path("empty")).exists());
+        assert!(v.is_whiteout("empty"));
+    }
+
+    #[test]
+    fn write_below_a_game_only_parent_still_works() {
+        let f = Fixture::new("gameparent");
+        let v = &f.vfs;
+        std::fs::create_dir(f.game().join("gonly")).unwrap();
+        let p = v.prepare_write("gonly\\n.txt", false).expect("game-only parent is visible");
+        std::fs::write(&p, b"new").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
     }
 }
