@@ -63,6 +63,477 @@ fn end_process_now(status: i32) -> ! {
     unsafe { libc::_exit(status) }
 }
 
+// ---------------------------------------------------------------------------------------
+// thread dumps: unwind a copy of each stopped thread's stack (#253)
+// ---------------------------------------------------------------------------------------
+//
+// While a thread is stopped the dump takes only its registers and a copy of its stack
+// (system calls only: no heap, no Rust lock a stopped thread may hold). The thread then
+// goes on (or ends) and the unwinding reads the COPY, with addresses into the stack moved
+// to it, ending where a frame would leave it – the shape of upstream #253, whose
+// `RtlVirtualUnwind` read live memory past the resume (a freed stack, a stale frame
+// register to near-null). Linux has no `RtlVirtualUnwind`: the stop is a targeted
+// `SIGUSR2` whose handler parks the thread, the copy is `pread` from `/proc/self/mem`
+// bounded by the mapping end in `/proc/self/maps`, and the unwind is a frame-pointer
+// walk with a leaf fallback, all inside the copy.
+
+/// Bytes of a thread's stack (from RSP up) a thread dump keeps.
+const DUMP_STACK: usize = 0x4_0000;
+
+/// Signal that parks a thread for a dump. The title is a Windows game: it never installs
+/// POSIX handlers itself, so this host-internal signal is never its own.
+const DUMP_SIGNAL: libc::c_int = libc::SIGUSR2;
+
+/// End of the mapping containing `addr` (`None`: unmapped), from `/proc/self/maps` with
+/// `open`/`read`/`close` only – stack buffers, no heap, no lock.
+unsafe fn stack_region_end(addr: u64) -> Option<u64> {
+    const PATH: &[u8] = b"/proc/self/maps\0";
+    let fd = libc::open(PATH.as_ptr() as *const libc::c_char, libc::O_RDONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 8192];
+    let mut tail = [0u8; 256];
+    let mut tail_len = 0usize;
+    let mut end: Option<u64> = None;
+    loop {
+        let r = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+        if r <= 0 {
+            break;
+        }
+        let chunk = &buf[..r as usize];
+        // first line may continue the previous chunk's tail
+        let mut start = 0usize;
+        if tail_len > 0 {
+            if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+                if let Some(e) = mapping_end_containing(&tail[..tail_len], &chunk[..nl], addr) {
+                    end = Some(e);
+                    tail_len = 0;
+                    if end.is_some() {
+                        break;
+                    }
+                } else {
+                    tail_len = 0;
+                }
+                start = nl + 1;
+            } else {
+                // still no newline: keep the tail bounded, skip this chunk's head
+                let keep = chunk.len().min(tail.len() - tail_len);
+                tail[tail_len..tail_len + keep].copy_from_slice(&chunk[..keep]);
+                tail_len += keep;
+                continue;
+            }
+        }
+        let mut line_start = start;
+        for (i, &b) in chunk.iter().enumerate().skip(start) {
+            if b == b'\n' {
+                if let Some(e) = mapping_end_containing(&[], &chunk[line_start..i], addr) {
+                    end = Some(e);
+                    break;
+                }
+                line_start = i + 1;
+            }
+        }
+        if end.is_some() {
+            break;
+        }
+        // stash the incomplete last line (bounded: overlong lines cannot hold addr anyway –
+        // the address range is at the head, parsed before the path can overflow it)
+        let rest = &chunk[line_start..];
+        if rest.is_empty() {
+            tail_len = 0;
+        } else if rest.len() <= tail.len() {
+            tail[..rest.len()].copy_from_slice(rest);
+            tail_len = rest.len();
+        } else {
+            if let Some(e) = mapping_end_containing(&[], rest, addr) {
+                end = Some(e);
+                break;
+            }
+            tail_len = 0;
+        }
+        if (r as usize) < buf.len() {
+            break;
+        }
+    }
+    libc::close(fd);
+    end
+}
+
+/// End address of the maps line `head ++ rest` when its range contains `addr`
+/// (`head` is the previous chunk's tail, possibly empty). Lines look like
+/// `start-end perms ...`: only the head is parsed.
+fn mapping_end_containing(head: &[u8], rest: &[u8], addr: u64) -> Option<u64> {
+    fn hex_value(line: &[u8], mut i: usize) -> (u64, usize) {
+        let mut v = 0u64;
+        while i < line.len() {
+            let d = match line[i] {
+                b'0'..=b'9' => (line[i] - b'0') as u64,
+                b'a'..=b'f' => (line[i] - b'a' + 10) as u64,
+                _ => break,
+            };
+            v = v.wrapping_shl(4) | d;
+            i += 1;
+        }
+        (v, i)
+    }
+    // copy the head (at most "ffffffffffffffff-") plus the range start into a stack line
+    let mut line = [0u8; 64];
+    let n = (head.len() + rest.len()).min(line.len());
+    let mut joined = 0usize;
+    for &b in head.iter().chain(rest.iter()).take(n) {
+        line[joined] = b;
+        joined += 1;
+    }
+    let (start, i) = hex_value(&line[..joined], 0);
+    if i >= joined || line[i] != b'-' {
+        return None;
+    }
+    let (stop, _) = hex_value(&line[..joined], i + 1);
+    (start <= addr && addr < stop).then_some(stop)
+}
+
+/// The stack from `rsp` up (to the end of its region, at most `buf.len()` bytes) copied to
+/// `buf`: its length. Only system calls – no lock a stopped thread may hold.
+///
+/// A short copy (fewer bytes than the region allows) is still returned when it holds at
+/// least one word: between the maps lookup and the read a neighbor thread's exit can
+/// punch a hole into the merged anonymous area the stack lives in (thread churn around
+/// a dump), and `/proc/self/mem` then short-reads or errors past the hole. The unwinder
+/// is bounds-checked and ends where the copy ends, so a truncated copy still unwinds
+/// the hottest frames – the same clamp upstream's region end provides.
+unsafe fn copy_stack(rsp: u64, buf: &mut [u8]) -> Option<usize> {
+    if buf.is_empty() {
+        return None;
+    }
+    let end = stack_region_end(rsp)?;
+    let n = (end.saturating_sub(rsp) as usize).min(buf.len());
+    if n < 8 {
+        return None;
+    }
+    const PATH: &[u8] = b"/proc/self/mem\0";
+    let fd = libc::open(PATH.as_ptr() as *const libc::c_char, libc::O_RDONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return None;
+    }
+    let mut off = 0usize;
+    while off < n {
+        let r = libc::pread(
+            fd,
+            buf.as_mut_ptr().add(off) as *mut libc::c_void,
+            n - off,
+            rsp.wrapping_add(off as u64) as libc::off_t,
+        );
+        if r == 0 {
+            break;
+        }
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        off += r as usize;
+    }
+    libc::close(fd);
+    (off >= 8).then_some(off)
+}
+
+/// A stopped thread's registers for the copy-then-unwind walk.
+#[derive(Clone, Copy, Default)]
+struct ThreadRegs {
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rsp: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn regs_from_ucontext(ctx: *const libc::c_void) -> ThreadRegs {
+    let uc = &*(ctx as *const libc::ucontext_t);
+    let g = |r: libc::c_int| uc.uc_mcontext.gregs[r as usize] as u64;
+    ThreadRegs {
+        rax: g(libc::REG_RAX),
+        rcx: g(libc::REG_RCX),
+        rdx: g(libc::REG_RDX),
+        rbx: g(libc::REG_RBX),
+        rsp: g(libc::REG_RSP),
+        rbp: g(libc::REG_RBP),
+        rsi: g(libc::REG_RSI),
+        rdi: g(libc::REG_RDI),
+        r8: g(libc::REG_R8),
+        r9: g(libc::REG_R9),
+        r10: g(libc::REG_R10),
+        r11: g(libc::REG_R11),
+        r12: g(libc::REG_R12),
+        r13: g(libc::REG_R13),
+        r14: g(libc::REG_R14),
+        r15: g(libc::REG_R15),
+        rip: g(libc::REG_RIP),
+    }
+}
+
+/// The return addresses of the frames from `regs` on (its RIP first), unwound from the
+/// thread's stack copy: `stack` is the bytes from `regs.rsp` on, taken while the thread
+/// was stopped. The thread has gone on (or ended) since, so the walk reads the copy –
+/// addresses into the stack are moved to it – and ends where a frame would leave it.
+fn unwind_regs(regs: &mut ThreadRegs, n: usize, stack: &[u8]) -> Vec<usize> {
+    if stack.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    let (orig, copy, len) = (regs.rsp, stack.as_ptr() as u64, stack.len() as u64);
+    if orig == 0 {
+        return Vec::new();
+    }
+    let in_copy = |v: u64| v >= copy && v < copy + len;
+    // registers restored from the copy hold addresses into the original stack
+    let to_copy = |r: &mut ThreadRegs| {
+        for f in [
+            &mut r.rax, &mut r.rcx, &mut r.rdx, &mut r.rbx, &mut r.rsp, &mut r.rbp,
+            &mut r.rsi, &mut r.rdi, &mut r.r8, &mut r.r9, &mut r.r10, &mut r.r11,
+            &mut r.r12, &mut r.r13, &mut r.r14, &mut r.r15,
+        ] {
+            if *f >= orig && *f < orig + len {
+                *f = *f - orig + copy;
+            }
+        }
+    };
+    let read_word = |at: u64| -> Option<u64> {
+        if !in_copy(at) || at + 8 > copy + len {
+            return None;
+        }
+        Some(unsafe { (copy as *const u8).add((at - copy) as usize).cast::<u64>().read_unaligned() })
+    };
+    to_copy(regs);
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let rip = regs.rip;
+        if rip == 0 || !in_copy(regs.rsp) || regs.rsp + 8 > copy + len {
+            break;
+        }
+        out.push(rip as usize);
+        // a frame-pointer link inside the copy: [rbp] is the caller's rbp, [rbp+8] its return
+        let rbp = regs.rbp;
+        if rbp & 7 == 0 {
+            if let (Some(next), Some(ret)) = (read_word(rbp), read_word(rbp.wrapping_add(8))) {
+                let next_orig = next >= orig && next < orig + len;
+                if ret != 0 && (next == 0 || next_orig || in_copy(next)) && next != rbp {
+                    regs.rbp = next;
+                    regs.rip = ret;
+                    regs.rsp = rbp.wrapping_add(16);
+                    to_copy(regs);
+                    continue;
+                }
+            }
+        }
+        // a leaf function: the return address is at RSP
+        match read_word(regs.rsp) {
+            Some(ret) => {
+                regs.rip = ret;
+                regs.rsp = regs.rsp.wrapping_add(8);
+            }
+            None => break,
+        }
+        to_copy(regs);
+    }
+    out
+}
+
+// One dump slot per thread the dump may park: the handler touches atomics only
+// (async-signal-safe), the dumper owns the slot between claim and release.
+struct DumpSlot {
+    tid: AtomicUsize,
+    ready: AtomicBool,
+    release: AtomicBool,
+    regs: [AtomicUsize; 17],
+}
+
+impl DumpSlot {
+    const fn new() -> DumpSlot {
+        DumpSlot {
+            tid: AtomicUsize::new(0),
+            ready: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            regs: [const { AtomicUsize::new(0) }; 17],
+        }
+    }
+}
+
+const MAX_DUMP_THREADS: usize = 64;
+static DUMP_SLOTS: [DumpSlot; MAX_DUMP_THREADS] = [const { DumpSlot::new() }; MAX_DUMP_THREADS];
+static DUMP_INSTALLED: AtomicBool = AtomicBool::new(false);
+static DUMPING: AtomicBool = AtomicBool::new(false);
+
+/// Parked-thread handler: store this thread's registers in its claimed slot, then wait
+/// (bounded) for the dumper to copy the stack. Async-signal-safe: atomics and
+/// `clock_gettime` only – no heap, no lock the thread may hold elsewhere.
+unsafe extern "C" fn dump_handler(
+    _signal: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    let me = libc::syscall(libc::SYS_gettid) as usize;
+    let Some(slot) = DUMP_SLOTS.iter().find(|s| s.tid.load(Ordering::Acquire) == me) else {
+        return;
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        let r = regs_from_ucontext(context);
+        let v = [
+            r.rax as usize, r.rcx as usize, r.rdx as usize, r.rbx as usize, r.rsp as usize,
+            r.rbp as usize, r.rsi as usize, r.rdi as usize, r.r8 as usize, r.r9 as usize,
+            r.r10 as usize, r.r11 as usize, r.r12 as usize, r.r13 as usize, r.r14 as usize,
+            r.r15 as usize, r.rip as usize,
+        ];
+        for (i, w) in v.iter().enumerate() {
+            slot.regs[i].store(*w, Ordering::Release);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = context;
+        for w in slot.regs.iter() {
+            w.store(0, Ordering::Release);
+        }
+    }
+    slot.ready.store(true, Ordering::Release);
+    // the dumper copies the stack, then releases us; never park forever (500 ms) –
+    // a dumper that died between claim and release must not hang the title
+    let mut now = std::mem::zeroed::<libc::timespec>();
+    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+    let until = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64 + 500_000_000;
+    while !slot.release.load(Ordering::Acquire) {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+        if now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64 >= until {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+}
+
+fn install_dump_handler() {
+    if DUMP_INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = dump_handler as libc::sighandler_t;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(DUMP_SIGNAL, &action, std::ptr::null_mut()) != 0 {
+            crate::xlog_warn!(
+                "thread dump: sigaction({DUMP_SIGNAL}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            DUMP_INSTALLED.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn task_tids() -> Vec<i32> {
+    let me = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+    match std::fs::read_dir("/proc/self/task") {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|&t| t != me)
+            .take(MAX_DUMP_THREADS)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `XCL_THREAD_DUMP_AT`: every other thread of the process stopped for a moment – where it
+/// is (RIP) and the calls on its stack that lead there, in the log. Only the registers
+/// and a copy of the stack are taken while a thread is parked: the unwinding, the module
+/// lookup and the formatting take locks the parked thread may hold. The unwinding reads
+/// the copy: the thread goes on, or ends.
+pub fn dump_threads() {
+    install_dump_handler();
+    if DUMPING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // allocated before any thread is parked: it may hold the heap's lock. (The slack past
+    // the copy: a frame's unwinding may read a little beyond where the copy ends.)
+    let mut stack = vec![0u8; DUMP_STACK + 0x1_0000];
+    let pid = unsafe { libc::getpid() };
+    let mut lines = Vec::new();
+    for tid in task_tids() {
+        let Some(slot) = DUMP_SLOTS.iter().find(|s| s.tid.load(Ordering::Acquire) == 0) else {
+            break;
+        };
+        for w in slot.regs.iter() {
+            w.store(0, Ordering::Relaxed);
+        }
+        slot.ready.store(false, Ordering::Relaxed);
+        slot.release.store(false, Ordering::Relaxed);
+        slot.tid.store(tid as usize, Ordering::Release);
+        if unsafe { libc::tgkill(pid, tid, DUMP_SIGNAL) } != 0 {
+            slot.tid.store(0, Ordering::Release);
+            continue;
+        }
+        // the parked thread stores its registers, then waits for the copy
+        let mut waited = 0;
+        while !slot.ready.load(Ordering::Acquire) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            waited += 1;
+        }
+        if !slot.ready.load(Ordering::Acquire) {
+            // exited, or blocking the dump signal: let it go if it arrives late
+            slot.tid.store(0, Ordering::Release);
+            continue;
+        }
+        let v: [usize; 17] = std::array::from_fn(|i| slot.regs[i].load(Ordering::Acquire));
+        let mut regs = ThreadRegs {
+            rax: v[0] as u64,
+            rcx: v[1] as u64,
+            rdx: v[2] as u64,
+            rbx: v[3] as u64,
+            rsp: v[4] as u64,
+            rbp: v[5] as u64,
+            rsi: v[6] as u64,
+            rdi: v[7] as u64,
+            r8: v[8] as u64,
+            r9: v[9] as u64,
+            r10: v[10] as u64,
+            r11: v[11] as u64,
+            r12: v[12] as u64,
+            r13: v[13] as u64,
+            r14: v[14] as u64,
+            r15: v[15] as u64,
+            rip: v[16] as u64,
+        };
+        let mut len = 0usize;
+        let copied = unsafe { copy_stack(regs.rsp, &mut stack[..DUMP_STACK]).inspect(|&n| len = n) };
+        // the thread goes on (or has ended): the unwinding reads the copy
+        slot.release.store(true, Ordering::Release);
+        slot.tid.store(0, Ordering::Release);
+        if copied.is_some() {
+            let frames: Vec<String> = unwind_regs(&mut regs, 14, &stack[..len])
+                .into_iter()
+                .map(crate::modules::describe_address)
+                .collect();
+            lines.push(format!("thread {tid}: {}", frames.join(" < ")));
+        }
+    }
+    crate::xlog_info!("thread dump ({} threads):\n{}", lines.len(), lines.join("\n"));
+    crate::log::flush();
+    DUMPING.store(false, Ordering::Release);
+}
+
 /// Linux has no `RtlAddFunctionTable`; `.pdata` translation is a later Phase-C step.
 // LINUX-TODO: Phase C — translate Windows unwind data before claiming C++ exception support.
 pub fn register_function_table(_base: usize, _rva: u32, _size: u32) -> bool {
@@ -440,6 +911,104 @@ mod tests {
     fn pc_hook_is_an_explicit_unsupported_path() {
         let error = install_pc_hook().unwrap_err();
         assert!(error.contains("not available on Linux"), "{error}");
+    }
+
+    /// recursion whose frames hold return addresses and saved registers that change as it runs
+    #[inline(never)]
+    fn churn_stack(depth: u32, seed: u64) -> u64 {
+        let local = std::hint::black_box([seed; 8]);
+        if depth == 0 {
+            return local.iter().fold(0u64, |a, &x| a.wrapping_add(x));
+        }
+        churn_stack(depth - 1, seed.wrapping_mul(6364136223846793005).wrapping_add(depth as u64)) ^ local[depth as usize % 8]
+    }
+
+    #[test]
+    fn copy_stack_copies_the_live_stack() {
+        let rsp: u64 = unsafe {
+            let r: u64;
+            std::arch::asm!("mov {}, rsp", out(reg) r, options(nomem, nostack, preserves_flags));
+            r
+        };
+        let mut buf = vec![0u8; DUMP_STACK];
+        let n = unsafe { copy_stack(rsp, &mut buf) }.expect("the current stack is mapped");
+        // a neighbor thread's exit can punch a hole past the maps lookup, truncating the
+        // copy: the first word (this frame) is always there, the tail is best-effort
+        assert!(n >= 8 && n <= DUMP_STACK, "bounded copy: {n}");
+        let live = unsafe { (rsp as *const u64).read_unaligned() };
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), live);
+    }
+
+    #[test]
+    fn unwind_reads_the_copy_not_live_memory() {
+        // fake original stack: leaf return addresses at its base
+        let mut orig = vec![0u8; 64];
+        for (i, w) in [0xBBBB_0001u64, 0xBBBB_0002, 0xBBBB_0003, 0].iter().enumerate() {
+            orig[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        let base = orig.as_ptr() as u64;
+        let stack = orig.clone();
+        let copy = stack.as_ptr() as u64;
+        let mut regs = ThreadRegs {
+            rip: 0xAAAA_0001,
+            rsp: base,
+            rsi: base + 8,
+            ..Default::default()
+        };
+        let frames = unwind_regs(&mut regs, 14, &stack);
+        assert_eq!(frames, vec![0xAAAA_0001usize, 0xBBBB_0001, 0xBBBB_0002, 0xBBBB_0003]);
+        // registers into the original stack moved to the copy
+        assert_eq!(regs.rsi, copy + 8);
+        // a live edit after the copy is invisible to the unwinder
+        orig[0] = 0xFF;
+        let mut regs2 = ThreadRegs { rip: 0xAAAA_0001, rsp: base, ..Default::default() };
+        assert_eq!(unwind_regs(&mut regs2, 14, &stack), frames);
+        // a walk that would leave the copy ends there: no zero terminator, so the leaf
+        // steps run to the end (the initial RIP + 7 words pushed; the 8th word is in RIP
+        // when RSP runs out, and the walk stops)
+        let full = vec![0x01u8; 64];
+        let full_base = full.as_ptr() as u64;
+        let full_copy = full.clone();
+        let mut regs3 = ThreadRegs { rip: 0xAAAA_0001, rsp: full_base, ..Default::default() };
+        let walked = unwind_regs(&mut regs3, 14, &full_copy);
+        assert_eq!(walked.len(), 8, "{walked:x?}");
+        assert_eq!(walked[0], 0xAAAA_0001);
+        // a zero RIP ends the walk at once
+        let mut regs4 = ThreadRegs { rip: 0, rsp: base, ..Default::default() };
+        assert!(unwind_regs(&mut regs4, 14, &stack).is_empty());
+    }
+
+    /// Thread dumps while threads run, start and end around them (#106: a dump read a near-null
+    /// address inside the unwinder).
+    #[test]
+    fn thread_dumps_while_threads_run_and_exit() {
+        use std::sync::atomic::AtomicBool;
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let busy: Vec<_> = (0..4u64)
+            .map(|i| std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !STOP.load(Ordering::Relaxed) {
+                    n = n.wrapping_add(churn_stack((n % 40) as u32 + 1, n ^ i));
+                }
+                n
+            }))
+            .collect();
+        let churn: Vec<_> = (0..4u64)
+            .map(|i| std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !STOP.load(Ordering::Relaxed) {
+                    n = std::thread::spawn(move || churn_stack((n % 24) as u32 + 1, n ^ i)).join().unwrap();
+                }
+            }))
+            .collect();
+        for _ in 0..40 {
+            dump_threads();
+        }
+        STOP.store(true, Ordering::Relaxed);
+        churn.into_iter().for_each(|t| t.join().unwrap());
+        busy.into_iter().for_each(|t| {
+            t.join().unwrap();
+        });
     }
 
     #[test]

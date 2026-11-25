@@ -50,6 +50,21 @@ pub fn run_boot(boot: &Boot) -> u32 {
     // the crash handler is the sigaction watchdog.
     crate::eh::install_crash_handler();
 
+    // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
+    if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
+        let at: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let _ = std::thread::Builder::new().name("xcl-thread-dump".into()).spawn(move || {
+            let t0 = std::time::Instant::now();
+            for s in at {
+                let left = s - t0.elapsed().as_secs_f64();
+                if left > 0.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(left));
+                }
+                crate::eh::dump_threads();
+            }
+        });
+    }
+
     let mut dirs = vec![boot.game_root.clone()];
     if let Some(p) = boot.exe_path.parent() {
         if p != boot.game_root {
