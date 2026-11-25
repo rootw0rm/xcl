@@ -159,7 +159,7 @@ pub fn build() -> Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
         exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
-        crash: CRASH.lock().ok().and_then(|g| g.clone()),
+        crash: lock_within(&CRASH, Duration::ZERO).and_then(|g| g.clone()),
         exit_code: None,
         #[cfg(windows)]
         environment: Vec::new(),
@@ -186,15 +186,78 @@ pub fn build() -> Report {
 }
 
 /// `m.try_lock()`, retried for `wait`: never an endless wait – the holder may be this very
-/// thread, crashed inside `build()`.
+/// thread, crashed inside `build()`. A poisoned lock is taken: the thread that held it panicked
+/// (the very crash this report is about), and its data – the crash text, the report being
+/// written – is what has to be read, not thrown away.
 fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
     let end = Instant::now() + wait;
     loop {
         match m.try_lock() {
             Ok(g) => return Some(g),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
             Err(TryLockError::WouldBlock) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => return None,
+            Err(TryLockError::WouldBlock) => return None,
         }
+    }
+}
+
+thread_local! {
+    /// Same-thread re-entrancy flag for the report writers below: a crash inside `build()`
+    /// must not deadlock the retry on the write lock it already holds.
+    static IN_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets `IN_WRITE` for its lifetime, restoring the previous value on drop.
+struct WriteGuard {
+    outer: bool,
+}
+
+impl WriteGuard {
+    fn enter() -> Self {
+        let outer = IN_WRITE.with(|f| f.replace(true));
+        Self { outer }
+    }
+
+    /// True when this thread is already inside a report write (it crashed midway).
+    fn reentered(&self) -> bool {
+        self.outer
+    }
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        IN_WRITE.with(|f| f.set(self.outer));
+    }
+}
+
+/// Last-resort report: the crash description plus whatever the caller already knows.
+/// Written when the full `build()` cannot run (contended locks, a panic midway) so a
+/// crash is never silently lost.
+fn minimal_report(title: String, exe: String, crash: Option<String>, code: Option<i64>) -> Report {
+    let mut r = Report {
+        xcl_version: env!("CARGO_PKG_VERSION").to_string(),
+        title,
+        exe,
+        crash,
+        exit_code: code,
+        ..Default::default()
+    };
+    // A crash recorded while the full report was building must not be lost.
+    if r.crash.is_none() {
+        r.crash = lock_within(&CRASH, Duration::ZERO).and_then(|g| g.clone());
+    }
+    r
+}
+
+fn write_fallback(boot: &crate::config::Boot, crash: Option<String>, code: Option<i64>) {
+    let r = minimal_report(
+        boot.title.clone(),
+        boot.exe_path.to_string_lossy().into_owned(),
+        crash,
+        code,
+    );
+    if let Ok(s) = serde_json::to_string_pretty(&r) {
+        let _ = std::fs::write(boot.report_path(), s);
     }
 }
 
@@ -206,9 +269,31 @@ pub fn write_crash_with_code(crash: String, code: i64) {
     if let Some(mut g) = lock_within(&CRASH, Duration::from_secs(2)) {
         g.get_or_insert(crash.clone());
     }
-    let Some(_g) = lock_within(&WRITE_LOCK, Duration::from_secs(2)) else { return };
+    let guard = WriteGuard::enter();
+    if guard.reentered() {
+        // This thread crashed inside a report write: skip the locks and write the crash
+        // description directly instead of deadlocking on them.
+        if let Some(boot) = crate::state::boot() {
+            write_fallback(&boot, Some(crash), Some(code));
+        }
+        return;
+    }
+    let Some(_g) = lock_within(&WRITE_LOCK, Duration::from_secs(2)) else {
+        // Contention (the holder may be this very thread, crashed inside `build()`):
+        // write the crash text now rather than losing the report.
+        if let Some(boot) = crate::state::boot() {
+            write_fallback(&boot, Some(crash), Some(code));
+        }
+        return;
+    };
     let Some(boot) = crate::state::boot() else { return };
-    let mut report = build();
+    let mut report = match std::panic::catch_unwind(build) {
+        Ok(r) => r,
+        Err(_) => {
+            write_fallback(&boot, Some(crash), Some(code));
+            return;
+        }
+    };
     // `build()` re-reads CRASH above, so the description is already in place.
     report.crash = Some(crash);
     report.exit_code = Some(code);
@@ -235,14 +320,36 @@ pub fn write_final_with_code(crash: Option<String>, code: i64) {
     #[cfg(windows)]
     crate::hle::kbm::release();
     let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };
-    if let Some(c) = crash {
+    if let Some(c) = &crash {
         if let Some(mut g) = lock_within(&CRASH, wait) {
-            g.get_or_insert(c);
+            g.get_or_insert(c.clone());
         }
     }
-    let Some(_g) = lock_within(&WRITE_LOCK, wait) else { return };
+    let guard = WriteGuard::enter();
+    if guard.reentered() {
+        if let Some(boot) = crate::state::boot() {
+            write_fallback(&boot, crash, Some(code));
+        }
+        return;
+    }
+    let Some(_g) = lock_within(&WRITE_LOCK, wait) else {
+        if let Some(boot) = crate::state::boot() {
+            write_fallback(&boot, crash, Some(code));
+        }
+        return;
+    };
     let Some(boot) = crate::state::boot() else { return };
-    let mut r = build();
+    let mut r = match std::panic::catch_unwind(build) {
+        Ok(r) => r,
+        Err(_) => {
+            write_fallback(&boot, crash, Some(code));
+            return;
+        }
+    };
+    // Late re-check: a crash recorded while `build()` was running is captured before exit.
+    if r.crash.is_none() {
+        r.crash = lock_within(&CRASH, Duration::ZERO).and_then(|g| g.clone());
+    }
     r.exit_code = Some(code);
     if let Ok(s) = serde_json::to_string_pretty(&r) {
         let _ = std::fs::write(boot.report_path(), s);
@@ -259,14 +366,36 @@ pub fn write_final(crash: Option<String>) {
     // a crash is kept even while another thread writes the report, and is written once that
     // thread is done – the process ends right after (#106); other calls give way at once
     let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };
-    if let Some(c) = crash {
+    if let Some(c) = &crash {
         if let Some(mut g) = lock_within(&CRASH, wait) {
-            g.get_or_insert(c);
+            g.get_or_insert(c.clone());
         }
     }
-    let Some(_g) = lock_within(&WRITE_LOCK, wait) else { return };
+    let guard = WriteGuard::enter();
+    if guard.reentered() {
+        if let Some(boot) = crate::state::boot() {
+            write_fallback(&boot, crash, None);
+        }
+        return;
+    }
+    let Some(_g) = lock_within(&WRITE_LOCK, wait) else {
+        if let Some(boot) = crate::state::boot() {
+            write_fallback(&boot, crash, None);
+        }
+        return;
+    };
     let Some(boot) = crate::state::boot() else { return };
-    let r = build();
+    let mut r = match std::panic::catch_unwind(build) {
+        Ok(r) => r,
+        Err(_) => {
+            write_fallback(&boot, crash, None);
+            return;
+        }
+    };
+    // Late re-check: a crash recorded while `build()` was running is captured before exit.
+    if r.crash.is_none() {
+        r.crash = lock_within(&CRASH, Duration::ZERO).and_then(|g| g.clone());
+    }
     if let Ok(s) = serde_json::to_string_pretty(&r) {
         let _ = std::fs::write(boot.report_path(), s);
     }
@@ -279,6 +408,125 @@ pub fn load(path: &std::path::Path) -> Option<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread that panics inside `build()` (or while holding the crash text) poisons the lock.
+    /// The report – and above all the crash – must still be written: the poisoned data is taken.
+    #[test]
+    fn a_poisoned_lock_is_taken_instead_of_losing_the_report() {
+        let m = std::sync::Arc::new(Mutex::new(7u32));
+        let other = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = other.lock().unwrap();
+            panic!("the thread writing the report panicked");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let g = lock_within(&m, Duration::ZERO).expect("a poisoned lock is still taken");
+        assert_eq!(*g, 7);
+        drop(g);
+
+        // A lock held by this very thread is not waited for forever (a report from a thread
+        // that is already inside `build()` must not wedge the process at exit).
+        let held = Mutex::new(1u32);
+        let g = held.lock().unwrap();
+        assert!(lock_within(&held, Duration::from_millis(20)).is_none());
+        drop(g);
+    }
+
+    #[test]
+    fn write_contention_falls_back_to_a_minimal_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "xcl-report-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let boot = crate::config::Boot {
+            title: "fallback-test".into(),
+            exe_path: dir.join("fallback-test.exe"),
+            game_root: dir.clone(),
+            data_dir: dir.clone(),
+            config: crate::config::Config::default(),
+        };
+        write_fallback(&boot, Some("fallback-boom".into()), Some(139));
+        let raw = std::fs::read_to_string(boot.report_path()).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            report["crash"].as_str().is_some_and(|c| c.contains("fallback-boom")),
+            "{raw}"
+        );
+        assert_eq!(report["exit_code"], serde_json::json!(139));
+        assert_eq!(report["title"], serde_json::json!("fallback-test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A poisoned `WRITE_LOCK` (watchdog thread crashed midway through a previous write)
+    /// still yields a full crash report through the watchdog's write path, in a child
+    /// process (lock globals are per-process).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn poisoned_write_lock_still_writes_the_crash_report() {
+        const CHILD: &str = "XCL_REPORT_POISON_CHILD";
+        const DIR_ENV: &str = "XCL_REPORT_POISON_DIR";
+        if std::env::var_os(CHILD).is_some() {
+            std::panic::set_hook(Box::new(|_| {}));
+            let dir = std::path::PathBuf::from(std::env::var(DIR_ENV).unwrap());
+            std::fs::create_dir_all(dir.join("logs")).unwrap();
+            crate::state::set_boot(crate::config::Boot {
+                title: "poison-test".into(),
+                exe_path: dir.join("poison-test.exe"),
+                game_root: dir.clone(),
+                data_dir: dir.clone(),
+                config: crate::config::Config::default(),
+            });
+            let _ = std::panic::catch_unwind(|| {
+                let _held = WRITE_LOCK.lock().unwrap();
+                panic!("poison the write lock");
+            });
+            crate::report::write_crash_with_code("poison-boom".into(), 139);
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "xcl-report-poison-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "report::tests::poisoned_write_lock_still_writes_the_crash_report",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(DIR_ENV, &dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let raw = std::fs::read_to_string(dir.join("logs").join("report.json")).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            report["crash"].as_str().is_some_and(|c| c.contains("poison-boom")),
+            "{raw}"
+        );
+        assert_eq!(report["exit_code"], serde_json::json!(139));
+        // The poisoned lock is taken, so the full report still lands, not just the fallback.
+        assert!(report["called_stubs"].is_array(), "{raw}");
+        assert!(report["imports_by_source"].is_object(), "{raw}");
+        assert!(report["modules"].is_array(), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_crash_is_kept_while_another_thread_writes_the_report() {
