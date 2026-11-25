@@ -19,6 +19,18 @@ static CRASH_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 /// Set once a fatal signal has reached XCL's handler (read by the crash-deadline thread).
 static CRASHED: AtomicBool = AtomicBool::new(false);
 
+/// Set once the crash path has dumped the other threads (port of upstream #164's
+/// `DUMPED` once-guard: a second fatal signal while the first report is still being
+/// written must not dump again).
+static DUMPED: AtomicBool = AtomicBool::new(false);
+
+/// Claims the one crash-path thread dump (`true`: the caller dumps; `false`: already
+/// dumped). Factored so unit tests can check the once-guard without touching the
+/// process-global `DUMPED`.
+fn claim_crash_dump(dumped: &AtomicBool) -> bool {
+    !dumped.swap(true, Ordering::AcqRel)
+}
+
 /// Seconds the process may take to end after a fatal signal before XCL ends it itself:
 /// `XCL_CRASH_EXIT_SECONDS` (default 30; 0 turns it off). The title's own crash filter (a
 /// crash report of a process with tens of GB committed) can take very long or never return,
@@ -757,6 +769,12 @@ fn crash_watchdog(read_fd: libc::c_int) {
     let address = CRASH_ADDRESS.load(Ordering::Acquire);
     // Shell exit-code convention for fatal signals, so the report carries exit_code too.
     crate::report::write_crash_with_code(format_crash(signal, pc, address), 128 + signal as i64);
+    // the other threads now: a title crash handler can keep the process for a long time
+    // before it ends, so name what its silent threads were doing (port of upstream #164;
+    // watchdog-thread context, not the raw signal handler, so parking threads is safe).
+    if claim_crash_dump(&DUMPED) {
+        dump_threads();
+    }
     terminate_with_signal(signal);
 }
 
@@ -1058,6 +1076,13 @@ mod tests {
         assert!(crash.contains("signal 5"), "{crash}");
         assert!(crash.contains("game_scarlett_master.exe+0x16624a5"), "{crash}");
         assert!(crash.contains(&format!("pc {:#x}", base + offset)), "{crash}");
+    }
+
+    #[test]
+    fn crash_dump_claims_once() {
+        let dumped = AtomicBool::new(false);
+        assert!(claim_crash_dump(&dumped), "first crash dumps threads");
+        assert!(!claim_crash_dump(&dumped), "second crash does not dump again");
     }
 
     #[test]
