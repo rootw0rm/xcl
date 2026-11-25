@@ -302,3 +302,44 @@ fn direct_msaa_loads_precede_get_dimensions() {
     }
     assert!(load_blocks >= 15, "expected MSAA textureLoad blocks across all format branches, saw {load_blocks}");
 }
+
+/// `image_get_resinfo` with `D16=1` packs two 16-bit dimensions per VGPR and preserves the
+/// trailing VGPRs for both standard 2D and MSAA textures (matching HLSL).
+#[test]
+fn gpu_direct_image_get_resinfo_d16() {
+    let mut code = Vec::new();
+    // T# 0: 2D 64x32 R32_UINT (s[16:23], SRSRC 4); T# 1: 2D MSAA array 4x4x3 (s[24:31], SRSRC 6)
+    code.extend(mimg("IMAGE_GET_RESINFO", &[("VDATA", 0), ("VADDR", 10), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("D16", 1)]));
+    code.extend(mimg("IMAGE_GET_RESINFO", &[("VDATA", 4), ("VADDR", 10), ("SRSRC", 6), ("DMASK", 0xF), ("DIM", 7), ("D16", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    if !gpu_ready() {
+        return;
+    }
+    let tex2d = TestTexture {
+        dim: TexDim::D2,
+        format: DXGI_FORMAT_R32_UINT,
+        width: 64,
+        height: 32,
+        depth: 1,
+        texel_bytes: 4,
+        data: vec![0u8; 64 * 32 * 4],
+        uav: false,
+    };
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 20, 9));
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 20, 15));
+    for r in &mut st.vgpr {
+        r[2] = 0xDEAD_BEEF;
+        r[3] = 0xCAFE_BABE;
+        r[6] = 0x1122_3344;
+        r[7] = 0x5566_7788;
+        r[10] = 0; // mip 0
+    }
+    let r = run_direct(&code, &st, &[tex2d, ms_array_u32()]);
+    assert_eq!(r.vgpr[0][0], 64 | (32 << 16), "2D D16 resinfo v0: {:#x}", r.vgpr[0][0]);
+    assert_eq!(r.vgpr[0][1], 1 | (1 << 16), "2D D16 resinfo v1: {:#x}", r.vgpr[0][1]);
+    assert_eq!((r.vgpr[0][2], r.vgpr[0][3]), (0xDEAD_BEEF, 0xCAFE_BABE), "2D D16 resinfo clobbered v2/v3");
+    assert_eq!(r.vgpr[0][4], 4 | (4 << 16), "MSAA array D16 resinfo v4: {:#x}", r.vgpr[0][4]);
+    assert_eq!(r.vgpr[0][5], 3 | (1 << 16), "MSAA array D16 resinfo v5: {:#x}", r.vgpr[0][5]);
+    assert_eq!((r.vgpr[0][6], r.vgpr[0][7]), (0x1122_3344, 0x5566_7788), "MSAA array D16 resinfo clobbered v6/v7");
+}

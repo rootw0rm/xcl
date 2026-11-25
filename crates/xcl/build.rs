@@ -45,12 +45,10 @@ fn direct_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn add(h: &mut u64, bytes: &[u8]) {
-    for &byte in bytes {
-        *h ^= byte as u64;
-        *h = h.wrapping_mul(0x100_0000_01b3);
-    }
-}
+// FNV-1a over the sources, each CRLF taken as LF (`source_hash.rs`, tested with the crate)
+#[path = "src/source_hash.rs"]
+mod source_hash;
+use source_hash::{add, add_source};
 
 fn main() {
     // xcl.exe without high-entropy ASLR: the title's memory then lies under 2^40, which a
@@ -72,7 +70,7 @@ fn main() {
         println!("cargo:rerun-if-changed={relative}");
         add(&mut h, relative.as_bytes());
         add(&mut h, &[0]);
-        add(&mut h, &std::fs::read(root.join(relative)).expect("read shader translator source"));
+        add_source(&mut h, &std::fs::read(root.join(relative)).expect("read shader translator source"));
         add(&mut h, &[0]);
     }
     println!("cargo:rustc-env=XCL_TRANSLATOR_SOURCE_ID={h:016x}");
@@ -81,7 +79,7 @@ fn main() {
         println!("cargo:rerun-if-changed={relative}");
         add(&mut p, relative.as_bytes());
         add(&mut p, &[0]);
-        add(&mut p, &std::fs::read(root.join(relative)).expect("read per-lane source"));
+        add_source(&mut p, &std::fs::read(root.join(relative)).expect("read per-lane source"));
         add(&mut p, &[0]);
     }
     println!("cargo:rustc-env=XCL_PER_LANE_SOURCE_ID={p:016x}");
@@ -94,7 +92,7 @@ fn main() {
     for path in &sources {
         add(&mut d, path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/").as_bytes());
         add(&mut d, &[0]);
-        add(&mut d, &std::fs::read(path).expect("read direct DXIL source"));
+        add_source(&mut d, &std::fs::read(path).expect("read direct DXIL source"));
         add(&mut d, &[0]);
     }
     println!("cargo:rustc-env=XCL_DIRECT_DXIL_SOURCE_ID={d:016x}");

@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 8;
+pub const TRANSLATOR_VERSION: u32 = 9;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -67,30 +67,45 @@ pub struct Kernel {
     pub static_samplers: Vec<([u32; 4], bool)>,
 }
 
+/// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset leaves it to `compact::wanted`.
+pub fn compact_mode() -> Option<bool> {
+    match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// `translate_full` in the compact form (`compact = true`) or the plain one.
+#[cfg(test)]
+pub fn translate_full_as(code: &[u8], o: KernelOptions, compact: bool) -> Result<Kernel, String> {
+    translate_entry(code, o, Entry::Kernel, Some(compact))
+}
+
 pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel)
+    translate_entry(code, o, Entry::Kernel, compact_mode())
 }
 
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Mesh(ms.clone()))
+    translate_entry(code, o, Entry::Mesh(ms.clone()), None)
 }
 
 /// A vertex shader (the recompiler's `Mode::Vertex`; wave-size independent).
 pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Vertex(vs.clone()))
+    translate_entry(code, o, Entry::Vertex(vs.clone()), None)
 }
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()))
+    translate_entry(code, o, Entry::Pixel(ps.clone()), None)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
 /// group of 21 triangles into `res` (the recompiler's `Mode::Geometry`). Always wave64.
 pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
-    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()))
+    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None)
 }
 
 /// The entry ABI.
@@ -106,17 +121,17 @@ pub enum Entry {
 
 /// A compute-mode program (the CS ABI of `cs`).
 pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Compute(cs.clone()))
+    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode())
 }
 
-fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
+fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<bool>) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -140,7 +155,7 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
     ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
-fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
+fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<bool>) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
         _ => None,
@@ -151,6 +166,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     };
     let kernel = matches!(entry, Entry::Kernel);
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+    let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
@@ -221,6 +237,11 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         }
     }
 
+    let plan = if (compute || kernel) && compact.unwrap_or_else(|| super::compact::large(&cfg)) { super::compact::plan(&cfg, &lw) } else { None };
+    let plan = plan.filter(|p| compact.unwrap_or_else(|| super::compact::wanted(&cfg, p)));
+    if let Some(p) = &plan {
+        crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());
+    }
     let n = cfg.blocks.len();
     let mut heads: Vec<Option<Block>> = vec![None; n];
     let entry = *cfg.rpo.first().ok_or("empty program")?;
@@ -254,7 +275,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         lw.partner = Partner::Missing;
         lw.xn = lw.c(0);
     }
-    let h0 = head(&mut lw, entry);
+    let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry) };
     let exit = lw.block(None);
     if gs_only {
         // the GS alone: in the lower hardware wave only
@@ -268,7 +289,10 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
     let mut gs_entry: Option<usize> = None;
-    for &b in &cfg.rpo {
+    if let Some(p) = &plan {
+        super::compact::emit(&mut lw, &cfg, p, h0, exit)?;
+    }
+    for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
         let es_block = two_phase && !in_gs(b);
@@ -369,6 +393,28 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     lw.finish(numthreads, hw)
 }
 
+/// True when a pixel shader uses RDNA2 Primitive Ordered Pixel Shading (POPS):
+/// reads `src_pops_exiting_wave_id` (operand 239) or accesses `HW_REG_POPS_PACKER`
+/// (hardware register 25 via `S_GETREG_B32` / `S_SETREG*`).
+fn uses_pops(insts: &[Decoded]) -> bool {
+    const SRC_POPS_EXITING_WAVE_ID: u64 = 239;
+    const HW_REG_POPS_PACKER: u64 = 25;
+    insts.iter().any(|d| {
+        if matches!(d.inst.name, "S_GETREG_B32" | "S_SETREG_B32" | "S_SETREG_IMM32_B32")
+            && crate::gpu::rdna2::field_value(d.enc, &d.words, "SIMM16").is_some_and(|v| (v & 0x3F) == HW_REG_POPS_PACKER)
+        {
+            return true;
+        }
+        d.ienc.operands.iter().any(|o| {
+            let Some(f) = o.field else { return false };
+            o.input
+                && !o.implicit
+                && (o.ty.starts_with("OPR_SRC") || o.ty.starts_with("OPR_SSRC"))
+                && crate::gpu::rdna2::field_value(d.enc, &d.words, f) == Some(SRC_POPS_EXITING_WAVE_ID)
+        })
+    })
+}
+
 impl Lw {
     /// The translator's state for a program (`insts`, its blocks starting at `leaders`) at
     /// `entry`: the shader with its buffers,
@@ -398,13 +444,16 @@ impl Lw {
         let mut s = Shader::new(stage, (6, 6));
         let io = s.raw_uav(0, 0);
         let res = if kernel || ms.is_some() || matches!(entry, Entry::Geometry(_)) { Some(s.raw_uav(1, 0)) } else { None };
+        if stage == Stage::Pixel && uses_pops(insts) {
+            s.enable_rov();
+        }
         let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
             s,
             ssa: Ssa::new(i32),
-            init: Init { io: Some(io), compute: None, vgpr_base: None, entry: Block(0), touched: BTreeSet::new() },
+            init: Init { io: Some(io), compute: None, vgpr_base: None, entry: Block(0), touched: BTreeSet::new(), slots: HashMap::new(), mem: None },
             wave64: o.wave64,
             split,
             lane: z,

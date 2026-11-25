@@ -1427,6 +1427,18 @@ impl Module {
             ops.into_iter().any(|v| self.value_ty(v) == t)
         })
     }
+    /// True if any surviving `dx.op.annotateHandle` call carries the `IsROV` flag (`0x2000`).
+    pub fn has_rov_handle(&self) -> bool {
+        self.blocks.iter().flatten().any(|&i| {
+            let Op::Call(f, args) = &self.insts[i as usize].op else { return false };
+            if self.funcs[*f as usize].name != "dx.op.annotateHandle" || args.len() < 3 {
+                return false;
+            }
+            let Value::Const(c) = args[2] else { return false };
+            let ConstDef::Aggregate(_, fields) = &self.consts[c as usize] else { return false };
+            fields.first().and_then(|&p0| self.const_u64(p0)).is_some_and(|w| w & 0x2000 != 0)
+        })
+    }
     /// The integer value of a constant (zero-extended from its width).
     pub fn const_u64(&self, v: Value) -> Option<u64> {
         match v {

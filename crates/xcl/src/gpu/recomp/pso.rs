@@ -251,6 +251,11 @@ mod translated {
                 Backend::current(),
                 direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
+            // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
+            let id = match crate::gpu::dxil::kernel::compact_mode() {
+                Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
+                _ => id,
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -828,21 +833,68 @@ pub struct TwoPass {
     pub samplers: Vec<StaticSampler>,
 }
 
+fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
+    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+    Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
+}
+
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers })
+    finish_two_pass_compiled(Compiled { dxil: cs, samplers: t.static_samplers }, record, ps)
 }
 
-/// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
-/// the pixel shader `ps` (its container: console or PC) reads.
-pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+fn compile_console_mesh(
+    blob: &[u8],
+    code: &[u8],
+    ms: &super::MsInterface,
+    wave64: bool,
+    windows: u32,
+    split_wave64: bool,
+) -> Result<Compiled, String> {
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
+    if crate::gpu::dxil::kernel::enabled() {
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
+        let o = crate::gpu::dxil::kernel::KernelOptions {
+            wave64,
+            split: wave64 && split_wave64,
+            mem_windows: windows,
+            sampler_base: 0,
+        };
+        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("MS");
+                dump_direct(blob, &k.dxil);
+                return Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers });
+            }
+            Err(e) => direct_fallback("MS", &e),
+        }
+    }
+    let t = super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?;
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("incomplete translation, missing: {missing:?}"));
+    }
+    let dxil = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
+    Ok(Compiled { dxil, samplers: t.static_samplers })
+}
+
+fn console_mesh_with(
+    blob: &[u8],
+    ps: Option<&[u8]>,
+    split_wave64: bool,
+    windows: u32,
+    cache_dir: &std::path::Path,
+    cache: &Mutex<ShaderCache>,
+    compile: impl FnOnce(&[u8], &super::MsInterface, bool) -> Result<Compiled, String>,
+) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
@@ -851,48 +903,35 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::detect_wave64(code);
-    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator, cached in RAM
-    // (`ShaderCache` + in-flight coalescing) and on disk (`translated/v2`) across all `(MS, PS)`
-    // pipelines that share this mesh shader (HLSL fallback on unsupported ops).
-    if crate::gpu::dxil::kernel::enabled() {
-        let windows = mem_windows();
-        let split = wave64 && split_wave64;
-        let translate_ms = || {
-            if dxc::defer() {
-                return Err("DXIL not compiled yet".into());
-            }
-            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split, mem_windows: windows, sampler_base: 0 };
-            let k = crate::gpu::dxil::kernel::translate_mesh(code, o, ms)?;
-            crate::gpu::dxil::coverage::record_translated("MS");
-            dump_direct(blob, &k.dxil);
-            Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+    let split = wave64 && split_wave64;
+    let compile_one = || compile(code, ms, wave64);
+    // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
+    // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
+    let cs = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
+        let key = ShaderKey {
+            hash: crate::gpu::shader::fnv64(blob),
+            stage: Stage::Mesh,
+            sampler_base: 0,
+            windows,
+            split_wave64: split,
+            cache_dir: cache_dir.to_path_buf(),
         };
-        let compiled = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
-            let key = ShaderKey {
-                hash: crate::gpu::shader::fnv64(blob),
-                stage: Stage::Mesh,
-                sampler_base: 0,
-                windows,
-                split_wave64: split,
-                cache_dir: dxc::cache_dir(),
-            };
-            let from_disk = || translated::cached(&dxc::cache_dir(), blob, Stage::Mesh, 0, windows, split, translate_ms);
-            cached_shader(shader_cache(), key, blob, from_disk).map(|s| s.as_ref().clone())
-        } else {
-            translate_ms()
-        };
-        match compiled {
-            Ok(c) => {
-                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: c.dxil, ms: msb, record, mesh_groups_per_record, samplers: c.samplers });
-            }
-            Err(e) if dxc::in_cached_only() => return Err(e),
-            Err(e) => direct_fallback("MS", &e),
-        }
-    }
-    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)
+        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, compile_one);
+        cached_shader(cache, key, blob, from_disk)?.as_ref().clone()
+    } else {
+        compile_one()?
+    };
+    finish_two_pass_compiled(cs, record, ps)
+}
+
+/// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
+/// the pixel shader `ps` (its container: console or PC) reads.
+pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    let windows = mem_windows();
+    let dir = dxc::cache_dir();
+    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
+        compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
+    })
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
@@ -1355,6 +1394,87 @@ mod shader_cache_tests {
                 assert!(Arc::ptr_eq(&results[0], r));
             }
         });
+    }
+
+    fn synthetic_mesh_container() -> Vec<u8> {
+        use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
+        let mut psv_r = vec![0u8; 48];
+        psv_r[12..14].copy_from_slice(&3u16.to_le_bytes()); // max_vertices
+        psv_r[14..16].copy_from_slice(&1u16.to_le_bytes()); // max_primitives
+        psv_r[24] = 13; // mesh
+        psv_r[27] = 2; // triangles
+        psv_r[36..40].copy_from_slice(&32u32.to_le_bytes());
+        psv_r[40..44].copy_from_slice(&1u32.to_le_bytes());
+        psv_r[44..48].copy_from_slice(&1u32.to_le_bytes());
+        let mut psv0 = 48u32.to_le_bytes().to_vec();
+        psv0.extend_from_slice(&psv_r);
+        psv0.extend_from_slice(&0u32.to_le_bytes());
+
+        // Minimal OSG1 with SV_Position (system_value = 1, mask = 0xF, float = 3).
+        let name = b"SV_Position\0";
+        let mut osg1 = Vec::new();
+        osg1.extend_from_slice(&1u32.to_le_bytes()); // count
+        osg1.extend_from_slice(&8u32.to_le_bytes()); // offset
+        let name_off = (8 + 32) as u32;
+        for w in [0u32, name_off, 0, 1, 3, 0, 0x0F0F, 0] {
+            osg1.extend_from_slice(&w.to_le_bytes());
+        }
+        osg1.extend_from_slice(name);
+
+        let f = fssm(&CODE, &[(7, 0)]);
+        container(&[
+            (b"SFI0", &[0; 8]),
+            (b"HASH", &[0; 20]),
+            (b"OSG1", &osg1),
+            (b"PSV0", &psv0),
+            (b"DXIL", &dxil_part(13, &[f])),
+        ])
+    }
+
+    #[test]
+    fn console_mesh_caches_hlsl_compute_pass_in_memory_and_on_disk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let blob = synthetic_mesh_container();
+        let dir = std::env::temp_dir().join(format!("xcl-mesh-hlsl-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Mutex::new(ShaderCache::new(64 << 20));
+        let compiles = AtomicUsize::new(0);
+
+        let run = |c: &Mutex<ShaderCache>| {
+            console_mesh_with(&blob, None, false, 1, &dir, c, |code, ms, wave64| {
+                compiles.fetch_add(1, Ordering::SeqCst);
+                compile_console_mesh(&blob, code, ms, wave64, 1, false)
+            })
+        };
+
+        let first = run(&cache).expect("first console_mesh compile");
+        assert_eq!(compiles.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.lock().unwrap().entries.len(), 1);
+
+        // Second call must hit in-memory ShaderCache without re-translating or recompiling.
+        let second = run(&cache).expect("in-memory cached console_mesh");
+        assert_eq!(compiles.load(Ordering::SeqCst), 1);
+        assert_eq!(second.cs, first.cs);
+        assert_eq!(second.samplers, first.samplers);
+
+        // Cold RAM cache must hit the on-disk translated/v2 Stage::Mesh entry unless disk caching is disabled.
+        if std::env::var("XCL_TRANSLATED_CACHE").ok().as_deref() != Some("0") {
+            let cold_cache = Mutex::new(ShaderCache::new(64 << 20));
+            let third = run(&cold_cache).expect("disk cached console_mesh");
+            assert_eq!(compiles.load(Ordering::SeqCst), 1);
+            assert_eq!(third.cs, first.cs);
+            assert_eq!(third.samplers, first.samplers);
+        }
+
+        // Public entry point also populates the global cache so a cached_only repeat succeeds.
+        let pub_first = console_mesh(&blob, None, false).expect("public console_mesh");
+        let (pub_second, missed) = dxc::cached_only(|| console_mesh(&blob, None, false));
+        let pub_second = pub_second.expect("cached_only console_mesh hit");
+        assert!(!missed);
+        assert_eq!(pub_second.cs, pub_first.cs);
+        assert_eq!(pub_second.ms, pub_first.ms);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

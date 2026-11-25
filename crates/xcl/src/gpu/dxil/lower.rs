@@ -72,10 +72,43 @@ pub struct Init {
     pub vgpr_base: Option<Value>,
     pub entry: Block,
     pub touched: BTreeSet<u32>,
+    /// the compact form: each register's local variable, and the block that loads them now
+    pub slots: HashMap<u32, Value>,
+    pub mem: Option<Block>,
 }
 
 impl Init {
     pub fn load(&mut self, s: &mut Shader, var: u32) -> Value {
+        let Some(b) = self.mem else { return self.first(s, var) };
+        let p = self.slot(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(true);
+        s.m.set_block(b);
+        let v = s.m.load(p, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        v
+    }
+
+    /// The local variable of `var`, made in the entry block with the register's first value.
+    pub fn slot(&mut self, s: &mut Shader, var: u32) -> Value {
+        if let Some(&p) = self.slots.get(&var) {
+            return p;
+        }
+        let v = self.first(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(false);
+        s.m.set_block(self.entry);
+        let i32 = s.m.i32();
+        let p = s.m.alloca(i32, 4);
+        s.m.store(p, v, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        self.slots.insert(var, p);
+        p
+    }
+
+    fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
         }
@@ -1974,7 +2007,7 @@ pub fn is_f16_rounded_op(name: &str) -> bool {
         name,
         "v_interp_p2_f16" | "v_cvt_f16_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_fma_f16"
             | "v_pk_fmac_f16" | "v_pk_min_f16" | "v_pk_max_f16" | "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_min_f16"
-            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_fmac_f16"
+            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_div_fixup_f16" | "v_fmac_f16"
             | "v_fmamk_f16" | "v_fmaak_f16" | "v_ldexp_f16" | "v_rcp_f16" | "v_rsq_f16" | "v_sqrt_f16" | "v_log_f16" | "v_exp_f16"
             | "v_sin_f16" | "v_cos_f16" | "v_fract_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_cvt_f16_u16"
             | "v_cvt_f16_i16"

@@ -608,6 +608,16 @@ fn cvt_norm_f16_instructions() {
     assert!(t.hlsl.contains("cvt_norm_u16_f16((0x00003C00u & 0xFFFFu))") && t.hlsl.contains("cvt_norm_u16_f16((0x0000BC00u & 0xFFFFu))"), "{}", t.hlsl);
 }
 
+/// `v_div_fixup_f16` (VOP3, three f16 sources: quotient, denominator, numerator) is translated
+/// like `v_div_fixup_f32`, on half-precision operands, instead of being left as unsupported.
+#[test]
+fn div_fixup_f16_instruction() {
+    let code = prog(&[("V_DIV_FIXUP_F16", "ENC_VOP3", &[("VDST", 1), ("SRC0", V + 9), ("SRC1", V + 10), ("SRC2", V + 11)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    assert!(t.hlsl.contains("div_fixup(f16tof32(((v9) & 0xFFFFu)), f16tof32(((v10) & 0xFFFFu)), f16tof32(((v11) & 0xFFFFu)))"), "{}", t.hlsl);
+}
+
 /// GPU verification of exact RNE rounding and edge cases for `V_CVT_NORM_*_F16` and
 /// `V_CVT_PKNORM_*_F16`: catches binary32 double-rounding (`0x3801`/`0xB801`), DXIL
 /// `clamp(NaN, -1, 1)` returning ±32767 instead of 0, ±Inf, ±0, subnormals, and VOP3 abs/neg.
@@ -3842,7 +3852,7 @@ fn memory_windows_above_4_gib(heap: bool) {
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(4u + xcl_w)]"), heap);
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil());
     let hi = |a: u64| (a >> 32) as u32;
@@ -4008,7 +4018,7 @@ fn gpu_uma_import_check_at_init() {
     if !gpu_ready() {
         return;
     }
-    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let s = crate::hle::d3d12x::real::stats().uma_import_check;
     assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
 }
@@ -4030,7 +4040,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     if !gpu_ready() {
         return;
     }
-    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let u = crate::gpu::uma::get().expect("UMA");
     assert_eq!(u.shader_windows(), 4, "runtime layout has 4 shader windows");
     assert!(u.is_sparse_window(0) && u.is_sparse_window(1) && u.is_sparse_window(2), "windows 0..2 sparse VRAM");
@@ -4076,10 +4086,10 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
     // Translate + DXC-compile RDNA2 compute shader (4 windows, 32-bit descriptor table with hi = 0)
     let p = prog(&[
-        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0)], None), // s[0:1] -> Window 3 root arg table
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)], None), // s[0:1] -> Window 3 root arg table
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None), // s5 = 0 (32-bit descriptor table pointer)
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32), ("SOFFSET", 125)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
         ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 20), ("VSRC1", 1)], None),
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
@@ -8164,6 +8174,96 @@ fn gpu_fmt_encode_int_sat_and_f16_rtz() {
     assert_eq!(r.mem[0x20C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "11_11_10_FLOAT saturates finite overflow and keeps +inf");
 }
 
+/// Direct DXIL and HLSL parity for `fmt_encode`: UINT/SINT saturation (`w < 32`), `w == 32`
+/// passthrough, and RTZ binary16 / 11_11_10_FLOAT rounding (`XCL-BT-026`, #1488, #1269).
+#[test]
+fn gpu_fmt_encode_direct_dxil_int_sat_and_f16_rtz() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let p = prog(&[
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 0), ("SRSRC", 4), ("SOFFSET", 128)], None),    // 16_16_UINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 5), ("SOFFSET", 128)], None),    // 16_16_SINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 4), ("SRSRC", 6), ("SOFFSET", 128)], None),  // 8_8_8_8_UINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("SRSRC", 7), ("SOFFSET", 128)], None),  // 8_8_8_8_SINT
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 12), ("SRSRC", 8), ("SOFFSET", 128)], None), // 2_10_10_10_SINT
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 16), ("SRSRC", 9), ("SOFFSET", 128)], None),    // 32_UINT
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 17), ("SRSRC", 10), ("SOFFSET", 128)], None),   // 32_SINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 18), ("SRSRC", 11), ("SOFFSET", 128)], None),  // 16_16_FLOAT overflow
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 20), ("SRSRC", 12), ("SOFFSET", 128)], None),  // 16_16_FLOAT normal RTZ
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 22), ("SRSRC", 13), ("SOFFSET", 128)], None),  // 16_16_FLOAT ±inf
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 24), ("SRSRC", 14), ("SOFFSET", 128)], None),  // 16_16_FLOAT subnormal RTZ / -0
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 26), ("SRSRC", 15), ("SOFFSET", 128)], None), // 11_11_10_FLOAT overflow + inf
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 29), ("SRSRC", 16), ("SOFFSET", 128)], None), // 11_11_10_FLOAT NaN / neg / RTZ
+    ]);
+    let mut st = KernelState::default();
+    let fmts = [
+        (4, 0x200, 27), (5, 0x204, 28), (6, 0x208, 60), (7, 0x20C, 61), (8, 0x210, 55),
+        (9, 0x214, 20), (10, 0x218, 21), (11, 0x21C, 29), (12, 0x220, 29), (13, 0x224, 29),
+        (14, 0x228, 29), (15, 0x22C, 43), (16, 0x230, 43),
+    ];
+    for (sr, base, fmt) in fmts {
+        st.sgpr[sr * 4..sr * 4 + 4].copy_from_slice(&vs(base, fmt));
+    }
+    for r in st.vgpr.iter_mut() {
+        r[0] = 70_000u32;
+        r[1] = u32::MAX;
+        r[2] = 40_000i32 as u32;
+        r[3] = (-40_000i32) as u32;
+        r[4] = 300u32;
+        r[5] = 255u32;
+        r[6] = 0u32;
+        r[7] = u32::MAX;
+        r[8] = 200i32 as u32;
+        r[9] = (-200i32) as u32;
+        r[10] = 127i32 as u32;
+        r[11] = (-128i32) as u32;
+        r[12] = 600i32 as u32;
+        r[13] = (-600i32) as u32;
+        r[14] = 0u32;
+        r[15] = (-3i32) as u32;
+        r[16] = 0xDEAD_BEEFu32;
+        r[17] = i32::MIN as u32;
+        r[18] = 65520.0f32.to_bits();
+        r[19] = (-65520.0f32).to_bits();
+        r[20] = 0x3F80_1800; // 1.0 + 0.75 * 2^-10: RNE -> 0x3C01, RTZ -> 0x3C00
+        r[21] = 0xBF80_1800; // -(1.0 + 0.75 * 2^-10): RNE -> 0xBC01, RTZ -> 0xBC00
+        r[22] = f32::INFINITY.to_bits();
+        r[23] = f32::NEG_INFINITY.to_bits();
+        r[24] = 0x3340_0000; // 0.75 * 2^-24: RNE -> 0x0001, RTZ -> 0x0000
+        r[25] = (-0.0f32).to_bits();
+        r[26] = 65520.0f32.to_bits();
+        r[27] = f32::INFINITY.to_bits();
+        r[28] = 65520.0f32.to_bits();
+        r[29] = f32::NAN.to_bits();
+        r[30] = (-1.0f32).to_bits();
+        r[31] = 0x3F81_F800; // 1.0 + 15.75 * 2^-10: RNE -> 0x3C10 (>>4 = 0x3C1), RTZ -> 0x3C0F (>>4 = 0x3C0)
+    }
+    let mem = vec![0u32; 0x100];
+    let t = translate(&p, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let direct_dxil = runner::direct_kernel_full(&p, true).unwrap().dxil;
+    for (backend, dxil) in [("hlsl", hlsl_dxil), ("direct_dxil", direct_dxil)] {
+        let r = runner::run_with_statics(&dxil, &st, &mem, &[], &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
+        assert_eq!(r.mem[0x200 / 4], 0xFFFF_FFFF, "{backend}: 16_16_UINT");
+        assert_eq!(r.mem[0x204 / 4], 0x8000_7FFF, "{backend}: 16_16_SINT");
+        assert_eq!(r.mem[0x208 / 4], 0xFF00_FFFF, "{backend}: 8_8_8_8_UINT");
+        assert_eq!(r.mem[0x20C / 4], 0x807F_807F, "{backend}: 8_8_8_8_SINT");
+        assert_eq!(r.mem[0x210 / 4], 0x1FF | (0x200 << 10) | (2 << 30), "{backend}: 2_10_10_10_SINT");
+        assert_eq!(r.mem[0x214 / 4], 0xDEAD_BEEF, "{backend}: 32_UINT passthrough");
+        assert_eq!(r.mem[0x218 / 4], i32::MIN as u32, "{backend}: 32_SINT passthrough");
+        assert_eq!(r.mem[0x21C / 4], 0xFBFF_7BFF, "{backend}: 16_16_FLOAT finite overflow RTZ");
+        assert_eq!(r.mem[0x220 / 4], 0xBC00_3C00, "{backend}: 16_16_FLOAT normal RTZ");
+        assert_eq!(r.mem[0x224 / 4], 0xFC00_7C00, "{backend}: 16_16_FLOAT ±inf");
+        assert_eq!(r.mem[0x228 / 4], 0x8000_0000, "{backend}: 16_16_FLOAT subnormal RTZ / -0.0");
+        assert_eq!(r.mem[0x22C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "{backend}: 11_11_10_FLOAT overflow + inf");
+        assert_eq!(r.mem[0x230 / 4], 0x3F0 | (0x3C0 << 21), "{backend}: 11_11_10_FLOAT NaN / neg / RTZ");
+    }
+}
+
 #[test]
 fn gpu_signed_bfe_arithmetic_shift() {
     for wave64 in gpu_waves() {
@@ -8737,4 +8837,193 @@ fn gpu_bvh_triangle_types_2_and_3() {
     assert!(hit2[0].is_finite() && (hit2[0] / hit2[1] - 2.0).abs() < 1e-4, "gpu type 2 hit: {hit2:?}");
     assert!(hit3[0].is_finite() && (hit3[0] / hit3[1] - 5.0 / 3.0).abs() < 1e-4, "gpu type 3 hit: {hit3:?}");
     assert!(miss2[0].is_infinite(), "gpu type 2 must miss type 0's interior: {miss2:?}");
+}
+
+#[test]
+fn gpu_permlane16_wqm_and_lds_stride64() {
+    if !gpu_ready() {
+        return;
+    }
+    // Check S_WQM_B32 / S_WQM_B64 (including SCC = 0 on empty input), V_PERMLANE16_B32 /
+    // V_PERMLANEX16_B32 across FI / BOUND_CTRL with masked EXEC, and DS_*2ST64_B32 / _B64 in LDS.
+    let code = prog(&[
+        // Scalar WQM: non-zero and zero cases (s6..s9 read back before returning)
+        ("S_WQM_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 0)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 129), ("SSRC1", 128)], None),
+        ("S_WQM_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 9), ("SSRC0", 129), ("SSRC1", 128)], None),
+        ("S_WQM_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 2)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 129), ("SSRC1", 128)], None),
+        // LDS stride-64 dual writes and reads (base offset v3 = lane * 4 for b32, + 4096 for b64)
+        ("DS_WRITE2ST64_B32", "ENC_DS", &[("ADDR", 3), ("DATA0", 1), ("DATA1", 2), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        ("DS_WRITE2ST64_B64", "ENC_DS", &[("ADDR", 4), ("DATA0", 6), ("DATA1", 8), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ2ST64_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 3), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        ("DS_READ2ST64_B64", "ENC_DS", &[("VDST", 12), ("ADDR", 4), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        // Drop odd lanes from EXEC before permlane16/permlanex16 so inactive-source modes are exercised
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 126)], None),
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 20)], None),
+        // FI=0, BOUND_CTRL=0: reading an odd (inactive) source keeps old v20
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 0)], Some(0x1111_1111)),
+        // FI=0, BOUND_CTRL=1: reading an odd (inactive) source returns 0
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 2)], Some(0x1111_1111)),
+        // FI=1, BOUND_CTRL=0: fetch-inactive reads v0 even from inactive odd lane 1
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 1)], Some(0x1111_1111)),
+        // Cross-row (other 16-lane row of each 32-lane half) reading even (active) lane 2
+        ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V), ("SRC1", 255), ("SRC2", 255), ("OP_SEL", 0)], Some(0x2222_2222)),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 14)], None),
+    ]);
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0x0002_0011; // quads 0, 1, 4 set -> 0x000F_00FF
+    st.sgpr[2] = 0x0000_0001; // quad 0 in lo
+    st.sgpr[3] = 0x8000_0000; // quad 7 in hi
+    st.sgpr[20] = 0x5555_5555; // even lanes active
+    st.sgpr[21] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 1000 + l as u32;
+        r[1] = 200 + l as u32;
+        r[2] = 500 + l as u32;
+        r[3] = (l as u32) * 4;
+        r[4] = 4096 + (l as u32) * 8;
+        r[6] = 0x1000 + l as u32;
+        r[7] = 0x2000 + l as u32;
+        r[8] = 0x3000 + l as u32;
+        r[9] = 0x4000 + l as u32;
+        r[20] = 0xDEAD_0000 | l as u32;
+        r[21] = 0xBEEF_0000 | l as u32;
+        r[22] = 0xCAFE_0000 | l as u32;
+        r[23] = 0xFEED_0000 | l as u32;
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    assert_eq!((r.sgpr[6], r.sgpr[7]), (0x000F_00FF, 1), "s_wqm_b32 nonzero");
+    assert_eq!((r.sgpr[8], r.sgpr[9]), (0, 0), "s_wqm_b32 zero");
+    assert_eq!((r.sgpr[10], r.sgpr[11], r.sgpr[12]), (0x0000_000F, 0xF000_0000, 1), "s_wqm_b64");
+
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        assert_eq!(v[10], st.vgpr[l][1], "lane {l} ds_read2st64_b32 off0");
+        assert_eq!(v[11], st.vgpr[l][2], "lane {l} ds_read2st64_b32 off1");
+        assert_eq!(v[12], st.vgpr[l][6], "lane {l} ds_read2st64_b64 off0 lo");
+        assert_eq!(v[13], st.vgpr[l][7], "lane {l} ds_read2st64_b64 off0 hi");
+        assert_eq!(v[14], st.vgpr[l][8], "lane {l} ds_read2st64_b64 off1 lo");
+        assert_eq!(v[15], st.vgpr[l][9], "lane {l} ds_read2st64_b64 off1 hi");
+
+        let half_base = l & !31;
+        let row_base = l & 16;
+        let other_row = row_base ^ 16;
+        if l % 2 == 0 {
+            // Even lanes were active; lane 1 in row is inactive, lane 2 in other row is active.
+            assert_eq!(v[20], st.vgpr[l][20], "lane {l} permlane16 bound=0 keeps vdst");
+            assert_eq!(v[21], 0, "lane {l} permlane16 bound=1 zeroes");
+            assert_eq!(v[22], st.vgpr[half_base | row_base | 1][0], "lane {l} permlane16 fi=1 fetches inactive");
+            assert_eq!(v[23], st.vgpr[half_base | other_row | 2][0], "lane {l} permlanex16 reads other row");
+        } else {
+            // Odd lanes were inactive under EXEC mask and retain original values.
+            assert_eq!(v[20], st.vgpr[l][20], "inactive lane {l} permlane16");
+            assert_eq!(v[21], st.vgpr[l][21], "inactive lane {l} permlane16 bound=1");
+            assert_eq!(v[22], st.vgpr[l][22], "inactive lane {l} permlane16 fi=1");
+            assert_eq!(v[23], st.vgpr[l][23], "inactive lane {l} permlanex16");
+        }
+    }
+}
+
+#[test]
+fn gpu_scalar_sext_mulhi_and_vector_i24_sub_co_ci_u64_shifts() {
+    if !gpu_ready() {
+        return;
+    }
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // Scalar sign extension, abs (with SCC), and 32x32->hi32 multiplies
+        ("S_SEXT_I32_I8", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 0)], None),
+        ("S_SEXT_I32_I16", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 0)], None),
+        ("S_ABS_I32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 1)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 13), ("SSRC0", 129), ("SSRC1", 128)], None),
+        ("S_MUL_HI_U32", "ENC_SOP2", &[("SDST", 14), ("SSRC0", 2), ("SSRC1", 3)], None),
+        ("S_MUL_HI_I32", "ENC_SOP2", &[("SDST", 15), ("SSRC0", 2), ("SSRC1", 3)], None),
+        // Vector 32x32->hi32 and signed 24-bit multiply/mad
+        v("V_MUL_HI_U32", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1)]),
+        v("V_MUL_HI_I32", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1)]),
+        v("V_MUL_I32_I24", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", V + 3)]),
+        v("V_MUL_HI_I32_I24", &[("VDST", 13), ("SRC0", V + 2), ("SRC1", V + 3)]),
+        v("V_MAD_I32_I24", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 4)]),
+        // 64-bit vector logical and arithmetic right shifts (including >= 32 shift amounts)
+        v("V_LSHRREV_B64", &[("VDST", 16), ("SRC0", V + 5), ("SRC1", V + 6)]),
+        v("V_ASHRREV_I64", &[("VDST", 18), ("SRC0", V + 5), ("SRC1", V + 6)]),
+        // Chained 64-bit subtraction with borrow across VOP3B (V_SUB_CO_CI_U32) and VOP2 (V_SUBREV_CO_CI_U32)
+        ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 20), ("SDST", 20), ("SRC0", V + 6), ("SRC1", V + 8), ("SRC2", 22)], None),
+        ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 21), ("SDST", 24), ("SRC0", V + 7), ("SRC1", V + 9), ("SRC2", 20)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 6)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 22)], None), // vcc = borrow-in
+        ("V_SUBREV_CO_CI_U32", "ENC_VOP2", &[("VDST", 22), ("SRC0", V + 8), ("VSRC1", 22)], None),
+    ]);
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0x0000_80FE; // low byte -2, low 16 bits -32514
+    st.sgpr[1] = -42i32 as u32;
+    st.sgpr[2] = 0xFFFF_FFFE; // u32::MAX - 1, or -2i32
+    st.sgpr[3] = 0x8000_0003;
+    st.sgpr[22] = 0x5555_5555; // borrow-in = 1 on even lanes, 0 on odd lanes
+    st.sgpr[23] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0x8000_0000u32.wrapping_add(l as u32 * 0x0101_0001);
+        r[1] = 0xFFFF_FFFEu32.wrapping_sub(l as u32);
+        // i24 inputs with garbage upper 8 bits that must be ignored
+        r[2] = (0xAAu32 << 24) | if l % 2 == 0 { 0x00FF_FFF5 } else { 0x0000_0025 }; // -11 or +37
+        r[3] = (0x55u32 << 24) | if l % 3 == 0 { 0x0080_0000 } else { 0x0001_0003 }; // -8388608 or +65539
+        r[4] = 1000u32.wrapping_sub(l as u32 * 37);
+        r[5] = (l as u32) % 68; // tests shifts <32, ==32, >32 and modulo 64 masking
+        r[6] = 0x8765_4321u32.wrapping_sub(l as u32);
+        r[7] = if l % 2 == 0 { 0xF123_4567 } else { 0x7123_4567 };
+        r[8] = 0x8765_4321; // matches r[6] at lane 0 to force borrow propagation on borrow-in = 1
+        r[9] = 0x1000_0000;
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    assert_eq!(r.sgpr[10], -2i32 as u32, "s_sext_i32_i8");
+    assert_eq!(r.sgpr[11], -32514i32 as u32, "s_sext_i32_i16");
+    assert_eq!((r.sgpr[12], r.sgpr[13]), (42, 1), "s_abs_i32");
+    assert_eq!(
+        r.sgpr[14],
+        (((st.sgpr[2] as u64) * (st.sgpr[3] as u64)) >> 32) as u32,
+        "s_mul_hi_u32"
+    );
+    assert_eq!(
+        r.sgpr[15],
+        ((((st.sgpr[2] as i32) as i64) * ((st.sgpr[3] as i32) as i64)) >> 32) as u32,
+        "s_mul_hi_i32"
+    );
+
+    let sext24 = |x: u32| -> i64 { (((x << 8) as i32) >> 8) as i64 };
+    for l in 0..64usize {
+        let inp = &st.vgpr[l];
+        let v = &r.vgpr[l];
+        assert_eq!(v[10], (((inp[0] as u64) * (inp[1] as u64)) >> 32) as u32, "lane {l} v_mul_hi_u32");
+        assert_eq!(
+            v[11],
+            ((((inp[0] as i32) as i64) * ((inp[1] as i32) as i64)) >> 32) as u32,
+            "lane {l} v_mul_hi_i32"
+        );
+        let prod24 = sext24(inp[2]) * sext24(inp[3]);
+        assert_eq!(v[12], prod24 as u32, "lane {l} v_mul_i32_i24");
+        assert_eq!(v[13], (prod24 >> 32) as u32, "lane {l} v_mul_hi_i32_i24");
+        assert_eq!(v[14], (prod24 as i32).wrapping_add(inp[4] as i32) as u32, "lane {l} v_mad_i32_i24");
+
+        let val64 = ((inp[7] as u64) << 32) | (inp[6] as u64);
+        let sh = inp[5] & 63;
+        let lshr = val64 >> sh;
+        let ashr = ((val64 as i64) >> sh) as u64;
+        assert_eq!((v[16], v[17]), (lshr as u32, (lshr >> 32) as u32), "lane {l} v_lshrrev_b64");
+        assert_eq!((v[18], v[19]), (ashr as u32, (ashr >> 32) as u32), "lane {l} v_ashrrev_i64");
+
+        let borrow_in = if l % 2 == 0 { 1u128 } else { 0u128 };
+        let a64 = val64 as u128;
+        let b64 = (((inp[9] as u64) << 32) | (inp[8] as u64)) as u128;
+        let diff64 = a64.wrapping_sub(b64).wrapping_sub(borrow_in) as u64;
+        assert_eq!((v[20], v[21]), (diff64 as u32, (diff64 >> 32) as u32), "lane {l} v_sub_co_ci_u32");
+        let subrev = (inp[6] as u64).wrapping_sub(inp[8] as u64).wrapping_sub(borrow_in as u64) as u32;
+        assert_eq!(v[22], subrev, "lane {l} v_subrev_co_ci_u32");
+    }
 }

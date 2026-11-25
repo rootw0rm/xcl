@@ -518,6 +518,7 @@ fn is_f16_rounded_op(name: &str) -> bool {
             | "v_max3_f16"
             | "v_frexp_mant_f16"
             | "v_mad_f16"
+            | "v_div_fixup_f16"
             | "v_fmac_f16"
             | "v_fmamk_f16"
             | "v_fmaak_f16"
@@ -3393,6 +3394,7 @@ impl Em {
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_div_fixup_f16" => fr(format!("div_fixup({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_med3_u16" => format!("med3u({a}, {b}, {c})"),

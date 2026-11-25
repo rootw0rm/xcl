@@ -13,6 +13,7 @@
 
 pub mod bitstream;
 pub mod cfg;
+mod compact;
 pub mod container;
 pub mod coverage;
 pub mod graphics;
@@ -41,6 +42,10 @@ pub mod validate;
 /// introduced, so a 1.7 validator would reject the container anyway.
 pub const VALVER: (u32, u32) = (1, 8);
 
+// LINUX-TODO Phase D: GPU/DXC-backed translation test; runner/dxc are
+// Windows-only until the SPIR-V backend lands.
+#[cfg(all(test, windows))]
+mod compact_tests;
 #[cfg(all(test, windows))]
 mod core_tests;
 #[cfg(all(test, windows))]

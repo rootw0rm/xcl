@@ -520,7 +520,7 @@ impl Shader {
     /// Declares `RWBuffer<comp>` at `u<lower>, space<space>`.
     pub fn typed_uav(&mut self, lower: u32, space: u32, comp: CompType) -> TypedBuffer {
         let id = self.bindings.len();
-        self.bindings.push(super::shader::Binding { comp_type: comp as u32, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::TYPED_BUFFER) });
+        self.bindings.push(super::shader::Binding { comp_type: comp as u32, rov: self.rov, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::TYPED_BUFFER) });
         let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
         let handle = self.annotate(h, kind::TYPED_BUFFER | 0x1000, typed_props(comp, 1));
         TypedBuffer { handle, comp, binding: Some(id) }
@@ -631,7 +631,7 @@ impl Shader {
     pub fn structured_uav(&mut self, lower: u32, space: u32, stride: u32) -> RawUav {
         self.require(Feature::RawAndStructuredBuffers);
         let id = self.bindings.len();
-        self.bindings.push(super::shader::Binding { stride, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::STRUCTURED_BUFFER) });
+        self.bindings.push(super::shader::Binding { stride, rov: self.rov, ..super::shader::Binding::new(ResClass::Uav, space, lower, kind::STRUCTURED_BUFFER) });
         let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
         let handle = self.annotate(h, kind::STRUCTURED_BUFFER | 0x1000, stride);
         RawUav { handle, binding: Some(id) }

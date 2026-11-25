@@ -900,9 +900,15 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
+        // `--used-only`: only the compute programs whose pipelines an earlier run of a title used
+        #[cfg(windows)]
+        let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
+        // Linux has no D3D12 runtime cache yet (Phase D): `--used-only` reads no keys.
+        #[cfg(not(windows))]
+        let used: Option<std::collections::HashSet<u64>> = None;
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -1351,8 +1357,15 @@ impl Pipelines {
     }
 }
 
+/// A compute program a title used in an earlier run (`--used-only`): its pipeline's key, as the
+/// runtime notes it (`real::shaders_key` of the one shader), is among `used`.
 #[cfg(windows)]
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
+    used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
+}
+
+#[cfg(windows)]
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1369,6 +1382,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let unused = AtomicUsize::new(0);
+    if let Some(u) = used {
+        println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
+    }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
@@ -1402,6 +1419,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    if used.is_some_and(|u| !used_compute(&blob, u)) {
+                        unused.fetch_add(1, Ordering::Relaxed);
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
@@ -1475,6 +1497,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if used.is_some() {
+        println!("compute programs passed over (no earlier run used their pipeline): {}", unused.into_inner());
+    }
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
@@ -1492,7 +1517,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
 /// `--precompile` compiles into the DXC cache, which is Windows-only until the SPIR-V backend.
 // LINUX-TODO: Phase D — fill the cache from the SPIR-V backend.
 #[cfg(not(windows))]
-fn precompile(_input: &Input, _limit: usize, _windows: u32, _split: Option<bool>, _only: Option<&str>, _pipelines: bool, _t0: std::time::Instant) -> i32 {
+fn precompile(_input: &Input, _limit: usize, _windows: u32, _split: Option<bool>, _only: Option<&str>, _pipelines: bool, _used: Option<&std::collections::HashSet<u64>>, _t0: std::time::Instant) -> i32 {
     eprintln!("xcl shaders --precompile: DXC is Windows-only; not supported on Linux yet (Phase D)");
     2
 }
@@ -1859,6 +1884,22 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 #[cfg(test)]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tests {
+    /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
+    /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
+    #[cfg(windows)]
+    #[test]
+    fn used_only_keeps_the_compute_programs_an_earlier_run_used() {
+        let (a, b) = (vec![1u8, 2, 3, 4], vec![5u8, 6, 7, 8]);
+        let used: std::collections::HashSet<u64> = [crate::hle::d3d12x::real::shaders_key(&[a.clone()])].into_iter().collect();
+        assert!(super::used_compute(&a, &used));
+        assert!(!super::used_compute(&b, &used));
+        // the keys as the runtime writes them, one hexadecimal key a line
+        let text = format!("{:016x}
+", crate::hle::d3d12x::real::shaders_key(&[b.clone()]));
+        let keys: std::collections::HashSet<u64> = text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect();
+        assert!(super::used_compute(&b, &keys));
+    }
+
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
 

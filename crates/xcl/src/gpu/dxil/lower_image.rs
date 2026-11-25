@@ -752,7 +752,7 @@ impl Lw {
             })?;
             let r = tmps.map(|t| self.rd(t));
             let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
-            return self.image_result(vdata, &vals, false, act);
+            return self.image_result(vdata, &vals, d16, act);
         }
 
         if base == "get_resinfo" {
@@ -787,7 +787,7 @@ impl Lw {
             })?;
             let r = tmps.map(|t| self.rd(t));
             let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
-            return self.image_result(vdata, &vals, false, act);
+            return self.image_result(vdata, &vals, d16, act);
         }
 
         let ic: Vec<Value> = (0..body as usize).map(|k| compu(self, i_body + k)).collect();

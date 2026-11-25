@@ -61,7 +61,12 @@ impl Lw {
         };
         let fr = |s: &mut Self, e: Value| {
             let e = if clamp { s.un(op::SATURATE, e) } else { e };
-            s.to_f16(e)
+            // The product of two binary16 operands fits exactly in binary32.
+            if name == "v_pk_mul_f16" {
+                s.to_f16_rounded(e)
+            } else {
+                s.to_f16(e)
+            }
         };
         let dot: Option<Value> = match name {
             "v_dot2_f32_f16" | "v_dot2c_f32_f16" => {
@@ -408,7 +413,11 @@ impl Lw {
             if m.clamp {
                 v = s.un(op::SATURATE, v);
             }
-            s.to_f16(v)
+            if name == "v_mul_f16" {
+                s.to_f16_rounded(v)
+            } else {
+                s.to_f16(v)
+            }
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
@@ -450,6 +459,7 @@ impl Lw {
             "v_max_f16" => f2!(|s: &mut Self, x, y| s.fmax(x, y)),
             "v_fma_f16" => f3!(|s: &mut Self, x, y, w| s.fmad(x, y, w)),
             "v_med3_f16" => f3!(|s: &mut Self, x, y, w| s.med3f(x, y, w)),
+            "v_div_fixup_f16" => f3!(|s: &mut Self, x, y, w| s.div_fixup(x, y, w)),
             "v_min3_f16" => f3!(|s: &mut Self, x, y, w| {
                 let t = s.fmin(x, y);
                 s.fmin(t, w)
@@ -499,12 +509,7 @@ impl Lw {
             "v_mad_f16" => {
                 let (x, y, w) = (fh(self, 0), fh(self, 1), fh(self, 2));
                 let p = self.fmul(x, y);
-                let ph = if self.dyn_rm {
-                    let rm = self.rd(super::lower::VAR_FP16_RM);
-                    self.f32_to_f16_rm(p, rm)
-                } else {
-                    self.f32_to_f16_rne(p)
-                };
+                let ph = self.to_f16_rounded(p);
                 let p16 = self.s.f16_to_f32(ph);
                 let e = self.fadd(p16, w);
                 fr(self, e)

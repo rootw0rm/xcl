@@ -918,8 +918,15 @@ impl Lw {
         let e1 = self.ftosi(s1);
         let e2 = self.ftoui(f);
         let e3 = self.ftosi(f);
-        // floats
-        let h = self.s.f32_to_f16(f);
+        // ty 4/5: saturate UINT to [0, mu] and SINT to [!ms, ms] when w < 32
+        let u4 = self.umin(x, mu);
+        let e4 = self.sel(big, x, u4);
+        let lo = self.not(ms);
+        let s5 = self.imax(x, lo);
+        let s5 = self.imin(s5, ms);
+        let e5 = self.sel(big, x, s5);
+        // floats (RTZ matches RDNA2 / HLSL fmt_encode so finite > 65504 saturates to max finite)
+        let h = self.f16_rtz(f);
         let w11 = self.cmpc(Pred::Eq, w, 11);
         let k3f0 = self.c(0x3F0);
         let nanv = self.selc(w11, 0x7E0, k3f0);
@@ -933,14 +940,10 @@ impl Lw {
         let small = self.sel(n, nanv, small);
         let w16 = self.cmpc(Pred::Eq, w, 16);
         let fl = self.sel(w16, h, small);
-        let t4 = self.cmpc(Pred::Eq, ty, 4);
-        let t5 = self.cmpc(Pred::Eq, ty, 5);
         let w32 = self.cmpc(Pred::Eq, w, 32);
-        let raw = self.lor(t4, t5);
-        let raw = self.lor(raw, w32);
-        let r = self.sel(raw, x, fl);
+        let r = self.sel(w32, x, fl);
         let mut res = r;
-        for (k, val) in [(3u32, e3), (2, e2), (1, e1), (0, e0)] {
+        for (k, val) in [(5u32, e5), (4, e4), (3, e3), (2, e2), (1, e1), (0, e0)] {
             let is = self.cmpc(Pred::Eq, ty, k);
             res = self.sel(is, val, res);
         }
