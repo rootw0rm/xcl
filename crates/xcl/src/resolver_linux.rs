@@ -553,6 +553,7 @@ mod tests {
             ("api-ms-win-crt-string-l1-1-0.dll", "wmemmove"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strstr"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strrchr"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "strcspn"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strtok_s"),
             ("api-ms-win-crt-string-l1-1-0.dll", "_strnicmp"),
             ("api-ms-win-crt-string-l1-1-0.dll", "strdup"),

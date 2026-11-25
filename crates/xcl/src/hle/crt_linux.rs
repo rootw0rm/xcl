@@ -1002,6 +1002,35 @@ pub unsafe extern "win64" fn strrchr(s: *const u8, c: i32) -> *mut u8 {
     last
 }
 
+/// `size_t strcspn(s, reject)` — length of the initial segment of `s` holding
+/// no byte from `reject` (index of the first rejected byte, or `strlen(s)` when
+/// none matches). Retail `exe+0x2237320` NULL chain: the mount check at
+/// `exe+0x53525C0` (via `exe+0x643C10`) calls `strcspn("packroot:/appdata0.rpf",
+/// ":...")`; the auto-stub returned 0, forcing a vacuous match in the
+/// drive-record loop. Bytes (not case-folded); the NUL terminator of `s` stops
+/// the scan and is never reported as a match.
+pub unsafe extern "win64" fn strcspn(s: *const u8, reject: *const u8) -> usize {
+    let mut i = 0;
+    loop {
+        let b = *s.add(i);
+        if b == 0 {
+            return i;
+        }
+        let mut j = 0;
+        loop {
+            let r = *reject.add(j);
+            if r == 0 {
+                break;
+            }
+            if r == b {
+                return i;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
 /// `char* strdup(s)` — owned heap copy (incl. NUL); asserts on OOM like `malloc`.
 pub unsafe extern "win64" fn strdup(s: *const u8) -> *mut u8 {
     let n = strlen(s);
@@ -3049,6 +3078,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("wmemmove", wmemmove as usize),
         ("strstr", strstr as usize),
         ("strrchr", strrchr as usize),
+        ("strcspn", strcspn as usize),
         ("strtok_s", strtok_s as usize),
         ("strdup", strdup as usize),
         ("_strdup", strdup as usize),
@@ -3474,6 +3504,15 @@ mod tests {
                 hay.as_ptr().add(11) as *mut u8
             );
             assert!(strrchr(hay.as_ptr(), b'z' as i32).is_null());
+            // strcspn returns the first rejected index, or the length when clean.
+            // Retail exe+0x2237320: the mount check calls
+            // strcspn("packroot:/appdata0.rpf", ":...") — 8, not the stub's 0.
+            assert_eq!(strcspn(b"packroot:/appdata0.rpf\0".as_ptr(), b":\0".as_ptr()), 8);
+            assert_eq!(strcspn(b"appdata0.rpf\0".as_ptr(), b":\0".as_ptr()), 12);
+            assert_eq!(strcspn(b"hello\0".as_ptr(), b"aeiou\0".as_ptr()), 1);
+            assert_eq!(strcspn(b"hello\0".as_ptr(), b"xyz\0".as_ptr()), 5);
+            assert_eq!(strcspn(b"hello\0".as_ptr(), b"\0".as_ptr()), 5);
+            assert_eq!(strcspn(b"\0".as_ptr(), b"abc\0".as_ptr()), 0);
             // strtok_s splits on any delimiter, skips runs, NUL-terminates tokens.
             let mut text = *b"a;b;;c\0";
             let delim = b";\0";
