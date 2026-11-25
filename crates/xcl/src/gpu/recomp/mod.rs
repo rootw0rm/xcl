@@ -82,6 +82,8 @@ pub mod ssa;
 mod tests;
 #[cfg(all(test, windows))]
 mod heap_window_tests;
+#[cfg(test)]
+mod link_tests;
 
 /// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
 /// window k is raw UAV `MEM_HEAP_BASE + k`. Not 0: a T# whose word 0 is 0 (an empty console

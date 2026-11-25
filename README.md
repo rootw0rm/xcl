@@ -202,7 +202,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
-  `report.json` has it under `dxc`.
+  `report.json` has it under `dxc`. A compute program with many memory-window accesses is compiled
+  as two libraries, the program and its accessors, and linked, which is much faster for DXC
+  (`XCL_LINK_MEM=0` turns it off); the linker needs DXC 1.8 or newer. With an older one the first
+  attempt fails, `xcl.log` says so, and every program is compiled whole after that.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange

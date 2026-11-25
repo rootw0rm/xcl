@@ -5763,13 +5763,10 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
     out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
 }
 
-/// The accessor functions: one per `mem` method (and overload) the translator emits.
-/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
-/// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
-/// out-of-UMA pointers can never wrap onto live memory windows.
-/// `heap`: Some(storage class) – window k is taken from the descriptor heap
-/// (`Options::heap_windows`) and the same rule is one comparison before the access.
-fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+/// The `mem` methods (and overloads) the translator emits: result, name, parameters, arguments,
+/// and what an access outside the windows does (the switch's `default`; its `break` leaves
+/// the accessor).
+fn mem_methods() -> Vec<(&'static str, String, &'static str, &'static str, &'static str)> {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5793,13 +5790,52 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
             sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o", "o = (int64_t)0; break;"));
         }
     }
+    sigs
+}
+
+/// The body of an accessor: the switch on the window `w` (`xcl_loadx4`).
+fn loadx4_switch(windows: u32, w: &str) -> String {
+    let mut s = format!("[branch] switch ({w}) {{ ");
+    s.push_str("case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
+    for k in 1..windows {
+        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+    }
+    s.push_str("default: return uint4(0u, 0u, 0u, 0u); }");
+    s
+}
+
+/// The body of an accessor: the switch on the window `w` (a `mem` method, `def` outside the windows).
+fn method_switch(windows: u32, w: &str, ret: &str, name: &str, args: &str, def: &str) -> String {
+    let mut s = format!("[branch] switch ({w}) {{ ");
+    if ret == "void" {
+        let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
+        }
+    } else {
+        let _ = write!(s, "case 0u: return mem.{name}({args}); ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
+        }
+    }
+    let _ = write!(s, "default: {def} }}");
+    s
+}
+
+/// The accessor functions: one per `mem` method (and overload) the translator emits.
+/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
+/// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
+/// out-of-UMA pointers can never wrap onto live memory windows.
+/// `heap`: Some(storage class) – window k is taken from the descriptor heap
+/// (`Options::heap_windows`) and the same rule is one comparison before the access.
+fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     let mut s = String::new();
     if let Some(coherent) = heap {
         // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
         // does what the switch's `default` does
         let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
         let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
-        for (ret, name, params, args, def) in sigs {
+        for (ret, name, params, args, def) in mem_methods() {
             let r = if ret == "void" { "" } else { "return " };
             // (the switch's `break` leaves the accessor)
             let outside = def.replace("break;", "return;");
@@ -5807,28 +5843,34 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         }
         return s;
     }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
-    for k in 1..windows {
-        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
-    }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
-    for (ret, name, params, args, def) in sigs {
-        let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
-        if ret == "void" {
-            let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
-            }
-        } else {
-            let _ = write!(s, "case 0u: return mem.{name}({args}); ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
-            }
-        }
-        let _ = writeln!(s, "default: {def} }} }}");
+    let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ {} }}", loadx4_switch(windows, "xcl_w"));
+    for (ret, name, params, args, def) in mem_methods() {
+        let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ {} }}", method_switch(windows, "xcl_w", ret, &name, args, def));
     }
     s
+}
+
+/// A translated program with several memory windows as two libraries for DXC's linker: the
+/// program, whose accessors are only declared, and the accessors. DXC inlines a function when
+/// it compiles the program, before it optimises: a switch per access, and its time grows with
+/// the square of them. The linker inlines the declared ones afterwards. None: no windows, or
+/// fewer than `min_accesses` places that use them (DXC is fast enough then).
+pub(super) fn linked_form(hlsl: &str, min_accesses: usize) -> Option<(String, String)> {
+    let (windows, inline) = (2..=4).map(|w| (w, mem_accessors(w, None))).find(|(_, a)| hlsl.contains(a.as_str()))?;
+    let (head, rest) = hlsl.split_once(inline.as_str())?;
+    if rest.matches("xcl_m").count() + rest.matches("xcl_loadx4(").count() < min_accesses || rest.matches("[numthreads(").count() != 1 {
+        return None;
+    }
+    let mut declared = String::from("uint4 xcl_l_loadx4(uint w, uint4 a);\nuint4 xcl_loadx4(uint4 a) { return xcl_l_loadx4(xcl_w, a); }\n");
+    let mut library: String = head.lines().filter(|l| l.contains("RWByteAddressBuffer mem")).map(|l| format!("{l}\n")).collect();
+    let _ = writeln!(library, "export uint4 xcl_l_loadx4(uint w, uint4 a) {{ {} }}", loadx4_switch(windows, "w"));
+    for (ret, name, params, args, def) in mem_methods() {
+        let r = if ret == "void" { "" } else { "return " };
+        let _ = writeln!(declared, "{ret} xcl_l_{name}(uint w, {params});\n{ret} xcl_m{name}({params}) {{ {r}xcl_l_{name}(xcl_w, {args}); }}");
+        let _ = writeln!(library, "export {ret} xcl_l_{name}(uint w, {params}) {{ {} }}", method_switch(windows, "w", ret, &name, args, def));
+    }
+    let program = format!("{head}{declared}{}", rest.replacen("[numthreads(", "[shader(\"compute\")]\n[numthreads(", 1));
+    Some((program, library))
 }
 
 /// Sub-dword d16 forms: (bytes, sign-extend, store, half: 0 low / 1 high) by the name after

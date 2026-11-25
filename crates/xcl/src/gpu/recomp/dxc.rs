@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
-use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8};
+use windows::Win32::Graphics::Direct3D::Dxc::{
+    CLSID_DxcCompiler, CLSID_DxcLinker, CLSID_DxcUtils, DxcBuffer, IDxcBlob, IDxcBlobEncoding, IDxcCompiler3, IDxcLinker, IDxcResult, IDxcUtils, DXC_CP, DXC_CP_UTF8,
+};
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
@@ -499,6 +501,128 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    // compute (also what MS and GS programs run as): DXC's time for its memory accesses is
+    // linear this way (`emit::linked_form`). Anything wrong with it: as one program, as before.
+    if profile.starts_with("cs_") && linking() {
+        if let Some((program, library)) = super::emit::linked_form(src, LINK_MIN_ACCESSES) {
+            match compile_linked(&program, &library, entry, profile, extra) {
+                Ok(dxil) => return Ok(dxil),
+                Err(e) => {
+                    // the same DXC fails the same way for the next program: stop trying
+                    if LINK_GATE.close() {
+                        crate::xlog_warn!("DXC: a program could not be linked with its memory accessors, compiled whole, and no more programs are linked: {e}");
+                    }
+                }
+            }
+        }
+    }
+    compile_whole(src, entry, profile, extra)
+}
+
+/// Accesses a program needs to be linked with its accessors: with 100 both ways take DXC 0.3 s.
+const LINK_MIN_ACCESSES: usize = 100;
+
+/// Whether programs are still linked with their accessors: off for the whole process after the
+/// first program that could not be linked (a DXC before 1.8 refuses `[WaveSize]` on a library
+/// entry, and would otherwise pay a failed attempt for every program).
+struct LinkGate(std::sync::atomic::AtomicBool);
+
+impl LinkGate {
+    const fn new() -> LinkGate {
+        LinkGate(std::sync::atomic::AtomicBool::new(true))
+    }
+
+    fn open(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Close the gate; true for the call that closed it.
+    fn close(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
+static LINK_GATE: LinkGate = LinkGate::new();
+
+/// `XCL_LINK_MEM=0`: every program is compiled whole (into the same cache: compare with
+/// another `XCL_DXIL_CACHE`).
+fn linking() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_LINK_MEM").map_or(true, |v| v != "0")) && LINK_GATE.open()
+}
+
+/// A value kept per key, made once: the first caller of a key makes it with `make`, outside the
+/// map's lock (other keys go on meanwhile), and callers of the same key wait for that and get
+/// its result. A failure is not kept: the next caller tries again.
+fn kept_once<T: Clone>(map: &Mutex<Option<HashMap<String, Arc<Mutex<Option<T>>>>>>, key: &str, make: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let cell = map.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(key.to_string()).or_default().clone();
+    let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = &*slot {
+        return Ok(v.clone());
+    }
+    let v = make()?;
+    *slot = Some(v.clone());
+    Ok(v)
+}
+
+/// Compile `program` and `library` (its memory accessors, kept once compiled) as libraries and
+/// link them to `profile`.
+fn compile_linked(program: &str, library: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    let model = profile.split_once('_').map_or("6_6", |(_, m)| m);
+    let lib = format!("lib_{model}");
+    let accessors = {
+        static KEPT: Mutex<Option<HashMap<String, Arc<Mutex<Option<Arc<Vec<u8>>>>>>>> = Mutex::new(None);
+        let key = format!("{lib} {extra:?}\n{library}");
+        kept_once(&KEPT, &key, || compile_whole(library, "", &lib, extra).map(Arc::new))?
+    };
+    let program = compile_whole(program, "", &lib, extra)?;
+    let instance = |clsid: &GUID, iid: &GUID| -> Result<*mut c_void, String> {
+        let mut p = std::ptr::null_mut();
+        let hr = unsafe { create_fn()?(clsid, iid, &mut p) };
+        if hr.is_err() || p.is_null() {
+            return Err(format!("DxcCreateInstance: {hr:?}"));
+        }
+        Ok(p)
+    };
+    unsafe {
+        let linker = IDxcLinker::from_raw(instance(&CLSID_DxcLinker, &IDxcLinker::IID)?);
+        let utils = IDxcUtils::from_raw(instance(&CLSID_DxcUtils, &IDxcUtils::IID)?);
+        let names = [crate::util::wide("program"), crate::util::wide("accessors")];
+        for (name, dxil) in names.iter().zip([&program, &*accessors]) {
+            let blob = utils.CreateBlob(dxil.as_ptr() as *const c_void, dxil.len() as u32, DXC_CP(0)).map_err(|e| format!("CreateBlob: {e}"))?;
+            linker.RegisterLibrary(PCWSTR(name.as_ptr()), &blob).map_err(|e| format!("RegisterLibrary: {e}"))?;
+        }
+        let (entry, profile) = (crate::util::wide(entry), crate::util::wide(profile));
+        let r = linker
+            .Link(PCWSTR(entry.as_ptr()), PCWSTR(profile.as_ptr()), &names.each_ref().map(|n| PCWSTR(n.as_ptr())), None)
+            .map_err(|e| format!("Link: {e}"))?;
+        output(r.GetStatus(), r.GetErrorBuffer(), r.GetResult())
+    }
+}
+
+/// The bytes of a finished DXC operation, or its messages.
+unsafe fn output(status: windows::core::Result<HRESULT>, errors: windows::core::Result<IDxcBlobEncoding>, result: windows::core::Result<IDxcBlob>) -> Result<Vec<u8>, String> {
+    let status = status.map_err(|e| format!("{e}"))?;
+    if status.is_err() {
+        let msg = errors
+            .ok()
+            .map(|b| {
+                let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
+                String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
+            })
+            .unwrap_or_default();
+        // an out-of-memory is the machine's, not the program's: not a deterministic rejection
+        // (the error cache of `compile_cached_in_observed` keys on the "dxc: " prefix)
+        if status == windows::Win32::Foundation::E_OUTOFMEMORY {
+            return Err(format!("dxc (0x{:08X}): {msg}", status.0 as u32));
+        }
+        return Err(format!("dxc: {msg}"));
+    }
+    let blob = result.map_err(|e| format!("{e}"))?;
+    Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+}
+
+fn compile_whole(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
@@ -520,23 +644,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
     unsafe {
         let r: IDxcResult = c.Compile(&buf, Some(&ptrs), None).map_err(|e| format!("Compile: {e}"))?;
-        let status = r.GetStatus().map_err(|e| format!("{e}"))?;
-        if status.is_err() {
-            let msg = r
-                .GetErrorBuffer()
-                .ok()
-                .map(|b| {
-                    let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
-                    String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
-                })
-                .unwrap_or_default();
-            if status == windows::Win32::Foundation::E_OUTOFMEMORY {
-                return Err(format!("dxc (0x{:08X}): {msg}", status.0 as u32));
-            }
-            return Err(format!("dxc: {msg}"));
-        }
-        let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
-        Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+        output(r.GetStatus(), r.GetErrorBuffer(), r.GetResult())
     }
 }
 
@@ -1407,5 +1515,108 @@ mod cache_tests {
         assert_eq!(ok_ice, synthetic_dxil(9));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `src` compiled whole and linked with its memory accessors, whatever their number, with the
+/// seconds each took.
+#[cfg(test)]
+pub(super) fn both_forms(src: &str, profile: &str) -> Result<[(Vec<u8>, f64); 2], String> {
+    std::thread::scope(|s| {
+        let t = std::thread::Builder::new().stack_size(DXC_STACK).spawn_scoped(s, || {
+            let (program, library) = super::emit::linked_form(src, 0).ok_or("no linked form")?;
+            let t0 = std::time::Instant::now();
+            let linked = compile_linked(&program, &library, "main", profile, &[])?;
+            let linked = (linked, t0.elapsed().as_secs_f64());
+            let t0 = std::time::Instant::now();
+            let whole = compile_whole(src, "main", profile, &[])?;
+            Ok([(whole, t0.elapsed().as_secs_f64()), linked])
+        });
+        t.map_err(|e| e.to_string())?.join().map_err(|_| "DXC: panic".to_string())?
+    })
+}
+
+/// The disassembly of a DXIL container.
+#[cfg(test)]
+pub(super) fn disassemble(dxil: &[u8]) -> Result<String, String> {
+    let c = compiler()?;
+    let buf = DxcBuffer { Ptr: dxil.as_ptr() as *const c_void, Size: dxil.len(), Encoding: 0 };
+    unsafe {
+        let r: IDxcResult = c.Disassemble(&buf).map_err(|e| format!("Disassemble: {e}"))?;
+        output(r.GetStatus(), r.GetErrorBuffer(), r.GetResult()).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod accessor_library_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    type Kept = Mutex<Option<HashMap<String, Arc<Mutex<Option<u32>>>>>>;
+
+    /// Two programs that share one accessor library, starting together, compile it once.
+    #[test]
+    fn threads_asking_for_one_key_make_its_value_once() {
+        let map: Kept = Mutex::new(None);
+        let made = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let v = kept_once(&map, "library", || {
+                        made.fetch_add(1, Ordering::SeqCst);
+                        // long enough for the other threads to ask before it is made
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(7)
+                    });
+                    assert_eq!(v, Ok(7));
+                });
+            }
+        });
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+    }
+
+    /// A value being made does not hold up the other keys.
+    #[test]
+    fn another_key_does_not_wait_for_a_value_being_made() {
+        let map: Kept = Mutex::new(None);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let map = &map;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let v = kept_once(map, "a", || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(1)
+                });
+                assert_eq!(v, Ok(1));
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            s.spawn(move || done_tx.send(kept_once(map, "b", || Ok(2))).unwrap());
+            let b = done_rx.recv_timeout(Duration::from_secs(2));
+            release_tx.send(()).unwrap();
+            assert_eq!(b, Ok(Ok(2)), "key b waited for key a");
+        });
+    }
+
+    /// A failed make is tried again by the next caller; a made value is kept.
+    #[test]
+    fn a_failure_is_not_kept() {
+        let map: Kept = Mutex::new(None);
+        assert_eq!(kept_once(&map, "k", || Err("no".to_string())), Err("no".to_string()));
+        assert_eq!(kept_once(&map, "k", || Ok(3)), Ok(3));
+        assert_eq!(kept_once(&map, "k", || Err("not asked".to_string())), Ok(3));
+    }
+
+    /// The first failure to link closes the gate, once.
+    #[test]
+    fn the_link_gate_closes_at_the_first_failure() {
+        let gate = LinkGate::new();
+        assert!(gate.open());
+        assert!(gate.close());
+        assert!(!gate.open());
+        assert!(!gate.close());
     }
 }
