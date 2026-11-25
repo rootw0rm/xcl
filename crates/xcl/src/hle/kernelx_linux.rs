@@ -72,6 +72,7 @@ pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 
 const ERROR_TIMEOUT: u32 = 1460;
+const ERROR_TOO_MANY_POSTS: u32 = 298;
 
 // Memory types.
 const MEM_COMMIT: u32 = 0x1000;
@@ -1141,6 +1142,13 @@ pub unsafe extern "win64" fn WaitForSingleObject(handle: usize, timeout_ms: u32)
             WAIT_TIMEOUT
         };
     }
+    if let Some(sem) = is_sem(handle) {
+        return if wait_sem(&sem, timeout_ms) {
+            WAIT_OBJECT_0
+        } else {
+            WAIT_TIMEOUT
+        };
+    }
     if let Some(t) = is_timer(handle) {
         return if wait_timer(&t, timeout_ms) {
             WAIT_OBJECT_0
@@ -1207,6 +1215,11 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         all = false;
                         break;
                     }
+                } else if let Some(s) = is_sem(h) {
+                    if *s.count.lock().unwrap() <= 0 {
+                        all = false;
+                        break;
+                    }
                 } else if joins().lock().unwrap().contains_key(&h) {
                     if join_if_finished(h).is_none() {
                         // `join_if_finished` consumes a finished join; re-check below.
@@ -1230,6 +1243,8 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         if !ev.manual {
                             *ev.signaled.lock().unwrap() = false;
                         }
+                    } else if let Some(s) = is_sem(h) {
+                        try_acquire_sem(&s);
                     } else if let Some(t) = is_timer(h) {
                         if !t.manual {
                             *t.signaled.lock().unwrap() = false;
@@ -1256,6 +1271,10 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
                         }
                         return WAIT_OBJECT_0 + i as u32;
                     }
+                } else if let Some(s) = is_sem(h) {
+                    if try_acquire_sem(&s) {
+                        return WAIT_OBJECT_0 + i as u32;
+                    }
                 } else if joins().lock().unwrap().contains_key(&h) {
                     if join_if_finished(h).is_some() || !joins().lock().unwrap().contains_key(&h) {
                         return WAIT_OBJECT_0 + i as u32;
@@ -1274,6 +1293,359 @@ pub unsafe extern "win64" fn WaitForMultipleObjects(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Semaphores: Linux-backed counting objects (retail `CreateSemaphoreExW` path).
+// ---------------------------------------------------------------------------------------
+//
+// The game creates a semaphore early in startup and retry-loops the call: the old
+// auto-stub returned NULL, so the loop fell through to the title's deliberate `int3`.
+// These are real host objects in their own handle table (closed through `CloseHandle`)
+// and waitable through `WaitForSingleObject`/`WaitForMultipleObjects` above: each
+// successful wait consumes one count, `ReleaseSemaphore` adds back up to the maximum.
+// Names/security/flags/access are accepted and ignored (no cross-process sharing on
+// Linux); validation mirrors Windows (`max <= 0` or `initial` outside `0..=max`
+// fails with `ERROR_INVALID_PARAMETER`, over-release with `ERROR_TOO_MANY_POSTS`).
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+struct SemState {
+    count: Mutex<i32>,
+    max: i32,
+    cvar: Condvar,
+}
+
+static SEMAPHORES: OnceLock<Mutex<HashMap<usize, std::sync::Arc<SemState>>>> = OnceLock::new();
+
+fn semaphores() -> &'static Mutex<HashMap<usize, std::sync::Arc<SemState>>> {
+    SEMAPHORES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_sem(handle: usize) -> Option<std::sync::Arc<SemState>> {
+    semaphores().lock().unwrap().get(&handle).cloned()
+}
+
+fn close_sem_handle(h: usize) -> bool {
+    if let Some(s) = semaphores().lock().unwrap().remove(&h) {
+        s.cvar.notify_all();
+        true
+    } else {
+        false
+    }
+}
+
+fn wait_sem(sem: &std::sync::Arc<SemState>, timeout_ms: u32) -> bool {
+    let mut g = sem.count.lock().unwrap();
+    if *g > 0 {
+        *g -= 1;
+        return true;
+    }
+    if timeout_ms == 0 {
+        return false;
+    }
+    if timeout_ms == INFINITE {
+        while *g <= 0 {
+            g = sem.cvar.wait(g).unwrap();
+        }
+        *g -= 1;
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    while *g <= 0 {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let (guard, timeout) = sem.cvar.wait_timeout(g, deadline - now).unwrap();
+        g = guard;
+        if *g > 0 {
+            break;
+        }
+        if timeout.timed_out() {
+            return false;
+        }
+    }
+    *g -= 1;
+    true
+}
+
+fn try_acquire_sem(sem: &std::sync::Arc<SemState>) -> bool {
+    let mut g = sem.count.lock().unwrap();
+    if *g > 0 {
+        *g -= 1;
+        true
+    } else {
+        false
+    }
+}
+
+/// `HANDLE CreateSemaphoreExW(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCWSTR name,
+/// DWORD flags, DWORD access)` — counting semaphore, never NULL on valid counts.
+pub unsafe extern "win64" fn CreateSemaphoreExW(
+    _attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    _name: *const u16,
+    _flags: u32,
+    _access: u32,
+) -> usize {
+    if max <= 0 || initial < 0 || initial > max {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    semaphores().lock().unwrap().insert(
+        id,
+        std::sync::Arc::new(SemState {
+            count: Mutex::new(initial),
+            max,
+            cvar: Condvar::new(),
+        }),
+    );
+    set_error(ERROR_SUCCESS);
+    id
+}
+
+/// `HANDLE CreateSemaphoreW(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCWSTR name)` —
+/// legacy spelling of the same semaphore.
+pub unsafe extern "win64" fn CreateSemaphoreW(
+    attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    name: *const u16,
+) -> usize {
+    CreateSemaphoreExW(attrs, initial, max, name, 0, 0)
+}
+
+/// `HANDLE CreateSemaphoreExA(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCSTR name,
+/// DWORD flags, DWORD access)` — ANSI (UTF-8 on Linux) twin.
+pub unsafe extern "win64" fn CreateSemaphoreExA(
+    attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    _name: *const u8,
+    flags: u32,
+    access: u32,
+) -> usize {
+    CreateSemaphoreExW(attrs, initial, max, std::ptr::null(), flags, access)
+}
+
+/// `HANDLE CreateSemaphoreA(SECURITY_ATTRIBUTES*, LONG initial, LONG max, LPCSTR name)` —
+/// ANSI legacy spelling.
+pub unsafe extern "win64" fn CreateSemaphoreA(
+    attrs: *const c_void,
+    initial: i32,
+    max: i32,
+    name: *const u8,
+) -> usize {
+    CreateSemaphoreExA(attrs, initial, max, name, 0, 0)
+}
+
+/// `BOOL ReleaseSemaphore(HANDLE, LONG count, LPLONG previous)` — adds `count` up to the
+/// maximum, reporting the previous count. Over-release fails without changing the count.
+pub unsafe extern "win64" fn ReleaseSemaphore(
+    handle: usize,
+    release: i32,
+    prev: *mut i32,
+) -> i32 {
+    let Some(sem) = is_sem(handle) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if release <= 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut g = sem.count.lock().unwrap();
+    let cur = *g;
+    let Some(next) = cur.checked_add(release) else {
+        set_error(ERROR_TOO_MANY_POSTS);
+        return 0;
+    };
+    if next > sem.max {
+        set_error(ERROR_TOO_MANY_POSTS);
+        return 0;
+    }
+    *g = next;
+    drop(g);
+    if !prev.is_null() {
+        *prev = cur;
+    }
+    if release == 1 {
+        sem.cvar.notify_one();
+    } else {
+        sem.cvar.notify_all();
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+// ---------------------------------------------------------------------------------------
+// Condition variables: guest-memory CONDITION_VARIABLEs against the CS table.
+// ---------------------------------------------------------------------------------------
+//
+// The game probes `SleepConditionVariableCS`/`WakeAllConditionVariable` through
+// `GetProcAddress`; the auto-stub NULLs failed the probe. A Windows
+// `CONDITION_VARIABLE` is one pointer (zero-initialized); host wait state lives here
+// keyed by guest address, so static (`{0}`) and `InitializeConditionVariable` forms
+// both work. `SleepConditionVariableCS` fully releases the critical section while
+// blocked (recursion preserved) and reacquires it before returning, as on Windows;
+// wakes are a generation bump, so a `Wake` racing the release is never missed and a
+// `Wake` with no waiters is lost, as on Windows.
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+struct CondWaiter {
+    signaled: Mutex<bool>,
+    cvar: Condvar,
+}
+
+static CONDVARS: OnceLock<Mutex<HashMap<usize, Vec<std::sync::Arc<CondWaiter>>>>> =
+    OnceLock::new();
+
+fn condvars() -> &'static Mutex<HashMap<usize, Vec<std::sync::Arc<CondWaiter>>>> {
+    CONDVARS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop `me` from the guest address's waiter list, signalling it first when asked.
+fn unpark_cond_waiter(key: usize, me: &std::sync::Arc<CondWaiter>, signal: bool) {
+    if signal {
+        *me.signaled.lock().unwrap() = true;
+        me.cvar.notify_one();
+    }
+    let mut g = condvars().lock().unwrap();
+    if let Some(v) = g.get_mut(&key) {
+        v.retain(|w| !std::sync::Arc::ptr_eq(w, me));
+        if v.is_empty() {
+            g.remove(&key);
+        }
+    }
+}
+
+/// `VOID InitializeConditionVariable(PCONDITION_VARIABLE)` — zeroes the guest slot.
+pub unsafe extern "win64" fn InitializeConditionVariable(cv: *mut usize) {
+    if !cv.is_null() {
+        *cv = 0;
+    }
+}
+
+/// `BOOL SleepConditionVariableCS(PCONDITION_VARIABLE, PCRITICAL_SECTION, DWORD ms)` —
+/// releases `cs` while blocked, reacquires before returning; 1 on wake, 0 on timeout
+/// (`ERROR_TIMEOUT`) or on a null/unknown/unowned CS (`ERROR_INVALID_PARAMETER`).
+pub unsafe extern "win64" fn SleepConditionVariableCS(
+    cv: *mut usize,
+    cs: *mut CritSec,
+    timeout_ms: u32,
+) -> i32 {
+    if cv.is_null() || cs.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(st) = cs_state_for(cs as usize) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let me = current_tid();
+    // The caller must hold the CS; snapshot the recursion to restore it.
+    let saved = {
+        let g = st.owner.lock().unwrap();
+        if g.0 != me || g.1 == 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        g.1
+    };
+    let cond_key = cv as usize;
+    let waiter = std::sync::Arc::new(CondWaiter {
+        signaled: Mutex::new(false),
+        cvar: Condvar::new(),
+    });
+    condvars().lock().unwrap().entry(cond_key).or_default().push(waiter.clone());
+    // Fully release, as Windows does (a contender wakes here). A Wake that lands from
+    // here on finds us in the list, so it is never missed; a Wake from before we
+    // registered is lost, as on Windows.
+    {
+        let mut g = st.owner.lock().unwrap();
+        *g = (0, 0);
+        st.cvar.notify_one();
+    }
+    // Block on our own waiter until signalled (or the timeout lapses).
+    let woken = {
+        let mut g = waiter.signaled.lock().unwrap();
+        if *g {
+            true
+        } else if timeout_ms == 0 {
+            false
+        } else if timeout_ms == INFINITE {
+            while !*g {
+                g = waiter.cvar.wait(g).unwrap();
+            }
+            true
+        } else {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+            while !*g {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (guard, timeout) = waiter.cvar.wait_timeout(g, deadline - now).unwrap();
+                g = guard;
+                if *g {
+                    break;
+                }
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            *g
+        }
+    };
+    unpark_cond_waiter(cond_key, &waiter, false);
+    // Reacquire before returning (same order as `EnterCriticalSection`).
+    {
+        let mut g = st.owner.lock().unwrap();
+        while g.0 != 0 {
+            g = st.cvar.wait(g).unwrap();
+        }
+        *g = (me, saved);
+    }
+    if woken {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_TIMEOUT);
+        0
+    }
+}
+
+fn wake_condvar(cv: *mut usize, all: bool) {
+    if cv.is_null() {
+        return;
+    }
+    let key = cv as usize;
+    if all {
+        let waiters = condvars().lock().unwrap().remove(&key).unwrap_or_default();
+        for w in waiters {
+            *w.signaled.lock().unwrap() = true;
+            w.cvar.notify_one();
+        }
+    } else {
+        let one = condvars().lock().unwrap().get(&key).and_then(|v| v.first().cloned());
+        if let Some(w) = one {
+            unpark_cond_waiter(key, &w, true);
+        }
+    }
+}
+
+/// `VOID WakeConditionVariable(PCONDITION_VARIABLE)` — wakes one waiter, if any.
+pub unsafe extern "win64" fn WakeConditionVariable(cv: *mut usize) {
+    wake_condvar(cv, false);
+}
+
+/// `VOID WakeAllConditionVariable(PCONDITION_VARIABLE)` — wakes every waiter, if any.
+pub unsafe extern "win64" fn WakeAllConditionVariable(cv: *mut usize) {
+    wake_condvar(cv, true);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1660,6 +2032,10 @@ pub unsafe extern "win64" fn CloseHandle(handle: usize) -> i32 {
         set_error(ERROR_SUCCESS);
         return 1;
     }
+    if close_sem_handle(handle) {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
     if close_timer_handle(handle) {
         set_error(ERROR_SUCCESS);
         return 1;
@@ -1757,6 +2133,126 @@ pub unsafe extern "win64" fn Sleep(ms: u32) {
 pub unsafe extern "win64" fn SleepEx(ms: u32, _alertable: i32) -> u32 {
     Sleep(ms);
     0
+}
+
+// ---------------------------------------------------------------------------------------
+// Processor topology + system info (retail `GetLogicalProcessorInformation` path).
+// ---------------------------------------------------------------------------------------
+//
+// The game's startup validation calls `GetLogicalProcessorInformation` through the
+// sysinfo API set and executes a deliberate `int3` when it returns FALSE (the stub
+// did). These shims report the host topology the process actually runs on (through
+// the same `process_affinity` the affinity calls fit to): one `RelationProcessorCore`
+// entry per online processor plus a single `RelationProcessorPackage` entry, and a
+// `SYSTEM_INFO` with AMD64 architecture, 4 KiB pages and 64 KiB granularity.
+// `GetLogicalProcessorInformation` follows the Windows size-probe contract (NULL or
+// short buffer → FALSE with `ERROR_INSUFFICIENT_BUFFER`, required size out).
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+/// `SYSTEM_INFO` (48 bytes on x86-64). Field order matches the Windows definition.
+#[repr(C)]
+pub struct SystemInfo {
+    pub arch: u16,
+    pub reserved: u16,
+    pub page: u32,
+    pub min_app: usize,
+    pub max_app: usize,
+    pub active_mask: usize,
+    pub num_processors: u32,
+    pub processor_type: u32,
+    pub allocation_granularity: u32,
+    pub processor_level: u16,
+    pub processor_revision: u16,
+}
+
+fn system_info_for() -> SystemInfo {
+    let allowed = process_affinity();
+    SystemInfo {
+        arch: 9, // PROCESSOR_ARCHITECTURE_AMD64
+        reserved: 0,
+        page: page_size() as u32,
+        min_app: 0x1_0000,
+        max_app: 0x7FFF_FFFE_FFFF,
+        active_mask: allowed,
+        num_processors: allowed.count_ones(),
+        processor_type: 8664, // PROCESSOR_AMD_X8664
+        allocation_granularity: 0x1_0000,
+        processor_level: 6,
+        processor_revision: 0,
+    }
+}
+
+/// `VOID GetSystemInfo(LPSYSTEM_INFO)` — always succeeds.
+pub unsafe extern "win64" fn GetSystemInfo(out: *mut SystemInfo) {
+    if out.is_null() {
+        return;
+    }
+    *out = system_info_for();
+}
+
+/// `VOID GetNativeSystemInfo(LPSYSTEM_INFO)` — same answers (never WOW64 here).
+pub unsafe extern "win64" fn GetNativeSystemInfo(out: *mut SystemInfo) {
+    GetSystemInfo(out)
+}
+
+const RELATION_PROCESSOR_CORE: u32 = 0;
+#[allow(dead_code)]
+const RELATION_NUMA_NODE: u32 = 1;
+#[allow(dead_code)]
+const RELATION_CACHE: u32 = 2;
+const RELATION_PROCESSOR_PACKAGE: u32 = 3;
+
+/// One `SYSTEM_LOGICAL_PROCESSOR_INFORMATION` (32 bytes on x86-64).
+fn write_processor_info_entry(buf: *mut u8, mask: usize, relation: u32) {
+    unsafe {
+        (buf as *mut usize).write_unaligned(mask);
+        (buf.add(8) as *mut u32).write_unaligned(relation);
+        (buf.add(12) as *mut u32).write_unaligned(0);
+        // The 16-byte union: zero except `ProcessorCore.Flags` (1 = hyperthreaded
+        // when the package holds more logical processors than core entries).
+        std::ptr::write_bytes(buf.add(16), 0, 16);
+    }
+}
+
+/// `BOOL GetLogicalProcessorInformation(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION, PDWORD)` —
+/// one core entry per online processor plus one package entry. Size probes follow the
+/// Windows contract; the entries' masks are the process affinity (a zero affinity —
+/// the host refused the query — fails with `ERROR_INVALID_PARAMETER`).
+pub unsafe extern "win64" fn GetLogicalProcessorInformation(
+    out: *mut u8,
+    ret_len: *mut u32,
+) -> i32 {
+    if ret_len.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let allowed = process_affinity();
+    if allowed == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let cpus: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
+    let need = ((cpus.len() + 1) * 32) as u32;
+    if out.is_null() || *ret_len < need {
+        *ret_len = need;
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    let hyperthreaded = cpus.len() > 1;
+    for (i, &cpu) in cpus.iter().enumerate() {
+        let entry = out.add(i * 32);
+        write_processor_info_entry(entry, 1usize << cpu, RELATION_PROCESSOR_CORE);
+        if hyperthreaded {
+            unsafe {
+                (entry.add(16) as *mut u8).write_unaligned(1u8);
+            }
+        }
+    }
+    write_processor_info_entry(out.add(cpus.len() * 32), allowed, RELATION_PROCESSOR_PACKAGE);
+    *ret_len = need;
+    set_error(ERROR_SUCCESS);
+    1
 }
 
 // ---------------------------------------------------------------------------------------
@@ -7547,11 +8043,19 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("SleepEx", SleepEx as usize),
         ("GetTickCount", GetTickCount as usize),
         ("GetTickCount64", GetTickCount64 as usize),
+        ("GetSystemInfo", GetSystemInfo as usize),
+        ("GetNativeSystemInfo", GetNativeSystemInfo as usize),
+        ("GetLogicalProcessorInformation", GetLogicalProcessorInformation as usize),
         ("QueryPerformanceCounter", QueryPerformanceCounter as usize),
         ("QueryPerformanceFrequency", QueryPerformanceFrequency as usize),
         ("GetSystemTimeAsFileTime", GetSystemTimeAsFileTime as usize),
         ("CreateEventW", CreateEventW as usize),
         ("CreateEventA", CreateEventA as usize),
+        ("CreateSemaphoreExW", CreateSemaphoreExW as usize),
+        ("CreateSemaphoreW", CreateSemaphoreW as usize),
+        ("CreateSemaphoreExA", CreateSemaphoreExA as usize),
+        ("CreateSemaphoreA", CreateSemaphoreA as usize),
+        ("ReleaseSemaphore", ReleaseSemaphore as usize),
         ("SetEvent", SetEvent as usize),
         ("ResetEvent", ResetEvent as usize),
         ("CloseHandle", CloseHandle as usize),
@@ -7566,6 +8070,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("TryEnterCriticalSection", TryEnterCriticalSection as usize),
         ("LeaveCriticalSection", LeaveCriticalSection as usize),
         ("DeleteCriticalSection", DeleteCriticalSection as usize),
+        ("InitializeConditionVariable", InitializeConditionVariable as usize),
+        ("SleepConditionVariableCS", SleepConditionVariableCS as usize),
+        ("WakeConditionVariable", WakeConditionVariable as usize),
+        ("WakeAllConditionVariable", WakeAllConditionVariable as usize),
         ("InitializeSRWLock", InitializeSRWLock as usize),
         ("AcquireSRWLockExclusive", AcquireSRWLockExclusive as usize),
         ("ReleaseSRWLockExclusive", ReleaseSRWLockExclusive as usize),
@@ -7909,6 +8417,62 @@ mod tests {
             assert_eq!(CloseHandle(wake), 1);
             // Unknown handles fail instead of blocking forever.
             assert_eq!(WaitForSingleObject(0xDEAD_BEEF, 0), WAIT_FAILED);
+        }
+    }
+
+    #[test]
+    fn system_info_reports_the_host_topology() {
+        unsafe {
+            // SYSTEM_INFO: AMD64, host page size, sane processor count.
+            let mut info: SystemInfo = std::mem::zeroed();
+            GetSystemInfo(&mut info);
+            assert_eq!(
+                (info.arch, info.page, info.allocation_granularity),
+                (9, page_size() as u32, 0x1_0000)
+            );
+            assert!(info.num_processors >= 1);
+            assert_eq!(info.num_processors, info.active_mask.count_ones());
+            GetNativeSystemInfo(&mut info);
+            assert_eq!(info.arch, 9);
+            GetSystemInfo(std::ptr::null_mut()); // null is a no-op, not a fault.
+            // Size probe: NULL buffer reports the required size with INSUFFICIENT_BUFFER.
+            let mut need = 0u32;
+            assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), &mut need), 0);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            assert!(need >= 64 && need % 32 == 0);
+            // Short buffer reports the same requirement.
+            let mut half = vec![0u8; (need - 32) as usize];
+            let mut half_len = half.len() as u32;
+            assert_eq!(GetLogicalProcessorInformation(half.as_mut_ptr(), &mut half_len), 0);
+            assert_eq!(half_len, need);
+            // Full buffer: core entries plus one package entry; masks cover the affinity.
+            let mut full = vec![0u8; need as usize];
+            let mut full_len = need;
+            assert_eq!(GetLogicalProcessorInformation(full.as_mut_ptr(), &mut full_len), 1);
+            assert_eq!((full_len, GetLastError()), (need, ERROR_SUCCESS));
+            let n = need as usize / 32;
+            let mut cores = 0u32;
+            let mut or_mask = 0usize;
+            for i in 0..n {
+                let base = i * 32;
+                let mask = usize::from_le_bytes(full[base..base + 8].try_into().unwrap());
+                let rel = u32::from_le_bytes(full[base + 8..base + 12].try_into().unwrap());
+                or_mask |= mask;
+                if rel == RELATION_PROCESSOR_CORE {
+                    cores += 1;
+                    assert_eq!(mask.count_ones(), 1);
+                } else {
+                    assert_eq!(rel, RELATION_PROCESSOR_PACKAGE);
+                }
+            }
+            assert_eq!(cores as usize, n - 1);
+            assert_eq!(or_mask, process_affinity());
+            // Null length fails cleanly.
+            assert_eq!(
+                GetLogicalProcessorInformation(full.as_mut_ptr(), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
         }
     }
 
@@ -9124,6 +9688,149 @@ mod tests {
             // Closed timers are gone from every wait path.
             assert_eq!(WaitForSingleObject(t, 0), WAIT_FAILED);
             assert_eq!(CancelWaitableTimer(t), 0);
+        }
+    }
+
+    #[test]
+    fn semaphores_create_wait_release_and_close() {
+        unsafe {
+            // Bad counts fail with NULL, never a handle.
+            assert_eq!(CreateSemaphoreExW(std::ptr::null(), 0, 0, std::ptr::null(), 0, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(CreateSemaphoreExW(std::ptr::null(), 2, 1, std::ptr::null(), 0, 0), 0);
+            assert_eq!(CreateSemaphoreExW(std::ptr::null(), -1, 1, std::ptr::null(), 0, 0), 0);
+            // Zero initial: first wait times out, release wakes the next.
+            let s = CreateSemaphoreExW(std::ptr::null(), 0, 2, std::ptr::null(), 0, 0);
+            assert_ne!(s, 0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_TIMEOUT);
+            let mut prev = -1i32;
+            assert_eq!(ReleaseSemaphore(s, 1, &mut prev), 1);
+            assert_eq!(prev, 0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_TIMEOUT);
+            // Release of 2 wakes two counts; over-release fails without changing the count.
+            assert_eq!(ReleaseSemaphore(s, 2, &mut prev), 1);
+            assert_eq!(prev, 0);
+            assert_eq!(ReleaseSemaphore(s, 1, std::ptr::null_mut()), 0);
+            assert_eq!(GetLastError(), ERROR_TOO_MANY_POSTS);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(s, 0), WAIT_TIMEOUT);
+            // A releaser thread wakes a 5 s wait.
+            let w = CreateSemaphoreW(std::ptr::null(), 0, 1, std::ptr::null());
+            let setter = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                ReleaseSemaphore(w, 1, std::ptr::null_mut())
+            });
+            assert_eq!(WaitForSingleObject(w, 5000), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(w), 1);
+            assert_eq!(CloseHandle(s), 1);
+            // Multi-object: the semaphore wakes a wait-any alongside an event.
+            let both = CreateSemaphoreExW(std::ptr::null(), 1, 1, std::ptr::null(), 0, 0);
+            let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let pair = [both, ev];
+            assert_eq!(WaitForMultipleObjects(2, pair.as_ptr(), 0, 0), WAIT_OBJECT_0);
+            // Consumed: the event (still clear) is next only after a release.
+            assert_eq!(ReleaseSemaphore(both, 1, std::ptr::null_mut()), 1);
+            assert_eq!(WaitForMultipleObjects(2, pair.as_ptr(), 0, 0), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(both), 1);
+            assert_eq!(CloseHandle(ev), 1);
+            // Unknown handles fail instead of blocking forever.
+            assert_eq!(ReleaseSemaphore(0xDEAD_BEEF, 1, std::ptr::null_mut()), 0);
+            assert_eq!(WaitForSingleObject(0xDEAD_BEEF, 0), WAIT_FAILED);
+            setter.join().unwrap();
+            // Legacy W/A spellings agree.
+            let a = CreateSemaphoreA(std::ptr::null(), 1, 1, std::ptr::null());
+            assert_ne!(a, 0);
+            assert_eq!(WaitForSingleObject(a, 0), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(a), 1);
+            let e = CreateSemaphoreExA(std::ptr::null(), 0, 1, std::ptr::null(), 0, 0);
+            assert_ne!(e, 0);
+            assert_eq!(WaitForSingleObject(e, 10), WAIT_TIMEOUT);
+            assert_eq!(CloseHandle(e), 1);
+            // Closed semaphores are gone from every wait path.
+            assert_eq!(WaitForSingleObject(both, 0), WAIT_FAILED);
+            assert_eq!(ReleaseSemaphore(both, 1, std::ptr::null_mut()), 0);
+        }
+    }
+
+    #[test]
+    fn condition_variables_sleep_and_wake() {
+        unsafe {
+            // Nulls and an unowned CS fail cleanly, never block.
+            let mut cv_slot = 0usize;
+            let cv = &mut cv_slot as *mut usize;
+            InitializeConditionVariable(cv);
+            assert_eq!(cv_slot, 0);
+            assert_eq!(SleepConditionVariableCS(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            let cs = Box::into_raw(Box::new(std::mem::zeroed::<CritSec>()));
+            assert_eq!(InitializeCriticalSection(cs), 1);
+            assert_eq!(SleepConditionVariableCS(cv, cs, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // A short timeout releases, lapses, and reacquires (still owned once).
+            EnterCriticalSection(cs);
+            assert_eq!(SleepConditionVariableCS(cv, cs, 20), 0);
+            assert_eq!(GetLastError(), ERROR_TIMEOUT);
+            LeaveCriticalSection(cs);
+            assert_eq!(TryEnterCriticalSection(cs), 1);
+            LeaveCriticalSection(cs);
+            // A waiter blocked in Sleep wakes on WakeAll and leaves owning nothing.
+            let cs_addr = cs as usize;
+            let cv_addr = cv as usize;
+            let woken = Arc::new(AtomicU32::new(0));
+            let h = std::thread::spawn({
+                let woken = woken.clone();
+                move || unsafe {
+                    let cs = cs_addr as *mut CritSec;
+                    let cv = cv_addr as *mut usize;
+                    EnterCriticalSection(cs);
+                    let r = SleepConditionVariableCS(cv, cs, 5000);
+                    if r == 1 {
+                        woken.fetch_add(1, Ordering::SeqCst);
+                    }
+                    LeaveCriticalSection(cs);
+                }
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            WakeAllConditionVariable(cv);
+            h.join().unwrap();
+            assert_eq!(woken.load(Ordering::SeqCst), 1);
+            assert_eq!(TryEnterCriticalSection(cs), 1);
+            LeaveCriticalSection(cs);
+            // WakeSingle wakes exactly one of two waiters; the other times out.
+            let mut cv2_slot = 0usize;
+            let cv2 = &mut cv2_slot as *mut usize;
+            InitializeConditionVariable(cv2);
+            let cv2_addr = cv2 as usize;
+            let r1 = Arc::new(AtomicU32::new(2));
+            let r2 = Arc::new(AtomicU32::new(2));
+            let waiter = |out: Arc<AtomicU32>| {
+                std::thread::spawn(move || unsafe {
+                    let cs = cs_addr as *mut CritSec;
+                    let cv = cv2_addr as *mut usize;
+                    EnterCriticalSection(cs);
+                    let r = SleepConditionVariableCS(cv, cs, 800);
+                    out.store(r as u32, Ordering::SeqCst);
+                    LeaveCriticalSection(cs);
+                })
+            };
+            let h1 = waiter(r1.clone());
+            let h2 = waiter(r2.clone());
+            std::thread::sleep(Duration::from_millis(150));
+            WakeConditionVariable(cv2);
+            h1.join().unwrap();
+            h2.join().unwrap();
+            let mut got = [r1.load(Ordering::SeqCst), r2.load(Ordering::SeqCst)];
+            got.sort_unstable();
+            assert_eq!(got, [0, 1]);
+            // Wakes with no waiters (and nulls) are lost silently.
+            WakeConditionVariable(cv2);
+            WakeAllConditionVariable(cv2);
+            WakeConditionVariable(std::ptr::null_mut());
+            WakeAllConditionVariable(std::ptr::null_mut());
+            assert_eq!(DeleteCriticalSection(cs), 1);
+            let _ = Box::from_raw(cs);
         }
     }
 
