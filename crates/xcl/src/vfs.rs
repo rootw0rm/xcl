@@ -488,7 +488,50 @@ impl Vfs {
         }
         let p = strip_verbatim(&p);
         if p.starts_with("\\\\") {
-            return Target::Pass; // UNC
+            // A UNC game root stays copy-on-write: UNC paths inside the game
+            // root or XCL's own folders classify through the VFS instead of
+            // passing straight to the host (upstream #1077). Linux host roots
+            // use `/` while UNC input uses `\`, and host normalization folds a
+            // leading `\\` to `/`, so fold both sides to one separator first;
+            // on Windows this is the same comparison (roots already use `\`).
+            let lc = p.to_lowercase();
+            let path = lc.trim_start_matches('\\');
+            let fold = |root: &str| root.replace('/', "\\");
+            let game = fold(&self.game_root_lc);
+            let game = game.trim_start_matches('\\');
+            let data = fold(&self.data_root_lc);
+            let data = data.trim_start_matches('\\');
+            let under = |root: &str| {
+                path == root
+                    || path
+                        .strip_prefix(root)
+                        .is_some_and(|r| r.starts_with('\\'))
+            };
+            let matches_own = self
+                .own_roots_lc
+                .iter()
+                .map(|r| fold(r))
+                .any(|r| under(r.trim_start_matches('\\')));
+            if !under(game) && !under(data) && !matches_own {
+                return Target::Pass; // UNC outside game and XCL folders
+            }
+            #[cfg(not(windows))]
+            {
+                // Linux rejects untranslated console paths below, but a UNC
+                // path naming a known root is already resolved, so finish it
+                // here: the game root returns `Game` (copy-on-write, as
+                // `classify_abs` yields on Windows), data/own folders `Pass`
+                // (what `classify_abs` yields there for untranslated paths).
+                // The remainder keeps the title's case; the length math
+                // assumes lowercasing preserves offsets, as `classify_abs` does.
+                if under(game) {
+                    let trimmed = p.trim_start_matches('\\');
+                    let rest = &trimmed[game.len()..];
+                    let rel = rest.strip_prefix('\\').unwrap_or(rest).to_string();
+                    return Target::Game { rel };
+                }
+                return Target::Pass;
+            }
         }
         #[cfg(windows)]
         let (p, translated) = match self.apply_mounts(&p) {
@@ -2018,5 +2061,30 @@ mod tests {
         let p = v.prepare_write("gonly\\n.txt", false).expect("game-only parent is visible");
         std::fs::write(&p, b"new").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"new");
+    }
+
+    #[test]
+    fn unc_game_root_protects_game_folder_from_writes() {
+        let game = Path::new(r"\\server\share\Game");
+        let data = Path::new(r"\\server\share\Data");
+        let v = Vfs::new(game, data, vec![]);
+        let full = |p: &str| Some(p.to_string());
+
+        assert_eq!(
+            v.classify_with(r"\\server\share\Game\save.dat", full),
+            Target::Game { rel: "save.dat".to_string() }
+        );
+        assert_eq!(
+            v.classify_with(r"\\server\share\Game", full),
+            Target::Game { rel: String::new() }
+        );
+        assert_eq!(
+            v.classify_with(r"\\server\share\Other\file.txt", full),
+            Target::Pass
+        );
+        assert_eq!(
+            v.classify_with(r"\\other_server\share\Game\save.dat", full),
+            Target::Pass
+        );
     }
 }
