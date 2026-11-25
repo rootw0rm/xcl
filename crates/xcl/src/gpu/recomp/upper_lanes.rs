@@ -494,7 +494,7 @@ fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
             (_, "OPR_SDST_M0") => out.push((124, 1)),
             (Some(f), ty) if !ty.starts_with("OPR_VGPR") && ty != "OPR_SRC_VGPR" => {
                 let v = rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f);
-                if v < 128 {
+                if v < 128 && v != 125 {
                     out.push((v, n));
                 }
             }
@@ -506,7 +506,14 @@ fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
         if let Some(e) = ext_encoding(d) {
             let x = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
             out.retain(|&(r, _)| r != 106);
-            out.push(if x("SD") == 1 { (x("SDST"), 2) } else { (106, 2) });
+            if x("SD") == 1 {
+                let dst = x("SDST");
+                if dst != 125 {
+                    out.push((dst, 2));
+                }
+            } else {
+                out.push((106, 2));
+            }
         }
     }
     out
@@ -536,7 +543,8 @@ pub(super) fn vgpr_writes(d: &Decoded) -> Vec<u64> {
             n = n.div_ceil(2);
         }
         n += (f("TFE") | f("LWE")) & 1;
-        w.truncate(n as usize);
+        let base = w[0];
+        w = (base..(base + n).min(256)).collect();
     }
     w
 }
@@ -612,7 +620,7 @@ fn step(d: &Decoded, st: &mut State) {
     let op = name.split('_').nth(1).unwrap_or("");
     let b64 = name.ends_with("_B64");
     if name.contains("SAVEEXEC") || name.contains("WREXEC") {
-        let s0 = st.src64(d, fv("SSRC0"));
+        let s0 = if b64 { st.src64(d, fv("SSRC0")) } else { (st.src32(d, fv("SSRC0")), Word::Zero) };
         let (el, eh) = (st.s[126], st.s[127]);
         let nl = bitop(op, s0.0, el).unwrap_or(Word::Any);
         let nh = bitop(op, s0.1, eh).unwrap_or(Word::Any);
@@ -621,8 +629,10 @@ fn step(d: &Decoded, st: &mut State) {
         if b64 {
             st.s[126] = nl;
             st.s[127] = nh;
-            st.set(dst, if wr { nl } else { el });
-            st.set(dst + 1, if wr { nh } else { eh });
+            if dst != 125 {
+                st.set(dst, if wr { nl } else { el });
+                st.set(dst + 1, if wr { nh } else { eh });
+            }
         } else {
             st.s[126] = nl;
             st.set(dst, if wr { nl } else { el });
@@ -643,7 +653,7 @@ fn step(d: &Decoded, st: &mut State) {
             "WQM" if d.enc.name == "ENC_SOP1" => Some(a(st)),
             "CMOV" if d.enc.name == "ENC_SOP1" => {
                 let x = a(st);
-                let o = (st.s[dst.min(127) as usize], st.s[(dst + 1).min(127) as usize]);
+                let o = if dst == 125 { (Word::Zero, Word::Zero) } else { (st.s[dst.min(127) as usize], st.s[(dst + 1).min(127) as usize]) };
                 Some((x.0.join(o.0), x.1.join(o.1)))
             }
             "CSELECT" => {
@@ -657,9 +667,11 @@ fn step(d: &Decoded, st: &mut State) {
             _ => None,
         };
         if let Some((lo, hi)) = r {
-            st.set(dst, lo);
-            if b64 {
-                st.set(dst + 1, hi);
+            if dst != 125 {
+                st.set(dst, lo);
+                if b64 {
+                    st.set(dst + 1, hi);
+                }
             }
             return;
         }
@@ -978,5 +990,107 @@ mod tests {
         // both paths the same constant (or nothing): the constant
         let r = reads(&[("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 4)], None), WWM, MASK, SEED, RESTORE, READ32]);
         assert_eq!(r, vec![Read::Const(u32::MAX)]);
+    }
+
+    #[test]
+    fn null_dst_multi_dword_writes_preserve_exec() {
+        const MOV_EXEC_LO: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 126)], None);
+        // S_OR_SAVEEXEC_B64 null, -1 must not clobber EXEC_LO (s126) with saved EXEC_HI (0)
+        assert_eq!(
+            reads(&[("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 125), ("SSRC0", 193)], None), MOV_EXEC_LO, READ32]),
+            vec![Read::Const(u32::MAX)],
+            "S_OR_SAVEEXEC_B64 null"
+        );
+        // 64-bit SOP1 writes to null must not clobber EXEC_LO
+        assert_eq!(
+            reads(&[WWM, ("S_MOV_B64", "ENC_SOP1", &[("SDST", 125), ("SSRC0", 128)], None), MOV_EXEC_LO, RESTORE, READ32]),
+            vec![Read::Const(u32::MAX)],
+            "S_MOV_B64 null"
+        );
+        assert_eq!(
+            reads(&[WWM, ("S_CMOV_B64", "ENC_SOP1", &[("SDST", 125), ("SSRC0", 128)], None), MOV_EXEC_LO, RESTORE, READ32]),
+            vec![Read::Const(u32::MAX)],
+            "S_CMOV_B64 null"
+        );
+        // VOP3 and SDWA V_CMP to null must not clobber EXEC_LO
+        assert_eq!(
+            reads(&[WWM, ("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 125), ("SRC0", V), ("SRC1", V + 1)], None), MOV_EXEC_LO, RESTORE, READ32]),
+            vec![Read::Const(u32::MAX)],
+            "VOP3 V_CMP null"
+        );
+        assert_eq!(
+            reads(&[
+                WWM,
+                ("V_CMP_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 1), ("VSRC1", 2), ("SD", 1), ("SDST", 125), ("SRC0_SEL", 6), ("SRC1_SEL", 6)], None),
+                MOV_EXEC_LO,
+                RESTORE,
+                READ32,
+            ]),
+            vec![Read::Const(u32::MAX)],
+            "SDWA V_CMP null"
+        );
+        // S_LOAD_DWORDX4 null must not clobber EXEC_HI (s127) from Zero to Any
+        assert_eq!(
+            reads(&[
+                ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 125), ("SBASE", 0), ("SOFFSET", 125)], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 20)], None),
+                READ32,
+            ]),
+            vec![Read::Native],
+            "S_LOAD_DWORDX4 null"
+        );
+    }
+
+    #[test]
+    fn saveexec_b32_reads_32bit_special_sources() {
+        // S_AND_SAVEEXEC_B32 with exec_hi (0 at entry) clears exec_lo
+        assert_eq!(
+            reads(&[
+                ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 127)], None),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 126)], None),
+                WWM,
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 2)], None),
+                RESTORE,
+                READ32,
+            ]),
+            vec![Read::Const(0)],
+            "S_AND_SAVEEXEC_B32 exec_hi"
+        );
+        // S_OR_SAVEEXEC_B32 with m0 (-1) sets exec_lo to all ones
+        assert_eq!(
+            reads(&[
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 193)], None),
+                ("S_OR_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 124)], None),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 126)], None),
+                WWM,
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 2)], None),
+                RESTORE,
+                READ32,
+            ]),
+            vec![Read::Const(u32::MAX)],
+            "S_OR_SAVEEXEC_B32 m0"
+        );
+    }
+
+    #[test]
+    fn mimg_tfe_and_lwe_write_fifth_vgpr() {
+        let img_sample_tfe: I = ("IMAGE_SAMPLE", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SSAMP", 0), ("DMASK", 0xF), ("TFE", 1)], None);
+        let img_sample_lwe: I = ("IMAGE_SAMPLE", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SSAMP", 0), ("DMASK", 0xF), ("LWE", 1)], None);
+        let img_load_lwe: I = ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("DMASK", 0xF), ("LWE", 1)], None);
+        let img_gather_tfe: I = ("IMAGE_GATHER4", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SSAMP", 0), ("DMASK", 0x1), ("TFE", 1)], None);
+        let img_d16_tfe: I = ("IMAGE_SAMPLE", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SSAMP", 0), ("DMASK", 0xF), ("D16", 1), ("TFE", 1)], None);
+        let img_hi_clamp: I = ("IMAGE_SAMPLE", "ENC_MIMG", &[("VDATA", 253), ("VADDR", 0), ("SRSRC", 0), ("SSAMP", 0), ("DMASK", 0xF), ("TFE", 1)], None);
+
+        let p = program(&[img_sample_tfe, img_load_lwe, img_gather_tfe, img_d16_tfe, img_hi_clamp]);
+        assert_eq!(vgpr_writes(&p[0]), vec![4, 5, 6, 7, 8], "IMAGE_SAMPLE dmask:0xf tfe:1");
+        assert_eq!(vgpr_writes(&p[1]), vec![4, 5, 6, 7, 8], "IMAGE_LOAD dmask:0xf lwe:1");
+        assert_eq!(vgpr_writes(&p[2]), vec![4, 5, 6, 7, 8], "IMAGE_GATHER4 tfe:1");
+        assert_eq!(vgpr_writes(&p[3]), vec![4, 5, 6], "IMAGE_SAMPLE dmask:0xf d16:1 tfe:1");
+        assert_eq!(vgpr_writes(&p[4]), vec![253, 254, 255], "v253.. clamped to 255");
+
+        const SEED_V8: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 193)], None);
+        const READ_V8: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 8), ("SRC1", 128 + 32)], None);
+        assert_eq!(reads(&[WWM, SEED_V8, img_sample_tfe, RESTORE, READ_V8]), vec![Read::Unknown], "TFE overwrites v8");
+        assert_eq!(reads(&[WWM, SEED_V8, img_sample_lwe, RESTORE, READ_V8]), vec![Read::Unknown], "LWE overwrites v8");
     }
 }
