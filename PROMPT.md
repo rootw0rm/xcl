@@ -9,28 +9,29 @@ full work plan.
 
 ## Status snapshot (2026-11-24 — refresh this when a phase flips)
 
-- `linux` @ `0f6c9e7` (merge of upstream `main` @ `fb32c87`, plus Linux
+- `linux` @ `b799e14` (merge of upstream `main` @ `cbc296a`, plus Linux
   fixes; pushed to `origin/linux`).
   Verify with `git log --oneline -3; git status -sb`.
-  Upstream brought heap-windows-16 (UE-style 16-window heap tiers,
-  `TRANSLATOR_VERSION` bump in caches), detile 3D packed mip tails, texture
-  upload staging memory, BVH triangle types, whole-wave per-lane
-  predicates, DXIL CSE/view-id fixes, frexp/exp denorm + setreg-mode fixes.
-  Linux fixes in the merge: `miniz_oxide` simd taken, `retour` stays
-  Windows-only; new `recomp::cfg` module included (pure logic); Linux keeps
-  the shared `hle_routes::ROUTES` table (already had upstream's new routes);
-  `Pipelines` struct keeps its Linux `cfg(windows)` gate + upstream docs;
-  `gpu::uma` gets a 2-constant Linux shim (full heap port is Phase D);
-  5 more GPU/validator test modules gated `cfg(all(test, windows))`.
+  Upstream brought the direct-compact shader path, null-device struct
+  returns, `-O0`-without-debug-nops, huge-compile verdict logging, GS
+  preservation on stale PSO blobs, per-lane WQM/LDS tests, disasm e2e
+  suite, sparse-VRAM tests, d3d12 resource+sync contract tests.
+  Linux fixes in the merge (2 commits): `compact_tests` + `pops_rov_tests`
+  + `heap_bounds_tests` + `cmp64_tests` + 3 `lower_dxil.rs` GPU tests gated
+  `cfg(all(test, windows))`; `used_compute`/new `precompile`/`--used-only`
+  test gated (they need `d3d12x::real`); Linux `precompile` stub + the
+  `--used-only` call site take `None` on Linux; new
+  `d3d12_resource_and_sync` e2e gets the file-top `#![cfg(windows)]`.
   Previous syncs' notes still hold.
-  A ralph loop is actively working the tree (uncommitted WIP) — do not
-  touch its files or stash the workdir.
+  A ralph loop is actively working the tree (glsl/spirv/vulkan_graphics WIP,
+  uncommitted and currently not compiling) — do not touch its files or
+  stash the workdir; merge verification happens in an isolated worktree.
   NOTE: this machine has **no game files** — `/run/media/...` does not
   exist here. Retail-dependent steps are SKIPPED on this host (see §4.7);
   never block the loop on them.
 - **Phase A done.** `cargo check -p xcl --tests` and `cargo check --workspace`
   are green (0 errors) on `x86_64-unknown-linux-gnu`; `cargo test -p xcl --lib`
-  passes (464 passed, 0 failed, 1 ignored; re-verified after the `fb32c87` sync).
+  passes (483 passed, 0 failed, 1 ignored; re-verified after the `cbc296a` sync).
   `target/debug/xcl` builds.
 - **Phase B done** (where game files exist). Offline tools run on the real
   paths, e.g. `xcl inspect .../game_scarlett_master.exe` reports 587 imports /
