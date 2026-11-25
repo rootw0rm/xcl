@@ -120,12 +120,9 @@ unsafe fn stack_region_end(addr: u64) -> Option<u64> {
             if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
                 if let Some(e) = mapping_end_containing(&tail[..tail_len], &chunk[..nl], addr) {
                     end = Some(e);
-                    tail_len = 0;
                     if end.is_some() {
                         break;
                     }
-                } else {
-                    tail_len = 0;
                 }
                 start = nl + 1;
             } else {
@@ -651,8 +648,183 @@ fn fault_pc(_context: *mut std::ffi::c_void) -> usize {
     0
 }
 
+/// `(start, end, perms, file-backed)` of the maps line `line` when its range contains
+/// `addr` (`None` otherwise). Lines look like `start-end perms offset dev inode
+/// [pathname]`: only the head is parsed, so overlong lines still parse. A pathname that
+/// is not bracketed (`[stack]`, `[vdso]`) means file-backed.
+fn parse_maps_line(line: &[u8], addr: u64) -> Option<(u64, u64, [u8; 4], bool)> {
+    fn hex(line: &[u8], mut i: usize) -> (u64, usize) {
+        let mut v = 0u64;
+        while i < line.len() {
+            let d = match line[i] {
+                b'0'..=b'9' => (line[i] - b'0') as u64,
+                b'a'..=b'f' => (line[i] - b'a' + 10) as u64,
+                b'A'..=b'F' => (line[i] - b'A' + 10) as u64,
+                _ => break,
+            };
+            v = v.wrapping_shl(4) | d;
+            i += 1;
+        }
+        (v, i)
+    }
+    let (start, i) = hex(line, 0);
+    if i == 0 || line.get(i) != Some(&b'-') {
+        return None;
+    }
+    let (end, mut i) = hex(line, i + 1);
+    if line.get(i) != Some(&b' ') {
+        return None;
+    }
+    i += 1;
+    if line.len() < i + 4 {
+        return None;
+    }
+    let perms = [line[i], line[i + 1], line[i + 2], line[i + 3]];
+    if perms.iter().any(|&c| !matches!(c, b'r' | b'w' | b'x' | b'p' | b's' | b'-')) {
+        return None;
+    }
+    i += 4;
+    // skip `offset dev inode`; whatever names the mapping follows them
+    for _ in 0..3 {
+        if line.get(i) != Some(&b' ') {
+            return None;
+        }
+        i += 1;
+        let f = i;
+        while i < line.len() && line[i] != b' ' {
+            i += 1;
+        }
+        if i == f {
+            return None;
+        }
+    }
+    while i < line.len() && line[i] == b' ' {
+        i += 1;
+    }
+    let file_backed = i < line.len() && line[i] != b'[';
+    (start <= addr && addr < end).then_some((start, end, perms, file_backed))
+}
+
+/// `(start, end, perms, file-backed)` of the `/proc/self/maps` line containing `addr`
+/// (`None`: unmapped or unreadable). Same syscall-only, no-lock discipline as
+/// `stack_region_end`: `open`/`read`/`close` on stack buffers, no heap, no lock.
+fn maps_region_for(addr: u64) -> Option<(u64, u64, [u8; 4], bool)> {
+    const PATH: &[u8] = b"/proc/self/maps\0";
+    let fd = unsafe { libc::open(PATH.as_ptr() as *const libc::c_char, libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 8192];
+    let mut tail = [0u8; 256];
+    let mut tail_len = 0usize;
+    let mut line = [0u8; 512];
+    let mut found = None;
+    unsafe {
+        loop {
+            let r = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+            if r <= 0 {
+                break;
+            }
+            let chunk = &buf[..r as usize];
+            // first line may continue the previous chunk's tail
+            let mut start = 0usize;
+            if tail_len > 0 {
+                if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+                    // the range and perms this needs sit at the head: the join is capped
+                    // at `line`, a pathname past that only decides file-backed
+                    let n = (tail_len + nl).min(line.len());
+                    line[..tail_len].copy_from_slice(&tail[..tail_len]);
+                    line[tail_len..n].copy_from_slice(&chunk[..n - tail_len]);
+                    if let Some(f) = parse_maps_line(&line[..n], addr) {
+                        found = Some(f);
+                        break;
+                    }
+                    start = nl + 1;
+                } else {
+                    // still no newline: keep the tail bounded, skip this chunk's head
+                    let keep = chunk.len().min(tail.len() - tail_len);
+                    tail[tail_len..tail_len + keep].copy_from_slice(&chunk[..keep]);
+                    tail_len += keep;
+                    continue;
+                }
+            }
+            let mut line_start = start;
+            for (i, &b) in chunk.iter().enumerate().skip(start) {
+                if b == b'\n' {
+                    if let Some(f) = parse_maps_line(&chunk[line_start..i], addr) {
+                        found = Some(f);
+                        break;
+                    }
+                    line_start = i + 1;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            // stash the incomplete last line (bounded: the range and perms this needs
+            // sit at the head, parsed before any pathname can overflow them)
+            let rest = &chunk[line_start..];
+            if rest.is_empty() {
+                tail_len = 0;
+            } else if rest.len() <= tail.len() {
+                tail[..rest.len()].copy_from_slice(rest);
+                tail_len = rest.len();
+            } else {
+                if let Some(f) = parse_maps_line(rest, addr) {
+                    found = Some(f);
+                    break;
+                }
+                tail_len = 0;
+            }
+            if (r as usize) < buf.len() {
+                break;
+            }
+        }
+        libc::close(fd);
+    }
+    found
+}
+
+/// The Linux memory state at `va` for a crash report: what `/proc/self/maps` says about
+/// it – the analogue of upstream #1186's `VirtualQuery` `{state}, {protect}, {type}
+/// region` line. A maps line means the address is reserved; `---` perms mean it was
+/// never committed (`reserve, no access`), anything else is committed (`commit` with
+/// the line's protection). No line means it is unmapped (Windows `free`). There is no
+/// `PAGE_GUARD` on Linux, so no guard suffix. Maps is read with `open`/`read`/`close`
+/// only (same syscall-only, no-lock discipline as `copy_stack`); the `String` itself is
+/// built in the watchdog thread, after the fault, never in the signal handler.
+/// UMA bookkeeping (`Uma::describe` in `gpu/uma.rs`, appended upstream) has no Linux
+/// twin yet (`gpu::uma` is constants-only on Linux): when UMA lands, append its
+/// `describe` here exactly as upstream does.
+fn describe_fault(va: usize) -> String {
+    match maps_region_for(va as u64) {
+        None => "unmapped".to_string(),
+        Some((start, end, perms, file_backed)) => {
+            let state = if perms[..3] == [b'-', b'-', b'-'] { "reserve" } else { "commit" };
+            let protect = match (perms[0], perms[1], perms[2]) {
+                (b'-', b'-', b'-') => "no access",
+                (b'r', b'-', b'-') => "read only",
+                (b'r', b'w', b'-') => "read write",
+                (b'-', b'-', b'x') => "execute",
+                (b'r', b'-', b'x') => "execute read",
+                (b'r', b'w', b'x') => "execute read write",
+                _ => "?",
+            };
+            let ty = if file_backed {
+                "mapped"
+            } else if perms[3] == b's' {
+                "shared"
+            } else {
+                "private"
+            };
+            format!("{state}, {protect}, {ty} region {start:#x}+{:#x}", end - start)
+        }
+    }
+}
+
 /// Crash description from synthetic or observed signal data: signal name and number,
-/// faulting PC with its nearest module+offset, and the fault address. When the fault
+/// faulting PC with its nearest module+offset, and the fault address with its memory
+/// state. When the fault
 /// is a `SIGSEGV` at address 0 through the title's own `mov dword ptr [0], imm32`
 /// exit instruction, the line names the deliberate crash and its tag. Reads guest
 /// code through the lock-free module ranges only (never blocks the crash watchdog),
@@ -671,6 +843,11 @@ pub fn format_crash(signal: libc::c_int, pc: usize, address: usize) -> String {
         if let Some(tag) = deliberate_tag_at_pc(pc) {
             crash += &format!(" – the title's own deliberate crash: mov dword ptr [0], {tag:#x}");
         }
+    }
+    // What the faulting address was: a raw reservation, a committed page, or nothing
+    // (port of upstream #1186's `describe_fault` state names; Linux reads maps itself).
+    if signal == libc::SIGSEGV {
+        crash += &format!(": {}", describe_fault(address));
     }
     crash
 }
@@ -1083,6 +1260,34 @@ mod tests {
         let dumped = AtomicBool::new(false);
         assert!(claim_crash_dump(&dumped), "first crash dumps threads");
         assert!(!claim_crash_dump(&dumped), "second crash does not dump again");
+    }
+
+    /// The crash report tells a raw reservation from a committed page (`describe_fault`,
+    /// the Linux port of upstream #1186's `VirtualQuery` state names: `mmap(PROT_NONE)`
+    /// is the reserve analogue, `mprotect(RW)` the commit, `munmap` the unmapped case).
+    #[test]
+    fn describe_fault_names_the_memory_state() {
+        unsafe {
+            const LEN: usize = 0x2000;
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED);
+            let base = p as usize;
+            let reserved = describe_fault(base + 0x100);
+            assert!(reserved.contains("reserve") && reserved.contains("no access"), "{reserved}");
+            assert_eq!(libc::mprotect(p, 0x1000, libc::PROT_READ | libc::PROT_WRITE), 0);
+            let committed = describe_fault(base + 0x100);
+            assert!(committed.contains("commit") && committed.contains("read write"), "{committed}");
+            assert_eq!(libc::munmap(p, LEN), 0);
+            let gone = describe_fault(base + 0x100);
+            assert!(gone.contains("unmapped"), "{gone}");
+        }
     }
 
     #[test]

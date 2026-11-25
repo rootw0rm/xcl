@@ -479,6 +479,29 @@ impl Uma {
         self.sparse_free.lock().unwrap().1.values().sum()
     }
 
+    /// What the unified memory bookkeeping says about `p`, for a crash report: its window, and
+    /// in a sparse window the allocation or the free reservation holding it. `try_lock`s: the
+    /// faulting thread may be the one holding a lock when the report is written.
+    pub fn describe(&self, p: usize) -> Option<String> {
+        let k = self.window_of(p)?;
+        let kind = match self.kinds[k] {
+            WindowKind::Sparse => "sparse",
+            WindowKind::Committed(n) => return Some(format!("a committed window ({k}, {} MB)", n >> 20)),
+            WindowKind::None => return Some(format!("window {k} outside this UMA")),
+        };
+        let mut g = match self.sparse_free.try_lock() {
+            Ok(g) => g,
+            Err(_) => return Some(format!("a {kind} window ({k}); sparse bookkeeping locked")),
+        };
+        let at = |m: &BTreeMap<usize, usize>| m.range(..=p).next_back().filter(|&(&a, &l)| p < a.saturating_add(l)).map(|(&a, &l)| (a, l));
+        let held = match (at(&g.1), at(&g.0)) {
+            (Some((a, l)), _) => format!("allocation {a:#x}+{l:#x}"),
+            (None, Some((a, l))) => format!("free reservation {a:#x}+{l:#x}"),
+            (None, None) => "no sparse range".into(),
+        };
+        Some(format!("a {kind} window ({k}), {held}"))
+    }
+
     /// `windows` committed windows of `size` bytes each.
     pub fn with_windows(windows: usize, size: usize) -> Option<Uma> {
         let size = ((size + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);

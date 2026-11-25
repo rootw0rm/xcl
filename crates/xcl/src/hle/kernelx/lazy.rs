@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Once, RwLock};
 
 use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
@@ -54,6 +55,31 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
         EXCEPTION_CONTINUE_EXECUTION
     } else {
+        // a fault nobody claims ends the process: say which page was wanted, and whether the
+        // marks that should hold it were keyed off the 64 KiB boundary (`mark` logs those)
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
+            let near = g
+                .range(page.saturating_sub(PAGE)..page + 2 * PAGE)
+                .copied()
+                .take(4)
+                .map(|p| format!("{p:#x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            drop(g);
+            let op = match r.ExceptionInformation[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "?",
+            };
+            crate::xlog_warn!(
+                "lazy: unclaimed {op} at {:#x}: page {page:#x} not marked (marked nearby: [{}])",
+                r.ExceptionInformation[1],
+                near
+            );
+        }
         EXCEPTION_CONTINUE_SEARCH
     }
 }
@@ -73,8 +99,21 @@ unsafe fn allows(access: usize, at: usize) -> bool {
 }
 
 /// `page` (reserved, 64 KiB aligned) is mapped: committed on first use.
+#[track_caller]
 pub(crate) fn mark(page: usize) {
     install();
+    if page & (PAGE - 1) != 0 {
+        // the fault handler keys the fault's own 64 KiB page: this mark can never be claimed
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let at = std::panic::Location::caller();
+            crate::xlog_warn!(
+                "lazy: marking {page:#x}, not {PAGE:#x} aligned (from {}:{}): a fault in it will not be claimed",
+                at.file(),
+                at.line()
+            );
+        }
+    }
     LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(page);
 }
 
