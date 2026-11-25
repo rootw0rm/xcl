@@ -82,7 +82,7 @@ pub mod ssa;
 mod tests;
 #[cfg(all(test, windows))]
 mod heap_window_tests;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod link_tests;
 
 /// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
