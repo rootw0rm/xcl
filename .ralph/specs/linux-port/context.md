@@ -291,3 +291,28 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
   Full step-17 present (`winit` + swapchain + window + D3D12.X routing) stays
   provisional after 17b; steps 17-21 stay chained behind SKIPPED step-12; Phase E/F
   remain blocked per PROMPT 4.7.
+
+## Current state (planner revise, 2026-11-25, `linux` @ `dc683bf`)
+
+- Steps 1-11 closed (11a-11s HLE slices, CRT forwarding + follow-ups, report parity);
+  12a-12g closed with review; 13 (`linux:glsl-backend`, `6c09624`), 14
+  (`linux:spirv-inproc`, `d64f32c`), 15 (`linux:vulkan-runner`, `a157022`), 16
+  (`linux:subgroup-width`, `baf36be`), 17a (`linux:vulkan-backend`, `f0bc0d8`),
+  and 17b (`linux:vulkan-graphics-headless`, `10d6bdf`) closed with review
+  (477 lib tests, title reaches `ExitProcess(0xc)` with 12 known null-device
+  failures; 17b review re-verified 5 graphics + 8 selector + 5 runner tests green,
+  real Arc A770 blit draw split-32, `spirv-val 2026.4` gate, shipped path spawns
+  nothing, no new deps).
+- No game files on this host: step-12 retail-smoke is SKIPPED here (`/run/media/anon`
+  absent); the synthetic title is the e2e target. Fresh triage here
+  (`gpu::recomp::vulkan_graphics` → 5 passed, `hle::vulkan_linux` → 8 passed, no
+  skip; `vulkaninfo` still Arc A770 / RTX 3090 Ti / Raphael): the offscreen blit
+  path is proven but the title's `render_triangle` primitive (`SV_VertexID`
+  `(-0.5,-0.5)/(0,0.5)/(0.5,-0.5)` + constant green, center-green/corner-blue) has
+  never run on a GPU — 17b used a vertex-buffer fetch passthrough by design.
+- Next slice is plan.md step 17c (`linux:vulkan-triangle-vertexid`, DEC-026):
+  headless offscreen `VertexIndex` triangle + constant-green FS with the title's
+  pixel asserts, same SKIPPED pattern, no routing/window/swapchain change; folds
+  the 17b fmt/teardown follow-ups where touched. One commit, synthetic
+  verification. Full step-17 present stays provisional after 17c; steps 17-21 stay
+  chained behind SKIPPED step-12; Phase E/F remain blocked per PROMPT 4.7.
