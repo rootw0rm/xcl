@@ -237,9 +237,9 @@ Windows behavior unchanged.
   import-free synthetic PE must run through TLS attach/callbacks/entry/detach before HLE.
   Runtime unresolved imports use executable stub thunks; metadata address `0` is only a
   classification marker. Step 11 now depends on 10e. Later steps remain provisional.
-- Planner refresh (2026-11-24, `linux` @ `f3bee90`): steps 1–11 are closed (11a–11s slices +
+- Planner refresh (2026-11-24, `linux` @ `f3bee90`): steps 1–11 are closed (11a–11s HLE slices +
   CRT forwarding `dd7a3a7` and follow-ups `c4187df`/`b96aa6e`/`cf92746`, report parity
-  `b45ca53`, clippy fix `ed0fd32`); `cargo test -p xcl --lib` is 369 passed / 0 failed.
+  `b45ca53`, clippy `ed0fd32`); `cargo test -p xcl --lib` is 369 passed / 0 failed.
   Queue holds 11 open tasks. Step 12 (retail smoke) is SKIPPED on hosts without
   `/run/media/...` game files — never stall on it. The next behavior slice is **step 12a**
   (`linux:crt-copy`, the only unblocked task): the next §4.7a CRT family
@@ -248,12 +248,62 @@ Windows behavior unchanged.
   Further CRT families follow one-per-commit after triage; Phase D stays blocked until the
   synthetic title runs to `ExitProcess` on Linux. Installed targets now include
   `x86_64-pc-windows-gnu` and `-gnullvm`, so the Builder can cross-build the title e2e here.
+- Planner revise (2026-11-25, `linux` @ `24d6820`, no game files on host): steps 12a
+  (`linux:crt-copy`, `38f95fd`), 12b (`linux:crt-search-dup`, `761c59a`), and 12c
+  (`linux:crt-convert-onexit`, `24d6820`) are closed with independent review (373 lib
+  tests, title reaches `ExitProcess` with only known null-device failures). The 12c
+  review's `llvm-readobj` audit confirms the only remaining MISS UCRT import in both
+  synthetic binaries is `__stdio_common_vfprintf`; new step 12d
+  (`linux:crt-vfprintf`) is the unblocked next task (win64 `va_list` format-string
+  engine writing into `CrtFile`; `%n` never honored). Steps 13–21 stay chained behind
+  SKIPPED step-12; Phase D/E/F remain blocked per §4.7.
 
 ## Phase C frontier — next CRT family
 
-12a. **CRT copy/concat** — `linux:crt-copy`.
+12a. **CRT copy/concat** — `linux:crt-copy` — LANDED (`38f95fd`).
     Outcome: NUL-safe win64 `strcpy`/`strncpy`/`strcat`/`wcs*`/`wmemcpy`/`wmemmove` exports in
     `hle/crt_linux.rs`, wired through exports + the HLE spot list, with resolver `Hle(ucrtbase)`
     checks via bundled-DLL routes and string contracts, plus a `crt` unit test.
     Acceptance: focused `crt` tests, full `cargo test -p xcl --lib` counts, workspace check,
-    and the cross-built synthetic title still reports `done, failures: 0` (no retail needed).
+    and the cross-built synthetic title still reaches `ExitProcess` with the known
+    null-device comparator (14–16 failures on Linux, not `failures: 0` — the Windows
+    `e2e.rs` expects 0 with a real GPU; see the step-12a/12b review notes).
+
+12b. **CRT search/duplication** — `linux:crt-search-dup` — LANDED (`761c59a`).
+    Outcome: NUL-safe win64 `strstr`/`strrchr`/`strdup`+`_strdup`/`wcschr`/`wcsstr`/`_wcsdup`+
+    `wcsdup` with empty-needle-returns-haystack, NUL-terminator find, miss-NULL, and owned
+    heap dup via CRT `malloc`, wired through exports + HLE spot list + `api-ms-win-crt-string`
+    contract and bundled-DLL resolver checks + unit test (372 lib tests green, title reaches
+    `ExitProcess`).
+
+12c. **CRT convert/onexit** — `linux:crt-convert-onexit` — LANDED (`24d6820`).
+    Outcome: win64 `mbrtowc`/`wcrtomb` (restartable multibyte/wide conversion, ASCII fast
+    path + UTF-8, `(size_t)-1` on bad sequence / `-2` on incomplete, NUL `s` handling) and
+    `_execute_onexit_table` (no-op success consistent with the existing
+    `_register_onexit_function`/`_initialize_onexit_table` successes) in `hle/crt_linux.rs`,
+    wired through exports + the HLE spot list, with resolver `Hle(ucrtbase)` checks via
+    `api-ms-win-crt-convert` + runtime contracts and bundled-DLL routes, plus a `crt` unit
+    test (373 lib tests green, title reaches `ExitProcess` with the known null-device
+    failures; `wcsdup` 12b follow-up also landed in both resolver lists).
+    Acceptance (met): focused `crt` tests, full `cargo test -p xcl --lib` counts,
+    workspace check, and the cross-built synthetic title still reaches `ExitProcess`
+    with the 14–16 known null-device failures (no retail needed). One commit, no refactors.
+
+12d. **CRT stdio vfprintf** — `linux:crt-vfprintf` (next, ready).
+    Outcome: win64 `__stdio_common_vfprintf(options, stream, format, locale, arglist)`
+    in `hle/crt_linux.rs` — a small format-string engine over the win64 `va_list`
+    (`char*` to 8-byte stack slots) writing into `CrtFile` via the existing
+    `fwrite`/flush path. Verbs: `%s`/`%c`/`%d`/`%i`/`%u`/`%x`/`%X`/`%o`/`%p`/`%%`
+    with width/precision/`*` and `ll`/`l`/`h`/`z` lengths, plus float `%f`/`%e`/`%g`/`%a`
+    reading `double` slots (covers the observed title verbs `%s`, `%g`, `%p`, `%llx`);
+    `options`/`locale` documented and otherwise ignored. `%n` is never honored (no
+    guest-pointer write). NULL stream/format is an error return, never a crash.
+    Wired through exports + the HLE spot list, with resolver `Hle(ucrtbase)` checks via
+    the `api-ms-win-crt-stdio` contract and bundled-DLL routes, plus a `crt` unit test
+    with crafted slot arrays (int/string/pointer/double verbs, width/precision, `%%`,
+    truncated format, `%n` no-write, NULL args).
+    Acceptance: focused `crt` tests, full `cargo test -p xcl --lib` counts, workspace
+    check, and the cross-built synthetic title still reaches `ExitProcess` with the
+    14–16 known null-device failures (no retail needed). One commit, no refactors.
+    This closes the last MISS UCRT import in both synthetic binaries per the 12c
+    `llvm-readobj` audit.

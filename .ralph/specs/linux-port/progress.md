@@ -815,3 +815,23 @@ Requirements: met — win64 `mbrtowc`/`wcrtomb` (ASCII fast path + strict UTF-8 
 ## Follow-ups (minor, non-blocking)
 - `mbrtowc` ignores `ps` and stores only the lead surrogate for astral input (no trail-half state); correct for the single-`wchar_t` destination and the stateless title path, but a restartable stream over astral text would need `ps` stashing. Revisit only if a caller shows it.
 - `mbrtowc` takes `ps` as `*mut u8` while `wcrtomb` takes `*mut u32` for the same `mbstate_t`; harmless (both treat it opaquely) but worth unifying next time the file is touched.
+
+## Planner revise — vfprintf triage (2026-11-25, `linux` @ `fdeb6d0`)
+
+Event `plan.revise`: `linux:crt-convert-onexit` passed review and closed (373 lib tests, title
+reaches `ExitProcess(0xe)` with only known null-device failures). Queue: 1 in_progress
+(step-12 retail-smoke, SKIPPED here — `/run/media/...` absent) + 9 open (steps 13–21 chained
+behind step-12); `task ready` is empty, so the next behavior slice needs a new unblocked task.
+
+Triage (evidence, not speculation): the 12c review's `llvm-readobj --coff-imports` audit on the
+cross-built `target/debug/xcl_testtitle.exe` (187 imports) vs `crt_linux.rs` exports leaves exactly
+1 MISS UCRT import: `api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vfprintf` (both binaries;
+`mbrtowc`/`wcrtomb` now resolve after 12c — the stale prebuilt exe still lists them, but the
+source export exists). It arrives via mingw/Rust `format!` paths (observed verbs in the binary:
+`%s`, `%g`, `%p`, `%llx`, `%%`), so the slice is a small win64 `va_list` (`char*` stack slots)
+format engine writing into `CrtFile`, with `%n` never honored.
+
+New task `linux:crt-vfprintf` (`task-1795565262-e15d`, plan.md step 12d) is the unblocked next
+task. Docs updated in the same pass: plan.md 12c marked LANDED + new 12d section; context.md
+current-state refresh. Steps 13–21 stay chained behind SKIPPED step-12; Phase D/E/F remain blocked
+per PROMPT §4.7. No code changes in this planner pass.
