@@ -291,6 +291,31 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
+  - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
+    `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
+    is not a whole number is ignored.
+  - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
+    line with what the title did in that time (presents, submits, draws, dispatches, frame-event
+    waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
+    memory in use. Where the lines stop changing is where the title stopped.
+  - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
+    thread of the title goes into `xcl.log`, for a title that stalls.
+  - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
+    (read, write or execute, the address, some registers and the callers on the stack), before the
+    title's own handlers see them – for a title whose crash filter ends the process without a trace.
+  - `XCL_TRACE_MEM=1` (any value turns it on): the title's memory allocations of 64 KiB or more
+    are logged, the first 60 (`XCL_TRACE_MEM=n` with `n > 1`: the first `n`). The same variable
+    also logs XCL's own allocations of 1 MB or more in the title's committed memory window, and
+    the ones that fail.
+  - `XCL_TRACE_IMPORTS`: logs the arguments and the result of every call of the imports it names.
+    A comma-separated list: `1` or `hle` for every function XCL implements (also what a list with
+    no word to add means), `all` for the system's functions too (short runs only), any other word
+    is the start of a `dll!Function` name to add, and `-word` one to leave out; the name is the
+    DLL's file name with its extension and case does not matter, so for example
+    `hle,-kernelx.dll!GetTickCount,gameinput`.
+  - `XCL_D3D12_TRACE=1` (any value): every call console code makes to a public D3D12.X method is
+    logged with the interface and method name. Very verbose: use it for a short run.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
