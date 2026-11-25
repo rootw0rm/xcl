@@ -82,6 +82,33 @@ first (short contract); this file is the work plan. Details live in
 5. Evidence before claims: run what you say you ran, report exact
    command + passed/failed/ignored/skipped. `SKIPPED <test>: <reason>`
    is not coverage. If it wasn't built/tested, say so.
+6. No laziness, no shortcuts, no deferrals — this is the rule that
+   governs all the others:
+   - Port the WHOLE fix. If an entry lists 3 hunks, all 3 land or the
+     report states exactly which didn't and why (with a file:line for
+     where the gap is). "Left out" without a reason is a failed
+     iteration. No `TODO` without an owner and a trigger condition.
+   - Never fake-success past a check to clear a crash. A stub that
+     returns "ok" must BE ok (real semantics, real tests) or stay an
+     honest logging stub the next iteration can see. Clearing a trap by
+     silencing the check that caught it is sabotage — it will be
+     reverted on sight.
+   - Failing-first: new tests must be shown failing before the fix
+     (or grafted onto pre-fix code) wherever feasible. A test that
+     never failed proves nothing.
+   - Full gates every time, no "will verify later": `cargo check -p
+     xcl --tests` + `cargo check --workspace` + `cargo test -p xcl
+     --lib` with exact counts, plus title e2e and a retail run
+     whenever the change touches boot, HLE, loader, or GPU paths.
+     An iteration that skips its gates is not done.
+   - No excuses, only adaptations: game files absent → SKIPPED that
+     session + full synthetic/unit program, never a stall. No Vulkan
+     device → `skip_test` + note + keep building what doesn't need
+     the device. Rate-limited → back off, sleep, continue from bodies.
+     Upstream force-pushed → port the new head. Blocked on a decision
+     → M5 backlog, never an idle iteration. The loop ends with landed
+     behavior or a handoff that names the exact next step — "couldn't"
+     without a what-next is not a report.
 
 ## 1. The launcher critical path (in order — no skipping ahead)
 
