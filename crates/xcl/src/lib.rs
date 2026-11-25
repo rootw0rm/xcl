@@ -13,6 +13,11 @@
 #[macro_use]
 pub mod log;
 pub mod manifest;
+#[cfg(windows)]
+pub mod memstat;
+#[cfg(not(windows))]
+#[path = "memstat_linux.rs"]
+pub mod memstat;
 pub mod config;
 pub mod disasm;
 #[cfg(windows)]

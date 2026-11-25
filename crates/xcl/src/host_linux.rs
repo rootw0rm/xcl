@@ -49,6 +49,8 @@ pub fn run_boot(boot: &Boot) -> u32 {
     // Linux has no KERNELBASE hooks to install and no RtlPcToFileHeader hook;
     // the crash handler is the sigaction watchdog.
     crate::eh::install_crash_handler();
+    // Port of upstream #194: the memory line whenever commit grows by a GiB (30 s cadence).
+    crate::memstat::start();
 
     // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
     if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {

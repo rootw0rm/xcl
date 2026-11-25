@@ -1163,6 +1163,14 @@ pub(crate) unsafe fn new_blob_from(src: *const u8, len: usize, out: *mut *mut c_
 // exports
 // ---------------------------------------------------------------------------------------
 
+/// (tiles of title memory with video memory, pool heaps holding them) for the memory
+/// line (port of upstream #194's `sparse::stats()` shape): `None` – the null backend
+/// has no sparse windows, so the memory line omits the segment, exactly as upstream
+/// omits it with no sparse windows.
+pub fn stats() -> Option<(usize, usize)> {
+    None
+}
+
 static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn create_device(ppv: *mut *mut c_void) -> HRESULT {

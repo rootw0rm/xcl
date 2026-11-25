@@ -210,6 +210,9 @@ pub unsafe extern "win64" fn VirtualAlloc(
         .lock()
         .unwrap()
         .insert(ptr as usize, (len, p));
+    if committed {
+        crate::memstat::note(crate::memstat::WINDOWS, len);
+    }
     set_error(ERROR_SUCCESS);
     ptr as *mut c_void
 }
@@ -497,6 +500,11 @@ pub unsafe extern "win64" fn ExitProcess(code: u32) -> ! {
         || crate::report::write_final_with_code(None, code as i64),
     ) {
         crate::xlog_info!("ExitProcess({code:#x})");
+        if code != 0 {
+            // Port of upstream #194: the memory line at an error exit (a nonzero
+            // exit is the process ending with an error, like a crash).
+            crate::memstat::log();
+        }
         // Best-effort DLL/FLS/TLS process-detach would run here on Windows; on Linux the
         // mapped images stay valid until `_exit`, and taking more locks from inside an
         // arbitrary guest call risks deadlock, so only the report is written.
@@ -519,6 +527,10 @@ pub unsafe extern "win64" fn TerminateProcess(proc_: usize, code: u32) -> i32 {
         || crate::report::write_final_with_code(None, code as i64),
     ) {
         crate::xlog_info!("TerminateProcess(current, {code:#x})");
+        if code != 0 {
+            // Port of upstream #194: the memory line at an error exit.
+            crate::memstat::log();
+        }
         crate::log::flush();
     }
     std::process::exit(code as i32);
@@ -2544,7 +2556,6 @@ fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
         let m = gfx_state()?;
         let _ = m; // lock ordering: mprotect outside the table lock
         if unsafe { libc::mprotect(at as *mut c_void, size, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
-            let m = gfx_state().unwrap();
             let mut g = m.lock().unwrap();
             g.allocs.remove(&at);
             g.free.insert(at, size);
@@ -2566,6 +2577,7 @@ fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
             return None;
         }
         unsafe { std::ptr::write_bytes(at as *mut u8, 0, size) };
+        crate::memstat::note(crate::memstat::GRAPHICS, size);
     }
     Some(at)
 }
@@ -2677,7 +2689,11 @@ fn xmem_graphics_layout(size: usize, a: XAllocAttrs) -> Option<(usize, usize)> {
 pub unsafe extern "win64" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut c_void {
     let a = XAllocAttrs::decode(attrs);
     if a.memory_type == 0 {
-        return xmem_heap_alloc(size, 1usize << a.alignment.clamp(4, usize::BITS - 2));
+        let q = xmem_heap_alloc(size, 1usize << a.alignment.clamp(4, usize::BITS - 2));
+        if !q.is_null() {
+            crate::memstat::note(crate::memstat::HEAP, size);
+        }
+        return q;
     }
     let Some((rounded, align)) = xmem_graphics_layout(size, a) else {
         set_error(ERROR_NOT_ENOUGH_MEMORY);
@@ -3043,6 +3059,7 @@ pub unsafe extern "win64" fn AllocateTitlePhysicalPages(
         unsafe { *arr.add(i) = page_number(first + i) };
     }
     phys_blocks().lock().unwrap().insert(first, (n, n, home));
+    crate::memstat::note(crate::memstat::PHYSICAL, bytes);
     set_error(ERROR_SUCCESS);
     1
 }
@@ -10589,6 +10606,46 @@ mod tests {
         unsafe {
             assert_eq!(TerminateProcess(0x1234_0000, 7), 0);
             assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn memstat_notes_each_title_commit_kind() {
+        // Port of upstream #194's counters: every commit path notes its kind (gross,
+        // frees not taken off). Growth assertions are lower bounds: other tests may
+        // note concurrently on other threads.
+        use crate::memstat::{GRAPHICS, HEAP, PHYSICAL, WINDOWS};
+        unsafe {
+            let w0 = crate::memstat::gross(WINDOWS);
+            let p = VirtualAlloc(std::ptr::null(), 0x2000, 0x3000, 4);
+            assert!(!p.is_null());
+            assert!(crate::memstat::gross(WINDOWS) >= w0 + 0x2000, "VirtualAlloc commit notes WINDOWS");
+            assert_eq!(VirtualFree(p, 0, 0x8000), 1);
+            // A reserve without commit notes nothing (nothing is committed).
+            let w1 = crate::memstat::gross(WINDOWS);
+            let r = VirtualAlloc(std::ptr::null(), 0x2000, 0x2000, 4);
+            assert!(!r.is_null());
+            assert_eq!(crate::memstat::gross(WINDOWS), w1, "reserve-only notes nothing");
+            assert_eq!(VirtualFree(r, 0, 0x8000), 1);
+
+            let h0 = crate::memstat::gross(HEAP);
+            let attrs = 8u64 << 24;
+            let h = XMemAlloc(1000, attrs);
+            assert!(!h.is_null());
+            assert!(crate::memstat::gross(HEAP) >= h0 + 1000, "heap alloc notes HEAP");
+            XMemFree(h, attrs);
+
+            let g0 = crate::memstat::gross(GRAPHICS);
+            let g = XMemAlloc(0x1_0000, 1u64 << 29);
+            assert!(!g.is_null());
+            assert!(crate::memstat::gross(GRAPHICS) >= g0 + 0x1_0000, "graphics alloc notes GRAPHICS");
+            XMemFree(g, 1u64 << 29);
+
+            let p0 = crate::memstat::gross(PHYSICAL);
+            let (mut n, mut pages) = (2usize, [0u64; 2]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            assert!(crate::memstat::gross(PHYSICAL) >= p0 + 2 * 0x1_0000, "page homes note PHYSICAL");
+            assert_eq!(XMemFreePhysicalPages(2, pages.as_mut_ptr()), 1);
         }
     }
 

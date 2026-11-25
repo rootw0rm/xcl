@@ -822,6 +822,31 @@ fn describe_fault(va: usize) -> String {
     }
 }
 
+/// The first 16 code bytes at `rip`, as hex (as far as they are readable): port of
+/// upstream #194's `code_at`, which walks `readable`. Linux has no `VirtualQuery`, so
+/// the region comes from the same `/proc/self/maps` parse as `describe_fault`
+/// (`maps_region_for`), clamped to the one region's end (upstream walks into the next
+/// region; a 16-byte tail across a mapping boundary truncates here instead). Unmapped
+/// or non-readable addresses yield an empty string and are never dereferenced. Called
+/// in the watchdog thread, after the fault, never in the signal handler.
+fn code_at(rip: usize) -> String {
+    let Some((_, end, perms, _)) = maps_region_for(rip as u64) else {
+        return String::new();
+    };
+    if perms[0] != b'r' {
+        return String::new();
+    }
+    let n = end.saturating_sub(rip as u64).min(16) as usize;
+    if n == 0 {
+        return String::new();
+    }
+    unsafe { std::slice::from_raw_parts(rip as *const u8, n) }
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Crash description from synthetic or observed signal data: signal name and number,
 /// faulting PC with its nearest module+offset, and the fault address with its memory
 /// state. When the fault
@@ -848,6 +873,13 @@ pub fn format_crash(signal: libc::c_int, pc: usize, address: usize) -> String {
     // (port of upstream #1186's `describe_fault` state names; Linux reads maps itself).
     if signal == libc::SIGSEGV {
         crash += &format!(": {}", describe_fault(address));
+    }
+    // The faulting instruction, for any exception (port of upstream #194): the
+    // registers alone rarely say what was dereferenced. Omitted when the PC is not
+    // readable (upstream prints an empty list there).
+    let bytes = code_at(pc);
+    if !bytes.is_empty() {
+        crash += &format!(" (code bytes: {bytes})");
     }
     crash
 }
@@ -946,6 +978,9 @@ fn crash_watchdog(read_fd: libc::c_int) {
     let address = CRASH_ADDRESS.load(Ordering::Acquire);
     // Shell exit-code convention for fatal signals, so the report carries exit_code too.
     crate::report::write_crash_with_code(format_crash(signal, pc, address), 128 + signal as i64);
+    // Port of upstream #194: the memory line at the crash (watchdog-thread context,
+    // safe to read /proc and take locks – never the raw signal handler).
+    crate::memstat::log();
     // the other threads now: a title crash handler can keep the process for a long time
     // before it ends, so name what its silent threads were doing (port of upstream #164;
     // watchdog-thread context, not the raw signal handler, so parking threads is safe).
@@ -1288,6 +1323,26 @@ mod tests {
             let gone = describe_fault(base + 0x100);
             assert!(gone.contains("unmapped"), "{gone}");
         }
+    }
+
+    /// The crash line carries the faulting instruction's bytes (port of upstream #194's
+    /// `code_at`): mapped code names its bytes, unmapped PCs name nothing (never
+    /// dereferenced).
+    #[test]
+    fn code_at_names_mapped_bytes_and_nothing_unmapped() {
+        static CODE: [u8; 16] = [
+            0x48, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x00, 0x48, 0x83, 0xc0, 0x01, 0xcc, 0xcc,
+        ];
+        let at = CODE.as_ptr() as usize;
+        let bytes = code_at(at);
+        assert_eq!(bytes, "48 8b 05 00 00 00 00 48 8b 00 48 83 c0 01 cc cc", "{bytes}");
+        // A clamped tail: two bytes before the region end would read past it, but the
+        // test's rodata region is far longer – instead check the unmapped case.
+        assert_eq!(code_at(0x1000), String::new(), "null is never mapped readable");
+        let crash = format_crash(libc::SIGTRAP, at, at);
+        assert!(crash.contains("(code bytes: 48 8b 05"), "{crash}");
+        let unmapped = format_crash(libc::SIGTRAP, 0x1000, 0x1000);
+        assert!(!unmapped.contains("code bytes"), "{unmapped}");
     }
 
     #[test]
