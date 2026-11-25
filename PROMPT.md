@@ -303,6 +303,15 @@ window to present to.
    known-good `VS_BlitGenAmbCube`-class blit) and run it on Vulkan,
    checking the position-output equivalent before attempting mesh/GS or
    the full 20k-pack `--recomp`.
+6. vkd3d-proton is **reference-only, never a dependency** (decided
+   2026-11-25): it implements *PC* D3D12, not console D3D12.X, so it saves
+   none of the console→PC translation that *is* Phase D; it is LGPL-2.1,
+   which breaks the static-musl single-exe model (same reason WinDurango
+   is reference-only); and XCL's backend relies on driver internals it
+   doesn't provide (vtable guards, Agility, DXC, UMA aliasing). Its
+   `vkd3d-shader` DXIL→SPIR-V lowering *is* the oracle for per-op semantics
+   when building `backend_spirv` — read it, don't link it. Never track
+   its master; pin a release if a behavior needs citing.
 
 ## 6. Phase E — system services on Linux
 
