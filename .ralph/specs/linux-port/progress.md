@@ -1193,3 +1193,44 @@ in the same pass: plan.md step 15 marked LANDED + 15 LANDED detail + Plan Change
 entry; context.md current-state refresh; DEC-023 recorded. Steps 17–21 stay chained
 behind SKIPPED step-12; Phase E/F remain blocked per §4.7. No code changes in this
 planner pass.
+
+## Verification Notes — step-16 subgroup-width (Builder, 2026-11-25, `linux`)
+
+Task `task-1795570615-1ff3` / plan.md step 16 (`linux:subgroup-width`, DEC-023).
+
+Landed (one commit, Linux-only runner file + progress.md, no refactors):
+- `crates/xcl/src/gpu/recomp/vulkan_runner.rs`: `LanePath::{Native64, Split32}` +
+  pure `lane_path_for(subgroup_size)` (64 → native, else split-32 incl. 0/unknown)
+  + `requires_split` mirroring `runner::split_wave64` (split == 32-lane path);
+  `device_subgroup_size()` / `device_lane_path()` query the real device;
+  `pick_device` now queries core `subgroupSize` plus
+  `VK_EXT_subgroup_size_control` min/max where the driver reports them and logs
+  `subgroupSize .. (min .. max) -> native-64|split-32`; `WORK_ITEMS = 64` shaping
+  kept for both paths (1 wave64 natively, 2 subgroups of 32 on split). Folded
+  step-15 review follow-ups: `skip_test` arms aligned with `runner.rs`
+  (`wave64`/`mesh` split), `pick_device` drops unused `_entry`, scoped `Scope`
+  guard owns every handle (early `?` can no longer leak device/pipe/pool).
+- Tests: `lane_path_selects_both_widths_without_device` forces 64 + 32 + 0/16
+  with no device; `device_lane_path_matches_subgroup_size` checks the queried
+  size maps through the same pure selection (skips cleanly with no device);
+  existing trivial `0..64` → `*2+1` gate unchanged.
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib gpu::recomp::vulkan_runner -- --nocapture` → 5 passed;
+  0 failed (`Intel Arc A770 subgroupSize 32 (min 8 max 32) -> split-32`, trivial
+  kernel passes on-device, no skip).
+- `cargo test -p xcl --lib -- --test-threads=4` → 396 passed; 0 failed; 0 ignored
+  (was 394; +2 new lane-path tests).
+- `cargo check --workspace` → 0 errors (10 pre-existing warnings);
+  `cargo clippy -p xcl --lib` → 0 errors (533 pre-existing warnings, incl. the
+  moved `manual_inspect` on the unchanged `map_err`+destroy pattern).
+- `git diff --check` clean; `rustfmt --check` clean on `vulkan_runner.rs`.
+- Shipped-path shell-out audit: `grep Command/process` in `vulkan_runner.rs` →
+  no hits; `TRANSLATOR_SOURCES` untouched (`git diff --stat` on build.rs/mod.rs/
+  emit.rs/Cargo.toml empty); no new deps (ash MIT + libloading ISC unchanged).
+- Cross-built synthetic title (fresh `XCL_DATA_ROOT`, prebuilt exes):
+  `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `called_stubs: 29`
+  (28 d3d12_xs + XclDefinitelyMissingFunction probe), DirectStorage + MFPlat PASS.
+  (Two interim runs without `XCL_DATA_ROOT` showed 14 fails from the reused
+  default data dir — files-delete + PLS EEXIST — not a code regression; fresh
+  root matches the 12g/13/14/15 baseline exactly.)
