@@ -20,3 +20,13 @@
 ## 2026-11-25 critic review (format-message 12e)
 - task-1795566077-cb3a PASS, already closed. Re-verified: format test 1 passed, full lib 375 passed, workspace check 0 errors, clippy 0 errors, title ExitProcess(0xe)/14 fails, called_stubs 33 with zero FormatMessage entries (was 34).
 - No blocking findings; one minor filed as progress.md follow-up (%%0 truncation ordering). Queue has open tasks but `task ready` empty (all blocked), so next is planner triage (plan.revise).
+
+## 2026-11-25 planner revise (mfplat 12f)
+- 12e closed with review (375 tests, title ExitProcess(0xe)/14 fails, called_stubs 33 zero FormatMessage, PresentX FAIL now formatted). Queue otherwise blocked behind SKIPPED retail-smoke, `task ready` empty.
+- Triage (fresh run here, no code change): title log + report.json `called_stubs: 33` = ~27 Phase-D D3D12 slots + DStorageGetFactory x1 + mfplat trio (MFStartup/MFCreateDXGIDeviceManager/MFShutdown x1 each; MFResetDXGIDeviceManagerX imported but never reached) + XclDefinitelyMissingFunction probe x1. Kernel32/oleaut32 leftovers are import-only, zero calls — stay stubs per §4.7b.
+- New task `linux:mfplat-headless` (plan.md step 12f, DEC-018): headless mfplat manager in mfplat_linux (Startup/Shutdown/Create/Reset+token + manager vtable, GameInput/XAudio2 null-object pattern) + unit test + resolver checks + title e2e gate (MFPlat PASS, called_stubs 33→30). DStorage stays provisional after (larger surface). Docs (plan/context/decisions) updated; `tasks.ready` next.
+
+## 2026-11-25 critic review (mfplat 12f)
+- task-1795566796-4e2a PASS, closed. Re-verified: mfplat 3 passed, full lib 378 passed, workspace check 0 errors, clippy 0 errors, git diff --check clean, title ExitProcess(0xd)/13 fails with [PASS] MFPlat, called_stubs 30 with zero mfplat entries (was 33), zero [STUB] mfplat lines.
+- No blocking findings; one minor filed as progress.md follow-up (manual_dangling_ptr on fake handle 1 — deliberate, warning-only). Task text said ExitProcess(0xe) but 0xd/13 is correct after the FAIL→PASS flip; noted in review.
+- Queue: task ready empty (remaining open tasks chained behind SKIPPED retail-smoke, no game files on host), so next is planner triage (plan.revise) — likely DStorage family next per plan.md 12f rationale.
