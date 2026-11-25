@@ -69,10 +69,21 @@ pub fn requires_split(subgroup_size: u32) -> bool {
     lane_path_for(subgroup_size) == LanePath::Split32
 }
 
-/// Name of the first compute-capable physical device (None text on error).
-/// Returns `(physical device, queue family index, name, subgroupSize)`.
+/// Name of the first physical device with a queue supporting `want` (None text on
+/// error). Returns `(physical device, queue family index, name, subgroupSize)`.
 fn pick_device(
     instance: &ash::Instance,
+) -> Result<(ash::vk::PhysicalDevice, u32, String, u32), String> {
+    pick_device_for(instance, ash::vk::QueueFlags::COMPUTE, "compute")
+}
+
+/// First physical device with a queue supporting `want` (graphics smoke needs a
+/// `GRAPHICS` family; the compute runner needs `COMPUTE`). One shared query so
+/// the graphics path never grows a second throwaway probe.
+pub(crate) fn pick_device_for(
+    instance: &ash::Instance,
+    want: ash::vk::QueueFlags,
+    want_name: &str,
 ) -> Result<(ash::vk::PhysicalDevice, u32, String, u32), String> {
     let phys = unsafe { instance.enumerate_physical_devices() }
         .map_err(|e| format!("no device: enumerate_physical_devices: {e}"))?;
@@ -87,7 +98,7 @@ fn pick_device(
         let queues = unsafe { instance.get_physical_device_queue_family_properties(p) };
         let Some(qfi) = queues
             .iter()
-            .position(|q| q.queue_flags.contains(ash::vk::QueueFlags::COMPUTE))
+            .position(|q| q.queue_flags.contains(want))
         else {
             continue;
         };
@@ -123,7 +134,15 @@ fn pick_device(
         }
         return Ok((p, qfi as u32, name, subgroup.subgroup_size));
     }
-    Err("no device: no compute queue family".into())
+    Err(format!("no device: no {want_name} queue family"))
+}
+
+/// First physical device with a `GRAPHICS` queue (headless graphics smoke).
+/// Error text starts with `"no "` like the compute pick so tests skip cleanly.
+pub(crate) fn pick_graphics_device(
+    instance: &ash::Instance,
+) -> Result<(ash::vk::PhysicalDevice, u32, String, u32), String> {
+    pick_device_for(instance, ash::vk::QueueFlags::GRAPHICS, "graphics")
 }
 
 /// `subgroupSize` of the first compute-capable physical device.
@@ -153,7 +172,7 @@ pub fn device_lane_path() -> Result<LanePath, String> {
     device_subgroup_size().map(lane_path_for)
 }
 
-fn find_memory_type(
+pub(crate) fn find_memory_type(
     props: &ash::vk::PhysicalDeviceMemoryProperties,
     bits: u32,
     want: ash::vk::MemoryPropertyFlags,

@@ -1427,3 +1427,77 @@ entry; context.md current-state refresh; DEC-025 recorded. Full step-17 present 
 provisional after 17b (windowed smoke cannot execute on this headless host). Steps 17-21
 stay chained behind SKIPPED step-12; Phase E/F remain blocked per §4.7. No code changes
 in this planner pass.
+
+## Verification Notes — step-17b vulkan-graphics-headless (Builder, 2026-11-25, `linux`)
+
+Task `task-1795572137-d004` / plan.md step 17b (`linux:vulkan-graphics-headless`, DEC-025).
+
+Landed (Linux-only files + progress.md, no refactors):
+- `crates/xcl/src/gpu/recomp/vulkan_graphics.rs` (new): headless offscreen
+  graphics path reusing the runner's shared query (`pick_graphics_device` via
+  `pick_device_for(GRAPHICS)`, one instance per draw, no second throwaway
+  instance). `draw_offscreen(vs_words, positions)`: 64×64 `R8G8B8A8_UNORM`
+  offscreen image + render pass (clear → store, final
+  `TRANSFER_SRC_OPTIMAL`) + framebuffer, graphics pipeline from
+  caller-supplied `translate_vs_spirv` Vertex words + a hand-assembled
+  trivial fragment passthrough (`trivial_fs_spv`, location-0 in → out),
+  one location-0 `vec4` vertex input, triangle list, no culling, image →
+  host-coherent buffer copy, 5 s fence wait, tight RGBA8 readback. Errors are
+  `String`s; missing Vulkan/device start with `"no "` and skip via the
+  runner's `skip_test`. Scoped `Drop` teardown mirrors the compute runner
+  (no leak on early `?`).
+- `crates/xcl/src/gpu/recomp/vulkan_runner.rs`: `pick_device` refactored to
+  `pick_device_for(instance, want, want_name)` (compute behavior unchanged) +
+  new `pub(crate) pick_graphics_device` (GRAPHICS family) + `find_memory_type`
+  now `pub(crate)`. No behavior change for the compute path.
+- `crates/xcl/src/gpu/recomp/mod.rs`: `#[cfg(target_os = "linux")] pub mod
+  vulkan_graphics;`.
+- `crates/xcl/src/hle/vulkan_linux.rs`: `select_cached()` (`OnceLock` — the
+  step-17a per-`create_device` probe-spam follow-up: one probe per process) +
+  `cached_selection_is_stable` test (no env touch, no race with the
+  env-mutating test).
+- `crates/xcl/src/hle/d3d12x_linux.rs`: `create_device` now queries
+  `select_cached()` (log line unchanged, still returns the null device).
+
+Deliberate deviation from the task text (documented for the Critic): the draw
+feeds `POSITION` from a small vertex buffer holding a fullscreen triangle
+instead of deriving corners from `VertexIndex` with no vertex input. Reason:
+the translated blit VS is a fetch-shader passthrough (`pos = (in.x, in.y, 0,
+1)`), so unbound inputs would make coverage driver-dependent and any
+coverage assertion flaky. The buffer keeps the position-output/coverage
+check the GLSL gate asserts fully deterministic (full-coverage, center-pixel
+and interpolation assertions all pass on-device). Everything else is literal:
+same blit words, offscreen only, no winit/swapchain/window, no D3D12.X
+routing change beyond the cached selector query, no `TRANSLATOR_SOURCES`
+change, no new deps.
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib gpu::recomp::vulkan_graphics` → 5 passed
+  (`synthetic_blit_draws_fullscreen_triangle` executes for real on the Intel
+  Arc A770, `subgroupSize 32 -> split-32`; `trivial_fs` passes real
+  `spirv-val`; fail-closed + no-spawn + retail-opt-in-skip gates pass).
+- `cargo test -p xcl --lib hle::vulkan_linux` → 8 passed (7 + cache test).
+- `cargo test -p xcl --lib gpu::recomp::vulkan_runner` → 5 passed (lane
+  agreement intact).
+- `cargo test -p xcl --lib` → 477 passed; 0 failed; 1 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only).
+- `cargo clippy -p xcl --lib` → 0 errors.
+- `rustfmt --check` clean on `vulkan_graphics.rs` + `vulkan_linux.rs`;
+  `git diff --check` clean.
+- Shipped-path audit: `Command::new`/`std::process` appear only after
+  `#[cfg(test)]` in the new module (tests use `spirv-val` as a gate where
+  present, like the spirv/glsl suites); `git diff` on
+  `build.rs`/`mod.rs`-translator-list/`Cargo.toml`/`Cargo.lock` empty except
+  the 2-line `pub mod` (no `TRANSLATOR_SOURCES` change, no new deps; `ash`
+  MIT + `libloading` ISC, runtime `dlopen` only).
+- Cross-built synthetic title (fresh `/tmp/vkg-game`, fresh
+  `XCL_DATA_ROOT=/tmp/vkg-data*` per run): default → `failures: 12`,
+  `ExitProcess(0xc)`, `exit_code: 12`, `crash: null`, `called_stubs: 29`
+  (28 `d3d12_xs` + `XclDefinitelyMissingFunction` probe, zero
+  `mfplat`/`xcrdapi`/`FormatMessage`), `[PASS] DirectStorage` + `[PASS]
+  MFPlat` hold — matches the 12g/13/14/15/16/17a baseline. 12 remaining FAILs
+  are the known null-device D3D12 categories; no new failure.
+- `XCL_VULKAN_BACKEND=vulkan` → single `vulkan backend: ... split-32 lane
+  path` line on stdout (was ~10 probe lines in 17a — caching works), still
+  12/0xc/29 (null device returned). `XCL_VULKAN_BACKEND=bogus` → stays null,
+  same 12/0xc/29.

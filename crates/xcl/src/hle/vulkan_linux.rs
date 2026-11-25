@@ -97,6 +97,17 @@ pub fn select() -> Selection {
     select_with(requested_backend(), vulkan_runner::device_lane_path)
 }
 
+/// Cached [`select()`]: the D3D12.X device is created repeatedly in one title
+/// run, and each `select()` with `XCL_VULKAN_BACKEND=vulkan` would otherwise
+/// create + destroy a throwaway Vulkan instance per call (step-17a review
+/// follow-up). The device set cannot change mid-process, so cache the first
+/// selection. Tests use [`select_with`]/[`select`] directly; only the hot
+/// device-creation path uses the cache.
+pub fn select_cached() -> &'static Selection {
+    static CACHED: std::sync::OnceLock<Selection> = std::sync::OnceLock::new();
+    CACHED.get_or_init(select)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +162,18 @@ mod tests {
             let sel = select_with(Backend::Vulkan, || Ok(lane));
             assert_eq!(sel.lane, Some(vulkan_runner::lane_path_for(size)));
         }
+    }
+
+    #[test]
+    fn cached_selection_is_stable() {
+        // The D3D12.X hot path uses `select_cached()`; repeated calls must
+        // agree (one probe per process, not one per device creation). No env
+        // touch here, so this cannot race the env-mutating test below.
+        let a = select_cached();
+        let b = select_cached();
+        assert_eq!(a.backend, b.backend);
+        assert_eq!(a.lane, b.lane);
+        assert_eq!(a.reason, b.reason);
     }
 
     #[test]

@@ -886,11 +886,12 @@ pub(crate) unsafe fn new_blob_from(src: *const u8, len: usize, out: *mut *mut c_
 static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn create_device(ppv: *mut *mut c_void) -> HRESULT {
-    // Step-17a: query the Vulkan backend selector; this slice still returns
+    // Step-17a: query the Vulkan backend selector (cached: one probe per
+    // process, not one per device creation); this slice still returns
     // the existing null device (no vtable/behavior change for the title).
-    // `select()` probes the real device only when `XCL_VULKAN_BACKEND=vulkan`
+    // `select_cached()` probes the real device only when `XCL_VULKAN_BACKEND=vulkan`
     // is set, otherwise it stays headless with no Vulkan instance.
-    let sel = crate::hle::vulkan_linux::select();
+    let sel = crate::hle::vulkan_linux::select_cached();
     crate::xlog_debug!("D3D12.X backend: {:?} ({})", sel.backend, sel.reason);
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_warn!("D3D12.X: creating a FALLBACK DEVICE (null device) – graphics are not rendered in milestone M1");

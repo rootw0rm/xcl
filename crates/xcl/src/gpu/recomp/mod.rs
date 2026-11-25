@@ -73,6 +73,8 @@ pub use emit::mesh_passthrough;
 pub mod runner;
 #[cfg(target_os = "linux")]
 pub mod vulkan_runner;
+#[cfg(target_os = "linux")]
+pub mod vulkan_graphics;
 pub mod ssa;
 #[cfg(all(test, windows))]
 mod tests;
