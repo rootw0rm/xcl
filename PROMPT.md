@@ -18,7 +18,12 @@ first (short contract); this file is the work plan. Details live in
   The ralph loop was stopped 2026-11-25; this session drives (streams in
   `/tmp/opencode/stream-<x>`, merged by the driver). Stream C landed:
   `report.json` is now written with the crash site on SIGTRAP/SIGABRT
-  (`6a563be`, lib tests 493 passed).
+  (`6a563be`, lib tests 493 passed). Stream A landed 4 sync/sysinfo
+  families (`bdafc1d`, lib tests 496 passed): retail now traps at
+  `exe+0x5a91c22`, diagnosed as the game's `js`-to-`int3` abort after
+  `0x1455e2a70` returns negative — its 4 `GetProcAddress`es for
+  xgameruntime `QueryApiImpl`/`InitializeApiImpl*` all return NULL.
+  Next family: those xgameruntime exports.
 - **Game files are PRESENT on this host** (the drive is mounted):
   `/run/media/anon/12TB_B/torrents/GTA6.Xbox.v1.0.2.1-CYBERLEEK/`
   (`game_scarlett_master.exe`, 120 MB, + `MicrosoftGame.Config`) and
