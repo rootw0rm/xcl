@@ -598,6 +598,9 @@ mod tests {
             "RtlNtStatusToDosError",
             "GetCurrentDirectoryW",
             "GetFullPathNameW",
+            // Step-12e message formatting: the title-called kernel32 stub.
+            "FormatMessageW",
+            "FormatMessageA",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, KERNELX);

@@ -4816,6 +4816,346 @@ pub unsafe extern "win64" fn GetFullPathNameA(
 }
 
 // ---------------------------------------------------------------------------------------
+// FormatMessage (Phase C step 12e): title-called kernel32 formatting, no CRT needed
+// ---------------------------------------------------------------------------------------
+//
+// The synthetic title calls `kernel32!FormatMessageW` once (its failure paths format a
+// Win32 code before `ExitProcess`); the auto-stub returned 0, so the text was empty.
+// This HLE covers the Win32 contract the title uses: `FROM_SYSTEM` code lookup,
+// `FROM_STRING` with `%1` inserts (plus `ARGUMENT_ARRAY`), `ALLOCATE_BUFFER` via the
+// process heap, truncation → `ERROR_INSUFFICIENT_BUFFER`, unknown-code fallback text,
+// and `NULL` output without `ALLOCATE_BUFFER` → `ERROR_INVALID_PARAMETER`.
+
+const FORMAT_MESSAGE_ALLOCATE_BUFFER: u32 = 0x0000_0100;
+const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
+const FORMAT_MESSAGE_FROM_STRING: u32 = 0x0000_0400;
+const FORMAT_MESSAGE_FROM_HMODULE: u32 = 0x0000_0800;
+const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
+const FORMAT_MESSAGE_ARGUMENT_ARRAY: u32 = 0x0000_2000;
+const ERROR_MR_MID_NOT_FOUND: u32 = 317;
+
+fn system_message_for(id: u32) -> Option<&'static str> {
+    match id {
+        0 => Some("The operation completed successfully.\r\n"),
+        2 => Some("The system cannot find the file specified.\r\n"),
+        3 => Some("The system cannot find the path specified.\r\n"),
+        5 => Some("Access is denied.\r\n"),
+        6 => Some("The handle is invalid.\r\n"),
+        8 => Some("Not enough memory resources are available to process this command.\r\n"),
+        14 => Some("Not enough storage is available to complete this operation.\r\n"),
+        87 => Some("The parameter is incorrect.\r\n"),
+        122 => Some("The data area passed to a system call is too small.\r\n"),
+        126 => Some("The specified module could not be found.\r\n"),
+        127 => Some("The specified procedure could not be found.\r\n"),
+        145 => Some("The directory is not empty.\r\n"),
+        183 => Some("Cannot create a file when that file already exists.\r\n"),
+        203 => Some("The system could not find the environment option that was entered.\r\n"),
+        317 => Some(
+            "The system cannot find message text for message number 0x%1 in the message file for %2.\r\n",
+        ),
+        487 => Some("Attempt to access invalid address.\r\n"),
+        1460 => Some("This operation returned because the timeout period expired.\r\n"),
+        0x8000_4001 => Some("Not implemented.\r\n"),
+        _ => {
+            // HRESULT_FROM_WIN32 codes share the Win32 text of their low word.
+            if id & 0xFFFF_0000 == 0x8007_0000 {
+                system_message_for(id & 0xFFFF)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn format_unknown_message(id: u32) -> String {
+    format!("Unknown error {id} (0x{id:08X}).\r\n")
+}
+
+/// `%0` always terminates the message, even with `IGNORE_INSERTS`.
+fn format_truncate_at_terminator(template: &str) -> &str {
+    let b = template.as_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'%' && b[i + 1] == b'0' {
+            return &template[..i];
+        }
+        i += 1;
+    }
+    template
+}
+
+unsafe fn format_arg_val(args: *const c_void, flags: u32, index_1based: usize) -> usize {
+    if args.is_null() || index_1based == 0 {
+        return 0;
+    }
+    unsafe {
+        if flags & FORMAT_MESSAGE_ARGUMENT_ARRAY != 0 {
+            let base = args as *const usize;
+            *base.add(index_1based - 1)
+        } else {
+            // `va_list *`: one indirection to the caller stack slots.
+            let base = *(args as *const *const usize);
+            if base.is_null() {
+                return 0;
+            }
+            *base.add(index_1based - 1)
+        }
+    }
+}
+
+fn format_int_insert(val: usize, inner: &str) -> String {
+    if inner.contains('X') {
+        format!("{:X}", val)
+    } else if inner.contains('x') {
+        format!("{:x}", val)
+    } else if inner.contains('o') || inner.contains('O') {
+        format!("{:o}", val)
+    } else if inner.contains('p') || inner.contains('P') {
+        format!("0x{:X}", val)
+    } else if inner.contains('c') || inner.contains('C') {
+        char::from_u32(val as u32).map(|c| c.to_string()).unwrap_or_else(|| val.to_string())
+    } else if inner.contains('d')
+        || inner.contains('D')
+        || inner.contains('i')
+        || inner.contains('I')
+    {
+        format!("{}", val as i32 as i64)
+    } else if inner.contains('u') || inner.contains('U') {
+        format!("{}", val)
+    } else {
+        format!("{}", val)
+    }
+}
+
+unsafe fn format_expand(
+    template: &str,
+    flags: u32,
+    args: *const c_void,
+    read_insert: &dyn Fn(usize) -> String,
+) -> String {
+    if flags & FORMAT_MESSAGE_IGNORE_INSERTS != 0 {
+        return format_truncate_at_terminator(template).to_owned();
+    }
+    let b = template.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len() + 16);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= b.len() {
+            out.push(b'%');
+            break;
+        }
+        let nxt = b[i + 1];
+        if nxt == b'%' {
+            out.push(b'%');
+            i += 2;
+            continue;
+        }
+        if nxt == b'0' {
+            break;
+        }
+        if !nxt.is_ascii_digit() || nxt == b'0' {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        // Insert number: 1..99 (one or two digits; `%100` is `%10` + `"0"`).
+        let mut num = (nxt - b'0') as usize;
+        let mut consumed = 2;
+        if i + 2 < b.len() && b[i + 2].is_ascii_digit() {
+            num = num * 10 + (b[i + 2] - b'0') as usize;
+            consumed = 3;
+        }
+        if num == 0 || num > 99 {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        // Optional `!format!` spec.
+        let mut inner = "";
+        if i + consumed < b.len() && b[i + consumed] == b'!' {
+            if let Some(rel) = b[i + consumed + 1..].iter().position(|&c| c == b'!') {
+                inner = std::str::from_utf8(&b[i + consumed + 1..i + consumed + 1 + rel])
+                    .unwrap_or("");
+                consumed += rel + 2;
+            }
+        }
+        let val = unsafe { format_arg_val(args, flags, num) };
+        let s = if inner.is_empty() || inner.contains('s') || inner.contains('S') {
+            read_insert(val)
+        } else {
+            format_int_insert(val, inner)
+        };
+        out.extend_from_slice(s.as_bytes());
+        i += consumed;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `DWORD FormatMessageW(DWORD, LPCVOID, DWORD, DWORD, LPWSTR, DWORD, va_list *)`.
+pub unsafe extern "win64" fn FormatMessageW(
+    flags: u32,
+    source: *const c_void,
+    message_id: u32,
+    _language_id: u32,
+    buffer: *mut u16,
+    size: u32,
+    args: *const c_void,
+) -> u32 {
+    let template: String = if flags & FORMAT_MESSAGE_FROM_STRING != 0 {
+        if source.is_null() {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        match from_wide_ptr(source as *const u16) {
+            Some(s) => s,
+            None => {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+        }
+    } else if flags & FORMAT_MESSAGE_FROM_SYSTEM != 0 {
+        match system_message_for(message_id) {
+            Some(s) => s.to_owned(),
+            None => format_unknown_message(message_id),
+        }
+    } else if flags & FORMAT_MESSAGE_FROM_HMODULE != 0 {
+        set_error(ERROR_MR_MID_NOT_FOUND);
+        return 0;
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let read_wide = &|ptr: usize| -> String {
+        if ptr == 0 {
+            return String::new();
+        }
+        unsafe { from_wide_ptr(ptr as *const u16).unwrap_or_default() }
+    };
+    let expanded = unsafe { format_expand(&template, flags, args, read_wide) };
+    let wide: Vec<u16> = expanded.encode_utf16().collect();
+    let len = wide.len() as u32;
+    if flags & FORMAT_MESSAGE_ALLOCATE_BUFFER != 0 {
+        if buffer.is_null() {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let need = wide.len() + 1;
+        let cap = (size as usize).max(need).max(1);
+        let mem = HeapAlloc(GetProcessHeap(), 0, cap * std::mem::size_of::<u16>());
+        if mem.is_null() {
+            return 0;
+        }
+        let dst = mem as *mut u16;
+        unsafe {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+            *dst.add(wide.len()) = 0;
+            *(buffer as *mut *mut u16) = dst;
+        }
+        set_error(ERROR_SUCCESS);
+        return len;
+    }
+    if buffer.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if wide.len() + 1 > size as usize {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), buffer, wide.len());
+        *buffer.add(wide.len()) = 0;
+    }
+    set_error(ERROR_SUCCESS);
+    len
+}
+
+/// `DWORD FormatMessageA(DWORD, LPCVOID, DWORD, DWORD, LPSTR, DWORD, va_list *)` —
+/// ANSI (UTF-8 on Linux) twin of `FormatMessageW`.
+pub unsafe extern "win64" fn FormatMessageA(
+    flags: u32,
+    source: *const c_void,
+    message_id: u32,
+    _language_id: u32,
+    buffer: *mut u8,
+    size: u32,
+    args: *const c_void,
+) -> u32 {
+    let template: String = if flags & FORMAT_MESSAGE_FROM_STRING != 0 {
+        if source.is_null() {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        match from_ansi_ptr(source as *const u8) {
+            Some(s) => s,
+            None => {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+        }
+    } else if flags & FORMAT_MESSAGE_FROM_SYSTEM != 0 {
+        match system_message_for(message_id) {
+            Some(s) => s.to_owned(),
+            None => format_unknown_message(message_id),
+        }
+    } else if flags & FORMAT_MESSAGE_FROM_HMODULE != 0 {
+        set_error(ERROR_MR_MID_NOT_FOUND);
+        return 0;
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let read_ansi = &|ptr: usize| -> String {
+        if ptr == 0 {
+            return String::new();
+        }
+        unsafe { from_ansi_ptr(ptr as *const u8).unwrap_or_default() }
+    };
+    let expanded = unsafe { format_expand(&template, flags, args, read_ansi) };
+    let bytes = expanded.as_bytes();
+    let len = bytes.len() as u32;
+    if flags & FORMAT_MESSAGE_ALLOCATE_BUFFER != 0 {
+        if buffer.is_null() {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let need = bytes.len() + 1;
+        let cap = (size as usize).max(need).max(1);
+        let mem = HeapAlloc(GetProcessHeap(), 0, cap);
+        if mem.is_null() {
+            return 0;
+        }
+        let dst = mem as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+            *dst.add(bytes.len()) = 0;
+            *(buffer as *mut *mut u8) = dst;
+        }
+        set_error(ERROR_SUCCESS);
+        return len;
+    }
+    if buffer.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if bytes.len() + 1 > size as usize {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+        *buffer.add(bytes.len()) = 0;
+    }
+    set_error(ERROR_SUCCESS);
+    len
+}
+
+// ---------------------------------------------------------------------------------------
 // Startup: command line, process heap, module file names (Phase C step 11b)
 // ---------------------------------------------------------------------------------------
 //
@@ -7265,6 +7605,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetDiskFreeSpaceExA", GetDiskFreeSpaceExA as usize),
         ("GetDiskFreeSpaceW", GetDiskFreeSpaceW as usize),
         ("GetDiskFreeSpaceA", GetDiskFreeSpaceA as usize),
+        ("FormatMessageW", FormatMessageW as usize),
+        ("FormatMessageA", FormatMessageA as usize),
     ]
 }
 
@@ -8005,6 +8347,137 @@ mod tests {
             // Null buffer/size fails cleanly.
             assert_eq!(GetModuleFileNameW(h, std::ptr::null_mut(), 260), 0);
             assert_eq!(GetModuleFileNameW(h, wbuf.as_mut_ptr(), 0), 0);
+        }
+    }
+
+    #[test]
+    fn format_message_system_string_allocate_and_truncate() {
+        unsafe {
+            // FROM_SYSTEM code message (Win32 2) ends like Windows with CRLF.
+            let mut buf = [0u16; 128];
+            let n = FormatMessageW(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                std::ptr::null(),
+                2,
+                0,
+                buf.as_mut_ptr(),
+                128,
+                std::ptr::null(),
+            );
+            assert!(n > 0);
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+            let s = String::from_utf16_lossy(&buf[..n as usize]);
+            assert!(s.contains("cannot find the file"), "{s}");
+            assert!(s.ends_with("\r\n"), "{s:?}");
+            // FROM_STRING with %1 inserts, argument-array of wide strings.
+            let fmt = crate::util::wide("%1:%2!");
+            let a1 = crate::util::wide("hello");
+            let a2 = crate::util::wide("42");
+            let arr = [a1.as_ptr() as usize, a2.as_ptr() as usize];
+            let mut buf2 = [0u16; 64];
+            let m = FormatMessageW(
+                FORMAT_MESSAGE_FROM_STRING | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                fmt.as_ptr() as *const c_void,
+                0,
+                0,
+                buf2.as_mut_ptr(),
+                64,
+                arr.as_ptr() as *const c_void,
+            );
+            assert!(m > 0);
+            let s2 = String::from_utf16_lossy(&buf2[..m as usize]);
+            assert_eq!(s2, "hello:42!");
+            // Integer insert via !d!.
+            let fmt3 = crate::util::wide("code %1!d!.");
+            let arr3 = [87usize];
+            let mut buf3 = [0u16; 64];
+            let k = FormatMessageW(
+                FORMAT_MESSAGE_FROM_STRING | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                fmt3.as_ptr() as *const c_void,
+                0,
+                0,
+                buf3.as_mut_ptr(),
+                64,
+                arr3.as_ptr() as *const c_void,
+            );
+            assert!(k > 0);
+            let s3 = String::from_utf16_lossy(&buf3[..k as usize]);
+            assert_eq!(s3, "code 87.");
+            // ALLOCATE_BUFFER hands out a heap string the caller can read.
+            let mut out: *mut u16 = std::ptr::null_mut();
+            let a = FormatMessageW(
+                FORMAT_MESSAGE_FROM_SYSTEM
+                    | FORMAT_MESSAGE_IGNORE_INSERTS
+                    | FORMAT_MESSAGE_ALLOCATE_BUFFER,
+                std::ptr::null(),
+                5,
+                0,
+                &mut out as *mut *mut u16 as *mut u16,
+                0,
+                std::ptr::null(),
+            );
+            assert!(a > 0);
+            assert!(!out.is_null());
+            let sa = String::from_utf16_lossy(std::slice::from_raw_parts(out, a as usize));
+            assert!(sa.contains("denied"), "{sa}");
+            assert_eq!(HeapFree(GetProcessHeap(), 0, out as *mut c_void), 1);
+            // Truncation fails with ERROR_INSUFFICIENT_BUFFER.
+            let mut tiny = [0u16; 4];
+            assert_eq!(
+                FormatMessageW(
+                    FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                    std::ptr::null(),
+                    2,
+                    0,
+                    tiny.as_mut_ptr(),
+                    4,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            // Unknown code falls back to text instead of failing.
+            let mut ubuf = [0u16; 64];
+            let u = FormatMessageW(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                std::ptr::null(),
+                0x00BE_BEEF,
+                0,
+                ubuf.as_mut_ptr(),
+                64,
+                std::ptr::null(),
+            );
+            assert!(u > 0);
+            let su = String::from_utf16_lossy(&ubuf[..u as usize]);
+            assert!(su.contains("Unknown error"), "{su}");
+            // NULL output without ALLOCATE_BUFFER is an error.
+            assert_eq!(
+                FormatMessageW(
+                    FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                    std::ptr::null(),
+                    2,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // ANSI twin agrees on the same code.
+            let mut abuf = [0u8; 128];
+            let an = FormatMessageA(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                std::ptr::null(),
+                2,
+                0,
+                abuf.as_mut_ptr(),
+                128,
+                std::ptr::null(),
+            );
+            assert!(an > 0);
+            let sa2 = String::from_utf8_lossy(&abuf[..an as usize]);
+            assert!(sa2.contains("cannot find the file"), "{sa2}");
         }
     }
 

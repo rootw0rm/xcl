@@ -465,6 +465,10 @@ mod tests {
             ("xmem.dll", "XMemAllocatePhysicalPages"),
             // Step 11o LSA probe backing advapi32legacy dynamic lookups.
             ("advapi32legacy.dll", "LsaOpenPolicy"),
+            // Step 12e message formatting: the title-called kernel32 stub.
+            ("kernel32.dll", "FormatMessageW"),
+            ("kernel32.dll", "FormatMessageA"),
+            ("api-ms-win-core-localization-l1-2-0.dll", "FormatMessageW"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(

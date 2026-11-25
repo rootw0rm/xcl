@@ -881,3 +881,36 @@ Requirements: met — win64 `__stdio_common_vfprintf` (8-byte slot `VaReader`, N
 ## Follow-ups (minor, non-blocking)
 - Unknown-verb failure discards the already-rendered prefix (returns `-1`, writes nothing); real UCRT would report `-1` having streamed the prefix. Safe HLE simplification, but worth documenting if a caller depends on partial output.
 - Unit test covers `hhd/hd/ld/lld/zd/hhx/hx/lx/llx/zx` but not bare-`I`/`I32`/`I64` spellings; routing is shared (`Ll`/`L`) so risk is low — cover them next time the file is touched.
+
+## Verification Notes — step-12e kernelx-format-message (Builder, 2026-11-25, `linux`)
+
+Task `task-1795566077-cb3a` (`linux:format-message`, plan.md step 12e).
+Retail-smoke SKIPPED here: `/run/media/...` absent (no game files on host); synthetic title is the e2e gate.
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/hle/kernelx_linux.rs`: win64 `FormatMessageW` + `FormatMessageA`
+  (ANSI twin over the same core, UTF-8 on Linux). `FROM_SYSTEM` maps Win32 codes to
+  English `\r\n` text (plus `HRESULT_FROM_WIN32` low-word decode and `E_NOTIMPL`);
+  unknown codes fall back to `Unknown error %u (0x%08X).\r\n` instead of failing.
+  `FROM_STRING` expands `%1..%99` with optional `!s!`/`!d!`/`!x!`/`!X!`/`!o!`/`!u!`/
+  `!c!`/`!p!` specs (`%%` → `%`, `%0` terminates); empty/`s` inserts read guest
+  wide (`W`) or ANSI (`A`) strings, integer specs format the slot value
+  (`d/i` as 32-bit signed, others full-width). `ARGUMENT_ARRAY` reads the array
+  directly, otherwise one indirection through the `va_list*`. `ALLOCATE_BUFFER`
+  allocates via the process heap and writes the pointer back; plain truncation
+  returns 0 with `ERROR_INSUFFICIENT_BUFFER`; NULL output without
+  `ALLOCATE_BUFFER`, NULL `FROM_STRING` source, `FROM_HMODULE`-only, or no source
+  flag fail with `ERROR_INVALID_PARAMETER`/`ERROR_MR_MID_NOT_FOUND`, never a crash.
+  Plus `format_message_system_string_allocate_and_truncate` unit test (system-code
+  message, `%1:%2!` + `%1!d!` argument-array inserts, allocate-buffer + heap free,
+  truncation, unknown-code fallback, NULL output, ANSI twin).
+- `crates/xcl/src/hle_linux.rs`: `FormatMessageW`/`FormatMessageA` in the KERNELX
+  spot-check list.
+- `crates/xcl/src/resolver_linux.rs`: `kernel32.dll` + `api-ms-win-core-localization`
+  contract checks for both names.
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib kernelx_linux::tests::format_message -- --test-threads=4` → 1 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 375 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (pre-existing warnings only); `git diff --check` clean.
+- Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/fmt-gate/game`, fresh `XCL_DATA_ROOT=/tmp/fmt-gate/data`): `XCL_DATA_ROOT=... ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)` (rc=14), `report.json` `called_stubs: 33` with no `FormatMessageW` entry and no `[STUB] ... FormatMessageW` line (was 34 with the stub). The `PresentX` FAIL line now shows formatted text (`The operation completed successfully. (0x00000000)`) proving the HLE served the call. All 14 FAILs are the known null-device categories; no new failure.
