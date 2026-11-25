@@ -34,6 +34,7 @@ use crate::util::HRESULT;
 
 /// A heap of video memory for placements at title addresses `[base, base + size)`.
 struct Arena<H> {
+    dev: usize,
     base: usize,
     size: usize,
     /// the heap's alignment (a placement that needs more does not go in)
@@ -57,15 +58,9 @@ impl<H: Clone> Arenas<H> {
         Arenas { list: Vec::new(), next_id: 0 }
     }
 
-    /// Arenas no resource used for `IDLE` go (their heap with the last reference).
-    fn sweep(&mut self, now: std::time::Instant) {
-        let _ = self.sweep_dropped(now);
-    }
-
-    /// Like `sweep`, returning expired heaps so callers can drop them outside `ARENAS.lock()`.
-    /// Preserves insertion order so `take`'s `rposition` continues selecting the newest fitting arena.
-    fn sweep_dropped(&mut self, now: std::time::Instant) -> Vec<H> {
-        let is_expired = |a: &Arena<H>| a.users == 0 && a.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE);
+    /// Return expired heaps for `dev` (preserving insertion order) to retire/drop outside `ARENAS.lock()`.
+    fn sweep_dropped_for(&mut self, dev: usize, now: std::time::Instant) -> Vec<H> {
+        let is_expired = |a: &Arena<H>| a.dev == dev && a.users == 0 && a.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE);
         if !self.list.iter().any(is_expired) {
             return Vec::new();
         }
@@ -82,26 +77,24 @@ impl<H: Clone> Arenas<H> {
         dropped
     }
 
-    /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
-    /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
-    /// (heap, offset, arena id); None: no heap.
-    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
-        self.sweep(now);
-        let fits = |a: &Arena<H>| a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
+    /// Place `bytes` at `va` (`align`) on `dev`; returns `(placement, expired_heaps)` without dropping inside `ARENAS.lock()`.
+    fn take_for(&mut self, dev: usize, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> (Option<(H, usize, u64)>, Vec<H>) {
+        let expired = self.sweep_dropped_for(dev, now);
+        let fits = |a: &Arena<H>| a.dev == dev && a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
         let i = match self.list.iter().rposition(fits) {
             Some(i) => i,
             None => {
                 let size = bytes.div_ceil(align) * align;
-                let heap = make(size, align)?;
+                let Some(heap) = make(size, align) else { return (None, expired) };
                 self.next_id += 1;
-                self.list.push(Arena { base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
+                self.list.push(Arena { dev, base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
                 self.list.len() - 1
             }
         };
         let a = &mut self.list[i];
         a.users += 1;
         a.idle_since = None;
-        Some((a.heap.clone(), va - a.base, a.id))
+        (Some((a.heap.clone(), va - a.base, a.id)), expired)
     }
 
     /// A resource in arena `id` released.
@@ -592,12 +585,6 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
-    /// signalled on title queues when reclaiming heaps so reclaimed `ID3D12Heap`s are only dropped
-    /// after all prior GPU work on the executing queue and tile-unmap queue has completed
-    retire_fence: ID3D12Fence,
-    retire_value: u64,
-    /// reclaimed pool and arena heaps waiting for `(unmap_fence_val, retire_fence_val)` GPU completion
-    retiring: std::collections::VecDeque<(ID3D12Heap, u64, u64)>,
     /// per-device timestamp of the last periodic reclaim check
     last_reclaim: std::time::Instant,
     pools: PoolHeaps,
@@ -640,15 +627,11 @@ impl Pages {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-        let retire_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
             queue,
             fence,
             value: 0,
-            retire_fence,
-            retire_value: 0,
-            retiring: std::collections::VecDeque::new(),
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
@@ -1123,10 +1106,92 @@ fn forget_pages(resource: usize) {
     }
 }
 
+/// Reclaimed heaps waiting for `unmap_mark` (if any) and every live queue's fence mark on one device.
+struct RetiringBatch<H, F> { heaps: Vec<H>, unmap_mark: Option<(F, u64)>, marks: Vec<(F, u64)> }
+
+/// Per-device multi-queue retirement state (`H` = heap, `F` = fence; pure-CPU types in tests).
+struct RetireQueue<H, F> { fences: std::collections::HashMap<usize, (F, u64)>, batches: Vec<RetiringBatch<H, F>> }
+
+impl<H, F: Clone> RetireQueue<H, F> {
+    fn new() -> Self { Self { fences: std::collections::HashMap::new(), batches: Vec::new() } }
+
+    /// Seal `heaps` behind `unmap_mark` and one fence signal per queue (signaled BEFORE queueing).
+    /// Returns `heaps` immediately when zero marks were signaled and `unmap_mark` is `None`.
+    fn retire_with<Q>(&mut self, heaps: Vec<H>, unmap_mark: Option<(F, u64)>, queues: &[(usize, Q)], mut make_fence: impl FnMut() -> Option<F>, mut signal: impl FnMut(&Q, &F, u64) -> bool) -> Vec<H> {
+        if heaps.is_empty() { return Vec::new(); }
+        let mut marks = Vec::with_capacity(queues.len());
+        for (k, q) in queues {
+            let (f, v) = match self.fences.entry(*k) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => { let Some(f) = make_fence() else { continue }; e.insert((f, 0)) }
+            };
+            if signal(q, f, *v + 1) { *v += 1; marks.push((f.clone(), *v)); }
+        }
+        if marks.is_empty() && unmap_mark.is_none() { return heaps; }
+        self.batches.push(RetiringBatch { heaps, unmap_mark, marks });
+        Vec::new()
+    }
+
+    /// Reap completed batches and prune dead-queue fences once completed; caller drops outside locks.
+    fn sweep_with(&mut self, live_queues: &HashSet<usize>, mut completed: impl FnMut(&F) -> u64) -> (Vec<RetiringBatch<H, F>>, Vec<F>) {
+        let (mut done, mut kept) = (Vec::new(), Vec::new());
+        for b in std::mem::take(&mut self.batches) {
+            if b.unmap_mark.as_ref().is_none_or(|(f, v)| completed(f) >= *v) && b.marks.iter().all(|(f, v)| completed(f) >= *v) { done.push(b); } else { kept.push(b); }
+        }
+        self.batches = kept;
+        let stale: Vec<usize> = self.fences.iter().filter(|(k, (f, v))| !live_queues.contains(k) && completed(f) >= *v).map(|(&k, _)| k).collect();
+        let pruned = stale.into_iter().filter_map(|k| self.fences.remove(&k).map(|(f, _)| f)).collect();
+        (done, pruned)
+    }
+}
+
+unsafe impl Send for RetireQueue<ID3D12Heap, ID3D12Fence> {}
+
+static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<ID3D12Heap, ID3D12Fence>>>> = Mutex::new(None);
+static RETIRING_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Collect all known live command queues belonging to `dev_key` (deduplicated by raw ptr).
+unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueue>) -> Vec<(usize, ID3D12CommandQueue)> {
+    let (mut seen, mut out) = (HashSet::new(), Vec::new());
+    let mut add = |q: ID3D12CommandQueue| {
+        let key = q.as_raw() as usize;
+        let mut q_dev: Option<ID3D12Device> = None;
+        if seen.insert(key) && q.GetDevice(&mut q_dev).is_ok() && q_dev.is_some_and(|d| d.as_raw() as usize == dev_key) {
+            out.push((key, q));
+        }
+    };
+    for raw in super::present::known_queues() {
+        let raw = raw as *mut c_void;
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) { add(q.clone()); }
+    }
+    for q in extra.into_iter().cloned().chain(super::title_textures::upload_queues()).chain(super::sparse::queue()) {
+        add(q);
+    }
+    out
+}
+
+/// Retire `newly_reclaimed` across all live queues on `dev_key`, sweep completed batches, and prune
+/// dead-queue fences; drops every finished `ID3D12Heap` and `ID3D12Fence` outside all locks.
+unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<ID3D12Heap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
+    let queues = collect_device_queues(dev_key, extra_queue);
+    let live_keys: HashSet<usize> = queues.iter().map(|&(k, _)| k).collect();
+    let _drop_outside_locks = {
+        let mut guard = RETIRE.lock().unwrap();
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
+        let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
+        let before = rq.batches.len();
+        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
+        let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
+        RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
+        (immediate, done, pruned)
+    };
+}
+
 /// Before GPU work on `queue`: have it wait for every tile mapping made so far on its device,
 /// release any previously retired heaps whose GPU fences have completed, and periodically (once
-/// per second per device) retire completely empty 64 MiB VRAM pool heaps and idle arenas behind a
-/// GPU fence signal so reclaimed heaps are never dropped while in-flight GPU work may reference them.
+/// per second per device) retire completely empty 64 MiB VRAM pool heaps and idle arenas behind
+/// per-queue GPU fence signals across all live queues on the device.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut dev: Option<ID3D12Device> = None;
     if queue.GetDevice(&mut dev).is_err() {
@@ -1135,11 +1200,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(dev) = dev else { return };
     let dev_key = dev.as_raw() as usize;
     let now = std::time::Instant::now();
-    let mut ready_to_drop = Vec::new();
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
-    let mut unmap_val = 0u64;
-    let mut retire_signal: Option<(ID3D12Fence, u64)> = None;
+    let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1149,62 +1212,22 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
                 pages.waited.insert(key, pages.value);
             }
-            if !pages.retiring.is_empty() {
-                let done_unmap = pages.fence.GetCompletedValue();
-                let done_retire = pages.retire_fence.GetCompletedValue();
-                while let Some(&(_, u_val, r_val)) = pages.retiring.front() {
-                    if done_unmap >= u_val && done_retire >= r_val {
-                        ready_to_drop.push(pages.retiring.pop_front().unwrap().0);
-                    } else {
-                        break;
-                    }
-                }
-            }
             if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
                 pages.last_reclaim = now;
                 do_reclaim = true;
                 newly_reclaimed = pages.sweep_and_reclaim(now);
-                unmap_val = pages.value;
+                if !newly_reclaimed.is_empty() {
+                    unmap_mark = Some((pages.fence.clone(), pages.value));
+                }
             }
         }
     }
     if do_reclaim {
-        newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped(now));
+        newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
     }
-    if !newly_reclaimed.is_empty() {
-        let mut g = PAGES.lock().unwrap();
-        if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            pages.retire_value += 1;
-            let rv = pages.retire_value;
-            retire_signal = Some((pages.retire_fence.clone(), rv));
-            for h in newly_reclaimed {
-                pages.retiring.push_back((h, unmap_val, rv));
-            }
-        } else {
-            ready_to_drop.extend(newly_reclaimed);
-        }
+    if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
     }
-    if let Some((fence, rv)) = retire_signal {
-        if queue.Signal(&fence, rv).is_err() {
-            // If signaling failed (e.g. device removed), drain entries queued for `rv` so they
-            // do not stay pinned forever waiting on an unsignalled fence value.
-            let mut g = PAGES.lock().unwrap();
-            if let Some(Some(pages)) = g.get_mut(&dev_key) {
-                let mut kept = std::collections::VecDeque::with_capacity(pages.retiring.len());
-                for item in pages.retiring.drain(..) {
-                    if item.2 == rv {
-                        ready_to_drop.push(item.0);
-                    } else {
-                        kept.push_back(item);
-                    }
-                }
-                pages.retiring = kept;
-            }
-        }
-    }
-    // Drop fence-completed reclaimed heaps outside all locks so D3D12 Release never blocks
-    // concurrent texture placement threads.
-    drop(ready_to_drop);
 }
 
 #[cfg(test)]
@@ -1350,7 +1373,12 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
-    let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
+    let dev_key = dev.as_raw() as usize;
+    let (taken, expired) = ARENAS.lock().unwrap().take_for(dev_key, va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align));
+    if !expired.is_empty() {
+        retire_heaps_and_sweep(dev, dev_key, expired, None, None);
+    }
+    let (heap, offset, id) = taken?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         ARENAS.lock().unwrap().release(id, now);
@@ -1563,14 +1591,14 @@ mod tests {
     fn arenas_sweep_dropped_returns_expired_heaps() {
         let t0 = Instant::now();
         let mut arenas: Arenas<u32> = Arenas::new();
-        let (_, _, id1) = arenas.take(0x10_0000, 0x1_0000, PAGE, t0, |_, _| Some(101)).unwrap();
-        let (_, _, id2) = arenas.take(0x20_0000, 0x1_0000, PAGE, t0, |_, _| Some(202)).unwrap();
+        let (_, _, id1) = arenas.take_for(1, 0x10_0000, 0x1_0000, PAGE, t0, |_, _| Some(101)).0.unwrap();
+        let (_, _, id2) = arenas.take_for(1, 0x20_0000, 0x1_0000, PAGE, t0, |_, _| Some(202)).0.unwrap();
         arenas.release(id1, t0);
         arenas.release(id2, t0 + Duration::from_secs(1));
-        assert!(arenas.sweep_dropped(t0 + Duration::from_millis(1900)).is_empty());
-        assert_eq!(arenas.sweep_dropped(t0 + IDLE + Duration::from_millis(10)), vec![101]);
+        assert!(arenas.sweep_dropped_for(1, t0 + Duration::from_millis(1900)).is_empty());
+        assert_eq!(arenas.sweep_dropped_for(1, t0 + IDLE + Duration::from_millis(10)), vec![101]);
         assert_eq!(arenas.bytes(), 0x1_0000);
-        assert_eq!(arenas.sweep_dropped(t0 + Duration::from_secs(1) + IDLE + Duration::from_millis(10)), vec![202]);
+        assert_eq!(arenas.sweep_dropped_for(1, t0 + Duration::from_secs(1) + IDLE + Duration::from_millis(10)), vec![202]);
         assert_eq!(arenas.bytes(), 0);
     }
 
@@ -1578,15 +1606,101 @@ mod tests {
     fn arenas_sweep_dropped_preserves_newest_fitting_order() {
         let t0 = Instant::now();
         let mut arenas: Arenas<u32> = Arenas::new();
-        let (_, _, id1) = arenas.take(0x10_0000, PAGE, PAGE, t0, |_, _| Some(101)).unwrap();
-        let (_, _, id2) = arenas.take(0x20_0000, PAGE, PAGE, t0, |_, _| Some(202)).unwrap();
-        let (_, _, id3) = arenas.take(0x20_0000, 2 * PAGE, PAGE, t0, |_, _| Some(303)).unwrap();
+        let id1 = arenas.take_for(1, 0x10_0000, PAGE, PAGE, t0, |_, _| Some(101)).0.unwrap().2;
+        let id2 = arenas.take_for(1, 0x20_0000, PAGE, PAGE, t0, |_, _| Some(202)).0.unwrap().2;
+        let id3 = arenas.take_for(1, 0x20_0000, 2 * PAGE, PAGE, t0, |_, _| Some(303)).0.unwrap().2;
         arenas.release(id1, t0);
         let t1 = t0 + IDLE + Duration::from_millis(10);
-        assert_eq!(arenas.sweep_dropped(t1), vec![101]);
-        let (heap, off, picked_id) = arenas.take(0x20_0000, PAGE, PAGE, t1, |_, _| panic!("must reuse existing arena")).unwrap();
+        assert_eq!(arenas.sweep_dropped_for(1, t1), vec![101]);
+        let (heap, off, picked_id) = arenas.take_for(1, 0x20_0000, PAGE, PAGE, t1, |_, _| panic!("must reuse existing arena")).0.unwrap();
         assert_eq!((heap, off, picked_id), (303, 0, id3), "sweep must preserve insertion order so rposition selects the newest fitting arena");
         assert_ne!(picked_id, id2);
+    }
+
+    #[test]
+    fn arenas_isolate_devices_and_take_for_returns_expired_heaps() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        struct DropFlag(Arc<AtomicUsize>);
+        impl Drop for DropFlag { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+        let (t0, d1, d2) = (Instant::now(), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut arenas: Arenas<Arc<DropFlag>> = Arenas::new();
+        let (h1, _, id1) = arenas.take_for(0x1000, 0x10_0000, PAGE, PAGE, t0, |_, _| Some(Arc::new(DropFlag(d1.clone())))).0.unwrap();
+        let (h2, _, id2) = arenas.take_for(0x2000, 0x10_0000, PAGE, PAGE, t0, |_, _| Some(Arc::new(DropFlag(d2.clone())))).0.unwrap();
+        assert_ne!(id1, id2, "distinct devices at the same VA must never alias arenas");
+        drop((h1, h2));
+        arenas.release(id1, t0);
+        arenas.release(id2, t0);
+        let t1 = t0 + IDLE + Duration::from_millis(10);
+        let exp1 = arenas.sweep_dropped_for(0x1000, t1);
+        assert_eq!((exp1.len(), arenas.bytes(), d1.load(Ordering::SeqCst), d2.load(Ordering::SeqCst)), (1, PAGE, 0, 0));
+        let (_, exp2) = arenas.take_for(0x2000, 0x20_0000, PAGE, PAGE, t1, |_, _| Some(Arc::new(DropFlag(Arc::new(AtomicUsize::new(0))))));
+        assert_eq!((exp2.len(), d2.load(Ordering::SeqCst)), (1, 0), "take_for must not drop expired heaps inside ARENAS");
+        drop((exp1, exp2));
+        assert_eq!((d1.load(Ordering::SeqCst), d2.load(Ordering::SeqCst)), (1, 1));
+    }
+
+    #[test]
+    fn retire_queue_waits_for_all_queues_and_prunes_dead_queue_fences() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let (mut rq, unmap_f) = (RetireQueue::<u32, Arc<AtomicU64>>::new(), Arc::new(AtomicU64::new(0)));
+        let mut qf: std::collections::HashMap<usize, Arc<AtomicU64>> = std::collections::HashMap::new();
+        let mk = || Some(Arc::new(AtomicU64::new(0)));
+        assert!(rq.retire_with(vec![101], Some((unmap_f.clone(), 1)), &[(1, 1usize), (2, 2), (3, 3)], mk, |q, f, _| { qf.entry(*q).or_insert_with(|| f.clone()); true }).is_empty());
+        assert!(rq.retire_with(vec![202], None, &[(1, 1usize), (2, 2), (4, 4)], mk, |q, f, _| { qf.entry(*q).or_insert_with(|| f.clone()); true }).is_empty());
+        qf[&2].store(2, Ordering::SeqCst);
+        qf[&3].store(1, Ordering::SeqCst);
+        unmap_f.store(1, Ordering::SeqCst);
+        let live: HashSet<usize> = [1, 2].into_iter().collect();
+        let (done, pruned) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert!(done.is_empty() && pruned.len() == 1 && Arc::ptr_eq(&pruned[0], &qf[&3]) && rq.fences.contains_key(&4));
+        drop(pruned);
+        qf[&1].store(1, Ordering::SeqCst);
+        let (done, pruned) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert_eq!((done.len(), done[0].heaps.as_slice(), pruned.len()), (1, &[101][..], 0));
+        assert!(Arc::strong_count(&qf[&3]) > 1, "completed batch fences must drop outside lock");
+        drop(done);
+        qf[&1].store(2, Ordering::SeqCst);
+        qf[&4].store(1, Ordering::SeqCst);
+        let (done, pruned) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert_eq!((done[0].heaps.as_slice(), pruned.len(), rq.batches.is_empty()), (&[202][..], 1, true));
+        assert!(Arc::ptr_eq(&pruned[0], &qf[&4]));
+        assert_eq!(rq.retire_with(vec![303], None, &[] as &[(usize, usize)], mk, |_, _, _| true), vec![303]);
+    }
+
+    #[test]
+    fn gpu_retire_queue_holds_heap_until_blocked_queue_passes_mark() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+        struct GuardedHeap(#[allow(dead_code)] ID3D12Heap, Arc<AtomicBool>);
+        impl Drop for GuardedHeap { fn drop(&mut self) { self.1.store(true, Ordering::SeqCst); } }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let q1: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let q2: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let probe: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let desc = D3D12_HEAP_DESC { SizeInBytes: PAGE as u64, Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, Alignment: PAGE as u64, Flags: D3D12_HEAP_FLAG_NONE };
+            let mut heap: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&desc, &mut heap).unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            q1.Wait(&gate, 1).unwrap();
+            let (k1, k2) = (q1.as_raw() as usize, q2.as_raw() as usize);
+            let mut rq: RetireQueue<GuardedHeap, ID3D12Fence> = RetireQueue::new();
+            assert!(rq.retire_with(vec![GuardedHeap(heap.unwrap(), dropped.clone())], None, &[(k1, q1.clone()), (k2, q2.clone())], || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok()).is_empty());
+            q2.Signal(&probe, 1).unwrap();
+            probe.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            let (done, pruned) = rq.sweep_with(&[k1, k2].into_iter().collect(), |f| f.GetCompletedValue());
+            assert!(done.is_empty() && pruned.is_empty() && !dropped.load(Ordering::SeqCst), "heap dropped while Q1 was still blocked");
+            gate.Signal(1).unwrap();
+            q1.Signal(&probe, 2).unwrap();
+            probe.SetEventOnCompletion(2, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            let (done, pruned) = rq.sweep_with(&[k1].into_iter().collect(), |f| f.GetCompletedValue());
+            assert_eq!((done.len(), pruned.len(), dropped.load(Ordering::SeqCst)), (1, 1, false));
+            drop((done, pruned));
+            assert!(dropped.load(Ordering::SeqCst));
+        }
     }
 
     #[test]
@@ -1748,7 +1862,7 @@ mod tests {
     /// A placement's arena id, with heaps numbered as they are made.
     fn take(a: &mut Arenas<u32>, va: usize, bytes: usize, align: usize, now: Instant) -> u64 {
         let n = a.list.len() as u32;
-        a.take(va, bytes, align, now, |_, _| Some(n)).unwrap().2
+        a.take_for(1, va, bytes, align, now, |_, _| Some(n)).0.unwrap().2
     }
 
     #[test]

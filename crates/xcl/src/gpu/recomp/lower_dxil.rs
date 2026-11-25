@@ -1203,9 +1203,10 @@ mod tests {
             return runner::skip_test("no DXC");
         }
         let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
-        let barriers = text.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
-        // the one where the halves take their console lanes, at the start (every lane is there)
-        assert_eq!(barriers, 1, "group barriers in the program:\n{text}");
+        let (_, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
+        // after the entry whole-wave branch, only one half reaches the body so no group barrier may appear there
+        assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");
         if !gpu() {
             return;
         }

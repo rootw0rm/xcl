@@ -18,6 +18,7 @@ pub mod memstat;
 #[cfg(not(windows))]
 #[path = "memstat_linux.rs"]
 pub mod memstat;
+pub(crate) mod cli;
 pub mod config;
 pub mod disasm;
 #[cfg(windows)]

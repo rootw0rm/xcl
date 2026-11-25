@@ -1384,6 +1384,15 @@ unsafe fn publish_cpu_cycle_break_with(va: u64, val: u64, uma: Option<&crate::gp
     }
 }
 
+/// Remove a synthetic test fence and queue entry from `SYNC_GRAPH` before they are dropped.
+#[cfg(test)]
+pub(super) fn forget_title_fence_for_test(fence: usize, queue: usize) {
+    if let Some(graph) = SYNC_GRAPH.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        graph.title_fences.remove(&fence);
+        graph.queue_seq.remove(&queue);
+    }
+}
+
 /// Before a title `ID3D12CommandQueue::Signal(title_fence, value)` is submitted, check if it would
 /// close a mixed cycle passing through any `Wait64BitValueX` `SyncCell`. If so, release that
 /// `SyncCell` on CPU BEFORE the title signal executes so Vulkan never enters a semaphore cycle.
