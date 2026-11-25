@@ -130,6 +130,7 @@ fn root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignat
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TexDim {
+    D1Array,
     D2,
     D2Array,
     D3,
@@ -248,6 +249,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         }
         let (dim, depth_or_array) = match t.dim {
             TexDim::D3 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, t.depth),
+            TexDim::D1Array => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, t.depth),
             _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
         };
         let rd = if t.dim == TexDim::Buffer {
@@ -347,6 +349,12 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         let mut sv = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: t.format, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
         let mut uv = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: t.format, ..Default::default() };
         match t.dim {
+            TexDim::D1Array => {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                sv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: t.depth, ..Default::default() };
+                uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                uv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
+            }
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
@@ -1516,16 +1524,17 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         }
         // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
         // (`Options::heap_windows`; programs with the root-UAV switch ignore it)
+        let win_count = arena.windows.len().clamp(crate::gpu::uma::MAX_WINDOWS, crate::gpu::uma::MAX_HEAP_WINDOWS);
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
             .map_err(e)?;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-        for k in 0..4usize {
+        for k in 0..win_count {
             let (b, size) = bufs.get(k).map_or((&mem_buf, arena.windows[0].1), |b| (b, arena.windows[k].1));
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
@@ -1679,16 +1688,17 @@ fn dispatch_with(
         // A PSO built by the backend's hook uses the runtime's window count: with heap windows
         // (`Options::heap_windows`) its accesses go to ResourceDescriptorHeap[MEM_HEAP_BASE + w],
         // so every window slot is a raw view of `mem` (no textures here to share the heap with).
+        let win_count = crate::gpu::uma::MAX_HEAP_WINDOWS;
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
             .map_err(e)?;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-        for k in 0..4usize {
+        for k in 0..win_count {
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);

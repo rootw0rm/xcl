@@ -216,14 +216,26 @@ pub enum LaunchExec {
     Unknown,
 }
 
+/// How a tracked SCC bit relates to the hardware's wave-wide SCC.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SccKind {
+    /// Uniform scalar SCC (independent of per-lane mask bits).
+    Uniform,
+    /// Hardware SCC = (mask != 0): 1 iff any lane in the wave has bit 1.
+    Any,
+    /// Hardware SCC = (a == b): 1 iff every lane in the wave has bit 1 (`!(a ^ b)`).
+    All,
+    /// Joined from incompatible mask-op SCC kinds or overflowed: never sound as a per-lane read.
+    Unknown,
+}
+
 /// The masks at a program point. `regs[r]`: the lane function of the mask SGPR r holds (wave64:
 /// in the pair's first register), None when it holds nothing the analysis knows as a mask.
-/// EXEC always has one. `scc`: (lane function, true when it is a mask op's "result has the
-/// lane's bit" rather than a uniform value).
+/// EXEC always has one. `scc`: (lane function, how hardware reduces the wave's bits to SCC).
 #[derive(Clone, PartialEq)]
 struct State {
     regs: Vec<Option<B>>,
-    scc: Option<(B, bool)>,
+    scc: Option<(B, SccKind)>,
 }
 
 /// How a block's successor is reached: unconditionally, or by its branch taken / not taken.
@@ -263,6 +275,20 @@ pub struct Summary {
     /// blocks the entry reaches: every block after its forward predecessors)
     pub blocks: Vec<Block>,
     pub order: Vec<usize>,
+}
+
+/// Whether `d` reads SCC as a non-branch input (either implicitly via `OPR_SSRC_SPECIAL_SCC`
+/// or explicitly via source encoding 253 / `SRC_SCC`).
+fn reads_scc(d: &Decoded) -> bool {
+    if matches!(d.inst.name, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") {
+        return false;
+    }
+    if d.ienc.operands.iter().any(|o| o.input && o.ty == "OPR_SSRC_SPECIAL_SCC") {
+        return true;
+    }
+    ["SSRC0", "SSRC1", "SRC0", "SRC1", "SRC2", "SOFFSET"]
+        .iter()
+        .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(253))
 }
 
 /// Executed with the lane's EXEC bit (VOPC and the lane reads / writes are mask producers).
@@ -454,7 +480,8 @@ impl<'a> Lanes<'a> {
             st.regs[EXEC] = Some(self.atom(Atom::Opaque(d.pc, EXEC), block)?);
         }
         if writes_scc {
-            st.scc = Some((self.atom(Atom::Scc(d.pc), block)?, !self.wave_branches));
+            let kind = if self.wave_branches { SccKind::Uniform } else { SccKind::Unknown };
+            st.scc = Some((self.atom(Atom::Scc(d.pc), block)?, kind));
         }
         Ok(())
     }
@@ -524,7 +551,7 @@ impl<'a> Lanes<'a> {
                 if let Some(sd) = sd.filter(|&r| r < 128) {
                     set.push((sd, if base.ends_with("_WREXEC") { new } else { e }));
                 }
-                scc = Some((new, true));
+                scc = Some((new, SccKind::Any));
             } else {
                 let (mut a, mut b) = (self.mask_src(st, d, s0), self.mask_src(st, d, s1));
                 // A bitwise scalar instruction can mix a tracked mask and an SGPR
@@ -541,7 +568,7 @@ impl<'a> Lanes<'a> {
                     ("NOT", Some(a), _) => Some(self.bdd.not(a)?),
                     ("WQM", Some(a), _) => self.wqm(a),
                     ("CSELECT", Some(a), Some(b)) => match st.scc {
-                        Some((u, false)) => {
+                        Some((u, SccKind::Uniform)) => {
                             let (ua, nu) = (self.bdd.and(u, a)?, self.bdd.not(u)?);
                             let nub = self.bdd.and(nu, b)?;
                             Some(self.bdd.or(ua, nub)?)
@@ -554,7 +581,7 @@ impl<'a> Lanes<'a> {
                 if let (Some(v), Some(sd)) = (value, sd.filter(|&r| r < 128)) {
                     set.push((sd, v));
                     if !matches!(op, "MOV" | "CSELECT") {
-                        scc = Some((v, true));
+                        scc = Some((v, SccKind::Any));
                     }
                 }
             }
@@ -567,7 +594,7 @@ impl<'a> Lanes<'a> {
                 let a = self.need(st, d, s0, block)?;
                 let b = self.need(st, d, s1, block)?;
                 let x = self.bdd.apply(Op::Xor, a, b)?;
-                scc = Some((if name == cmp.0 { self.bdd.not(x)? } else { x }, true));
+                scc = Some(if name == cmp.0 { (self.bdd.not(x)?, SccKind::All) } else { (x, SccKind::Any) });
             }
         }
         // whatever else the instruction writes is no longer a known mask
@@ -584,7 +611,7 @@ impl<'a> Lanes<'a> {
         if writes_scc {
             st.scc = match scc.filter(|_| !self.wave_branches) {
                 Some(s) => Some(s),
-                None => Some((self.atom(Atom::Scc(d.pc), block)?, false)),
+                None => Some((self.atom(Atom::Scc(d.pc), block)?, SccKind::Uniform)),
             };
         }
         Ok(())
@@ -609,58 +636,62 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// Whether `c` is the same in every lane that reaches with its EXEC bit (`reach` and `e`):
-    /// then a lane deciding by its own bit decides as the whole wave does. Unknown (too large
-    /// to build) is no.
-    fn uniform_over(&mut self, reach: B, e: B, c: B) -> bool {
-        let Some(re) = self.bdd.within(|bdd| bdd.and(reach, e)) else { return false };
-        if self.bdd.implies(re, c) {
+    /// Whether each active lane's bit `c` agrees with the hardware's wave-wide reduction `kind`
+    /// (including bits in inactive lanes): then a lane deciding by its own bit decides as the
+    /// whole wave does. Unknown (too large to build) is no.
+    fn uniform_over(&mut self, reach: B, e: B, c: B, kind: SccKind) -> bool {
+        if reach == FALSE || kind == SccKind::Uniform {
             return true;
         }
-        match self.bdd.within(|bdd| bdd.not(c)) {
-            Some(nc) => self.bdd.implies(re, nc),
-            None => false,
+        let Some(re) = self.bdd.within(|bdd| bdd.and(reach, e)) else { return false };
+        match kind {
+            SccKind::Uniform => true,
+            SccKind::Unknown => false,
+            SccKind::Any => c == FALSE || (re != FALSE && self.bdd.implies(re, c)),
+            SccKind::All => {
+                c == TRUE
+                    || (re != FALSE
+                        && self.bdd.within(|bdd| bdd.not(c)).is_some_and(|nc| self.bdd.implies(re, nc)))
+            }
         }
     }
 
-    /// The condition under which a lane takes the branch ending a block, and whether it is a
-    /// lane mask's.
-    fn cond(&mut self, st: &State, d: &Decoded, block: usize) -> R<(B, bool)> {
+    /// The unnegated condition, its wave-wide reduction kind, and whether the branch negates it.
+    fn cond(&mut self, st: &State, d: &Decoded, block: usize) -> R<(B, SccKind, bool)> {
         let e = st.regs[EXEC].expect("EXEC");
         // All hardware lanes take the same edge. A wave decision carries no fact about
         // this lane's mask bit, even when the wave took the nonzero edge.
         if self.wave_branches {
-            return Ok((self.atom(Atom::Scc(d.pc), block)?, false));
+            return Ok((self.atom(Atom::Scc(d.pc), block)?, SccKind::Uniform, false));
         }
-        let (c, lane, negate) = match d.inst.name {
+        Ok(match d.inst.name {
             n @ ("S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") => {
-                let (c, lane) = match st.scc {
+                let (c, kind) = match st.scc {
                     Some(s) => s,
-                    None => (self.atom(Atom::Scc(d.pc), block)?, false),
+                    None => (self.atom(Atom::Scc(d.pc), block)?, SccKind::Uniform),
                 };
-                (c, lane, n == "S_CBRANCH_SCC0")
+                (c, kind, n == "S_CBRANCH_SCC0")
             }
             n @ ("S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ") => {
                 let v = match st.regs[VCC] {
                     Some(v) => v,
                     None => self.atom(Atom::Opaque(d.pc, VCC), block)?,
                 };
-                (self.bdd.and(v, e)?, true, n == "S_CBRANCH_VCCZ")
+                (v, SccKind::Any, n == "S_CBRANCH_VCCZ")
             }
-            n @ ("S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") => (e, true, n == "S_CBRANCH_EXECZ"),
-            _ => (self.atom(Atom::Scc(d.pc), block)?, false, false),
-        };
-        Ok((if negate { self.bdd.not(c)? } else { c }, lane))
+            n @ ("S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") => (e, SccKind::Any, n == "S_CBRANCH_EXECZ"),
+            _ => (self.atom(Atom::Scc(d.pc), block)?, SccKind::Uniform, false),
+        })
     }
 
     /// `cond` within `STEP_NODES` new nodes; past that, an unknown per-lane condition.
-    fn cond_bounded(&mut self, st: &State, d: &Decoded, block: usize) -> R<(B, bool)> {
+    fn cond_bounded(&mut self, st: &State, d: &Decoded, block: usize) -> R<(B, SccKind, bool)> {
         self.bdd.limit = (self.bdd.nodes.len() + STEP_NODES).min(MAX_NODES);
         let r = self.cond(st, d, block);
         self.bdd.limit = MAX_NODES;
         match r {
             Ok(c) => Ok(c),
-            Err(_) => Ok((self.atom(Atom::Scc(d.pc), block)?, true)),
+            Err(_) => Ok((self.atom(Atom::Scc(d.pc), block)?, SccKind::Unknown, false)),
         }
     }
 
@@ -677,10 +708,11 @@ impl<'a> Lanes<'a> {
                 Edge::Always => reach,
                 edge => {
                     // a fact too large to build is left without the branch's condition (weaker)
-                    let (c, _) = self.cond_bounded(&st, last, b)?;
+                    let (raw_c, _, negate) = self.cond_bounded(&st, last, b)?;
+                    let take_neg = (edge == Edge::Taken) == negate;
                     self.bdd
                         .within(|bdd| {
-                            let c = if edge == Edge::Taken { c } else { bdd.not(c)? };
+                            let c = if take_neg { bdd.not(raw_c)? } else { raw_c };
                             bdd.and(reach, c)
                         })
                         .unwrap_or(reach)
@@ -719,10 +751,22 @@ impl<'a> Lanes<'a> {
         // an SCC a mask op set on any incoming edge, back edges included (their masks may not
         // count here, but a lane's own SCC carried around a loop is still a lane's: thehollowedone,
         // #1745)
-        let scc_lane = self.preds[b].iter().any(|&(p, k)| outs[p].get(k).is_some_and(|(f, s)| *f != FALSE && s.scc.is_some_and(|x| x.1)));
+        let mut scc_kind = SccKind::Uniform;
+        for &(p, k) in &self.preds[b] {
+            if let Some((f, s)) = outs[p].get(k) {
+                if *f != FALSE {
+                    if let Some((_, knd)) = s.scc {
+                        scc_kind = match (scc_kind, knd) {
+                            (SccKind::Uniform, k) | (k, SccKind::Uniform) => k,
+                            (a, b) if a == b => a,
+                            _ => SccKind::Unknown,
+                        };
+                    }
+                }
+            }
+        }
         for slot in 0..=SCC {
             let get = |s: &State| if slot == SCC { s.scc.map(|x| x.0) } else { s.regs[slot] };
-            let lane = scc_lane;
             let v = if forced.contains(&(b, slot)) {
                 Some(self.atom(Atom::Join(b, slot), b)?)
             } else if edges.iter().any(|(_, s)| get(s).is_none()) {
@@ -731,6 +775,8 @@ impl<'a> Lanes<'a> {
                 let first = get(&edges[0].1).unwrap();
                 Some(if edges.iter().all(|(_, s)| get(s) == Some(first)) {
                     first
+                } else if slot == SCC && scc_kind != SccKind::Uniform {
+                    self.atom(Atom::Join(b, slot), b)?
                 } else if edges.iter().all(|(fact, s)| self.bdd.implies(*fact, get(s).unwrap())) {
                     TRUE
                 } else if edges.iter().all(|(fact, s)| self.bdd.disjoint(*fact, get(s).unwrap(), &mut HashSet::new())) {
@@ -742,10 +788,10 @@ impl<'a> Lanes<'a> {
             if slot == SCC {
                 // unknown but a lane's on some edge: an unknown lane condition, not a uniform one
                 let v = match v {
-                    None if lane => Some(self.atom(Atom::Join(b, SCC), b)?),
+                    None if scc_kind != SccKind::Uniform => Some(self.atom(Atom::Join(b, SCC), b)?),
                     v => v,
                 };
-                st.scc = v.map(|v| (v, lane));
+                st.scc = v.map(|v| (v, scc_kind));
             } else {
                 st.regs[slot] = v;
             }
@@ -808,8 +854,12 @@ impl<'a> Lanes<'a> {
                 let (_, full) = self.join(h, &outs, &forced, true)?;
                 let guess = ins[h].as_ref().unwrap();
                 for slot in 0..=SCC {
-                    let (g, f) = if slot == SCC { (guess.scc.map(|x| x.0), full.scc.map(|x| x.0)) } else { (guess.regs[slot], full.regs[slot]) };
-                    if g != f && forced.insert((h, slot)) {
+                    let changed = if slot == SCC {
+                        guess.scc != full.scc
+                    } else {
+                        guess.regs[slot] != full.regs[slot]
+                    };
+                    if changed && forced.insert((h, slot)) {
                         wrong = true;
                         dirty[h] = true;
                     }
@@ -838,14 +888,16 @@ impl<'a> Lanes<'a> {
                         sum.guarded.push(d.pc);
                     }
                 }
-                // an SCC a mask op set, read by a scalar instruction: the console reads the whole
-                // wave's, each lane here its own bit, the same only where it is constant over EXEC
-                let n = d.inst.name;
-                if ["S_CSELECT", "S_CMOV", "S_ADDC", "S_SUBB"].iter().any(|p| n.starts_with(p)) {
-                    if let Some((c, true)) = st.scc {
-                        let e = st.regs[EXEC].unwrap();
-                        if !self.uniform_over(reach[b], e, c) {
-                            return Err("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit");
+                // an SCC a mask op set, read by a scalar or vector instruction (implicit or
+                // SRC_SCC = 253): the console reads the whole wave's, each lane here its own bit,
+                // the same only where it agrees wave-wide
+                if reads_scc(d) {
+                    if let Some((c, kind)) = st.scc {
+                        if kind != SccKind::Uniform {
+                            let e = st.regs[EXEC].unwrap();
+                            if !self.uniform_over(reach[b], e, c, kind) {
+                                return Err("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit");
+                            }
                         }
                     }
                 }
@@ -859,14 +911,15 @@ impl<'a> Lanes<'a> {
             }
             let last = &self.insts[end - 1];
             if self.succ[b].iter().any(|s| s.1 != Edge::Always) {
-                let (c, lane) = self.cond_bounded(&st, last, b)?;
-                // a lane branch is each lane's only where the condition is constant over the lanes
-                // in EXEC (`s_and_saveexec` then `s_cbranch_execz`); `s_cbranch_vccz` on a mask some
-                // lanes in EXEC lack takes the whole wave's way on the console (Kalmarv, #1745)
-                if lane && !self.uniform_over(reach[b], st.regs[EXEC].unwrap(), c) {
+                let (raw_c, kind, _) = self.cond_bounded(&st, last, b)?;
+                let lane = kind != SccKind::Uniform;
+                // a lane branch is each lane's only where the condition agrees with the whole
+                // wave's reduction (`s_and_saveexec` then `s_cbranch_execz`); `s_cbranch_vccz` on a
+                // mask with bits in inactive lanes or lacking active lanes takes the whole wave's
+                // way on the console (Kalmarv, #1745)
+                if lane && !self.uniform_over(reach[b], st.regs[EXEC].unwrap(), raw_c, kind) {
                     return Err("a branch on whether any lane of a mask is set, with lanes in EXEC without its bit");
                 }
-                let (_, lane) = self.cond_bounded(&st, last, b)?;
                 if lane {
                     sum.lane_branches += 1;
                 } else {
@@ -1116,5 +1169,56 @@ mod tests {
         // the quads of any other mask are not followed
         let s = run_launch(&[CMP, ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 106)]), MOV2, ENDPGM], LaunchExec::All).unwrap();
         assert_eq!((s.guarded, s.wqm_all), (vec![8], vec![]));
+    }
+
+    #[test]
+    fn whole_wave_scc_accounts_for_inactive_lanes() {
+        let save_and: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+        let save_andn2: I = ("S_ANDN2_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+        let cmp_exec_all: I = ("S_CMP_EQ_U64", "ENC_SOPC", &[("SSRC0", 126), ("SSRC1", 193)]);
+        let cmp_exec_zero: I = ("S_CMP_EQ_U64", "ENC_SOPC", &[("SSRC0", 126), ("SSRC1", 128)]);
+        let not_exec: I = ("S_NOT_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 126)]);
+        let cmp_vcc_eq0: I = ("S_CMP_EQ_U64", "ENC_SOPC", &[("SSRC0", 106), ("SSRC1", 128)]);
+        let cmp_vcc_lg0: I = ("S_CMP_LG_U64", "ENC_SOPC", &[("SSRC0", 106), ("SSRC1", 128)]);
+        let br_scc1: I = ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]);
+        let br_scc0: I = ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)]);
+
+        // partial EXEC != -1: hardware SCC = 0, active lanes see 1
+        assert!(run(&[CMP, save_and, cmp_exec_all, br_scc1, MOV2, ENDPGM]).is_err());
+        // full EXEC == -1 wave-wide: hardware SCC = 1, every lane sees 1
+        assert!(run(&[cmp_exec_all, br_scc1, MOV2, ENDPGM]).is_ok());
+        // !EXEC with partial EXEC is nonzero in inactive lanes: hardware SCC = 1, active lanes see 0
+        assert!(run(&[CMP, save_and, not_exec, br_scc0, MOV2, ENDPGM]).is_err());
+        // !EXEC with full EXEC is 0 wave-wide: hardware SCC = 0, every lane sees 0
+        assert!(run(&[not_exec, br_scc0, MOV2, ENDPGM]).is_ok());
+        // VCC has bits in inactive lanes after s_andn2_saveexec: active lanes have VCC == 0, wave has VCC != 0
+        assert!(run(&[CMP, save_andn2, cmp_vcc_eq0, br_scc1, MOV2, ENDPGM]).is_err());
+        assert!(run(&[CMP, save_andn2, cmp_vcc_lg0, br_scc1, MOV2, ENDPGM]).is_err());
+        // EXEC == 0 check on narrowed EXEC matches per-lane (!EXEC)
+        assert!(run(&[CMP, save_and, cmp_exec_zero, br_scc1, MOV2, ENDPGM]).is_ok());
+    }
+
+    #[test]
+    fn vccz_branch_checks_bits_outside_exec() {
+        let save_andn2: I = ("S_ANDN2_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+        // active lanes have VCC == 0, but inactive lanes have VCC == 1: hardware sees VCC != 0
+        assert!(run(&[CMP, save_andn2, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, ENDPGM]).is_err());
+        assert!(run(&[CMP, save_andn2, ("S_CBRANCH_VCCNZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, ENDPGM]).is_err());
+        // VCC == 0 wave-wide: sound
+        let zero_vcc: I = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 128)]);
+        assert!(run(&[zero_vcc, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, ENDPGM]).is_ok());
+    }
+
+    #[test]
+    fn explicit_src_scc_reads_are_validated() {
+        let and_mask: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 106), ("SSRC1", 126)]);
+        let save_and: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+        // explicit SRC_SCC (253) on SALU and VALU reads of a non-uniform mask SCC must be refused
+        let smov_scc: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 253)]);
+        let vmov_scc: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 253)]);
+        assert_eq!(run(&[CMP, and_mask, smov_scc, ENDPGM]).err(), Some("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit"));
+        assert_eq!(run(&[CMP, and_mask, vmov_scc, ENDPGM]).err(), Some("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit"));
+        // when SCC agrees across every active lane (s_and_saveexec), explicit SRC_SCC is sound
+        assert!(run(&[CMP, save_and, smov_scc, ENDPGM]).is_ok());
     }
 }

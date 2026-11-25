@@ -274,11 +274,19 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
         readback.Unmap(0, None);
         Ok(got)
     };
-    let got = run();
+    let got = match run() {
+        Ok(got) => got,
+        Err(e) => {
+            // The copy may still be running: what it uses stays (a few KiB, once). Released under
+            // the GPU, vkd3d-proton frees it at once and the GPU faults (RADV: page faults, then a
+            // ring timeout) – a slow first use of the imported window is enough to get here.
+            std::mem::forget((queue, alloc, list, fence, readback));
+            return Err(e);
+        }
+    };
     for &(_, _, p, _) in &probes {
         u.free(p);
     }
-    let got = got?;
     let wrong: Vec<String> =
         probes.iter().filter(|&&(_, i, _, c)| got[i] != c).map(|&(k, i, _, c)| format!("window {k}: wrote {c:#x}, the GPU read {:#x}", got[i])).collect();
     if !wrong.is_empty() {
@@ -3395,6 +3403,13 @@ fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
     if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
         return r;
     }
+    if crate::gpu::uma::get().is_some_and(|u| u.shader_windows() > crate::gpu::uma::MAX_WINDOWS) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            crate::xlog_warn!("D3D12.X: the driver refused an expanded-window pipeline; switch-form retry requires XCL_UMA_WINDOWS=4");
+        });
+        return r;
+    }
     let n = SWITCH_FORM_RETRIES.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 100 == 0 {
         crate::xlog_warn!("D3D12.X: the driver ran out of memory on a pipeline with heap windows – building it in the switch form ({} so far)", n + 1);
@@ -3598,7 +3613,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3635,12 +3650,12 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 }
 
 /// Before a big driver compile in the background: its turn – at most the configured number at
-/// once, and 3 GB of commit
-/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
-/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
-/// when that thread builds it itself. Holding such a build back holds the title back: on a
-/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
-/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+/// once, and the commit headroom it asks for (`commit_free`, from `big_compile_headroom`; the
+/// title loading next to it must not run out). Unless one of the title's threads waits for the
+/// pipeline (`wanted`): then at once and without a slot (None), as when that thread builds it
+/// itself. Holding such a build back holds the title back: on a machine with less than the
+/// headroom free throughout a retail title's world loading, the first one would not go on and
+/// keeps the slot, until the title's watchdog ends it.
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let slot = {
@@ -3666,12 +3681,21 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     Some(slot)
 }
 
-/// 3 GB of commit are free (true when that is not known).
-fn big_compile_commit_free() -> bool {
+/// Commit headroom a big driver compile waits for: 3 GB for the class that starts at
+/// `huge_pso_bytes()` (each takes ~1.5 GB in the driver), and ~512× the DXIL size above 6 MiB
+/// of it — the driver's compile of a 29.8 MB program grew past 14 GB free before it was stopped
+/// (#1269), and programs of ~1 MB took several GB each on an 8 GB card (same issue). The floor
+/// leaves every program up to 6 MiB of DXIL waiting for exactly what it waited for before.
+fn big_compile_headroom(dxil_len: usize) -> u64 {
+    (3u64 << 30).max(dxil_len as u64 * 512)
+}
+
+/// That much commit is free (true when that is not known).
+fn big_compile_commit_free(need: u64) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
 }
 
 #[cfg(test)]
@@ -3786,6 +3810,17 @@ mod big_compile_tests {
     }
 
     #[test]
+    fn headroom_is_the_3_gb_floor_until_512_times_the_dxil_exceeds_it() {
+        // the class from huge_pso_bytes() up to 6 MiB of DXIL: the floor, unchanged
+        assert_eq!(big_compile_headroom(huge_pso_bytes()), 3 << 30);
+        assert_eq!(big_compile_headroom(6 << 20), 3 << 30);
+        // above it the wait scales with the program: the 29.8 MB one that grew past 14 GB of
+        // free commit (#1269) waits for 15 GB
+        assert_eq!(big_compile_headroom(8 << 20), 4 << 30);
+        assert_eq!(big_compile_headroom(29_800_000), 29_800_000u64 * 512);
+    }
+
+    #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
         let first = big_compile_turn(&S, || true, || false).expect("its turn");
@@ -3850,7 +3885,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
+    // in the background, a few at a time and within the commit headroom the program asks for
     let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
@@ -5122,7 +5157,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
     }

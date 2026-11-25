@@ -48,7 +48,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
-| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft |
+| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller or a PlayStation controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft; a DualShock 4 (USB) |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
 ### Graphics
@@ -63,6 +63,9 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
+Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
+An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
+
 ### Media and tools
 
 | Feature | State | What it does | Verified by |
@@ -76,6 +79,9 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
+- **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
+  when no XInput controller is connected – buttons, sticks and triggers, no rumble or light bar.
+  `XCL_PLAYSTATION_PAD=0` turns this off.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
@@ -122,6 +128,10 @@ xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driv
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+- **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
+  blob is left to the runtime instead of being compiled in the pass — those compiles take tens
+  of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
+  sets the cap in KiB (0 turns it off).
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.

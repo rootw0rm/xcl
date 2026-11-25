@@ -51,6 +51,7 @@
 //! Memory instructions use a flat model: descriptor/base addresses index one
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
+pub mod cfg;
 #[cfg(windows)]
 pub mod dxc;
 #[cfg(windows)]
@@ -63,6 +64,7 @@ pub mod glsl;
 pub mod spirv;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod partition;
 pub mod x64_masks;
 #[cfg(windows)]
 pub mod pso;
@@ -84,6 +86,11 @@ pub const MEM_HEAP_BASE: u32 = 0;
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+
+pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
+    windows <= crate::gpu::uma::MAX_WINDOWS
+        || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
+}
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -983,15 +990,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
     em.indent = depth;
-    let mut flow = emit::Flow::Next;
-    let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-    for (k, d) in block.iter().enumerate() {
-        let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-        flow = em.inst(d, next);
-        if !matches!(flow, emit::Flow::Next) {
-            break;
-        }
-    }
+    let flow = em.emit_insts(insts_in(c, start, end), end);
     body.push_str(&em.take());
     *blocks += 1;
     flow
@@ -1196,15 +1195,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let end = c.leaders.get(i + 1).copied().unwrap_or(u64::MAX);
         body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
         em.indent = depth + 1;
-        let mut flow = emit::Flow::Next;
-        let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-        for (k, d) in block.iter().enumerate() {
-            let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-            flow = em.inst(d, next);
-            if !matches!(flow, emit::Flow::Next) {
-                break;
-            }
-        }
+        let flow = em.emit_insts(insts_in(c, start, end), end);
         body.push_str(&em.take());
         let fallthrough = if end == u64::MAX || !c.starts.contains(&end) { "0xFFFFFFFFu".to_string() } else { format!("{end}u") };
         let tail = match flow {
@@ -1433,6 +1424,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     } else {
         opt
     };
+    if !valid_window_count(opt.mem_windows as usize, opt.heap_windows) {
+        return Err(format!("unsupported shader memory layout: {} windows (heap: {})", opt.mem_windows, opt.heap_windows));
+    }
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1474,9 +1468,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
-    // continues from the ES into the GS through s_setpc: left as it is)
+    // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
+    // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    } else if matches!(opt.mode, Mode::Pixel(_)) {
+        em.mask_whole_live = x64_masks::by_pc(&insts, false);
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
@@ -1503,12 +1500,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
         em.indent = 1;
-        for (i, d) in insts.iter().enumerate() {
-            let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
-            if let emit::Flow::End = em.inst(d, next) {
-                break;
-            }
-        }
+        em.emit_insts(&insts, u64::MAX);
         body.push_str(&em.take());
         blocks = 1;
     } else {

@@ -213,9 +213,14 @@ mod translated {
         }
     }
 
+    /// The direct translator's version: `TRANSLATOR_VERSION` and the hash of its sources (build.rs).
+    pub(super) fn direct_version(version: u32, source: &str) -> u64 {
+        identity_for(source, &version.to_string())
+    }
+
     /// `identity_for` of `backend`: unchanged for the HLSL path (its entries stay valid),
     /// tagged with the direct translator's version and routing mode otherwise.
-    pub(super) fn identity_with(source: &str, toolchain: &str, backend: Backend, direct_version: u32) -> u64 {
+    pub(super) fn identity_with(source: &str, toolchain: &str, backend: Backend, direct_version: u64) -> u64 {
         let base = identity_for(source, toolchain);
         let tag = match backend {
             Backend::Hlsl => return base,
@@ -244,7 +249,7 @@ mod translated {
                 env!("XCL_TRANSLATOR_SOURCE_ID"),
                 super::dxc::toolchain_identity(),
                 Backend::current(),
-                crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
+                direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
@@ -1132,6 +1137,22 @@ mod shader_cache_tests {
         ];
         assert!(ids.iter().all(|&i| i != 0));
         assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
+    }
+
+    /// An edit of the direct translator's sources changes the direct entries' identity (no
+    /// `TRANSLATOR_VERSION` bump needed) and leaves the HLSL path's.
+    #[test]
+    fn direct_dxil_identity_tracks_its_sources() {
+        use translated::{direct_version, identity_with, Backend};
+        let built = env!("XCL_DIRECT_DXIL_SOURCE_ID");
+        assert_eq!(built.len(), 16);
+        assert!(u64::from_str_radix(built, 16).is_ok());
+        let id = |backend, version, source| identity_with("s", "t", backend, direct_version(version, source));
+        for backend in [Backend::DirectCompute, Backend::DirectAll] {
+            assert_ne!(id(backend, 7, built), id(backend, 7, "edited"), "{backend:?}: edited sources, same version");
+            assert_ne!(id(backend, 7, built), id(backend, 8, built), "{backend:?}: a version bump");
+        }
+        assert_eq!(id(Backend::Hlsl, 7, built), id(Backend::Hlsl, 8, "edited"));
     }
 
     /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and

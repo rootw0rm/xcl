@@ -166,6 +166,7 @@ struct Lower<'a, I: Ir> {
     /// per IR block: not every lane that reached one of the program's lane branches gets here
     /// before they meet again (a loop that lanes leave one by one, an arm some lanes skip)
     partial: Vec<bool>,
+    track_frexp_denorm: bool,
     /// stale-value ownership for blocks split by a coalesced run: backbone blocks of console
     /// block b (`blk(b)` and its continuations) share `blk(b)` for both defs and uses, while a
     /// run's inner block keeps its own `def_owner` (any def there is partial to outside reads)
@@ -1009,12 +1010,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
             n @ ("S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ") => {
                 let v = self.read_bit(b, VCC)?;
-                let c = if self.wave_branches {
-                    self.mask_nonzero(v)
-                } else {
-                    let e = self.read_bit(b, EXEC)?;
-                    self.ir.bin(Bin::And, v, e)
-                };
+                let c = if self.wave_branches { self.mask_nonzero(v) } else { v };
                 if n == "S_CBRANCH_VCCZ" {
                     self.not(c)
                 } else {
@@ -1260,6 +1256,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         bit_uses: Vec::new(),
         lane: None,
         partial,
+        track_frexp_denorm: super::emit::tracks_frexp_f32_denorm(insts),
         def_owner,
         use_owner,
         unguarded: false,
@@ -1618,6 +1615,9 @@ impl<I: Ir> Lower<'_, I> {
         }
         if name == "S_BARRIER" && self.partial[b] {
             return Err("a barrier where some lanes are elsewhere".into());
+        }
+        if self.track_frexp_denorm && self.partial[b] && super::emit::writes_frexp_f32_denorm(d) {
+            return Err("a FREXP denormal mode write where some lanes are elsewhere".into());
         }
         // instructions whose #1426 semantics are known to differ from the HLSL path and the
         // console (each reported on #1426): left to the fallback until fixed there

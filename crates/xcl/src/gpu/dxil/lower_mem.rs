@@ -439,37 +439,44 @@ impl Lw {
         })?;
         let part = self.lnot(whole);
         self.guarded(part, &mut |lw| {
-            let big = lw.cmpc(Pred::UGe, n, 4);
-            let n8 = lw.shlc(n, 3);
-            let n8 = lw.andc(n8, 31);
+            // dword k of `r` holds bytes 4k..min(4k + 4, n); each lands at b + 4k with shift s
+            // and spills into the next dword when s + its bit width passes 32
             let one = lw.c(1);
-            let m = lw.bin(BinOp::Shl, one, n8);
-            let m = lw.sub(m, one);
             let all = lw.c(u32::MAX);
-            let m = lw.sel(big, all, m);
-            let ms = lw.bin(BinOp::Shl, m, s);
-            let vs = lw.bin(BinOp::Shl, r[0], s);
-            lw.st_part(b, ms, vs);
+            let k4 = lw.c(4);
+            let k32 = lw.c(32);
             let snz = lw.cmpc(Pred::Ne, s, 0);
-            let top = lw.add(s, n8);
-            // s + 8n with n = 4 gives s + 32 (n8 above is masked to 31)
-            let is4 = lw.cmpc(Pred::UGe, n, 4);
-            let k = lw.c(32);
-            let z = lw.c(0);
-            let t = lw.sel(is4, k, z);
-            let top = lw.add(top, t);
-            let over = lw.cmpc(Pred::UGt, top, 32);
-            let spill = lw.land(snz, over);
-            lw.guarded(spill, &mut |lw| {
-                let b4 = lw.addc(b, 4);
-                let k32 = lw.c(32);
-                let inv = lw.sub(k32, s);
-                let inv = lw.andc(inv, 31);
-                let m2 = lw.bin(BinOp::LShr, m, inv);
-                let v2 = lw.bin(BinOp::LShr, r[0], inv);
-                lw.st_part(b4, m2, v2);
-                Ok(())
-            })
+            let inv = lw.sub(k32, s);
+            let inv = lw.andc(inv, 31);
+            for k in 0..4u32 {
+                let has = lw.cmpc(Pred::UGt, n, k * 4);
+                let rk = r[k as usize];
+                lw.guarded(has, &mut |lw| {
+                    let rem = lw.addc(n, (k * 4).wrapping_neg());
+                    let big = lw.cmpc(Pred::UGe, rem, 4);
+                    let chunk = lw.sel(big, k4, rem);
+                    let c8 = lw.shlc(chunk, 3);
+                    let c8m = lw.andc(c8, 31);
+                    let m = lw.bin(BinOp::Shl, one, c8m);
+                    let m = lw.sub(m, one);
+                    let m = lw.sel(big, all, m);
+                    let at = lw.addc(b, 4 * k);
+                    let ms = lw.bin(BinOp::Shl, m, s);
+                    let vs = lw.bin(BinOp::Shl, rk, s);
+                    lw.st_part(at, ms, vs);
+                    let top = lw.add(s, c8);
+                    let over = lw.cmpc(Pred::UGt, top, 32);
+                    let spill = lw.land(snz, over);
+                    lw.guarded(spill, &mut |lw| {
+                        let at4 = lw.addc(at, 4);
+                        let m2 = lw.bin(BinOp::LShr, m, inv);
+                        let v2 = lw.bin(BinOp::LShr, rk, inv);
+                        lw.st_part(at4, m2, v2);
+                        Ok(())
+                    })
+                })?;
+            }
+            Ok(())
         })
     }
 
@@ -1457,7 +1464,8 @@ impl Lw {
             "umax" | "max_u32" => direct(self, AtomicOp::UMax, RmwOp::UMax, v),
             "smin" | "min_i32" => direct(self, AtomicOp::IMin, RmwOp::Min, v),
             "smax" | "max_i32" => direct(self, AtomicOp::IMax, RmwOp::Max, v),
-            "cmpswap" | "fcmpswap" | "cmpst_b32" | "cmpst_f32" => self.cmpxchg(at, v2, v),
+            "cmpswap" | "cmpst_b32" => self.cmpxchg(at, v2, v),
+            "fcmpswap" | "cmpst_f32" => self.fcas32(at, v2, v),
             "fmin" | "fmax" | "min_f32" | "max_f32" => {
                 let min = op == "fmin" || op == "min_f32";
                 match at {
@@ -1549,6 +1557,111 @@ impl Lw {
         p
     }
 
+    /// Bitwise IEEE-754 f32 ordered equality: `-0.0 == +0.0`, `NaN != NaN` (denormals kept).
+    pub(super) fn feq_bits32(&mut self, a: Value, b: Value) -> Value {
+        let abs_a = self.andc(a, 0x7FFF_FFFF);
+        let not_nan = self.cmpc(Pred::ULe, abs_a, 0x7F80_0000);
+        let same = self.cmp(Pred::Eq, a, b);
+        let both = self.or(a, b);
+        let mag = self.andc(both, 0x7FFF_FFFF);
+        let both_zero = self.cmpc(Pred::Eq, mag, 0);
+        let eq = self.lor(same, both_zero);
+        self.land(not_nan, eq)
+    }
+
+    /// Bitwise IEEE-754 f64 ordered equality in pure i64 ops (no DoubleExtensions needed).
+    fn feq_bits64(&mut self, a: Value, b: Value) -> Value {
+        let mask = self.c64(0x7FFF_FFFF_FFFF_FFFF);
+        let inf = self.c64(0x7FF0_0000_0000_0000);
+        let z = self.c64(0);
+        let abs_a = self.and(a, mask);
+        let not_nan = self.cmp(Pred::ULe, abs_a, inf);
+        let same = self.cmp(Pred::Eq, a, b);
+        let both = self.or(a, b);
+        let mag = self.and(both, mask);
+        let both_zero = self.cmp(Pred::Eq, mag, z);
+        let eq = self.lor(same, both_zero);
+        self.land(not_nan, eq)
+    }
+
+    /// IEEE-754 32-bit float compare-exchange loop (at most 4096 rounds); returns the old value.
+    fn fcas32(&mut self, at: At, cmp: Value, new: Value) -> Value {
+        let z = self.c(0);
+        let init = match at {
+            At::Mem(a) => self.mraw_atomic(AtomicOp::Or, a, z),
+            At::Lds(i) => {
+                let g = self.lds.expect("lds");
+                self.s.gs_atomic(RmwOp::Or, g, i, z)
+            }
+        };
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let try_cas = self.block(Some(1));
+        let ex = self.block(Some(2));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i32 = self.s.m.i32();
+        let c = self.s.m.phi(i32);
+        let i = self.s.m.phi(i32);
+        self.s.m.add_incoming(c, init, pre);
+        self.s.m.add_incoming(i, z, pre);
+        let eq = self.feq_bits32(c, cmp);
+        let lp_end = self.cur();
+        self.cond_br(eq, try_cas, ex);
+        self.s.m.set_block(try_cas);
+        let p = self.cmpxchg(at, c, new);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        let res = self.s.m.phi(i32);
+        self.s.m.add_incoming(res, c, lp_end);
+        self.s.m.add_incoming(res, p, me);
+        res
+    }
+
+    /// IEEE-754 64-bit float compare-exchange loop (at most 4096 rounds); returns the old value.
+    fn fcas64(&mut self, a: Value, cmp: Value, new: Value) -> Value {
+        let z64 = self.c64(0);
+        let init = self.mraw_atomic(AtomicOp::Or, a, z64);
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let try_cas = self.block(Some(1));
+        let ex = self.block(Some(2));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i64t = self.i64();
+        let i32 = self.s.m.i32();
+        let c = self.s.m.phi(i64t);
+        let i = self.s.m.phi(i32);
+        self.s.m.add_incoming(c, init, pre);
+        let z = self.c(0);
+        self.s.m.add_incoming(i, z, pre);
+        let eq = self.feq_bits64(c, cmp);
+        let lp_end = self.cur();
+        self.cond_br(eq, try_cas, ex);
+        self.s.m.set_block(try_cas);
+        let p = self.mraw_cmpxchg(a, c, new);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        let res = self.s.m.phi(i64t);
+        self.s.m.add_incoming(res, c, lp_end);
+        self.s.m.add_incoming(res, p, me);
+        res
+    }
+
     /// Float min / max on `mem` as one integer atomic (the recompiler's `float_minmax_mem`).
     fn float_minmax_mem(&mut self, min: bool, a: Value, v: Value) -> LResult<Value> {
         let (pos, neg) = if min { (AtomicOp::IMin, AtomicOp::UMax) } else { (AtomicOp::IMax, AtomicOp::UMin) };
@@ -1600,7 +1713,8 @@ impl Lw {
                 "umax" => lw.mraw_atomic(AtomicOp::UMax, a, v),
                 "smin" => lw.mraw_atomic(AtomicOp::IMin, a, v),
                 "smax" => lw.mraw_atomic(AtomicOp::IMax, a, v),
-                "cmpswap" | "fcmpswap" => lw.mraw_cmpxchg(a, cv, v),
+                "cmpswap" => lw.mraw_cmpxchg(a, cv, v),
+                "fcmpswap" => lw.fcas64(a, cv, v),
                 "fmin" | "fmax" => {
                     let min = ops == "fmin";
                     let (pos, neg) = if min { (AtomicOp::IMin, AtomicOp::UMax) } else { (AtomicOp::IMax, AtomicOp::UMin) };

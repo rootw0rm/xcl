@@ -498,6 +498,13 @@ mod tests {
     }
 
     #[test]
+    fn xmem_imports_route_through_kernelx() {
+        let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
+        let (a, s) = resolve_inner("xmem.dll", &name("XMemIsToolsMemAvailable"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
+    }
+
+    #[test]
     fn hle_alias_stubs_inherit_canonical_module_default() {
         let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
         let e_notimpl = crate::util::E_NOTIMPL as u32 as u64;

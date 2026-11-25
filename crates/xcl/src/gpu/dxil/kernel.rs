@@ -35,7 +35,8 @@ pub struct KernelOptions {
 }
 
 /// Version of the direct translator's output, part of the on-disk translation cache's
-/// identity (`recomp::pso`): bump it on any change that alters the emitted containers
+/// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
+/// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
 pub const TRANSLATOR_VERSION: u32 = 8;
 
@@ -130,7 +131,8 @@ fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel
 /// (as the HLSL compute mode's `globallycoherent` windows).
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, 4);
+    let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -423,6 +425,7 @@ impl Lw {
             sampler_base: o.sampler_base,
             dyn_rm: false,
             f32_rm: false,
+            track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
             exec_cache: HashMap::new(),
             xs: None,

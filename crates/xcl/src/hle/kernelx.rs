@@ -58,6 +58,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemFreePhysicalPages,
         XMemTransferMemory,
         XMemGetWorkingSetStatistics,
+        XMemIsToolsMemAvailable,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
         ToolingMemoryStatus,
@@ -184,6 +185,12 @@ pub mod mirrors {
     }
     static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new() });
 
+    /// Whether `(t, p)` is a CPU-inaccessible GPU-view alias reservation (`MEM_64K_PAGES`
+    /// reserve with `PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS`).
+    pub fn is_gpu_view_reservation(t: u32, p: u32) -> bool {
+        t & PAGES_64K == PAGES_64K && t & 0x1000 == 0 && p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS
+    }
+
     /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
     pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
         if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
@@ -247,13 +254,17 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
         return q;
     }
-    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
-    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them.
+    // Skip CPU-inaccessible GPU-view mirror reservations (`PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS`):
+    // their pixels live in the paired CPU view (`mirrors::source`), so putting them in sparse VA
+    // wastes sparse address space and write-watch overhead while still needing mirror pairing.
+    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES && !mirrors::is_gpu_view_reservation(t, p) {
         if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
             if t & 0x1000 != 0 && commit_sparse(q, size, p).is_null() {
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -276,7 +287,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q as *mut c_void;
         }
     }
-    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 {
+    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 && !mirrors::is_gpu_view_reservation(t, p) {
         // on the console all graphics memory is GPU-visible, reserved address space too (titles
         // reserve a range, then commit or map pages and place resources in it): prefer the
         // sparse VRAM windows first so reservations consume zero system RAM until committed
@@ -287,10 +298,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             uma.and_then(|u| u.sparse_reserve(size))
         };
         if let Some(q) = reserved {
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.reserve(size, 0x1_0000)) {
+            mirrors::reserved(q as usize, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
@@ -316,7 +329,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             // a pool of their own)
             const KEEP: usize = 96 << 20;
             let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
-            if let Some(q) = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)) {
+            if let Some(q) = fits.then(|| u.alloc(size, align)).flatten() {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
@@ -433,6 +446,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         if release {
             u.sparse_release(a);
+            mirrors::released(a);
         }
         return 1;
     }
@@ -818,6 +832,12 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
     }
     std::ptr::write_bytes((buf as *mut u8).add(8), 0, 32);
     1
+}
+
+/// `BOOL XMemIsToolsMemAvailable()`: whether tooling (debug) memory is available on the console.
+/// Returns FALSE (0) in retail title execution.
+pub unsafe extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+    0
 }
 
 /// Title physical pages (64 KiB) emulated in the unified memory region: an allocation is one
@@ -2715,6 +2735,11 @@ mod tests {
     }
 
     #[test]
+    fn xmem_is_tools_mem_available_returns_false() {
+        assert_eq!(unsafe { XMemIsToolsMemAvailable() }, 0);
+    }
+
+    #[test]
     fn get_proc_address_and_load_library_ex_reject_null_name() {
         unsafe {
             let k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
@@ -3013,6 +3038,31 @@ mod tests {
             assert_eq!(u32::from_ne_bytes(xinfo[48..52].try_into().unwrap()), 1);
             assert!(committed_range(base + 0x1000, 0x1000));
             assert!(committed_page(base + 0x1000));
+        }
+    }
+
+    #[test]
+    fn sparse_64k_reservation_registers_gpu_view_mirror_and_releases_cleanly() {
+        unsafe {
+            // Reserve a 64 KiB-page CPU view (lands in sparse UMA when space is available) and
+            // pair it with a PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS GPU view of the same size.
+            let size = 4 << 20;
+            let cpu = VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE | MEM_64K_PAGES, mem::PAGE_READWRITE);
+            assert!(!cpu.is_null());
+            let gpu = VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE | MEM_64K_PAGES, mem::PAGE_NOACCESS | 0x800);
+            assert!(!gpu.is_null());
+            assert_eq!(
+                mirrors::source(gpu as usize + 0x2_0000),
+                Some(cpu as usize + 0x2_0000),
+                "GPU view must resolve to CPU view even when CPU view lives in sparse UMA"
+            );
+            // GPU-view alias must not consume sparse UMA VA.
+            if let Some(u) = crate::gpu::uma::get() {
+                assert!(!u.is_sparse(gpu as usize), "CPU-inaccessible GPU view should stay outside sparse UMA");
+            }
+            assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
+            assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
         }
     }
 }

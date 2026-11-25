@@ -59,7 +59,8 @@ const MAX_FILL: u64 = 256 << 20;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Watchdog timeout for GPU `queue.Wait` so a genuinely hung GPU cycle never triggers a 30 s
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
-/// cleanly without prematurely breaking synchronization.
+/// cleanly without prematurely breaking synchronization. Overridable via `XCL_GPU_WAIT_TIMEOUT_MS`
+/// for diagnostics.
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
@@ -73,6 +74,18 @@ fn wait_timeout() -> Duration {
             .filter(|&ms| ms > 0)
             .map(Duration::from_millis)
             .unwrap_or(WAIT_TIMEOUT)
+    })
+}
+
+fn gpu_wait_watchdog_timeout() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("XCL_GPU_WAIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(GPU_WAIT_WATCHDOG_TIMEOUT)
     })
 }
 
@@ -1096,6 +1109,45 @@ static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// A `queue.Wait` XCL itself put on a queue (sparse uploads and readbacks, texture page
+/// mappings). These are not in `SYNC_GRAPH`; the GPU wait watchdog lists the unmet ones, so a
+/// producer queue that stands behind one of them shows in the log.
+struct InternalWait {
+    what: &'static str,
+    fence: ID3D12Fence,
+    value: u64,
+    at: Instant,
+}
+
+static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex::new(None);
+
+/// `queue` was made to wait for `fence` >= `value` by XCL (`what` says for what).
+pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D12Fence, value: u64) {
+    let mut g = INTERNAL_WAITS.lock().unwrap();
+    let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
+    waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
+    waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
+}
+
+/// The internal waits not yet met: `q<id>: <what> >= <value> (done <completed>, <age> ms)`.
+fn internal_waits_summary() -> String {
+    let unmet: Vec<(usize, String)> = {
+        let g = INTERNAL_WAITS.lock().unwrap();
+        g.iter()
+            .flat_map(|m| m.iter())
+            .flat_map(|(&q, waits)| waits.iter().map(move |w| (q, w)))
+            .filter_map(|(q, w)| {
+                let done = unsafe { w.fence.GetCompletedValue() };
+                (done < w.value).then(|| (q, format!("{} >= {:#x} (done {done:#x}, {} ms)", w.what, w.value, w.at.elapsed().as_millis())))
+            })
+            .collect()
+    };
+    if unmet.is_empty() {
+        return "none".into();
+    }
+    unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
@@ -1402,7 +1454,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout() {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1452,11 +1504,12 @@ fn wake_sync_watchdog() {
                 let pq = prod_q.map(queue_id);
                 crate::xlog_warn!(
                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                    gpu_wait_watchdog_timeout().as_millis()
                 );
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
+                crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
             }
         });
         pair
@@ -4072,6 +4125,30 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// An internal wait shows in the watchdog's summary while its fence is short of the value,
+    /// and is gone from it once the fence gets there.
+    #[test]
+    fn an_internal_wait_is_listed_until_its_fence_reaches_the_value() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let queue = fence.as_raw() as usize; // any address no real queue has
+            note_internal_wait(queue, "test wait 7d1c", &fence, 3);
+            let s = internal_waits_summary();
+            assert!(s.contains("test wait 7d1c >= 0x3 (done 0x0"), "{s}");
+            fence.Signal(3).unwrap();
+            let s = internal_waits_summary();
+            assert!(!s.contains("test wait 7d1c"), "{s}");
+        }
+    }
 
     #[test]
     fn copy_scratch_budget_counts_resources_until_gpu_completion() {

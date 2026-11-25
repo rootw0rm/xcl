@@ -21,12 +21,14 @@
 use super::lower::{LResult, Lw};
 use super::module::{BinOp, CastOp, Pred, Value};
 
-/// MODE[1:0] | MODE[5:4] << 4 (single-precision round and denormal modes), `f32_rm` programs.
+/// MODE[1:0] and MODE[5:4] (single-precision round and denormal modes).
 pub const VAR_F32_MODE: u32 = super::lower::VAR_BUDGET + 5;
 /// The MODE bits `VAR_F32_MODE` mirrors.
 pub const MODE_BITS: u32 = 0x33;
 /// Initial MODE (nearest even, f32 denormals kept: what the translator assumes elsewhere).
 pub const MODE_INIT: u32 = 0x30;
+/// Translator-only flag: an instruction on this path has explicitly written MODE[4].
+pub(super) const F32_DENORM_INPUT_WRITTEN: u32 = 1 << 31;
 
 const MASK52: u64 = (1 << 52) - 1;
 
@@ -43,13 +45,18 @@ impl Lw {
     /// MODE ← (MODE & !mask) | (v & mask), on the mirrored bits.
     pub fn mode_write(&mut self, v: Value, mask: u32) {
         let mask = mask & MODE_BITS;
-        if mask == 0 || !self.f32_rm {
+        if mask == 0 || !(self.f32_rm || self.track_frexp_denorm) {
             return;
         }
         let cur = self.rd(VAR_F32_MODE);
         let keep = self.andc(cur, !mask);
         let nv = self.andc(v, mask);
         let r = self.or(keep, nv);
+        let r = if self.track_frexp_denorm && mask & 0x10 != 0 {
+            self.orc(r, F32_DENORM_INPUT_WRITTEN)
+        } else {
+            r
+        };
         self.wr(VAR_F32_MODE, r);
     }
 

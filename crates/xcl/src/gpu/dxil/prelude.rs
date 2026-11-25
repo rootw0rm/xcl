@@ -99,6 +99,44 @@ impl Lw {
         let ei = self.ftosi(e);
         self.selc(s, 0, ei)
     }
+    pub fn frexp_exp_f32(&mut self, bits: Value, legacy_src: impl FnOnce(&mut Self) -> Value) -> Value {
+        use super::lower_round::{F32_DENORM_INPUT_WRITTEN, VAR_F32_MODE};
+        let mode = if self.track_frexp_denorm { self.rd(VAR_F32_MODE) } else { self.c(0) };
+        let written = self.andc(mode, F32_DENORM_INPUT_WRITTEN);
+        let known = self.nz(written);
+        let legacy = |lw: &mut Self| {
+            let x = legacy_src(lw);
+            lw.frexp_exp(x)
+        };
+        match self.s.m.const_u64(known) {
+            Some(0) => legacy(self),
+            Some(1) => self.frexp_exp_f32_bits(bits, mode),
+            _ => {
+                let result = self.frexp_exp_f32_bits(bits, mode);
+                let old = legacy(self);
+                self.sel(known, result, old)
+            }
+        }
+    }
+
+    fn frexp_exp_f32_bits(&mut self, bits: Value, mode: Value) -> Value {
+        let e8 = self.lshrc(bits, 23);
+        let exp = self.andc(e8, 0xFF);
+        let fraction = self.andc(bits, 0x7F_FFFF);
+        let normal = self.addc(exp, (-126i32) as u32);
+        // firstbithigh(0) returns -1; a zero fraction always produces 0 below.
+        let top = self.firstbithigh(fraction);
+        let subnormal = self.addc(top, (-148i32) as u32);
+        let empty = self.cmpc(Pred::Eq, fraction, 0);
+        let keep = self.andc(mode, 0x10);
+        let flush = self.cmpc(Pred::Eq, keep, 0);
+        let zero = self.lor(empty, flush);
+        let low = self.selc(zero, 0, subnormal);
+        let no_exp = self.cmpc(Pred::Eq, exp, 0);
+        let finite = self.sel(no_exp, low, normal);
+        let special = self.cmpc(Pred::Eq, exp, 0xFF);
+        self.selc(special, 0, finite)
+    }
     /// `ldexp_f`: exact x · 2^n on the bits.
     pub fn ldexp_f(&mut self, x: Value, n: Value) -> Value {
         let u = self.bits(x);

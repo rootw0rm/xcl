@@ -1899,8 +1899,24 @@ mod tests {
                     if !placed {
                         println!("{label}: not reserved on this adapter (committed instead)");
                     }
-                } else if !is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0 {
+                } else if (!is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0)
+                    && !(is_3d
+                        && xg::Texture::new(&d)
+                            .unwrap()
+                            .texels()
+                            .is_some_and(|s| s.first_tail < s.chain.levels.len()))
+                {
                     assert!(placed, "{label} should use shared vram::Pages");
+                } else if is_3d
+                    && xg::Texture::new(&d)
+                        .unwrap()
+                        .texels()
+                        .is_some_and(|s| s.first_tail < s.chain.levels.len())
+                {
+                    assert!(
+                        !placed,
+                        "{label} has an XG packed mip tail; use the committed detile/upload path"
+                    );
                 }
                 write_tiled(base, &d, 0x71);
                 refresh(queue.as_raw());

@@ -490,6 +490,37 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn gpu_frexp_exp_f32_denorm_per_lane() {
+        const PRESERVE: I = ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)]);
+        const FREXP: I = ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)]);
+        let partial = decode(&[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            PRESERVE,
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            FREXP,
+            ENDPGM,
+        ]);
+        let err = super::kernel(&partial, false).unwrap_err();
+        assert!(err.contains("FREXP denormal mode write where some lanes are elsewhere"), "{err}");
+
+        if !gpu() {
+            return;
+        }
+        let (dxil, _) = super::kernel(&decode(&[PRESERVE, FREXP, ENDPGM]), false).unwrap();
+        let mut state = runner::KernelState::default();
+        for v in &mut state.vgpr {
+            v[0] = 1;
+        }
+        let result = runner::run(&dxil, &state, &[]).unwrap();
+        for (lane, v) in result.vgpr.iter().take(32).enumerate() {
+            assert_eq!(v[4] as i32, -148, "lane {lane}");
+        }
+    }
+
     /// An instruction lowered by #1426 that writes to `Lw`'s entry block after the program's
     /// blocks are written (scratch) gives a container, and runs.
     #[cfg(windows)]
@@ -931,6 +962,74 @@ mod tests {
             let direct = runner::run(&dxil, &st, &[]).unwrap();
             for l in 0..lanes {
                 for r in 3..=9 {
+                    assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
+                }
+            }
+        }
+    }
+
+    /// `S_FF0_I32_B32/B64` and `S_FLBIT_I32_B32/B64` on mask registers agree with HLSL on
+    /// wave32 and wave64 across partial, all-ones, and all-zeros masks.
+    #[cfg(windows)]
+    #[test]
+    fn mask_ff0_and_flbit_agree_with_hlsl_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let wave64_ok = runner::wave64_supported() == Ok(true);
+        for w64 in [false, true] {
+            let lanes = if w64 { 64 } else { 32 };
+            if w64 && !wave64_ok {
+                runner::skip_test("mask_ff0_flbit, wave64: no wave64");
+                continue;
+            }
+            let (ff0, flbit) = if w64 { ("S_FF0_I32_B64", "S_FLBIT_I32_B64") } else { ("S_FF0_I32_B32", "S_FLBIT_I32_B32") };
+            let lines: &[I] = &[
+                // vcc = (v0 < 5) -> bits 0..4 set, first 0 at bit 5, highest set bit at 4
+                ("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", 133), ("VSRC1", 0)]),
+                // invert: (v0 >= 5) -> wait, V_CMP_LT_U32(5, v0) is 5 < v0, so v0 > 5 (bits 6..N set, first 0 at 0)
+                (ff0, "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+                (flbit, "ENC_SOP1", &[("SDST", 5), ("SSRC0", 106)]),
+                // vcc = (v0 < 37) via V_CMP_GT_U32(37, v0) -> bits 0..36 set (all-ones in wave32, first 0 at 37 in wave64)
+                ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 165), ("VSRC1", 0)]),
+                (ff0, "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)]),
+                (flbit, "ENC_SOP1", &[("SDST", 7), ("SSRC0", 106)]),
+                // vcc = all zeros (v0 > 100 -> V_CMP_LT_U32(100, v0) false for all lanes)
+                ("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0), ("LITERAL", 100)]),
+                (ff0, "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+                (flbit, "ENC_SOP1", &[("SDST", 9), ("SSRC0", 106)]),
+                // also B32 on low word of a mask in wave64/wave32
+                ("S_FF0_I32_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)]),
+                ("S_FLBIT_I32_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 126)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 4)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 5)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 6)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 7)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 8)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 9)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 10)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 11)]),
+                ("S_ENDPGM", "ENC_SOPP", &[]),
+            ];
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "wave{lanes}: {:?}", t.unsupported_why);
+            let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &["-Gis"]).unwrap(), &st, &[]).unwrap();
+            let insts = decode(lines);
+            let (dxil, _) = super::kernel(&insts, w64).unwrap_or_else(|e| panic!("wave{lanes}: {e}"));
+            let direct = runner::run(&dxil, &st, &[]).unwrap();
+            for l in 0..lanes {
+                for r in 1..=8 {
                     assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
                 }
             }

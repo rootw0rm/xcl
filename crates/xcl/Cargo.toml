@@ -14,7 +14,7 @@ name = "xcl"
 path = "src/main.rs"
 
 [dependencies]
-miniz_oxide = "0.9"
+miniz_oxide = { version = "0.9", features = ["simd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"

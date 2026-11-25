@@ -438,6 +438,34 @@ fn gpu_direct_f32_round_modes_dynamic_and_denormals() {
     }
 }
 
+#[test]
+fn gpu_frexp_exp_f32_denorm_with_directed_rounding() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut code = encode("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 3)], None).unwrap();
+    for (name, enc, fields) in [
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 1)][..]),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)]),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 2)]),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V)]),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("S_ENDPGM", "ENC_SOPP", &[]),
+    ] {
+        code.extend(encode(name, enc, fields, None).unwrap());
+    }
+    let mut st = KernelState::default();
+    for v in &mut st.vgpr {
+        v[..3].copy_from_slice(&[1, 0x3F80_0000, 0x3380_0000]);
+    }
+    let r = run(&code, &st);
+    for (lane, v) in r.vgpr.iter().enumerate() {
+        assert_eq!(v[4] as i32, -148, "lane {lane}: preserve after S_ROUND_MODE");
+        assert_eq!(v[5], 0, "lane {lane}: flush after S_DENORM_MODE");
+        assert_eq!(v[6], 0x3F80_0001, "lane {lane}: round toward +inf after S_DENORM_MODE");
+    }
+}
+
 /// Unimplemented directed ops are translation errors, not silent nearest-even results.
 #[test]
 fn direct_f32_round_mode_unsupported_op_rejected() {

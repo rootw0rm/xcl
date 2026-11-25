@@ -1003,10 +1003,11 @@ impl Module {
         w.enter_block(BLOCK_FUNCTION);
         w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
+        let mut operands = Vec::new();
         for &b in &order {
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs, &pos);
+                self.write_inst(&mut w, i, inst_id, &abs, &pos, &mut operands);
                 if !self.is_void(self.insts[i].ty) {
                     inst_id += 1;
                 }
@@ -1157,7 +1158,15 @@ impl Module {
         }
     }
 
-    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64, pos: &[Option<u32>]) {
+    fn write_inst(
+        &self,
+        w: &mut BitWriter,
+        i: usize,
+        inst_id: u64,
+        abs: &dyn Fn(Value) -> u64,
+        pos: &[Option<u32>],
+        ops: &mut Vec<u64>,
+    ) {
         // Relative operand; forward references are only legal in phis.
         let rel = |v: Value| -> u64 {
             let a = abs(v);
@@ -1174,13 +1183,14 @@ impl Module {
                 0
             }
         };
+        ops.clear();
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
-                let mut ops = vec![rel(*a), rel(*b), *op as u64];
+                ops.extend_from_slice(&[rel(*a), rel(*b), *op as u64]);
                 if *flags != 0 {
                     ops.push(*flags);
                 }
-                w.record(FUNC_CODE_INST_BINOP, &ops)
+                w.record(FUNC_CODE_INST_BINOP, ops)
             }
             Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), t.0 as u64, *op as u64]),
             Op::Cmp(p, a, b) => w.record(FUNC_CODE_INST_CMP2, &[rel(*a), rel(*b), *p as u64]),
@@ -1188,18 +1198,18 @@ impl Module {
             Op::Extract(a, idx) => w.record(FUNC_CODE_INST_EXTRACTVAL, &[rel(*a), *idx as u64]),
             Op::Call(f, args) => {
                 let fd = &self.funcs[*f as usize];
-                let mut ops = vec![0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))];
+                ops.extend_from_slice(&[0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))]);
                 ops.extend(args.iter().map(|&a| rel(a)));
-                w.record(FUNC_CODE_INST_CALL, &ops)
+                w.record(FUNC_CODE_INST_CALL, ops)
             }
             Op::Phi(inc) => {
-                let mut ops = vec![self.insts[i].ty.0 as u64];
+                ops.push(self.insts[i].ty.0 as u64);
                 // incoming edges from unreachable (unwritten) blocks are dropped
                 for &(v, b) in inc.iter().filter(|(_, b)| pos.get(b.0 as usize).copied().flatten().is_some()) {
                     ops.push(signed(inst_id as i64 - abs(v) as i64));
                     ops.push(bb(b));
                 }
-                w.record(FUNC_CODE_INST_PHI, &ops)
+                w.record(FUNC_CODE_INST_PHI, ops)
             }
             Op::Load(p, align) => {
                 let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
@@ -1212,9 +1222,9 @@ impl Module {
             Op::Gep(p, idx) => {
                 let pt = self.value_ty(*p);
                 let (src, _) = self.pointee_of(pt).unwrap_or((pt, 0));
-                let mut ops = vec![1, src.0 as u64, rel(*p)];
+                ops.extend_from_slice(&[1, src.0 as u64, rel(*p)]);
                 ops.extend(idx.iter().map(|&v| rel(v)));
-                w.record(FUNC_CODE_INST_GEP, &ops)
+                w.record(FUNC_CODE_INST_GEP, ops)
             }
             Op::AtomicRmw(op, p, v) => {
                 // [ptr, val, op, vol, ordering, synchscope (crossthread = 1)]
@@ -1233,12 +1243,12 @@ impl Module {
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
             Op::CondBr(c, t, f) => w.record(FUNC_CODE_INST_BR, &[bb(*t), bb(*f), rel(*c)]),
             Op::Switch(v, d, cases) => {
-                let mut ops = vec![self.value_ty(*v).0 as u64, rel(*v), bb(*d)];
+                ops.extend_from_slice(&[self.value_ty(*v).0 as u64, rel(*v), bb(*d)]);
                 for &(c, b) in cases {
                     ops.push(abs(c));
                     ops.push(bb(b));
                 }
-                w.record(FUNC_CODE_INST_SWITCH, &ops)
+                w.record(FUNC_CODE_INST_SWITCH, ops)
             }
             Op::Ret => w.record(FUNC_CODE_INST_RET, &[]),
             Op::Unreachable => w.record(FUNC_CODE_INST_UNREACHABLE, &[]),

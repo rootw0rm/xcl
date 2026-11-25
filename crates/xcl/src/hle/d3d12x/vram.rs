@@ -840,6 +840,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
         let _ = queue.Wait(&pages.fence, pages.value);
+        super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
         pages.waited.insert(key, pages.value);
     }
 }
@@ -886,7 +887,30 @@ pub unsafe fn place_pages(
     if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
         return None;
     }
+    if console_has_packed_3d_mips(desc) {
+        return None;
+    }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
+}
+
+/// XG and the PC driver pack volume mip tails differently. Keep these textures on the
+/// detile/upload path rather than mapping title pages directly onto the driver's packed tail.
+fn console_has_packed_3d_mips(desc: &D3D12_RESOURCE_DESC) -> bool {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || desc.MipLevels <= 1 {
+        return false;
+    }
+    let mut console_desc = [0u8; 0x38];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            desc as *const _ as *const u8,
+            console_desc.as_mut_ptr(),
+            console_desc.len(),
+        )
+    };
+    crate::hle::xg::Texture::new(&console_desc)
+        .ok()
+        .and_then(|t| t.texels().map(|s| s.depth > 0 && s.first_tail < s.chain.levels.len()))
+        .unwrap_or(false)
 }
 
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its
@@ -926,6 +950,37 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    #[test]
+    fn packed_console_3d_mip_tails_use_the_detile_upload_path() {
+        fn desc(
+            dimension: u32,
+            width: u64,
+            height: u32,
+            depth: u16,
+            mips: u16,
+            format: u32,
+            layout: u32,
+        ) -> D3D12_RESOURCE_DESC {
+            let mut bytes = [0u8; 0x38];
+            bytes[0..4].copy_from_slice(&dimension.to_le_bytes());
+            bytes[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+            bytes[0x18..0x1C].copy_from_slice(&height.to_le_bytes());
+            bytes[0x1C..0x1E].copy_from_slice(&depth.to_le_bytes());
+            bytes[0x1E..0x20].copy_from_slice(&mips.to_le_bytes());
+            bytes[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+            bytes[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            bytes[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const D3D12_RESOURCE_DESC) }
+        }
+
+        let packed_3d = desc(4, 64, 64, 64, 4, 28, 0x105);
+        assert!(console_has_packed_3d_mips(&packed_3d));
+        let single_mip_3d = desc(4, 64, 64, 64, 1, 28, 0x105);
+        assert!(!console_has_packed_3d_mips(&single_mip_3d));
+        let packed_2d = desc(3, 64, 64, 1, 7, 28, 0x105);
+        assert!(!console_has_packed_3d_mips(&packed_2d));
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
