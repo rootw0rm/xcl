@@ -230,6 +230,13 @@ pub unsafe extern "win64" fn _initialize_onexit_table(_table: usize) -> i32 {
     0
 }
 
+/// `int _execute_onexit_table(...)` — run C++ terminators; nothing is queued in
+/// this HLE (matching the `_register_onexit_function`/`_initialize_onexit_table`
+/// successes above), so report success (`0`) without touching the table.
+pub unsafe extern "win64" fn _execute_onexit_table(_table: usize) -> i32 {
+    0
+}
+
 /// `int _initialize_narrow_environment(void)` — `0` = success.
 pub unsafe extern "win64" fn _initialize_narrow_environment() -> i32 {
     0
@@ -1028,6 +1035,183 @@ pub unsafe extern "win64" fn wcsdup_impl(s: *const u16) -> *mut u16 {
     p
 }
 
+// ---------------------------------------------------------------------------------------
+// Restartable multibyte/wide conversion (Phase C step-12c): `mbrtowc`/`wcrtomb`
+// over UTF-8 with a stateless `mbstate_t` (the `ps` argument is accepted and,
+// for `wcrtomb` surrogate pairing, used as a pending-high slot, but each
+// complete character restarts from `s`). Same NULL-stub fault class as memcpy:
+// a logging stub returning NULL/`(size_t)-1` unconditionally would mis-route
+// every locale/argv conversion, so these decode for real. `mbrtowc` returns the
+// bytes consumed (`0` for NUL, `(size_t)-1` = `usize::MAX` on a bad sequence
+// with `errno = 42 (EILSEQ)`, `(size_t)-2` = `usize::MAX - 1` on an incomplete
+// prefix); `s == NULL` probes statelessness and returns `0`. `wcrtomb` returns
+// the bytes stored (`1` for NUL, `(size_t)-1` on error); `s == NULL` probes and
+// returns `1`. Astral planes arrive as surrogate pairs through `ps`: a lone
+// high stores pending and returns `0`, the matching low emits 4 bytes.
+// ---------------------------------------------------------------------------------------
+
+/// Windows `EILSEQ` (`errno` value set by `mbrtowc`/`wcrtomb` on bad sequences).
+const EILSEQ_WIN: i32 = 42;
+
+fn set_win_errno(code: i32) {
+    unsafe {
+        *_errno() = code;
+    }
+}
+
+/// Decode one UTF-8 character starting at `s` with at most `n` bytes available.
+/// Returns the code point and its byte length, or an error marker.
+fn utf8_decode_one(s: *const u8, n: usize) -> Result<(u32, usize), usize> {
+    // `n >= 1` is established by the caller; `b0` is always readable.
+    let b0 = unsafe { *s };
+    if b0 < 0x80 {
+        return Ok((b0 as u32, 1));
+    }
+    // Continuation byte as a lead, or never-valid leads, are bad sequences.
+    if b0 < 0xC2 {
+        return Err(usize::MAX);
+    }
+    let (mut cp, len, min): (u32, usize, u32) = if b0 < 0xE0 {
+        ((b0 & 0x1F) as u32, 2, 0x80)
+    } else if b0 < 0xF0 {
+        ((b0 & 0x0F) as u32, 3, 0x800)
+    } else if b0 < 0xF5 {
+        ((b0 & 0x07) as u32, 4, 0x10000)
+    } else {
+        return Err(usize::MAX);
+    };
+    if n < len {
+        return Err(usize::MAX - 1);
+    }
+    for i in 1..len {
+        let b = unsafe { *s.add(i) };
+        if b & 0xC0 != 0x80 {
+            return Err(usize::MAX);
+        }
+        cp = (cp << 6) | (b & 0x3F) as u32;
+    }
+    // Overlong forms (incl. `C0 80` for NUL), surrogates and out-of-range.
+    if cp < min || (0xD800..0xE000).contains(&cp) || cp > 0x10FFFF {
+        return Err(usize::MAX);
+    }
+    Ok((cp, len))
+}
+
+/// `size_t mbrtowc(wchar_t* pwc, const char* s, size_t n, mbstate_t* ps)` —
+/// convert one UTF-8 character to UTF-16. Stateless: `ps` is accepted but each
+/// complete character restarts from `s`.
+pub unsafe extern "win64" fn mbrtowc(
+    pwc: *mut u16,
+    s: *const u8,
+    n: usize,
+    _ps: *mut u8,
+) -> usize {
+    if s.is_null() {
+        // Stateless UTF-8 has no shift states.
+        return 0;
+    }
+    if n == 0 {
+        return usize::MAX - 1;
+    }
+    if *s == 0 {
+        if !pwc.is_null() {
+            *pwc = 0;
+        }
+        return 0;
+    }
+    match utf8_decode_one(s, n) {
+        Ok((cp, len)) => {
+            if !pwc.is_null() {
+                if cp < 0x10000 {
+                    *pwc = cp as u16;
+                } else {
+                    // Astral: single-`wchar_t` destination holds the lead
+                    // surrogate; the trail half has no state slot on this path.
+                    *pwc = (0xD800 + ((cp - 0x10000) >> 10)) as u16;
+                }
+            }
+            len
+        }
+        Err(e) => {
+            if e == usize::MAX {
+                set_win_errno(EILSEQ_WIN);
+            }
+            e
+        }
+    }
+}
+
+/// `size_t wcrtomb(char* s, wchar_t wc, mbstate_t* ps)` — convert one UTF-16
+/// unit (or surrogate pair via `*ps`) to UTF-8. `*ps` holds a pending high
+/// surrogate (`0` = none); without `ps` lone surrogates are errors.
+pub unsafe extern "win64" fn wcrtomb(s: *mut u8, wc: u32, ps: *mut u32) -> usize {
+    // Probe: stateless UTF-8 encodes NUL in one byte.
+    if s.is_null() {
+        return 1;
+    }
+    let w = (wc & 0xFFFF) as u16;
+    let pending: u16 = if ps.is_null() {
+        0
+    } else {
+        ((*ps) & 0xFFFF) as u16
+    };
+    let clear_pending = || {
+        if !ps.is_null() {
+            *ps = 0;
+        }
+    };
+    // NUL clears any pending high (a pair never spans NUL) and stores one byte.
+    if w == 0 {
+        clear_pending();
+        *s = 0;
+        return 1;
+    }
+    // High surrogate: stash and wait for the low half.
+    if (0xD800..0xDC00).contains(&w) {
+        if ps.is_null() {
+            set_win_errno(EILSEQ_WIN);
+            return usize::MAX;
+        }
+        *ps = w as u32;
+        return 0;
+    }
+    // Low surrogate: needs a stashed high half.
+    if (0xDC00..0xE000).contains(&w) {
+        if ps.is_null() || !(0xD800..0xDC00).contains(&pending) {
+            set_win_errno(EILSEQ_WIN);
+            return usize::MAX;
+        }
+        let cp =
+            0x10000 + ((pending as u32 - 0xD800) << 10) + (w as u32 - 0xDC00);
+        *ps = 0;
+        *s.add(0) = (0xF0 | (cp >> 18)) as u8;
+        *s.add(1) = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+        *s.add(2) = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+        *s.add(3) = (0x80 | (cp & 0x3F)) as u8;
+        return 4;
+    }
+    // A pending high followed by a BMP unit is an unpaired surrogate.
+    if pending != 0 {
+        clear_pending();
+        set_win_errno(EILSEQ_WIN);
+        return usize::MAX;
+    }
+    let cp = w as u32;
+    if cp < 0x80 {
+        *s = cp as u8;
+        1
+    } else if cp < 0x800 {
+        *s.add(0) = (0xC0 | (cp >> 6)) as u8;
+        *s.add(1) = (0x80 | (cp & 0x3F)) as u8;
+        2
+    } else {
+        *s.add(0) = (0xE0 | (cp >> 12)) as u8;
+        *s.add(1) = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+        *s.add(2) = (0x80 | (cp & 0x3F)) as u8;
+        3
+    }
+}
+
 /// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
 pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
@@ -1319,6 +1503,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("_crt_atexit", _crt_atexit as usize),
         ("_register_onexit_function", _register_onexit_function as usize),
         ("_initialize_onexit_table", _initialize_onexit_table as usize),
+        ("_execute_onexit_table", _execute_onexit_table as usize),
         ("_initialize_narrow_environment", _initialize_narrow_environment as usize),
         ("_configure_narrow_argv", _configure_narrow_argv as usize),
         ("_seh_filter_exe", _seh_filter_exe as usize),
@@ -1384,6 +1569,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("wcsstr", wcsstr as usize),
         ("_wcsdup", wcsdup_impl as usize),
         ("wcsdup", wcsdup_impl as usize),
+        ("mbrtowc", mbrtowc as usize),
+        ("wcrtomb", wcrtomb as usize),
         ("getenv", getenv as usize),
         ("setvbuf", setvbuf as usize),
         ("fopen", fopen as usize),
@@ -1818,6 +2005,70 @@ mod tests {
             assert_eq!(wcslen(w), wcslen(whay.as_ptr()));
             assert_eq!(wcscmp(w, whay.as_ptr()), 0);
             free(w as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn convert_and_onexit_match_ucrt() {
+        unsafe {
+            // mbrtowc: ASCII fast path, NUL handling and stateless probe.
+            let mut wc: u16 = 0xFFFF;
+            assert_eq!(mbrtowc(&mut wc, b"A\0".as_ptr(), 1, std::ptr::null_mut()), 1);
+            assert_eq!(wc, 0x41);
+            assert_eq!(mbrtowc(&mut wc, b"\0".as_ptr(), 1, std::ptr::null_mut()), 0);
+            assert_eq!(wc, 0);
+            assert_eq!(
+                mbrtowc(std::ptr::null_mut(), std::ptr::null(), 1, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                mbrtowc(std::ptr::null_mut(), b"A\0".as_ptr(), 1, std::ptr::null_mut()),
+                1
+            );
+            // 2-byte (U+00E9) and 3-byte (U+20AC) UTF-8.
+            let e_acute = [0xC3u8, 0xA9, 0];
+            assert_eq!(mbrtowc(&mut wc, e_acute.as_ptr(), 2, std::ptr::null_mut()), 2);
+            assert_eq!(wc, 0xE9);
+            let euro = [0xE2u8, 0x82, 0xAC, 0];
+            assert_eq!(mbrtowc(&mut wc, euro.as_ptr(), 3, std::ptr::null_mut()), 3);
+            assert_eq!(wc, 0x20AC);
+            // Incomplete prefix returns -2 without errno; bad sequences return -1.
+            assert_eq!(
+                mbrtowc(&mut wc, e_acute.as_ptr(), 1, std::ptr::null_mut()),
+                usize::MAX - 1
+            );
+            assert_eq!(mbrtowc(&mut wc, e_acute.as_ptr(), 0, std::ptr::null_mut()), usize::MAX - 1);
+            for bad in [[0xFFu8, 0, 0], [0x80, 0, 0], [0xC0, 0xAF, 0]] {
+                *_errno() = 0;
+                assert_eq!(
+                    mbrtowc(&mut wc, bad.as_ptr(), bad.len() - 1, std::ptr::null_mut()),
+                    usize::MAX
+                );
+                assert_eq!(*_errno(), 42);
+            }
+            // wcrtomb: ASCII, NUL and multibyte round-trips; NULL probe returns 1.
+            let mut buf = [0u8; 8];
+            assert_eq!(wcrtomb(buf.as_mut_ptr(), 0x41, std::ptr::null_mut()), 1);
+            assert_eq!(buf[0], 0x41);
+            assert_eq!(wcrtomb(buf.as_mut_ptr(), 0, std::ptr::null_mut()), 1);
+            assert_eq!(buf[0], 0);
+            assert_eq!(wcrtomb(std::ptr::null_mut(), 0, std::ptr::null_mut()), 1);
+            assert_eq!(wcrtomb(buf.as_mut_ptr(), 0xE9, std::ptr::null_mut()), 2);
+            assert_eq!(&buf[..2], &[0xC3, 0xA9]);
+            assert_eq!(wcrtomb(buf.as_mut_ptr(), 0x20AC, std::ptr::null_mut()), 3);
+            assert_eq!(&buf[..3], &[0xE2, 0x82, 0xAC]);
+            // Lone low surrogate is an error.
+            *_errno() = 0;
+            assert_eq!(wcrtomb(buf.as_mut_ptr(), 0xDE00, std::ptr::null_mut()), usize::MAX);
+            assert_eq!(*_errno(), 42);
+            // Surrogate pair (U+1F600) through the restartable state.
+            let mut st: u32 = 0;
+            assert_eq!(wcrtomb(buf.as_mut_ptr(), 0xD83D, &mut st), 0);
+            assert_eq!(wcrtomb(buf.as_mut_ptr(), 0xDE00, &mut st), 4);
+            assert_eq!(&buf[..4], &[0xF0, 0x9F, 0x98, 0x80]);
+            assert_eq!(st, 0);
+            // onexit table executes as a no-op success like register/initialize.
+            assert_eq!(_execute_onexit_table(0), 0);
         }
     }
 
