@@ -2821,6 +2821,23 @@ fn page_home(page: usize) -> Option<usize> {
         .flatten()
 }
 
+/// The contiguous home address of `pages` when they are consecutive pages of one live allocation.
+fn contiguous_home_in(blocks: &std::collections::BTreeMap<usize, (usize, usize, usize)>, pages: &[usize]) -> Option<usize> {
+    let first_page = *pages.first()?;
+    if first_page == 0 || !(1..pages.len()).all(|i| i.checked_mul(FRAMES).and_then(|d| first_page.checked_add(d)) == Some(pages[i])) {
+        return None;
+    }
+    let index = page_index(first_page)?;
+    let end = index.checked_add(pages.len())?;
+    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
+    (live > 0 && end <= first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+}
+
+fn contiguous_home(pages: &[usize]) -> Option<usize> {
+    let blocks = phys_blocks().lock().ok()?;
+    contiguous_home_in(&blocks, pages)
+}
+
 /// Copy home → `dst` for a live page (homes are always committed `malloc` memory).
 unsafe fn copy_home_to(page: usize, dst: usize) -> bool {
     let Some(home) = page_home(page) else { return false };
@@ -3073,6 +3090,23 @@ pub unsafe extern "win64" fn MapTitlePhysicalPages(
         };
         let mut g = away().lock().unwrap();
         let st = g.get_or_insert_with(Away::default);
+        // Consecutive pages of one live allocation share one home block: copy it whole.
+        // Anything else (holes, scattered runs, consecutive numbers spanning two
+        // allocations) falls through to the per-page loop, so cross-allocation runs
+        // never merge into one block over unrelated memory.
+        if let Some(home) = contiguous_home(&pages) {
+            if pages.iter().all(|p| !st.page.contains_key(p)) {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, bytes)
+                };
+                for (i, &p) in pages.iter().enumerate() {
+                    st.at.insert(at + i * PHYS_PAGE, p);
+                    st.page.insert(p, at + i * PHYS_PAGE);
+                }
+                set_error(ERROR_SUCCESS);
+                return at as *mut c_void;
+            }
+        }
         for (i, &p) in pages.iter().enumerate() {
             if p == 0 {
                 continue;
@@ -10081,6 +10115,107 @@ mod tests {
             assert_eq!(*((va + page) as *const u32), 0xB);
             assert_eq!(XMemFreePhysicalPages(2, pp.as_mut_ptr()), 1);
             assert_eq!(VirtualFree(va as *mut c_void, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn contiguous_home_requires_one_allocation() {
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(10, (3, 3, 0x1_0000_0000));
+        // separate allocation whose page numbers immediately follow, with a non-adjacent home
+        blocks.insert(13, (2, 2, 0x2_0000_0000));
+        // separate allocation whose home happens to be adjacent (still a distinct reservation)
+        blocks.insert(15, (1, 1, 0x2_0002_0000));
+
+        let p = |i| page_number(i);
+        assert_eq!(contiguous_home_in(&blocks, &[p(10), p(11), p(12)]), Some(0x1_0000_0000));
+        assert_eq!(contiguous_home_in(&blocks, &[p(11), p(12)]), Some(0x1_0000_0000 + PHYS_PAGE));
+        assert_eq!(contiguous_home_in(&blocks, &[p(13), p(14)]), Some(0x2_0000_0000));
+        // spanning two allocations: refused, whether or not the homes are adjacent
+        assert_eq!(contiguous_home_in(&blocks, &[p(12), p(13)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[p(14), p(15)]), None);
+        // non-consecutive, zero, empty, or overflow
+        assert_eq!(contiguous_home_in(&blocks, &[p(10), p(12)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[0, p(10)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[usize::MAX, 0]), None);
+    }
+
+    #[test]
+    fn cross_allocation_pages_map_split_and_unmap_preserves_neighbors() {
+        // (a) consecutive pages of one allocation map as one block: the NULL-address
+        // path returns a single contiguous span holding every page's contents.
+        // (b) consecutive page numbers from two separate allocations never merge into
+        // one block over unrelated memory: each page maps with its own contents.
+        // (c) unmapping or freeing one address preserves a neighbor's mapping.
+        // Only own pages and VAs are asserted, so other tests may run alongside.
+        unsafe {
+            let page = 0x1_0000usize;
+            let (mut n, mut pages) = (2usize, [0u64; 2]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            assert_eq!(contiguous_home(&[pages[0] as usize, pages[1] as usize]), page_home(pages[0] as usize));
+            let mp = XMemMapPhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()) as *mut u32;
+            assert!(!mp.is_null());
+            *mp.add(page / 4 * 0) = 0xA0;
+            *mp.add(page / 4 * 1) = 0xA1;
+            assert_eq!(XMemMapPhysicalPages(mp as *mut c_void, 2, std::ptr::null_mut()) as usize, mp as usize);
+            let mp2 = XMemMapPhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()) as *mut u32;
+            assert!(!mp2.is_null());
+            assert_eq!(*mp2.add(page / 4 * 0), 0xA0);
+            assert_eq!(*mp2.add(page / 4 * 1), 0xA1);
+            assert_eq!(XMemFreePhysicalPages(2, pages.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(mp as *mut c_void, 0, 0x8000), 1);
+            assert_eq!(VirtualFree(mp2 as *mut c_void, 0, 0x8000), 1);
+
+            // Two back-to-back allocations; their numbers are consecutive unless another
+            // test allocated between the two calls (both layouts are asserted correctly).
+            let (mut na, mut pa) = (2usize, [0u64; 2]);
+            let (mut nb, mut pb) = (2usize, [0u64; 2]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut na, pa.as_mut_ptr()), 1);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut nb, pb.as_mut_ptr()), 1);
+            let all = [pa[0] as usize, pa[1] as usize, pb[0] as usize, pb[1] as usize];
+            let consecutive =
+                all[1] == all[0] + FRAMES && all[2] == all[1] + FRAMES && all[3] == all[2] + FRAMES;
+            if consecutive {
+                assert_eq!(contiguous_home(&all), None, "two allocations never share one home");
+            }
+            assert!(write_physical_pages(&[all[0]], 0, &0xB0u32.to_ne_bytes()));
+            assert!(write_physical_pages(&[all[1]], 0, &0xB1u32.to_ne_bytes()));
+            assert!(write_physical_pages(&[all[2]], 0, &0xB2u32.to_ne_bytes()));
+            assert!(write_physical_pages(&[all[3]], 0, &0xB3u32.to_ne_bytes()));
+            let mut quad = [pa[0], pa[1], pb[0], pb[1]];
+            let mq = XMemMapPhysicalPages(std::ptr::null_mut(), 4, quad.as_mut_ptr()) as *mut u32;
+            assert!(!mq.is_null());
+            for i in 0..4 {
+                assert_eq!(*mq.add(page / 4 * i), 0xB0 + i as u32, "page {i} keeps its own contents");
+            }
+            assert_eq!(XMemFreePhysicalPages(2, pa.as_mut_ptr()), 1);
+            assert_eq!(XMemFreePhysicalPages(2, pb.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(mq as *mut c_void, 0, 0x8000), 1);
+
+            // Neighbor mappings survive unmap and free of an adjacent address.
+            let (mut n1, mut p1) = (1usize, [0u64; 1]);
+            let (mut n2, mut p2) = (1usize, [0u64; 1]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n1, p1.as_mut_ptr()), 1);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n2, p2.as_mut_ptr()), 1);
+            let m1 = XMemMapPhysicalPages(std::ptr::null_mut(), 1, p1.as_mut_ptr()) as *mut u32;
+            let m2 = XMemMapPhysicalPages(std::ptr::null_mut(), 1, p2.as_mut_ptr()) as *mut u32;
+            assert!(!m1.is_null() && !m2.is_null());
+            *m1 = 0xC1;
+            *m2 = 0xC2;
+            assert_eq!(XMemMapPhysicalPages(m1 as *mut c_void, 1, std::ptr::null_mut()) as usize, m1 as usize);
+            assert_eq!(*m2, 0xC2, "unmapping one address leaves the neighbor mapped");
+            let m1b = XMemMapPhysicalPages(std::ptr::null_mut(), 1, p1.as_mut_ptr()) as *mut u32;
+            assert_eq!(*m1b, 0xC1, "unmapped data went back to its own home");
+            assert_eq!(XMemFreePhysicalPages(1, p1.as_mut_ptr()), 1);
+            assert_eq!(*m2, 0xC2, "freeing one page leaves the neighbor's mapping alone");
+            let gone = XMemMapPhysicalPages(std::ptr::null_mut(), 1, p1.as_mut_ptr());
+            assert!(gone.is_null(), "a freed page no longer resolves");
+            assert_eq!(XMemMapPhysicalPages(m2 as *mut c_void, 1, std::ptr::null_mut()) as usize, m2 as usize);
+            assert_eq!(XMemFreePhysicalPages(1, p2.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(m1 as *mut c_void, 0, 0x8000), 1);
+            assert_eq!(VirtualFree(m2 as *mut c_void, 0, 0x8000), 1);
+            assert_eq!(VirtualFree(m1b as *mut c_void, 0, 0x8000), 1);
         }
     }
 }
