@@ -492,6 +492,12 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..(v + n).min(128));
     }
+    // read-modify-write / conditional writes keep (part of) SDST
+    if d.inst.name.starts_with("S_CMOV")
+        || matches!(d.inst.name, "S_ADDK_I32" | "S_MULK_I32" | "S_BITSET0_B32" | "S_BITSET0_B64" | "S_BITSET1_B32" | "S_BITSET1_B64")
+    {
+        r.extend(w.iter().copied());
+    }
     (r, w)
 }
 
@@ -527,7 +533,10 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         dst.extend(v..v + n);
     }
     // read-modify-write accumulators
-    if matches!(d.inst.name, "V_FMAC_F32" | "V_MAC_F32" | "V_FMAC_LEGACY_F32") {
+    if matches!(
+        d.inst.name,
+        "V_FMAC_F32" | "V_MAC_F32" | "V_FMAC_LEGACY_F32" | "V_FMAC_F16" | "V_PK_FMAC_F16" | "V_DOT2C_F32_F16" | "V_DOT4C_I32_I8"
+    ) {
         r.extend(w.iter().copied());
     }
     (r, w)
@@ -1194,5 +1203,119 @@ mod tests {
         }
         assert!(total > 2500 && modified > 250, "the SDWA tests are not all there: {total} lines, {modified} with source or output modifiers");
         assert!(wrong.is_empty(), "{} of {total} SDWA lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    fn dec(name: &str, enc: &str, fields: &[(&str, u64)]) -> Decoded {
+        let bytes = encode(name, enc, fields, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+        decode(&bytes, 0).unwrap_or_else(|e| panic!("decode {name}: {e:?}"))
+    }
+
+    #[test]
+    fn rmw_vector_accumulators_read_vdst() {
+        const V: u64 = 256;
+        for (name, enc, fields) in [
+            ("V_FMAC_F16", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)][..]),
+            ("V_FMAC_F16", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", V + 2)]),
+            ("V_PK_FMAC_F16", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)]),
+            ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)]),
+            ("V_DOT4C_I32_I8", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ] {
+            let (r, w) = vgpr_uses(&dec(name, enc, fields));
+            assert_eq!(w, vec![5], "{name} ({enc}) writes");
+            assert!(r.contains(&5), "{name} ({enc}) must include VDST in reads: {r:?}");
+            assert!(r.contains(&1) && r.contains(&2), "{name} ({enc}) source reads: {r:?}");
+        }
+        // Negative controls: non-RMW ops and V_WRITELANE_B32 must not add VDST to reads
+        for (name, enc, fields) in [
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)][..]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)]),
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 1), ("SRC1", 128)]),
+        ] {
+            let (r, w) = vgpr_uses(&dec(name, enc, fields));
+            assert_eq!(w, vec![5], "{name} writes");
+            assert!(!r.contains(&5), "{name} should not read VDST: {r:?}");
+        }
+    }
+
+    #[test]
+    fn rmw_scalar_ops_read_sdst() {
+        for (name, enc, fields, want_w) in [
+            ("S_ADDK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 1)][..], vec![8u64]),
+            ("S_MULK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 3)], vec![8]),
+            ("S_CMOVK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 1)], vec![8]),
+            ("S_CMOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], vec![8]),
+            ("S_CMOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], vec![8, 9]),
+            ("S_BITSET0_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], vec![8]),
+            ("S_BITSET0_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], vec![8, 9]),
+            ("S_BITSET1_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], vec![8]),
+            ("S_BITSET1_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], vec![8, 9]),
+        ] {
+            let (r, w) = sgpr_uses(&dec(name, enc, fields));
+            assert_eq!(w, want_w, "{name} writes");
+            for reg in &want_w {
+                assert!(r.contains(reg), "{name} must include SDST s{reg} in reads: {r:?}");
+            }
+        }
+        // NULL (125) destination stays excluded from reads and writes
+        for (name, enc, fields) in [
+            ("S_ADDK_I32", "ENC_SOPK", &[("SDST", 125), ("SIMM16", 1)][..]),
+            ("S_CMOV_B64", "ENC_SOP1", &[("SDST", 125), ("SSRC0", 128)]),
+        ] {
+            let (r, w) = sgpr_uses(&dec(name, enc, fields));
+            assert!(w.is_empty() && r.is_empty(), "{name} with NULL dest: r={r:?}, w={w:?}");
+        }
+        // Negative controls: plain overwrites must not read SDST
+        for (name, enc, fields) in [
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)][..]),
+            ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 1)]),
+        ] {
+            let (r, w) = sgpr_uses(&dec(name, enc, fields));
+            assert_eq!(w, vec![8], "{name} writes");
+            assert!(!r.contains(&8), "{name} should not read SDST: {r:?}");
+        }
+    }
+
+    #[test]
+    fn rmw_uses_propagate_taint_in_partition_and_mesh_wave() {
+        use crate::gpu::recomp::{mesh_wave, partition};
+        const V: u64 = 256;
+        for acc in ["V_FMAC_F16", "V_PK_FMAC_F16", "V_DOT2C_F32_F16", "V_DOT4C_I32_I8"] {
+            let mut bytes = Vec::new();
+            bytes.extend(encode("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None).unwrap());
+            bytes.extend(encode(acc, "ENC_VOP2", &[("VDST", 0), ("SRC0", V + 1), ("VSRC1", 2)], None).unwrap());
+            bytes.extend(encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None).unwrap());
+            bytes.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let mut insts = Vec::new();
+            let mut off = 0;
+            while off < bytes.len() {
+                let d = decode(&bytes[off..], off as u64).unwrap();
+                off += d.len;
+                insts.push(d);
+            }
+            let p = partition::classify(&insts);
+            assert_eq!(p.tier, partition::Tier::MayDiffer, "{acc} dropped lane-id taint");
+            assert!(p.reasons.contains("lane-id"), "{acc} reasons: {:?}", p.reasons);
+        }
+
+        // mesh_wave: S_ADDK_I32 / S_BITSET1_B32 / S_CMOV_B32 must preserve mask taint on s8
+        let mut addk = Vec::new();
+        addk.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 126)], None).unwrap());
+        addk.extend(encode("S_ADDK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 1)], None).unwrap());
+        addk.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        addk.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        assert_eq!(mesh_wave::analyze(&addk).mask_scc_branches, vec![8], "S_ADDK_I32 lost mask taint on s8");
+
+        for (name, enc, fields) in [
+            ("S_BITSET1_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)][..]),
+            ("S_CMOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)]),
+        ] {
+            let mut code = Vec::new();
+            code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 126)], None).unwrap());
+            code.extend(encode(name, enc, fields, None).unwrap());
+            code.extend(encode("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 128)], None).unwrap());
+            code.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+            code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            assert_eq!(mesh_wave::analyze(&code).mask_scc_branches, vec![12], "{name} lost mask taint on s8");
+        }
     }
 }
