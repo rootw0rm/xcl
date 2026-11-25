@@ -16,7 +16,9 @@ first (short contract); this file is the work plan. Details live in
   Upstream `6e1e2be` → `568e7db` is README/assets only (retail game
   status: about 60 %, ~5 fps in its world) — no code, no Linux fallout.
   The ralph loop was stopped 2026-11-25; this session drives (streams in
-  `/tmp/opencode/stream-<x>`, merged by the driver).
+  `/tmp/opencode/stream-<x>`, merged by the driver). Stream C landed:
+  `report.json` is now written with the crash site on SIGTRAP/SIGABRT
+  (`6a563be`, lib tests 493 passed).
 - **Game files are PRESENT on this host** (the drive is mounted):
   `/run/media/anon/12TB_B/torrents/GTA6.Xbox.v1.0.2.1-CYBERLEEK/`
   (`game_scarlett_master.exe`, 120 MB, + `MicrosoftGame.Config`) and
