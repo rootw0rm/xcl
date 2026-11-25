@@ -14,38 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::{elements_at, ranked, vs_param_register, VsInterface};
+pub use super::{HlslVsBackend, VsBackend};
 use crate::gpu::rdna2::{self, Decoded, Operand, Variant};
-
-/// A vertex-shader backend: HLSL (`emit.rs`) or GLSL (this module).
-///
-/// Both take the same console interface and RDNA2 bytes so the position/param contract
-/// stays identical; only the shading language changes.
-pub trait VsBackend {
-    /// The translation this backend produces.
-    type Output;
-    /// Translate `code` as a vertex shader with interface `vs`.
-    fn translate_vs(code: &[u8], vs: &VsInterface, wave64: bool) -> Result<Self::Output, String>;
-}
-
-/// The HLSL path (`super::translate` with a vertex mode).
-pub struct HlslVsBackend;
 
 /// The GLSL 450 path in this module.
 pub struct GlslVsBackend;
-
-impl VsBackend for HlslVsBackend {
-    type Output = super::Translation;
-    fn translate_vs(code: &[u8], vs: &VsInterface, wave64: bool) -> Result<Self::Output, String> {
-        super::translate(
-            code,
-            &super::Options {
-                mode: super::Mode::Vertex(vs.clone()),
-                wave64,
-                ..Default::default()
-            },
-        )
-    }
-}
 
 impl VsBackend for GlslVsBackend {
     type Output = GlslTranslation;

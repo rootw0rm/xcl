@@ -60,6 +60,7 @@ pub mod lower;
 pub mod lower_dxil;
 pub(crate) mod emit;
 pub mod glsl;
+pub mod spirv;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod x64_masks;
@@ -118,6 +119,34 @@ impl VsInterface {
     /// The first VGPR the fetch shader puts ISG1 register `register` in (None: not fetched).
     pub fn input_vgpr(&self, register: u32) -> Option<u64> {
         fetched_registers(&self.inputs).iter().position(|&r| r == register).map(|k| self.attr_base + 4 * k as u64)
+    }
+}
+
+/// A vertex-shader backend: HLSL (`emit.rs`), GLSL (`glsl.rs`) or SPIR-V (`spirv.rs`).
+///
+/// All three take the same console interface and RDNA2 bytes so the
+/// position/param contract stays identical; only the shading language changes.
+pub trait VsBackend {
+    /// The translation this backend produces.
+    type Output;
+    /// Translate `code` as a vertex shader with interface `vs`.
+    fn translate_vs(code: &[u8], vs: &VsInterface, wave64: bool) -> Result<Self::Output, String>;
+}
+
+/// The HLSL path (`super::translate` with a vertex mode).
+pub struct HlslVsBackend;
+
+impl VsBackend for HlslVsBackend {
+    type Output = Translation;
+    fn translate_vs(code: &[u8], vs: &VsInterface, wave64: bool) -> Result<Self::Output, String> {
+        translate(
+            code,
+            &Options {
+                mode: Mode::Vertex(vs.clone()),
+                wave64,
+                ..Default::default()
+            },
+        )
     }
 }
 

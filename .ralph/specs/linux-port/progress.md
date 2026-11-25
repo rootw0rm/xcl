@@ -1085,3 +1085,21 @@ then hand-roll the blit-subset assembler). Docs updated in the same pass: plan.m
 marked LANDED + 13 LANDED detail + Plan Changes entry; context.md current-state refresh;
 DEC-021 recorded. Steps 15–21 stay chained behind SKIPPED step-12; Phase E/F remain
 blocked per §4.7. No code changes in this planner pass.
+
+## Verification Notes — step-14 spirv-inproc (Builder, 2026-11-25, `linux`)
+
+Task `task-1795568511-058d` (`linux:spirv-inproc`, plan.md step 14, DEC-021).
+Retail-smoke SKIPPED here: `/run/media/...` absent (no game files on host); synthetic title is the e2e gate.
+
+Landed (one commit, no refactors, no new deps — hand-rolled to avoid any license/static-musl audit):
+- `crates/xcl/src/gpu/recomp/spirv.rs` (new): `SpirvVsBackend` behind the shared `VsBackend` contract + `translate_vs_spirv` (decode, branch rejection, straight-line blit subset: SALU mov/add/sub/logic, VALU mov/logic/add/sub/mul/fma/cvt, `exp pos0` → `Position`, `exp param N` → ranked out params with `vs_param_register`/`elements_at` register semantics, `s_endpgm` ends; full-EXEC bring-up assumption documented, everything else recorded + skipped, never a crash). Hand-assembled SPIR-V 1.0 words (`Capability Shader`, `Logical GLSL450`, `Vertex` entry, `Position` builtin + ranked param `Location` outs, `VertexIndex`/`InstanceIndex` builtins; core integer/float/bitcast/convert/compare/select ops only — `min`/`max` via compare+select, `fma` as mul+add — so no `GLSL.std.450` import). `spirv-val`/`spirv-dis` live only in `#[cfg(test)]`; the shipped path builds words only.
+- `crates/xcl/src/gpu/recomp/mod.rs`: shared `VsBackend` trait + `HlslVsBackend` (step-13 review follow-up for the third backend); `pub mod spirv;`.
+- `crates/xcl/src/gpu/recomp/glsl.rs`: uses `super::{VsBackend, HlslVsBackend}` (re-exported for compatibility); no behavior change. No `TRANSLATOR_SOURCES` change (SPIR-V backend has no disk cache, same as GLSL).
+
+Verification (this host, no game files — retail opt-in no-ops):
+- `cargo test -p xcl --lib -- gpu::recomp::spirv` → 4 passed; 0 failed (synthetic-blit structural + real `spirv-val` gate, `spirv-val 2026.4`; GLSL-parity position/param contract; shipped-path no-`Command`/`process` audit; retail `XCL_SAMPLE_RPF` unset → skip).
+- `cargo test -p xcl --lib -- gpu::recomp::glsl` → 2 passed; 0 failed (no regression from the trait move).
+- `cargo test -p xcl --lib -- --test-threads=4` → 391 passed; 0 failed; 0 ignored (was 387; +4 spirv).
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (one `is_multiple_of` fixed in-slice; remaining `as_chunks` suggestion pre-existing style, warning-only); `git diff --check` clean; `rustfmt --check` clean on the touched files.
+- Shipped-path shell-out audit: `grep -rn "Command::new" crates/xcl/src/gpu/recomp/spirv.rs` → 4 sites, all inside `#[cfg(test)] mod tests`; `translate_vs_spirv` builds words only.
+- Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/spv-fresh-game`, fresh `XCL_DATA_ROOT=/tmp/spv-fresh-data`): `XCL_DATA_ROOT=... timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `crash: null`, `called_stubs: 29` (28 `d3d12_xs` console slots + expected `XclDefinitelyMissingFunction` probe, zero `xcrdapi`/`mfplat`/`FormatMessage`) — matches the 12g/13 baseline; `[PASS] DirectStorage`, `[PASS] MFPlat` hold. No new failure.
