@@ -163,7 +163,7 @@ Windows behavior unchanged.
 
 ## Phase D — RDNA2 → SPIR-V + Vulkan
 
-13. **backend split + GLSL** — `code-assist:linux-port:step-13:glsl-backend`.
+13. **backend split + GLSL** — `linux:glsl-backend` — LANDED (`6c09624`).
     Outcome: emitter exposes a backend trait; a GLSL 450 backend emits one known-good blit VS
     (e.g. `VS_BlitGenAmbCube` class from the retail pack via `XCL_SAMPLE_RPF`) with the same
     register/export semantics as the HLSL path. External `glslc` is bring-up only.
@@ -302,6 +302,20 @@ Windows behavior unchanged.
   no shell-out in the shipped path). Steps 14–21 stay chained behind SKIPPED
   step-12; Phase E/F remain blocked per §4.7.
 
+ - Planner revise (2026-11-25, `linux` @ `6c09624`, no game files on host): step 13
+   (`linux:glsl-backend`, `6c09624`) closed with review (387 lib tests, title
+   `ExitProcess(0xc)`/12 fails, `called_stubs: 29` with zero `xcrdapi`/`mfplat`/
+   `FormatMessage` entries, real `glslc 2026.4` compile gate passed, shipped path
+   spawns nothing). Fresh triage: title baseline unchanged (`ExitProcess(0xc)`/12
+   fails, `called_stubs: 29` = 28 Phase-D `d3d12_xs` console slots + expected
+   `XclDefinitelyMissingFunction` probe, zero non-GPU calls; every remaining FAIL
+   is a null-device D3D12 category needing the real Vulkan backend). New step 14
+   (`linux:spirv-inproc`) is the unblocked next task: in-process SPIR-V backend
+   for the same blit-class VS (synthetic/in-tree RDNA2 program as the no-retail
+   gate, `XCL_SAMPLE_RPF` retail sample opt-in, `spirv-val` where present else
+   structural checks, no shell-out in the shipped path). Steps 15–21 stay chained
+   behind SKIPPED step-12; Phase E/F remain blocked per §4.7.
+
 ## Phase C frontier — next CRT family
 
 12a. **CRT copy/concat** — `linux:crt-copy` — LANDED (`38f95fd`).
@@ -438,3 +452,6 @@ Windows behavior unchanged.
     calls. The other ~28 are Phase-D console slots (real Vulkan backend, explicitly
     blocked per §4.7). `XclDefinitelyMissingFunction` is the expected probe and never
     implemented.
+
+ 13. **glsl-backend** — `linux:glsl-backend` — LANDED (`6c09624`).
+     Outcome: backend-neutral `VsBackend` trait + `translate_vs_glsl` straight-line blit subset in new `gpu/recomp/glsl.rs` (one-line `pub mod glsl`). Acceptance (met): synthetic-blit structural + real `glslc -fshader-stage=vert` gate, `XCL_SAMPLE_RPF` opt-in skip, 387 lib tests, title `ExitProcess(0xc)`/12 fails / `called_stubs: 29` matching the 12g baseline. One commit, no refactors.

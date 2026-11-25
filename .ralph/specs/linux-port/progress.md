@@ -1024,7 +1024,7 @@ Independent re-verification (this host, no game files — retail SKIPPED):
 Requirements: met — win64 `DStorageGetFactory` (factory + `IID_FACTORY_X1` accept, unknown IID → `E_NOINTERFACE`, NULL out → `E_POINTER`) + factory/queue/file/status vtables in new `hle/dstorage_linux.rs` (win64, no `windows_sys`, never NULL slots) + `read/write_physical_pages` helpers in `kernelx_linux` (validate-before-write, all-or-nothing) + `xcrdapi_exports()` merge so `xcrdapi.dll` resolves `Hle(xcrdapi)`; `execute` covers title verbs only (uncompressed file→memory, physical pages, cancel zero-preservation; zlib/BCPack/swizzle/memory-source refused). One commit (`4f6f151`), Linux-only files + progress.md, no refactors.
 
 ## Follow-ups (minor, non-blocking)
-- None. NULL/QI/fence paths fail closed, `rustfmt --check` clean, no new warnings attributable to the slice.
+- None from 12g. NULL/QI/fence paths fail closed, `rustfmt --check` clean, no new warnings attributable to the slice.
 
 ## Verification Notes — step-13 glsl-backend (Builder, 2026-11-25, `linux`)
 
@@ -1040,3 +1040,48 @@ Verification (this host, no game files — retail opt-in no-ops):
 - `cargo test -p xcl --lib -- --test-threads=4` → 387 passed; 0 failed; 0 ignored (was 385; +2 glsl).
 - `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors, no new warnings (one `manual_is_multiple_of` fixed in-slice); `git diff --check` clean; `rustfmt --check` clean on the new file (whole-tree `rustfmt --check` drift in `dxc.rs`/`upper_lanes.rs`/`x64_masks.rs` is pre-existing per AGENTS.md).
 - Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/glsl-fresh-game`, fresh `XCL_DATA_ROOT=/tmp/glsl-fresh-data`): `XCL_DATA_ROOT=... timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `called_stubs: 29` (28 `d3d12_xs` console slots + expected `XclDefinitelyMissingFunction` probe, zero `xcrdapi`/`mfplat`/`FormatMessage`) — matches the 12g baseline; no new failure.
+
+## Critic review — step-13 glsl-backend (Fresh-Eyes, 2026-11-25, `linux` @ `6c09624`)
+
+Task `task-1795567789-dc8b` (`linux:glsl-backend`) — PASS, closed.
+
+Independent re-verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib -- gpu::recomp::glsl` → 2 passed; 0 failed. `glslc` IS installed here (`2026.4` / `1.4.363.0`), so the synthetic-blit `glslc -fshader-stage=vert` compile gate ran for real, not the skip path; retail `XCL_SAMPLE_RPF` unset → clean skip.
+- `cargo test -p xcl --lib` → 387 passed; 0 failed; 0 ignored (matches Builder; +4 over the 12g 383 = 2 glsl + 2 from the upstream sync interval).
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (the two `unused variable` warnings are pre-existing `kernelx_linux.rs`, not this slice); `git diff --check` clean; `rustfmt --check crates/xcl/src/gpu/recomp/glsl.rs` clean.
+- Shipped-path shell-out audit: all four `std::process::Command::new("glslc")` sites are inside `#[cfg(test)] mod tests` (lines 825+); the shipped `translate_vs_glsl` path never spawns a compiler. `TRANSLATOR_SOURCES` untouched is correct — the GLSL backend has no disk cache, and `mod.rs` (already listed) is the only shared file touched.
+- Synthetic title (fresh `/tmp/glsl-critic-game` from `tests/data/testgame` + prebuilt exes, fresh `XCL_DATA_ROOT=/tmp/glsl-critic-data`, `timeout 120 ./target/debug/xcl run "$GAME" -- --hello`) → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)` (rc=12), `report.json` `exit_code: 12`, `crash: null`, `called_stubs: 29` (28 `d3d12_xs` console slots + expected `XclDefinitelyMissingFunction` probe; zero `xcrdapi`/`mfplat`/`FormatMessage`) — matches the 12g baseline; no new failure. `[PASS] DirectStorage`, `[PASS] MFPlat` both hold.
+
+Requirements: met — `VsBackend` trait (`HlslVsBackend` via `super::translate` + vertex mode, `GlslVsBackend` via the new emitter; same interface/bytes in, shading language out) + `translate_vs_glsl` straight-line blit subset (decode, branch rejection, SALU mov/add/sub/logic, VALU mov/logic/add/sub/mul/fma/cvt, `exp pos0` → `gl_Position`, `exp param N` → ranked `out_p` params with `vs_param_register`/`elements_at` semantics, full-EXEC bring-up assumption documented, everything else recorded + emitted as a comment so output still compiles) + `#version 450` header (location ins/outs, Vertex/InstanceIndex VGPR init, EXEC all-ones, bitcast intrinsics, no `WaveGetLaneIndex`/`asfloat`/`SV_Position`). One commit (`6c09624`), new module + one-line `mod.rs`, no refactors.
+
+## Follow-ups (minor, non-blocking)
+- `VsBackend` lives in `glsl.rs`; when step 14 adds the third (SPIR-V) backend, consider moving the trait to `mod.rs`.
+- `TRANSLATOR_SOURCES` omits `glsl.rs` (correct while GLSL has no disk cache); revisit when step 14 adds translation identity/caching.
+
+## Planner revise — spirv-inproc triage (2026-11-25, `linux` @ `6c09624`)
+
+Event `plan.revise`: `linux:glsl-backend` passed review and closed (387 lib tests, title
+`ExitProcess(0xc)`/12 fails, `called_stubs: 29`, real `glslc 2026.4` gate, shipped path
+spawns nothing). Queue: 1 in_progress (step-12 retail-smoke, SKIPPED here —
+`/run/media/...` absent) + 8 open (stable-key steps 13–21 chained behind step-12, step-13
+already landed as side task `6c09624`); `task ready --all` is empty, so the next behavior
+slice needs a new unblocked side task (stable-key chain left intact per DEC-020).
+
+Triage (evidence, not speculation): title baseline unchanged from the 12g/13 reviews
+(`ExitProcess(0xc)`/12 fails, `called_stubs: 29` = 28 `d3d12_xs` console slots +
+`XclDefinitelyMissingFunction` probe, zero `xcrdapi`/`mfplat`/`FormatMessage`; every FAIL
+a null-device D3D12 category). No further one-family HLE slice exists — the only
+runnable frontier is Phase D. The GLSL slice's two review follow-ups (`VsBackend`
+placement when the third backend lands, `TRANSLATOR_SOURCES`/caching identity) are
+step-14 work, not new tasks.
+
+New task `linux:spirv-inproc` (plan.md step 14, recorded as DEC-021): in-process SPIR-V
+backend for the same blit-class VS — synthetic/in-tree RDNA2 program as the no-retail
+gate, `XCL_SAMPLE_RPF` retail sample opt-in (no-op when unset, never counted), `spirv-val`
+where present else structural word checks (magic/version/bound/schema), SPIR-V image
+matches the GLSL-backed position/param contract, no process spawn in the shipped path,
+dep license field verified GPL-2.0-compatible before adding (pure-Apache-2.0-only is out —
+then hand-roll the blit-subset assembler). Docs updated in the same pass: plan.md step 13
+marked LANDED + 13 LANDED detail + Plan Changes entry; context.md current-state refresh;
+DEC-021 recorded. Steps 15–21 stay chained behind SKIPPED step-12; Phase E/F remain
+blocked per §4.7. No code changes in this planner pass.

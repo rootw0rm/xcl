@@ -138,6 +138,25 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
   with `XCL_SAMPLE_RPF` opt-in, `glslc` bring-up only. Steps 14–21 stay chained behind
   SKIPPED step-12; Phase E/F remain blocked per §4.7.
 
+## Current state (planner revise, 2026-11-25, `linux` @ `6c09624`)
+
+- Steps 1–11 closed (11a–11s HLE slices, CRT forwarding + follow-ups, report parity);
+  12a (`linux:crt-copy`), 12b (`linux:crt-search-dup`), 12c
+  (`linux:crt-convert-onexit`), 12d (`linux:crt-vfprintf`), 12e
+  (`linux:format-message`), 12f (`linux:mfplat-headless`, `00a9f50`),
+  12g (`linux:dstorage-read`, `4f6f151`), and 13 (`linux:glsl-backend`, `6c09624`)
+  closed with review (387 lib tests, title reaches `ExitProcess(0xc)` with 12 known
+  null-device failures; 13 review re-verified real `glslc 2026.4` compile gate and
+  zero shell-out in the shipped path).
+- No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic
+  title (`tests/testtitle` + `testgamedll`, `gnullvm`/`gnu` targets installed) is the e2e target.
+- Stub-triage exhausted (fresh run here: `ExitProcess(0xc)`/12 fails, `called_stubs: 29`
+  = 28 `d3d12_xs` slots + expected probe, zero non-GPU calls; all FAILs are null-device
+  D3D12 categories). Next slice is plan.md step 14 (`linux:spirv-inproc`, DEC-021):
+  in-process SPIR-V backend for the same blit-class VS, synthetic/in-tree gate
+  with `XCL_SAMPLE_RPF` opt-in, `spirv-val` where present else structural checks.
+  Steps 15–21 stay chained behind SKIPPED step-12; Phase E/F remain blocked per §4.7.
+
 ## Integration points
 
 - `crates/xcl/src/lib.rs`: module list is the cfg gate boundary.

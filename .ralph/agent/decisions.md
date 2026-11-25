@@ -328,3 +328,13 @@ Template for each entry:
 - **Reasoning:** §4.7b orders by what the exe actually calls; nothing callable outside Phase D remains. A side `linux:glsl-backend` task (like the 12a–12g side tasks) keeps the stable-key chain untouched while giving the Builder a reviewable vertical slice that runs without game files. The shipped path must not shell out to an external compiler.
 - **Reversibility:** high — additive emitter backend behind a trait; the original step-13 chain entry stays provisional.
 - **Timestamp:** 2026-11-25T00:00:00Z
+
+## DEC-021 — Next slice is in-process SPIR-V for the same blit VS
+
+- **Decision:** After 13, implement step 14 (`linux:spirv-inproc`) as an unblocked side task gated synthetically, leaving steps 15–21 chained behind SKIPPED step-12.
+- **Chosen Option:** in-process SPIR-V backend for the same blit-class VS the GLSL slice covers (synthetic/in-tree RDNA2 program as the no-retail gate, `XCL_SAMPLE_RPF` retail sample opt-in, `spirv-val` where present else structural word checks, no shell-out in the shipped path). Verify the new dep's license field before adding (`rspirv` only if its `Cargo.toml` license is GPL-2.0-compatible dual MIT-or-Apache-2.0 used under MIT / MIT / BSD / zlib; pure-Apache-2.0-only is out per AGENTS.md — then hand-roll a minimal SPIR-V assembler for the blit subset reusing the `glsl.rs` decode/step shape). Move the shared `VsBackend` trait to `mod.rs` when the third backend lands (13 review follow-up); revisit `TRANSLATOR_SOURCES`/disk-cache identity when translation caching lands.
+- **Confidence:** 72
+- **Alternatives Considered:** (a) keep Phase D blocked and publish `review.passed` (stalls the loop — a real Phase-D slice is ready and §8.7 forbids consecutive no-diff iterations); (b) fold step 14 into the chained `code-assist:linux-port:step-14:spirv-inproc` by clearing its `blocked_by` (mutates the stable-key queue left intact since 12a); (c) jump to the Vulkan runner first (needs valid SPIR-V words before device dispatch — premature).
+- **Reasoning:** §4.7 orders by executable evidence; the GLSL slice proved the blit-subset register/export semantics and the `VsBackend` seam with a real `glslc` gate. The next checkable increment is byte-identical semantics as SPIR-V words with no external compiler, keeping the synthetic title at `ExitProcess(0xc)`/12 fails / `called_stubs: 29` as the regression gate.
+- **Reversibility:** high — additive emitter backend; the stable-key step-14 chain entry stays provisional.
+- **Timestamp:** 2026-11-25T00:00:00Z
