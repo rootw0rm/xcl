@@ -4514,11 +4514,15 @@ mod tests {
                 scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
             }
             on_create(raw, alloc.as_raw() as usize, 0, ty);
-            {
+            // Read under the lock, assert after it: a failed assert while holding the lock poisons
+            // COPY_SCRATCH, the list's Release hook (`real::cl_release`) then panics on it while the
+            // test unwinds, and that aborts the whole test binary.
+            let (active, released) = {
                 let cache = COPY_SCRATCH.lock().unwrap();
-                assert!(!cache.active.contains_key(&key), "the new list starts without one");
-                assert!(!cache.released.is_empty(), "the GPU may still use it: it stays until the fence");
-            }
+                (cache.active.contains_key(&key), !cache.released.is_empty())
+            };
+            assert!(!active, "the new list starts without one");
+            assert!(released, "the GPU may still use it: it stays until the fence");
             fence.Signal(1).unwrap();
             on_release(key);
             super::super::alloc_pool::forget(alloc.as_raw() as usize);
@@ -4701,6 +4705,59 @@ mod tests {
             cell64.store(0x0000_0002_0000_0001, Ordering::Release);
             assert!(w64.is_satisfied());
         }
+    }
+
+    #[test]
+    fn wait64_flags_do_not_mask_the_recorded_counter() {
+        let mut token = 0usize;
+        let list = (&mut token as *mut usize).cast::<c_void>();
+        let cell = AtomicU64::new(0);
+        let va = &cell as *const AtomicU64 as u64;
+        for (current, wanted, flags) in [
+            (2, 1, 0x231_0000_0001),
+            (4, 2, 0x270_0000_0001),
+            (5, 3, 1),
+            (0x1_0000_0004, 0x1_0000_0002, 0xFFFF_FFFF_0000_0001),
+        ] {
+            cell.store(current, Ordering::Release);
+            unsafe { wait64_x(list, va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, wanted, flags, 0) };
+            let waits = LISTS.lock().unwrap().as_ref().unwrap()[&(list as usize)].pending_waits.clone();
+            on_release(list as usize);
+            assert_eq!(waits.len(), 1);
+            let w = waits[0];
+            assert_eq!((w.width, w.value, w.mask), (8, wanted, u64::MAX));
+            unsafe {
+                assert!(w.is_satisfied(), "{current:#x} >= {wanted:#x}; flags {flags:#x}");
+                cell.store(wanted - 1, Ordering::Release);
+                assert!(!w.is_satisfied(), "a genuinely earlier counter must still wait");
+                cell.store(wanted, Ordering::Release);
+                assert!(w.is_satisfied(), "equality satisfies GREATER_EQUAL");
+            }
+        }
+    }
+
+    #[test]
+    fn wait64_satisfied_counter_keeps_submission_together_and_wait32_keeps_its_mask() {
+        let mut tokens = [0usize; 2];
+        let lists = [tokens.as_mut_ptr().cast::<c_void>(), unsafe { tokens.as_mut_ptr().add(1).cast::<c_void>() }];
+        let cell64 = AtomicU64::new(4);
+        let cell32 = AtomicU32::new(0xDEAD_005A);
+        unsafe {
+            wait64_x(lists[1], &cell64 as *const AtomicU64 as u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 2, 0x270_0000_0001, 0);
+        }
+        let mut batches = Vec::new();
+        unsafe { execute_with_waits(&lists, |chunk| batches.push(chunk.to_vec())) };
+        on_release(lists[1] as usize);
+        assert_eq!(batches, vec![lists.to_vec()], "an already satisfied counter must not split the batch");
+
+        unsafe {
+            wait32_x(lists[0], &cell32 as *const AtomicU32 as u64, D3D12_COMPARISON_FUNC_EQUAL.0 as u32, 0x5A, 0xFF, 0);
+        }
+        let waits = LISTS.lock().unwrap().as_ref().unwrap()[&(lists[0] as usize)].pending_waits.clone();
+        on_release(lists[0] as usize);
+        assert_eq!(waits.len(), 1);
+        assert_eq!((waits[0].width, waits[0].mask), (4, 0xFF));
+        assert!(unsafe { waits[0].is_satisfied() });
     }
 
     #[test]

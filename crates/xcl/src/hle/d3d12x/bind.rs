@@ -1109,6 +1109,7 @@ mod tests {
         use std::mem::{transmute_copy, ManuallyDrop};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
 
         const TRIES: u32 = 40;
         // mode 0: write (x, 1, 1) at a[0..12]; mode 1: count the groups
@@ -1124,13 +1125,35 @@ void main(uint t : SV_GroupIndex) {
     if (mode == 0u) a.Store3(0, uint3(x, 1u, 1u)); else c.InterlockedAdd(0, 1u);
 }
 "#;
+        if crate::gpu::recomp::dxc::location().is_err() {
+            skip_test("no DXC");
+            return;
+        }
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                skip_test("no GPU");
-                return;
-            }
-            let dev = dev.unwrap();
+            let setup = || -> Result<(ID3D12Device, String), String> {
+                let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI factory unavailable: {e}"))?;
+                let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+                let (adapter, name): (IDXGIAdapter1, String) = if sel == crate::gpu::adapter::Selector::Warp {
+                    (factory.EnumWarpAdapter().map_err(|e| format!("WARP unavailable: {e}"))?, "WARP (software renderer)".into())
+                } else {
+                    let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next()
+                        .ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+                    (adapter, crate::gpu::adapter::name(&desc))
+                };
+                let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_11_0).map_err(|e| format!("{name}: D3D12 device unavailable ({e})"))?;
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+                dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32)
+                    .map_err(|e| format!("{name}: cannot query SM 6.6 ({e})"))?;
+                if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                    return Err(crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state()));
+                }
+                Ok((dev, name))
+            };
+            let (dev, name) = match setup() {
+                Ok(selected) => selected,
+                Err(reason) => { skip_test(&reason); return; }
+            };
+            println!("ExecuteIndirect adapter: {name}");
             let dxil = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
             let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
             let cs = D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() };

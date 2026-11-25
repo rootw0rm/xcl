@@ -7645,7 +7645,16 @@ mod readback_routing_tests {
                     drop(r_ok);
                     drop(heap);
                 }
-                assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+                // D3D12CreateDevice gives the process's one device: once another test adopted it,
+                // r_ok was adopted too, and its last Release is held (`late_release`) while a
+                // queue of another test still has work. The heap pins `mem` until then (#1487).
+                let start = std::time::Instant::now();
+                let mut freed = VirtualFree(mem, 0, MEM_RELEASE);
+                while freed == 0 && start.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    freed = VirtualFree(mem, 0, MEM_RELEASE);
+                }
+                assert_ne!(freed, 0, "the heap's pages were not let go within 10 s");
             }
         }
     }
