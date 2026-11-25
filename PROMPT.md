@@ -10,8 +10,13 @@ first (short contract); this file is the work plan. Details live in
 
 ## Status snapshot (2026-11-25 — refresh when a milestone flips)
 
-- `linux` @ `083cdee`, pushed to `origin/linux`. Upstream `main` @
-  `6e1e2be` merged in. Verify: `git log --oneline -3; git status -sb`.
+- `linux` @ `2553a45` (merge of upstream `main` @ `568e7db`, plus Linux
+  work; pushed to `origin/linux`).
+  Verify with `git log --oneline -3; git status -sb`.
+  Upstream `6e1e2be` → `568e7db` is README/assets only (retail game
+  status: about 60 %, ~5 fps in its world) — no code, no Linux fallout.
+  The ralph loop was stopped 2026-11-25; this session drives (streams in
+  `/tmp/opencode/stream-<x>`, merged by the driver).
 - **Game files are PRESENT on this host** (the drive is mounted):
   `/run/media/anon/12TB_B/torrents/GTA6.Xbox.v1.0.2.1-CYBERLEEK/`
   (`game_scarlett_master.exe`, 120 MB, + `MicrosoftGame.Config`) and
