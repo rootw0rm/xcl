@@ -19,6 +19,8 @@ pub mod kernelx_linux;
 pub mod crt_linux;
 #[path = "hle/xgameruntime_linux.rs"]
 pub mod xgameruntime_linux;
+#[path = "hle/xgameruntime_api_linux.rs"]
+pub mod xgameruntime_api_linux;
 #[path = "hle/minuserx_linux.rs"]
 pub mod minuserx_linux;
 #[path = "hle/mfplat_linux.rs"]
@@ -201,6 +203,14 @@ fn xgameruntime_exports() -> Vec<(&'static str, usize)> {
     // Step-11i identity slice carries real Linux addresses; the rest stays Stub (0).
     // Step-11o taskqueue + networking slice merges real addresses below.
     for (name, addr) in xgameruntime_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    // Step-12h GDK-thunk protocol slice: InitializeApiImpl(Ex/Ex2) + QueryApiImpl.
+    for (name, addr) in xgameruntime_api_linux::exports() {
         if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
             slot.1 = addr;
         } else {
@@ -827,7 +837,14 @@ mod tests {
         }
         // Step-11o XTaskQueue + networking slice: dispatch is real, not stub metadata.
         // Step-11p XUser/XAsync/save/PLS slice: sign-in + storage are real.
+        // Step-12h GDK-thunk protocol: the game's GetProcAddress probes resolve.
         for name in [
+            "InitializeApiImpl",
+            "InitializeApiImplEx",
+            "InitializeApiImplEx2",
+            "UninitializeApiImpl",
+            "QueryApiImpl",
+            "XErrorReport",
             "XTaskQueueCreate",
             "XTaskQueueCreateComposite",
             "XTaskQueueGetPort",

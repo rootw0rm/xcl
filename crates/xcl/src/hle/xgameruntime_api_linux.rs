@@ -1,0 +1,1342 @@
+//! Linux GDK-thunk protocol slice: `InitializeApiImpl(Ex/Ex2)` + `QueryApiImpl`.
+//!
+//! The Windows `hle/xgameruntime/api.rs` stays the implementation source of truth
+//! (GDK `QueryApiImpl(clsid, iid)` hands each API family out as a COM-style vtable
+//! built from `gdk_table`, the extracted public-PC-GDK slot map). This module is the
+//! Linux twin: same GUIDs, same slot layouts, same XCL-owned objects — but no PC
+//! runtime leg (no `System32\xgameruntime.dll` on Linux), so every class XCL does
+//! not implement answers `REGDB_E_CLASSNOTREG` and every unimplemented slot logs
+//! once and answers `E_NOTIMPL`, both visible in `report.json` (`ApiStats`) and
+//! `xcl.log`. The entry points are real `win64` code addresses so the game's
+//! `GetProcAddress(xgameruntime.dll, …)` probes and static imports resolve as HLE.
+
+#![allow(non_snake_case)]
+
+use std::collections::BTreeMap;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+#[path = "xgameruntime/gdk_table.rs"]
+mod gdk_table;
+
+use crate::hle::{xgameruntime_linux as xr, xtaskqueue_linux as xq, xuser_linux as xu};
+use crate::util::{write_cstr_out, E_INVALIDARG, HRESULT, S_OK};
+use xu::XAsyncBlock;
+
+// ---------------------------------------------------------------------------------------
+// identities
+// ---------------------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Guid(pub u32, pub u16, pub u16, pub [u8; 8]);
+
+impl Guid {
+    pub const fn from_u128(v: u128) -> Guid {
+        Guid((v >> 96) as u32, (v >> 80) as u16, (v >> 64) as u16, (v as u64).to_be_bytes())
+    }
+}
+
+impl std::fmt::Display for Guid {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let d = &self.3;
+        write!(f, "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{}", self.0, self.1, self.2, d[0], d[1], d[2..].iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+}
+
+const fn g(v: u128) -> Guid {
+    Guid::from_u128(v)
+}
+
+pub const XUSER: Guid = g(0x01acd177_91f9_4763_a38e_ccbb55ce32e0);
+/// interface of XUserGetGamertag (with a gamertag component): its own vtable
+#[cfg_attr(not(test), allow(dead_code))]
+const XUSER_GAMERTAG_IID: Guid = g(0xcef4fac0_7676_4a94_a119_4c43f9eb5b74);
+/// older console GDK XUser IID (same base slot layout)
+const XUSER_V2_IID: Guid = g(0x1bf2f8c5_d507_4e52_bb05_f726d0e71161);
+const XUSER_DEVICE: Guid = g(0x7d824997_10dc_45ab_86b7_2737767c0bf1);
+pub const XGAMESAVE: Guid = g(0x704c3f58_e629_4cc2_b197_30511b996fe2);
+/// the interface the game's libHttpClient asks for (GDK table: 0b9d556e)
+#[cfg_attr(not(test), allow(dead_code))]
+const XPACKAGE_OLD_IID: Guid = g(0xe2a4734b_2f4a_456d_aa8f_d065e04fb209);
+/// console GDK 19041 XPackage v1 IID: XPackageEnumeratePackages is at slot 28
+const XPACKAGE_V1_IID: Guid = g(0xbe3f3e9f_c4b3_424d_9a95_d1af060559a5);
+/// console GDK 19041/22000 XPackage v2 IID: EnumeratePackages @ 35, RegisterPackageInstalled @ 36
+const XPACKAGE_V2_IID: Guid = g(0xf92d8712_2b27_4d8a_bf01_11a6f8e3eb42);
+pub const XPACKAGE: Guid = g(0xaf406016_e850_4aa8_a88d_2f3dcb9dac7e);
+pub const XPLS: Guid = g(0xf4faf4d4_2d04_4fce_b3e0_474a713a3e84);
+const XPLS_V1_IID: Guid = g(0xd29411df_0794_4553_8b27_95fc02d0f75d);
+pub const XGAME: Guid = g(0x973a344e_24bf_4d0f_8457_56c534892b29);
+const XGAME_V1_IID: Guid = g(0x50849859_0ad8_4f81_80e4_5bc78626f852);
+pub const XSYSTEM: Guid = g(0xe349bd1a_fc20_4e40_b99c_4178cc6b409f);
+const XSYSTEM_V2_IID: Guid = g(0x67ce4bfc_b1d1_4ac7_bc3a_cb9219a97a85);
+/// console GDK XSystem v3 IID: XSystemGetAppSpecificDeviceId is at slot 4 (not slot 5)
+const XSYSTEM_V3_IID: Guid = g(0x6fd71f09_7513_49f0_89bc_bfaf5df6f852);
+const XANALYTICS: Guid = g(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b);
+const XFEATURE: Guid = g(0x8836fe87_edb9_4fe3_8dad_05f0d2cd5b40);
+const XDISPLAY: Guid = g(0x1b339674_328d_4283_a200_3171f18d3639);
+const XGAMEEVENT: Guid = g(0xbbfbdcc7_bfe7_409b_a5ca_edf054960b4d);
+pub const XNETWORKING: Guid = g(0x37e56907_2f10_41e8_b72f_36edb185331a);
+pub const XERROR: Guid = g(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
+pub const XGAMEUI: Guid = g(0xdfcd4649_4ff8_4043_ba07_35d607df98b0);
+const XSTORE: Guid = g(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
+const XAPPBROADCAST: Guid = g(0x186d5592_a72d_45fb_9560_11aed0e6647a);
+const XAPPCAPTURE: Guid = g(0xa4f1aee2_2f41_4485_b008_a7c26d52ac27);
+/// XAsync + XTaskQueue + XThread (iid = clsid)
+pub const XASYNC: Guid = g(0x073b7dcb_1fcf_4030_94be_e3c9eb623428);
+
+/// classes that reach Xbox Live / the Store or take XCL's user handles: not available
+const REFUSED: [(Guid, &str); 3] = [(XSTORE, "XStore"), (XAPPBROADCAST, "XAppBroadcast"), (XAPPCAPTURE, "XAppCapture")];
+
+/// rows of the GDK table: (function, class, interface, slot)
+fn table() -> impl Iterator<Item = (&'static str, Guid, Guid, usize)> {
+    gdk_table::API.iter().map(|&(n, c, i, s)| (n, g(c), g(i), s as usize))
+}
+
+/// a class's name for the log: the prefix of its first function in the GDK table
+fn family(c: &Guid) -> String {
+    let Some((n, ..)) = table().find(|r| r.1 == *c) else { return "?".into() };
+    let end = n.char_indices().skip(1).filter(|(_, ch)| ch.is_ascii_uppercase()).nth(1).map_or(n.len(), |(k, _)| k);
+    n[..end].to_string()
+}
+
+const REGDB_E_CLASSNOTREG: HRESULT = 0x8004_0154_u32 as i32;
+const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
+
+// ---------------------------------------------------------------------------------------
+// entry points
+// ---------------------------------------------------------------------------------------
+
+static INIT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+pub unsafe extern "win64" fn InitializeApiImplEx2(gdk: u64, os: u64, flags: u64, _options: *mut c_void) -> HRESULT {
+    if INIT_COUNT.fetch_add(1, Ordering::AcqRel) == 0 {
+        crate::xlog_info!("XGameRuntime: InitializeApiImplEx2({gdk:#x}, {os:#x}, flags {flags:#x}) – title goes through the GDK thunks (XCL objects, no PC runtime)");
+    }
+    S_OK
+}
+
+pub unsafe extern "win64" fn InitializeApiImplEx(gdk: u64, os: u64, flags: u64) -> HRESULT {
+    crate::xlog_info!("XGameRuntime: InitializeApiImplEx({gdk:#x}, {os:#x}, flags {flags:#x})");
+    InitializeApiImplEx2(gdk, os, flags, std::ptr::null_mut())
+}
+
+pub unsafe extern "win64" fn InitializeApiImpl(gdk: u64, os: u64) -> HRESULT {
+    crate::xlog_info!("XGameRuntime: InitializeApiImpl({gdk:#x}, {os:#x})");
+    InitializeApiImplEx2(gdk << 32 | (os & 0xFFFF_FFFF), 0, 0, std::ptr::null_mut())
+}
+
+pub unsafe extern "win64" fn UninitializeApiImpl() {
+    // saturating: titles may uninitialize without (or more often than) initializing
+    if INIT_COUNT.load(Ordering::Acquire) > 0 {
+        INIT_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub unsafe extern "win64" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
+    if clsid.is_null() || iid.is_null() || out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = std::ptr::null_mut();
+    let (c, i) = (*clsid, *iid);
+    if let Some((_, name)) = REFUSED.iter().find(|r| r.0 == c) {
+        note(c, i, format!("{name}: unavailable (offline)"));
+        return REGDB_E_CLASSNOTREG;
+    }
+    if let Some(o) = own(&c, &i) {
+        let known = o.iface.iids.contains(&i) || i == c;
+        note(c, i, format!("{}: XCL{}", o.iface.name, if known { "" } else { " (interface version not in the GDK table: the main vtable)" }));
+        *out = o as *const Obj as *mut c_void;
+        return S_OK;
+    }
+    note(c, i, format!("{}: missing", family(&c)));
+    REGDB_E_CLASSNOTREG
+}
+
+// ---------------------------------------------------------------------------------------
+// XCL's API objects
+// ---------------------------------------------------------------------------------------
+
+/// One vtable of an XCL class.
+struct Iface {
+    name: &'static str,
+    clsid: Guid,
+    /// interface ids this vtable answers
+    iids: Vec<Guid>,
+    /// the class's main vtable: also for interface ids the GDK table does not know
+    main: bool,
+    /// slot → function (GDK table)
+    names: Vec<Option<&'static str>>,
+    /// (slot, function): the API function itself, without `this` (a shim drops it)
+    slots: Vec<(usize, usize)>,
+}
+
+/// A class XCL answers for: its functions by GDK name.
+struct Class {
+    name: &'static str,
+    clsid: Guid,
+    impls: Vec<(&'static str, usize)>,
+}
+
+/// Functions that return bool (an unimplemented one answers false).
+fn returns_bool(name: &str) -> bool {
+    let rest = name.trim_start_matches('X');
+    let verb = rest.char_indices().skip(1).find(|(_, ch)| ch.is_ascii_uppercase()).map_or("", |(k, _)| &rest[k..]);
+    verb.starts_with("Is") || verb.contains("Unregister") || name == "XPackageUpdateInstallationMonitor" || name == "XPackageUninstallPackage"
+}
+
+#[repr(C)]
+struct Obj {
+    vtbl: *const usize,
+    iface: Iface,
+    /// slot → API function the shim calls
+    targets: [usize; SLOTS],
+}
+
+unsafe impl Sync for Obj {}
+unsafe impl Send for Obj {}
+
+const SLOTS: usize = 96;
+
+unsafe extern "win64" fn query_interface(this: *const Obj, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() || iid.is_null() {
+        return E_INVALIDARG;
+    }
+    let f = &(*this).iface;
+    if *iid == f.clsid || f.iids.contains(&*iid) || (f.main && own(&f.clsid, &*iid).is_some_and(|o| std::ptr::eq(o, this))) {
+        *out = this as *mut c_void;
+        return S_OK;
+    }
+    *out = std::ptr::null_mut();
+    // a title asserting on this (a newer interface version of the class?) ends without a trace otherwise
+    crate::xlog_warn!("XGameRuntime: {} QueryInterface({}) refused (E_NOINTERFACE) – an interface version XCL's GDK table does not know?", f.name, *iid);
+    E_NOINTERFACE
+}
+
+unsafe extern "win64" fn add_ref(_this: *const Obj) -> u32 {
+    1
+}
+
+static UNIMPLEMENTED: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+unsafe fn unknown_slot(this: *const Obj, slot: usize) -> usize {
+    let f = &(*this).iface;
+    let key = match f.names.get(slot).copied().flatten() {
+        Some(n) => n.to_string(),
+        None => format!("{}#{slot}", f.name),
+    };
+    let first = {
+        let mut g = UNIMPLEMENTED.lock().unwrap();
+        let n = g.entry(key.clone()).or_insert(0);
+        *n += 1;
+        *n == 1
+    };
+    if first {
+        crate::xlog_warn!("XGameRuntime: {key} – not supported (E_NOTIMPL)");
+    }
+    if f.names.get(slot).copied().flatten().is_some_and(returns_bool) {
+        0
+    } else {
+        E_NOTIMPL as u32 as usize
+    }
+}
+
+/// Slot `slot` of an XCL object: its API function with the caller's arguments after `this`.
+unsafe fn call_target(this: *const Obj, slot: usize, a: [usize; 9]) -> usize {
+    let f: unsafe extern "win64" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize = std::mem::transmute((*this).targets[slot]);
+    f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+}
+
+type Fwd = unsafe extern "win64" fn(*const Obj, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+
+macro_rules! per_slot {
+    ($($n:literal)*) => {
+        const SHIMS: [Fwd; SLOTS] = [$({
+            unsafe extern "win64" fn f(this: *const Obj, a: usize, b: usize, c: usize, d: usize, e: usize, g: usize, h: usize, i: usize, j: usize) -> usize {
+                call_target(this, $n, [a, b, c, d, e, g, h, i, j])
+            }
+            f
+        }),*];
+        const STUBS: [unsafe extern "win64" fn(*const Obj) -> usize; SLOTS] = [$({
+            unsafe extern "win64" fn f(this: *const Obj) -> usize {
+                unknown_slot(this, $n)
+            }
+            f
+        }),*];
+    };
+}
+per_slot!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+    40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79
+    80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95);
+
+fn object(iface: Iface) -> &'static Obj {
+    let mut v: Vec<usize> = (0..SLOTS).map(|k| STUBS[k] as usize).collect();
+    v[0] = query_interface as usize;
+    v[1] = add_ref as usize;
+    v[2] = add_ref as usize;
+    let mut targets = [0usize; SLOTS];
+    for &(k, f) in &iface.slots {
+        v[k] = SHIMS[k] as usize;
+        targets[k] = f;
+    }
+    let vtbl = Box::leak(v.into_boxed_slice()).as_ptr();
+    Box::leak(Box::new(Obj { vtbl, iface, targets }))
+}
+
+/// The vtables of a class from the GDK table: interface ids whose slots do not collide share
+/// one (the one holding the class id itself, or the first, is the main one).
+fn layout(c: Class) -> Vec<Iface> {
+    let mut by_iid: BTreeMap<Guid, Vec<(usize, &'static str)>> = BTreeMap::new();
+    for (n, cl, i, slot) in table() {
+        if cl == c.clsid && slot < SLOTS {
+            by_iid.entry(i).or_default().push((slot, n));
+        }
+    }
+    let mut order: Vec<Guid> = by_iid.keys().copied().collect();
+    order.sort_by_key(|i| (*i != c.clsid, by_iid[i].iter().map(|r| r.0).min()));
+    let mut groups: Vec<(Vec<Guid>, Vec<Option<&'static str>>)> = Vec::new();
+    for i in order {
+        let rows = &by_iid[&i];
+        let free = groups.iter().position(|(_, names)| rows.iter().all(|&(s, _)| names[s].is_none()));
+        let k = free.unwrap_or_else(|| {
+            groups.push((Vec::new(), vec![None; SLOTS]));
+            groups.len() - 1
+        });
+        groups[k].0.push(i);
+        for &(s, n) in rows {
+            groups[k].1[s] = Some(n);
+        }
+    }
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(k, (iids, names))| {
+            let slot_of = |f: &str| names.iter().position(|n| *n == Some(f));
+            Iface {
+                name: c.name,
+                clsid: c.clsid,
+                main: k == 0,
+                slots: c.impls.iter().filter_map(|&(f, p)| Some((slot_of(f)?, p))).collect(),
+                iids,
+                names,
+            }
+        })
+        .collect()
+}
+
+fn classes() -> Vec<Class> {
+    vec![
+        Class { name: "XUser", clsid: XUSER, impls: xuser() },
+        Class { name: "XUser (devices)", clsid: XUSER_DEVICE, impls: xuser_devices() },
+        Class { name: "XGameSave", clsid: XGAMESAVE, impls: xgamesave() },
+        Class { name: "XPersistentLocalStorage", clsid: XPLS, impls: xpls() },
+        Class { name: "XPackage", clsid: XPACKAGE, impls: xpackage() },
+        Class { name: "XGame", clsid: XGAME, impls: xgame() },
+        Class { name: "XSystem", clsid: XSYSTEM, impls: xsystem() },
+        Class { name: "XSystemAnalytics", clsid: XANALYTICS, impls: named![XSystemGetAnalyticsInfo] },
+        Class { name: "XGameRuntimeFeature", clsid: XFEATURE, impls: vec![("XGameRuntimeIsFeatureAvailable", xr::XGameRuntimeIsFeatureAvailable as usize)] },
+        Class {
+            name: "XDisplay",
+            clsid: XDISPLAY,
+            impls: vec![("XLaunchUri", launch_uri as usize), ("XDisplayAcquireTimeoutDeferral", display_deferral as usize), ("XDisplayCloseTimeoutDeferralHandle", nothing as usize)],
+        },
+        // telemetry: offline, accepted and dropped
+        Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)] },
+        Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking() },
+        Class { name: "XError", clsid: XERROR, impls: xerror() },
+        // dialogs and text entry without a host UI: the object answers, every slot is
+        // E_NOTIMPL until a headless dialog slice lands (logged, in the report)
+        Class { name: "XGameUi", clsid: XGAMEUI, impls: Vec::new() },
+        Class { name: "XAsync", clsid: XASYNC, impls: xasync_impls() },
+    ]
+}
+
+/// Build an explicit legacy console interface vtable from `(slot, function_name)` rows.
+fn legacy_iface(
+    name: &'static str,
+    clsid: Guid,
+    iid: Guid,
+    rows: &[(usize, &'static str)],
+    impls: &[(&'static str, usize)],
+) -> Iface {
+    let mut names = vec![None; SLOTS];
+    let mut slots = Vec::new();
+    for &(slot, fname) in rows {
+        if slot < SLOTS {
+            names[slot] = Some(fname);
+            if let Some(&(_, ptr)) = impls.iter().find(|&&(n, _)| n == fname) {
+                slots.push((slot, ptr));
+            }
+        }
+    }
+    Iface { name, clsid, iids: vec![iid], main: false, names, slots }
+}
+
+/// Older console GDK (19041 / 2020) interface versions whose vtable slot indices differ
+/// from the PC GDK 261000 table.
+fn legacy_ifaces() -> Vec<Iface> {
+    let pkg = xpackage();
+    let sys = xsystem();
+    let pkg_v1 = [
+        (3, "XPackageGetCurrentProcessPackageIdentifier"),
+        (4, "XPackageIsPackagedProcess"),
+        (5, "XPackageCreateInstallationMonitor"),
+        (6, "XPackageCloseInstallationMonitorHandle"),
+        (7, "XPackageGetInstallationProgress"),
+        (8, "XPackageUpdateInstallationMonitor"),
+        (9, "XPackageRegisterInstallationProgressChanged"),
+        (10, "XPackageUnregisterInstallationProgressChanged"),
+        (11, "XPackageGetUserLocale"),
+        (12, "XPackageFindChunkAvailability"),
+        (13, "XPackageEnumerateChunkAvailability"),
+        (14, "XPackageChangeChunkInstallOrder"),
+        (16, "XPackageInstallChunksAsync"),
+        (17, "XPackageInstallChunksResult"),
+        (28, "XPackageEnumeratePackages"),
+    ];
+    let pkg_v2 = [
+        (3, "XPackageGetCurrentProcessPackageIdentifier"),
+        (4, "XPackageIsPackagedProcess"),
+        (5, "XPackageCreateInstallationMonitor"),
+        (6, "XPackageCloseInstallationMonitorHandle"),
+        (7, "XPackageGetInstallationProgress"),
+        (8, "XPackageUpdateInstallationMonitor"),
+        (9, "XPackageRegisterInstallationProgressChanged"),
+        (10, "XPackageUnregisterInstallationProgressChanged"),
+        (11, "XPackageGetUserLocale"),
+        (18, "XPackageEstimateDownloadSize"),
+        (22, "XPackageUnregisterPackageInstalled"),
+        (24, "XPackageGetMountPathSize"),
+        (25, "XPackageGetMountPath"),
+        (26, "XPackageCloseMountHandle"),
+        (30, "XPackageGetWriteStats"),
+        (33, "XPackageEnumerateFeatures"),
+        (35, "XPackageEnumeratePackages"),
+        (36, "XPackageRegisterPackageInstalled"),
+    ];
+    let sys_v3 = [(4, "XSystemGetAppSpecificDeviceId")];
+    vec![
+        legacy_iface("XPackage", XPACKAGE, XPACKAGE_V1_IID, &pkg_v1, &pkg),
+        legacy_iface("XPackage", XPACKAGE, XPACKAGE_V2_IID, &pkg_v2, &pkg),
+        legacy_iface("XSystem", XSYSTEM, XSYSTEM_V3_IID, &sys_v3, &sys),
+    ]
+}
+
+fn objects() -> &'static [&'static Obj] {
+    static O: OnceLock<Vec<&'static Obj>> = OnceLock::new();
+    O.get_or_init(|| {
+        let mut ifaces: Vec<Iface> = classes().into_iter().flat_map(layout).collect();
+        // Register older compatible console IIDs whose slot layouts match the main vtable.
+        for f in &mut ifaces {
+            if !f.main {
+                continue;
+            }
+            match f.clsid {
+                c if c == XUSER => f.iids.push(XUSER_V2_IID),
+                c if c == XSYSTEM => f.iids.push(XSYSTEM_V2_IID),
+                c if c == XGAME => f.iids.push(XGAME_V1_IID),
+                c if c == XPLS => f.iids.push(XPLS_V1_IID),
+                c if c == XNETWORKING => f.iids.push(XNETWORKING),
+                _ => {}
+            }
+        }
+        ifaces.extend(legacy_ifaces());
+        ifaces.into_iter().map(object).collect()
+    })
+}
+
+/// XCL's object for (clsid, iid): the vtable holding that interface, else the class's main one.
+fn own(c: &Guid, i: &Guid) -> Option<&'static Obj> {
+    let all = objects();
+    all.iter().copied().find(|o| o.iface.clsid == *c && o.iface.iids.contains(i)).or_else(|| all.iter().copied().find(|o| o.iface.clsid == *c && o.iface.main))
+}
+
+/// `(name, function)` pairs for functions named like their GDK function
+macro_rules! named {
+    ($($f:ident),* $(,)?) => {
+        vec![$( (stringify!($f), $f as usize) ),*]
+    };
+}
+use named;
+
+fn xuser() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("XUserDuplicateHandle", xu::XUserDuplicateHandle as usize),
+        ("XUserCloseHandle", xu::XUserCloseHandle as usize),
+        ("XUserCompare", xu::XUserCompare as usize),
+        ("XUserGetMaxUsers", xu::XUserGetMaxUsers as usize),
+        ("XUserAddAsync", xu::XUserAddAsync as usize),
+        ("XUserAddResult", xu::XUserAddResult as usize),
+        ("XUserGetLocalId", xu::XUserGetLocalId as usize),
+        ("XUserGetId", xu::XUserGetId as usize),
+        ("XUserGetIsGuest", xu::XUserGetIsGuest as usize),
+        ("XUserGetState", xu::XUserGetState as usize),
+        ("XUserGetGamertag", xu::XUserGetGamertag as usize),
+        ("XUserGetAgeGroup", xu::XUserGetAgeGroup as usize),
+        ("XUserCheckPrivilege", XUserCheckPrivilege as usize),
+        ("XUserRegisterForChangeEvent", xu::XUserRegisterForChangeEvent as usize),
+        ("XUserUnregisterForChangeEvent", xu::XUserUnregisterForChangeEvent as usize),
+        ("XUserGetTokenAndSignatureAsync", xu::XUserGetTokenAndSignatureAsync as usize),
+        ("XUserGetTokenAndSignatureResultSize", xu::XUserGetTokenAndSignatureResultSize as usize),
+        ("XUserGetTokenAndSignatureResult", xu::XUserGetTokenAndSignatureResult as usize),
+        ("XUserGetTokenAndSignatureUtf16Async", xu::XUserGetTokenAndSignatureUtf16Async as usize),
+        ("XUserGetTokenAndSignatureUtf16ResultSize", xu::XUserGetTokenAndSignatureUtf16ResultSize as usize),
+        ("XUserGetTokenAndSignatureUtf16Result", xu::XUserGetTokenAndSignatureUtf16Result as usize),
+    ];
+    v.extend([
+        ("XUserFindUserByLocalId", xu::XUserFindUserByLocalId as usize),
+        ("XUserFindUserById", xu::XUserFindUserById as usize),
+        ("XUserResolvePrivilegeWithUiAsync", resolve_privilege_async as usize),
+        ("XUserResolvePrivilegeWithUiResult", empty_result as usize),
+        ("XUserResolveIssueWithUiAsync", resolve_issue_async as usize),
+        ("XUserResolveIssueWithUiResult", empty_result as usize),
+        ("XUserResolveIssueWithUiUtf16Async", resolve_issue_async as usize),
+        ("XUserResolveIssueWithUiUtf16Result", empty_result as usize),
+        ("XUserGetSignOutDeferral", sign_out_deferral as usize),
+        ("XUserCloseSignOutDeferralHandle", nothing as usize),
+        ("XUserAddByIdWithUiAsync", add_by_id_async as usize),
+        ("XUserAddByIdWithUiResult", xu::XUserAddResult as usize),
+        ("XUserIsStoreUser", no as usize),
+        ("XUserPlatformRemoteConnectSetEventHandlers", ok as usize),
+        ("XUserPlatformRemoteConnectCancelPrompt", ok as usize),
+        ("XUserPlatformSpopPromptSetEventHandlers", ok as usize),
+        ("XUserPlatformSpopPromptComplete", ok as usize),
+        ("XUserIsSignOutPresent", no as usize),
+        ("XUserSignOutAsync", sign_out_async as usize),
+        ("XUserSignOutResult", empty_result as usize),
+    ]);
+    v
+}
+
+/// device association: every controller belongs to the single local signed-in user
+fn xuser_devices() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XUserRegisterForDeviceAssociationChanged", xu::XUserRegisterForDeviceAssociationChanged as usize),
+        ("XUserUnregisterForDeviceAssociationChanged", xu::XUserUnregisterForDeviceAssociationChanged as usize),
+        ("XUserRegisterForDefaultAudioEndpointUtf16Changed", register_token4 as usize),
+        ("XUserUnregisterForDefaultAudioEndpointUtf16Changed", yes as usize),
+        ("XUserFindForDevice", xu::XUserFindForDevice as usize),
+        ("XUserFindControllerForUserWithUiAsync", xu::XUserFindControllerForUserWithUiAsync as usize),
+        ("XUserFindControllerForUserWithUiResult", xu::XUserFindControllerForUserWithUiResult as usize),
+    ]
+}
+
+fn xgamesave() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XGameSaveFilesGetFolderWithUiAsync", xu::XGameSaveFilesGetFolderWithUiAsync as usize),
+        ("XGameSaveFilesGetFolderWithUiResult", xu::XGameSaveFilesGetFolderWithUiResult as usize),
+        ("XGameSaveFilesGetRemainingQuota", files_remaining_quota as usize),
+    ]
+}
+
+fn xpls() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("XPersistentLocalStorageGetPathSize", xu::XPersistentLocalStorageGetPathSize as usize),
+        ("XPersistentLocalStorageGetPath", xu::XPersistentLocalStorageGetPath as usize),
+        ("XPersistentLocalStorageGetSpaceInfo", xu::XPersistentLocalStorageGetSpaceInfo as usize),
+    ];
+    // no prompt to show: the space asked for is granted
+    v.extend([("XPersistentLocalStoragePromptUserForSpaceAsync", prompt_space_async as usize), ("XPersistentLocalStoragePromptUserForSpaceResult", empty_result as usize)]);
+    v
+}
+
+fn xpackage() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("XPackageGetCurrentProcessPackageIdentifier", xr::XPackageGetCurrentProcessPackageIdentifier as usize),
+        ("XPackageGetIdentifier", xr::XPackageGetIdentifier as usize),
+        ("XPackageIsPackagedProcess", xr::XPackageIsPackagedProcess as usize),
+        ("XPackageCreateInstallationMonitor", XPackageCreateInstallationMonitor as usize),
+        ("XPackageGetInstallationProgress", XPackageGetInstallationProgress as usize),
+        ("XPackageRegisterInstallationProgressChanged", XPackageRegisterInstallationProgressChanged as usize),
+        ("XPackageUnregisterInstallationProgressChanged", XPackageUnregisterInstallationProgressChanged as usize),
+        ("XPackageFindChunkAvailability", XPackageFindChunkAvailability as usize),
+        ("XPackageEstimateDownloadSize", XPackageEstimateDownloadSize as usize),
+        ("XPackageGetMountPathSize", XPackageGetMountPathSize as usize),
+        ("XPackageGetMountPath", XPackageGetMountPath as usize),
+        ("XPackageCloseMountHandle", XPackageCloseMountHandle as usize),
+        ("XPackageGetWriteStats", XPackageGetWriteStats as usize),
+        ("XPackageGetPackageKind", XPackageGetPackageKind as usize),
+        ("XPackageEnumeratePackages", enumerate_packages as usize),
+    ];
+    v.extend([
+        ("XPackageCloseInstallationMonitorHandle", nothing as usize),
+        ("XPackageUpdateInstallationMonitor", no as usize),
+        ("XPackageEnumerateChunkAvailability", ok as usize),
+        ("XPackageChangeChunkInstallOrder", ok as usize),
+        ("XPackageInstallChunks", install_chunks as usize),
+        ("XPackageInstallChunksAsync", install_chunks_async as usize),
+        ("XPackageInstallChunksResult", install_chunks_result as usize),
+        ("XPackageUninstallChunks", ok as usize),
+        ("XPackageRegisterPackageInstalled", register_token4 as usize),
+        ("XPackageUnregisterPackageInstalled", yes as usize),
+        ("XPackageEnumerateFeatures", ok as usize),
+        ("XPackageUninstallPackage", no as usize),
+        ("XPackageMountWithUiAsync", mount_with_ui_async as usize),
+        ("XPackageMountWithUiResult", mount_with_ui_result as usize),
+    ]);
+    v
+}
+
+fn xgame() -> Vec<(&'static str, usize)> {
+    named![XGameGetXboxTitleId, XLaunchNewGame, XLaunchRestartOnCrash]
+}
+
+fn xsystem() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("XSystemGetConsoleId", xr::XSystemGetConsoleId as usize),
+        ("XSystemGetXboxLiveSandboxId", xr::XSystemGetXboxLiveSandboxId as usize),
+        ("XSystemGetAppSpecificDeviceId", XSystemGetAppSpecificDeviceId as usize),
+    ];
+    v.extend([("XSystemHandleTrack", ok as usize), ("XSystemIsHandleValid", yes as usize), ("XSystemAllowFullDownloadBandwidth", nothing as usize)]);
+    v
+}
+
+fn xnetworking() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XNetworkingQueryPreferredLocalUdpMultiplayerPort", xq::XNetworkingQueryPreferredLocalUdpMultiplayerPort as usize),
+        ("XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged", xq::XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged as usize),
+        ("XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged", xq::XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged as usize),
+        ("XNetworkingGetConnectivityHint", xq::XNetworkingGetConnectivityHint as usize),
+        ("XNetworkingRegisterConnectivityHintChanged", xq::XNetworkingRegisterConnectivityHintChanged as usize),
+        ("XNetworkingUnregisterConnectivityHintChanged", xq::XNetworkingUnregisterConnectivityHintChanged as usize),
+    ]
+}
+
+fn xerror() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XErrorReport", XErrorReport as usize),
+        ("XErrorSetCallback", error_set_callback as usize),
+        ("XErrorSetOptions", error_set_options as usize),
+    ]
+}
+
+fn xasync_impls() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XAsyncGetStatus", xu::XAsyncGetStatus as usize),
+        ("XAsyncGetResultSize", xu::XAsyncGetResultSize as usize),
+        ("XAsyncCancel", xu::XAsyncCancel as usize),
+        ("XAsyncRun", xu::XAsyncRun as usize),
+        ("XAsyncBegin", xu::XAsyncBegin as usize),
+        ("XAsyncSchedule", xu::XAsyncSchedule as usize),
+        ("XAsyncComplete", xu::XAsyncComplete as usize),
+        ("XAsyncGetResult", xu::XAsyncGetResult as usize),
+        ("XTaskQueueCreate", xq::XTaskQueueCreate as usize),
+        ("XTaskQueueCreateComposite", xq::XTaskQueueCreateComposite as usize),
+        ("XTaskQueueGetPort", xq::XTaskQueueGetPort as usize),
+        ("XTaskQueueDuplicateHandle", xq::XTaskQueueDuplicateHandle as usize),
+        ("XTaskQueueDispatch", xq::XTaskQueueDispatch as usize),
+        ("XTaskQueueCloseHandle", xq::XTaskQueueCloseHandle as usize),
+        ("XTaskQueueSubmitCallback", xq::XTaskQueueSubmitCallback as usize),
+        ("XTaskQueueSubmitDelayedCallback", xq::XTaskQueueSubmitDelayedCallback as usize),
+        ("XTaskQueueRegisterWaiter", xq::XTaskQueueRegisterWaiter as usize),
+        ("XTaskQueueUnregisterWaiter", xq::XTaskQueueUnregisterWaiter as usize),
+        ("XTaskQueueTerminate", xq::XTaskQueueTerminate as usize),
+        ("XTaskQueueRegisterMonitor", xq::XTaskQueueRegisterMonitor as usize),
+        ("XTaskQueueUnregisterMonitor", xq::XTaskQueueUnregisterMonitor as usize),
+        ("XTaskQueueGetCurrentProcessTaskQueue", xq::XTaskQueueGetCurrentProcessTaskQueue as usize),
+        ("XTaskQueueSetCurrentProcessTaskQueue", xq::XTaskQueueSetCurrentProcessTaskQueue as usize),
+        ("XThreadSetTimeSensitive", XThreadSetTimeSensitive as usize),
+        ("XThreadVerifyNotTimeSensitive", XThreadVerifyNotTimeSensitive as usize),
+        ("XThreadAssertNotTimeSensitive", XThreadAssertNotTimeSensitive as usize),
+        ("XThreadIsTimeSensitive", XThreadIsTimeSensitive as usize),
+    ]
+}
+
+// ---------------------------------------------------------------------------------------
+// functions only the thunk path has
+// ---------------------------------------------------------------------------------------
+
+unsafe extern "win64" fn nothing(_a: usize) {}
+
+unsafe extern "win64" fn no(_a: usize) -> bool {
+    false
+}
+
+unsafe extern "win64" fn yes() -> bool {
+    true
+}
+
+unsafe extern "win64" fn ok() -> HRESULT {
+    S_OK
+}
+
+const E_GAMEUSER_DEFERRAL_NOT_AVAILABLE: HRESULT = 0x8924_5103_u32 as i32;
+const E_GAMEUSER_USER_NOT_FOUND: HRESULT = 0x8924_5104_u32 as i32;
+
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Register*(queue, context, callback, token): a token, nothing will be called
+unsafe extern "win64" fn register_token4(_q: usize, _ctx: usize, _cb: usize, token: *mut u64) -> HRESULT {
+    if token.is_null() {
+        return E_INVALIDARG;
+    }
+    *token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    S_OK
+}
+
+static EMPTY_ID: u8 = 0;
+
+/// an async call that completes at once with no result
+unsafe fn completed(b: *mut XAsyncBlock) -> HRESULT {
+    xu::begin_with(b, &EMPTY_ID as *const u8 as usize, || Ok(Vec::new()))
+}
+
+/// the Result of such a call: its status
+unsafe extern "win64" fn empty_result(b: *mut XAsyncBlock) -> HRESULT {
+    xu::XAsyncGetStatus(b, false)
+}
+
+unsafe extern "win64" fn resolve_privilege_async(_user: usize, _options: u32, _privilege: u32, b: *mut XAsyncBlock) -> HRESULT {
+    completed(b)
+}
+
+unsafe extern "win64" fn resolve_issue_async(_user: usize, _url: usize, b: *mut XAsyncBlock) -> HRESULT {
+    completed(b)
+}
+
+unsafe extern "win64" fn sign_out_async(_user: usize, b: *mut XAsyncBlock) -> HRESULT {
+    completed(b)
+}
+
+unsafe extern "win64" fn prompt_space_async(_bytes: u64, b: *mut XAsyncBlock) -> HRESULT {
+    completed(b)
+}
+
+unsafe extern "win64" fn sign_out_deferral(out: *mut usize) -> HRESULT {
+    if !out.is_null() {
+        *out = 0;
+    }
+    E_GAMEUSER_DEFERRAL_NOT_AVAILABLE
+}
+
+/// XUserAddByIdWithUiAsync: the local user by either of its ids (XUserAddByIdWithUiResult =
+/// XUserAddResult)
+unsafe extern "win64" fn add_by_id_async(id: u64, b: *mut XAsyncBlock) -> HRESULT {
+    let mut h = std::ptr::null_mut();
+    let hr = xu::XUserFindUserByLocalId(id, &mut h);
+    let hr = if hr >= 0 { hr } else { xu::XUserFindUserById(id, &mut h) };
+    if hr < 0 {
+        return E_GAMEUSER_USER_NOT_FOUND;
+    }
+    xu::XUserCloseHandle(h);
+    xu::XUserAddAsync(0, b)
+}
+
+/// Opening links on the title's behalf would act on the PC: refused.
+unsafe extern "win64" fn launch_uri(_user: usize, uri: *const u8) -> HRESULT {
+    crate::xlog_warn!("XLaunchUri({}) – refused", crate::util::from_cstr_ptr(uri).unwrap_or_default());
+    E_NOTIMPL
+}
+
+/// nothing to defer on a PC
+unsafe extern "win64" fn display_deferral(out: *mut usize) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 1;
+    S_OK
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct XVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub build: u16,
+    pub revision: u16,
+}
+
+#[repr(C)]
+pub struct XSystemAnalyticsInfo {
+    pub os_version: XVersion,
+    pub hosting_os_version: XVersion,
+    pub family: [u8; 64],
+    pub form: [u8; 64],
+}
+
+fn fixed64(s: &str) -> [u8; 64] {
+    let mut a = [0u8; 64];
+    let b = s.as_bytes();
+    a[..b.len().min(63)].copy_from_slice(&b[..b.len().min(63)]);
+    a
+}
+
+/// What a console reports: the Xbox OS build, family "Windows.Xbox".
+pub unsafe extern "win64" fn XSystemGetAnalyticsInfo() -> XSystemAnalyticsInfo {
+    let v = XVersion { major: 10, minor: 0, build: 25398, revision: 0 };
+    let form = if crate::state::config().is_series_s() { "Xbox Series S" } else { "Xbox Series X" };
+    XSystemAnalyticsInfo { os_version: v, hosting_os_version: v, family: fixed64("Windows.Xbox"), form: fixed64(form) }
+}
+
+fn package_identifier() -> String {
+    let c = crate::state::config();
+    if !c.package_identifier.is_empty() {
+        return c.package_identifier.clone();
+    }
+    let title = crate::state::boot().map(|b| b.title.clone()).unwrap_or_else(|| "XCL.Title".into());
+    format!("{title}_1.0.0.0_x64__xcl")
+}
+
+fn game_root() -> String {
+    crate::state::boot().map(|b| b.game_root.to_string_lossy().into_owned()).unwrap_or_else(|| ".".into())
+}
+
+struct Mount {
+    path: String,
+}
+
+pub unsafe extern "win64" fn XPackageMount(id: *const u8, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let id = crate::util::from_cstr_ptr(id).unwrap_or_default();
+    if !id.is_empty() && !id.eq_ignore_ascii_case(&package_identifier()) {
+        crate::xlog_warn!("XPackageMount({id}) – unknown package (DLC?)");
+        return crate::util::E_NOT_FOUND;
+    }
+    *out = Box::into_raw(Box::new(Mount { path: game_root() })) as *mut c_void;
+    S_OK
+}
+
+pub unsafe extern "win64" fn XPackageGetMountPathSize(m: *mut c_void, size: *mut usize) -> HRESULT {
+    if m.is_null() || size.is_null() {
+        return E_INVALIDARG;
+    }
+    let mount = &*(m as *const Mount);
+    *size = mount.path.len() + 1;
+    S_OK
+}
+
+pub unsafe extern "win64" fn XPackageGetMountPath(m: *mut c_void, size: usize, buf: *mut u8) -> HRESULT {
+    if m.is_null() {
+        return E_INVALIDARG;
+    }
+    write_cstr_out(&(*(m as *const Mount)).path, buf, size, std::ptr::null_mut())
+}
+
+pub unsafe extern "win64" fn XPackageCloseMountHandle(m: *mut c_void) {
+    if !m.is_null() {
+        drop(Box::from_raw(m as *mut Mount));
+    }
+}
+
+/// every chunk is installed (XPackageChunkAvailability::Ready = 0)
+unsafe extern "win64" fn XPackageFindChunkAvailability(_id: usize, _count: u32, _sel: usize, out: *mut u32) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 0;
+    S_OK
+}
+
+unsafe extern "win64" fn XPackageEstimateDownloadSize(_id: usize, _count: u32, _sel: usize, size: *mut u64, confirm: *mut bool) -> HRESULT {
+    if !size.is_null() {
+        *size = 0;
+    }
+    if !confirm.is_null() {
+        *confirm = false;
+    }
+    S_OK
+}
+
+/// XPackageWriteStats { interval, budget, elapsed, bytesWritten }: nothing measured
+unsafe extern "win64" fn XPackageGetWriteStats(out: *mut [u64; 4]) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = [0; 4];
+    S_OK
+}
+
+/// XPackageKind::Game
+unsafe extern "win64" fn XPackageGetPackageKind(_id: usize, out: *mut u32) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 0;
+    S_OK
+}
+
+/// A stable id per console and title.
+unsafe extern "win64" fn XSystemGetAppSpecificDeviceId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str()).hash(&mut h);
+    crate::util::write_cstr_out(&format!("{:016X}", h.finish()), buf, size, used)
+}
+
+/// The local user has every privilege (no Xbox Live to deny one).
+unsafe extern "win64" fn XUserCheckPrivilege(_user: *mut c_void, _options: u32, _privilege: u32, has: *mut bool, reasons: *mut u32) -> HRESULT {
+    if has.is_null() {
+        return E_INVALIDARG;
+    }
+    *has = true;
+    if !reasons.is_null() {
+        *reasons = 0;
+    }
+    S_OK
+}
+
+unsafe extern "win64" fn files_remaining_quota(_user: *mut c_void, _config: *const u8, quota: *mut i64) -> HRESULT {
+    if quota.is_null() {
+        return E_INVALIDARG;
+    }
+    *quota = 256 << 20;
+    S_OK
+}
+
+/// The installation monitor of a fully installed package (XCL runs from an unpacked folder).
+static MONITOR: u64 = 0x4D4F_4E49;
+
+unsafe extern "win64" fn XPackageCreateInstallationMonitor(_id: *const u8, _count: u32, _sel: *const c_void, _interval: u32, _queue: *mut c_void, out: *mut *const u64) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = &MONITOR;
+    S_OK
+}
+
+/// XPackageInstallationProgress { totalBytes, installedBytes, launchBytes, launchable,
+/// completed }: everything installed.
+unsafe extern "win64" fn XPackageGetInstallationProgress(_monitor: *const u64, p: *mut u8) {
+    if p.is_null() {
+        return;
+    }
+    for k in 0..3 {
+        std::ptr::write_unaligned(p.add(8 * k) as *mut u64, 1);
+    }
+    *p.add(24) = 1;
+    *p.add(25) = 1;
+}
+
+unsafe extern "win64" fn XPackageRegisterInstallationProgressChanged(_monitor: *const u64, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> HRESULT {
+    if !token.is_null() {
+        *token = 1;
+    }
+    S_OK
+}
+
+unsafe extern "win64" fn XPackageUnregisterInstallationProgressChanged(_monitor: *const u64, _token: u64, _wait: bool) -> bool {
+    true
+}
+
+/// `<TitleId>` of the game's MicrosoftGame.Config (xcl.toml `title_id` overrides).
+pub unsafe extern "win64" fn XGameGetXboxTitleId(out: *mut u32) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let t = &crate::state::config().title_id;
+    *out = u32::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
+    if *out == 0 {
+        crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0");
+    }
+    S_OK
+}
+
+unsafe extern "win64" fn XLaunchNewGame(exe: *const u8, args: *const u8, _user: *mut c_void) {
+    crate::xlog_warn!(
+        "XLaunchNewGame({}, {}) – ignored (XCL runs a single title)",
+        crate::util::from_cstr_ptr(exe).unwrap_or_default(),
+        crate::util::from_cstr_ptr(args).unwrap_or_default()
+    );
+}
+
+unsafe extern "win64" fn XLaunchRestartOnCrash(_args: *const u8, _reserved: u32) -> HRESULT {
+    S_OK
+}
+
+/// XPackageInstallChunks(id, count, selectors, interval, suppress, queue, monitor): installed
+unsafe extern "win64" fn install_chunks(id: *const u8, count: u32, sel: *const c_void, interval: u32, _suppress: bool, queue: *mut c_void, out: *mut *const u64) -> HRESULT {
+    XPackageCreateInstallationMonitor(id, count, sel, interval, queue, out)
+}
+
+static INSTALL_ID: u8 = 0;
+static MOUNT_ID: u8 = 0;
+
+unsafe extern "win64" fn install_chunks_async(_id: usize, _count: u32, _sel: usize, _interval: u32, _suppress: bool, b: *mut XAsyncBlock) -> HRESULT {
+    xu::begin_with(b, &INSTALL_ID as *const u8 as usize, || Ok((&MONITOR as *const u64 as usize).to_le_bytes().to_vec()))
+}
+
+unsafe extern "win64" fn install_chunks_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+    xu::XAsyncGetResult(b, &INSTALL_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
+}
+
+unsafe extern "win64" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock) -> HRESULT {
+    let mut m: *mut c_void = std::ptr::null_mut();
+    let hr = XPackageMount(id, &mut m);
+    if hr < 0 {
+        return hr;
+    }
+    let m = m as usize;
+    xu::begin_with(b, &MOUNT_ID as *const u8 as usize, move || Ok(m.to_le_bytes().to_vec()))
+}
+
+unsafe extern "win64" fn mount_with_ui_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+    xu::XAsyncGetResult(b, &MOUNT_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
+}
+
+/// XPackageDetails (XPackage.h)
+#[repr(C)]
+struct PackageDetails {
+    package_identifier: *const u8,
+    version: XVersion,
+    kind: u32,
+    display_name: *const u8,
+    description: *const u8,
+    publisher: *const u8,
+    store_id: *const u8,
+    installing: bool,
+    index: u32,
+    count: u32,
+    age_restricted: bool,
+    title_id: *const u8,
+}
+
+/// XPackageEnumeratePackages(kind, scope, context, callback): the game itself (no DLC).
+unsafe extern "win64" fn enumerate_packages(kind: u32, _scope: u32, ctx: *mut c_void, cb: Option<unsafe extern "win64" fn(*mut c_void, *const PackageDetails) -> bool>) -> HRESULT {
+    let Some(cb) = cb else { return E_INVALIDARG };
+    if kind != 0 {
+        return S_OK;
+    }
+    let c = |s: String| std::ffi::CString::new(s).unwrap_or_default();
+    let id = c(package_identifier());
+    let title = c(crate::state::boot().map(|b| b.title.clone()).unwrap_or_default());
+    let title_id = c(crate::state::config().title_id.trim_start_matches("0x").to_ascii_uppercase());
+    let empty = c(String::new());
+    let d = PackageDetails {
+        package_identifier: id.as_ptr() as *const u8,
+        version: XVersion { major: 1, minor: 0, build: 0, revision: 0 },
+        kind: 0,
+        display_name: title.as_ptr() as *const u8,
+        description: empty.as_ptr() as *const u8,
+        publisher: empty.as_ptr() as *const u8,
+        store_id: empty.as_ptr() as *const u8,
+        installing: false,
+        index: 0,
+        count: 1,
+        age_restricted: false,
+        title_id: title_id.as_ptr() as *const u8,
+    };
+    cb(ctx, &d);
+    S_OK
+}
+
+static ERROR_CB: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+static ERROR_OPTIONS: AtomicUsize = AtomicUsize::new(0);
+
+pub unsafe extern "win64" fn XErrorReport(hr: HRESULT, message: *const u8) {
+    let text = crate::util::from_cstr_ptr(message).unwrap_or_default();
+    crate::xlog_warn!("XErrorReport {:#x}: {text}", hr as u32);
+    // Copy and release `ERROR_CB` before invoking the guest callback so re-entrant calls to
+    // `XErrorSetCallback` or `XErrorReport` do not deadlock.
+    let entry = *ERROR_CB.lock().unwrap();
+    if let Some((cb, ctx)) = entry {
+        let f: unsafe extern "win64" fn(HRESULT, *const u8, *mut c_void) -> bool = std::mem::transmute(cb);
+        let _ = f(hr, message, ctx as *mut c_void);
+    }
+}
+
+unsafe extern "win64" fn error_set_callback(cb: usize, ctx: *mut c_void) {
+    *ERROR_CB.lock().unwrap() = (cb != 0).then_some((cb, ctx as usize));
+}
+
+unsafe extern "win64" fn error_set_options(options: u32, _reserved: usize) {
+    // Store requested options without triggering DebugBreak in-process.
+    ERROR_OPTIONS.store(options as usize, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------------------
+// XThread (the async object's thread quarter)
+// ---------------------------------------------------------------------------------------
+
+thread_local! {
+    static TIME_SENSITIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub unsafe extern "win64" fn XThreadSetTimeSensitive(v: bool) -> HRESULT {
+    TIME_SENSITIVE.with(|c| c.set(v));
+    S_OK
+}
+
+pub unsafe extern "win64" fn XThreadIsTimeSensitive() -> bool {
+    TIME_SENSITIVE.with(|c| c.get())
+}
+
+pub unsafe extern "win64" fn XThreadVerifyNotTimeSensitive() -> HRESULT {
+    if TIME_SENSITIVE.with(|c| c.get()) {
+        crate::xlog_warn!("XThreadVerifyNotTimeSensitive called on a time-sensitive thread");
+    }
+    S_OK
+}
+
+pub unsafe extern "win64" fn XThreadAssertNotTimeSensitive() {
+    if TIME_SENSITIVE.with(|c| c.get()) {
+        crate::xlog_warn!("XThreadAssertNotTimeSensitive called on a time-sensitive thread");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------------------
+
+static SEEN: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+fn note(c: Guid, i: Guid, what: String) {
+    let key = format!("{c}/{i}");
+    let mut g = SEEN.lock().unwrap();
+    if !g.contains_key(&key) {
+        crate::xlog_info!("XGameRuntime: QueryApiImpl {key} → {what}");
+        g.insert(key, what);
+    }
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApiStats {
+    /// "clsid/iid" → who answered (XCL, unavailable, missing)
+    pub apis: BTreeMap<String, String>,
+    /// XCL objects' slots the title called that XCL does not implement: "Iface#slot" → calls
+    pub unimplemented: BTreeMap<String, u64>,
+}
+
+pub fn stats() -> ApiStats {
+    ApiStats { apis: SEEN.lock().unwrap().clone(), unimplemented: UNIMPLEMENTED.lock().unwrap().clone() }
+}
+
+/// Implemented exports with real code addresses. Every other name in `XGAMERUNTIME`
+/// stays `Stub` (metadata `0`) until its slice lands.
+pub fn exports() -> Vec<(&'static str, usize)> {
+    vec![
+        ("InitializeApiImpl", InitializeApiImpl as usize),
+        ("InitializeApiImplEx", InitializeApiImplEx as usize),
+        ("InitializeApiImplEx2", InitializeApiImplEx2 as usize),
+        ("UninitializeApiImpl", UninitializeApiImpl as usize),
+        ("QueryApiImpl", QueryApiImpl as usize),
+        ("XErrorReport", XErrorReport as usize),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe fn query(c: Guid, i: Guid) -> (HRESULT, *mut c_void) {
+        let mut o = std::ptr::null_mut();
+        (QueryApiImpl(&c, &i, &mut o), o)
+    }
+
+    unsafe fn slot<T>(o: *mut c_void, k: usize) -> T {
+        std::mem::transmute_copy(&*(*(o as *const *const usize)).add(k))
+    }
+
+    fn slot_in_table(name: &str) -> (Guid, Guid, usize) {
+        table().find(|r| r.0 == name).map(|r| (r.1, r.2, r.3)).unwrap_or_else(|| panic!("{name} not in the GDK table"))
+    }
+
+    #[test]
+    fn api_init_is_idempotent_s_ok() {
+        unsafe {
+            assert_eq!(InitializeApiImpl(0x1, 0x2), S_OK);
+            assert_eq!(InitializeApiImplEx(0x1, 0x2, 0), S_OK);
+            assert_eq!(InitializeApiImplEx2(0x6336_0000_2712, 0x65f4_0000_1edd, 2, std::ptr::null_mut()), S_OK);
+            assert_eq!(InitializeApiImplEx2(0x6336_0000_2712, 0x65f4_0000_1edd, 2, std::ptr::null_mut()), S_OK);
+            UninitializeApiImpl();
+            UninitializeApiImpl();
+            // saturating: uninitializing without initializing must not underflow
+            UninitializeApiImpl();
+            assert_eq!(InitializeApiImplEx2(0, 0, 0, std::ptr::null_mut()), S_OK);
+            UninitializeApiImpl();
+        }
+    }
+
+    #[test]
+    fn query_rejects_nulls() {
+        unsafe {
+            let mut o = std::ptr::null_mut();
+            assert_eq!(QueryApiImpl(std::ptr::null(), &XUSER, &mut o), E_INVALIDARG);
+            assert_eq!(QueryApiImpl(&XUSER, std::ptr::null(), &mut o), E_INVALIDARG);
+            assert_eq!(QueryApiImpl(&XUSER, &XUSER, std::ptr::null_mut()), E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn refused_and_unknown_classes_are_not_served() {
+        unsafe {
+            // the Store reaches Xbox Live: unavailable offline, never a fake object
+            assert_eq!(query(XSTORE, XSTORE).0, REGDB_E_CLASSNOTREG);
+            // an unknown class: missing, never a fake object
+            let missing = g(0xdeadbeef_0000_4000_8000_0123456789ab);
+            let (hr, o) = query(missing, missing);
+            assert_eq!(hr, REGDB_E_CLASSNOTREG);
+            assert!(o.is_null());
+            assert!(stats().apis.values().any(|v| v.contains("missing")), "{:?}", stats().apis);
+        }
+    }
+
+    /// Every wired function is in its class in the GDK table, and the slots the thunks
+    /// call match the table.
+    #[test]
+    fn every_impl_is_in_its_gdk_class() {
+        for c in classes() {
+            for (f, _) in &c.impls {
+                assert_eq!(slot_in_table(f).0, c.clsid, "{f} is not a {} function", c.name);
+            }
+        }
+        for (f, slot) in [
+            ("XUserAddAsync", 7),
+            ("XUserGetState", 14),
+            ("XUserCheckPrivilege", 20),
+            ("XUserUnregisterForChangeEvent", 34),
+            ("XUserIsStoreUser", 42),
+            ("XPackageEnumeratePackages", 39),
+            ("XPersistentLocalStorageGetPath", 4),
+            ("XSystemGetAppSpecificDeviceId", 5),
+            ("XGameGetXboxTitleId", 3),
+            ("XAsyncBegin", 7),
+            ("XTaskQueueCreate", 12),
+        ] {
+            assert_eq!(slot_in_table(f).2, slot, "{f}");
+        }
+        // slots XCL does not wire yet still belong to a known class (they become
+        // logged E_NOTIMPL stubs, not silent gaps)
+        assert_eq!(slot_in_table("XPackageGetUserLocale").0, XPACKAGE);
+        assert_eq!(slot_in_table("XGameSaveCreateContainer").0, XGAMESAVE);
+        let main = own(&XUSER, &XUSER).unwrap();
+        assert!(!main.iface.iids.is_empty() && main.iface.main);
+        assert!(own(&XSTORE, &XSTORE).is_none());
+        assert!(returns_bool("XUserIsStoreUser") && returns_bool("XPackageUnregisterPackageInstalled") && !returns_bool("XUserGetState"));
+    }
+
+    #[test]
+    fn xuser_main_vtable_serves_the_offline_user() {
+        unsafe {
+            let (hr, u) = query(XUSER, XUSER);
+            assert_eq!(hr, S_OK);
+            assert!(!u.is_null());
+            // XUserGetMaxUsers through the vtable: 1 offline user
+            let get_max: unsafe extern "win64" fn(*mut c_void, *mut u32) -> HRESULT = slot(u, slot_in_table("XUserGetMaxUsers").2);
+            let mut max = 0u32;
+            assert_eq!(get_max(u, &mut max), S_OK);
+            assert_eq!(max, 1);
+            // XUserCheckPrivilege through the vtable: the local user has every privilege
+            let check: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut bool, *mut u32) -> HRESULT =
+                slot(u, slot_in_table("XUserCheckPrivilege").2);
+            let (mut has, mut reasons) = (false, 0u32);
+            assert_eq!(check(u, std::ptr::null_mut(), 0, 220, &mut has, &mut reasons), S_OK);
+            assert!(has);
+            // the gamertag interface has its own vtable; an unknown later XUser
+            // interface falls back to the main one
+            let (_, gt) = query(XUSER, XUSER_GAMERTAG_IID);
+            assert!(!std::ptr::eq(gt as *const Obj, u as *const Obj));
+            let (_, later) = query(XUSER, g(0x26f3c674_a2fe_44fa_b6c4_a323bc94ff53));
+            assert!(std::ptr::eq(later as *const Obj, u as *const Obj));
+        }
+    }
+
+    #[test]
+    fn xgame_title_id_and_xerror_through_vtable() {
+        unsafe {
+            let (hr, gm) = query(XGAME, XGAME);
+            assert_eq!(hr, S_OK);
+            let get_id: unsafe extern "win64" fn(*mut c_void, *mut u32) -> HRESULT = slot(gm, slot_in_table("XGameGetXboxTitleId").2);
+            let mut id = 0u32;
+            assert_eq!(get_id(gm, &mut id), S_OK);
+            let want = u32::from_str_radix(crate::state::config().title_id.trim_start_matches("0x"), 16).unwrap_or(0);
+            assert_eq!(id, want);
+
+            // XError vtable: the callback runs, options stick, no DebugBreak
+            static ERR_SEEN: AtomicU32 = AtomicU32::new(0);
+            unsafe extern "win64" fn on_error(hr: HRESULT, _msg: *const u8, _ctx: *mut c_void) -> bool {
+                ERR_SEEN.store(hr as u32, Ordering::SeqCst);
+                true
+            }
+            let (hr, err) = query(XERROR, XERROR);
+            assert_eq!(hr, S_OK);
+            let report: unsafe extern "win64" fn(*mut c_void, HRESULT, *const u8) = slot(err, slot_in_table("XErrorReport").2);
+            let set_cb: unsafe extern "win64" fn(*mut c_void, usize, *mut c_void) = slot(err, slot_in_table("XErrorSetCallback").2);
+            let set_opt: unsafe extern "win64" fn(*mut c_void, u32, usize) = slot(err, slot_in_table("XErrorSetOptions").2);
+            set_opt(err, 3, 0);
+            set_cb(err, on_error as usize, std::ptr::null_mut());
+            report(err, crate::util::E_FAIL, c"unit error".as_ptr() as *const u8);
+            assert_eq!(ERR_SEEN.load(Ordering::SeqCst), crate::util::E_FAIL as u32);
+            set_cb(err, 0, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn legacy_console_iids_map_to_their_own_slots() {
+        // SLOTS must cover the full GDK table (highest slot is 83).
+        let max_slot = table().map(|r| r.3).max().unwrap_or(0);
+        assert!(max_slot < SLOTS, "SLOTS={SLOTS} truncates slot {max_slot}");
+
+        let bound = |o: &Obj, slot: usize, name: &str| {
+            assert_eq!(o.iface.names[slot], Some(name), "{} slot {slot}", o.iface.name);
+            assert_ne!(o.targets[slot], 0, "{} slot {slot} ({name}) has no function", o.iface.name);
+            o.targets[slot]
+        };
+        let pm = own(&XPACKAGE, &XPACKAGE).expect("XPackage main");
+        let main_fn = |name: &str| bound(pm, slot_in_table(name).2, name);
+
+        // XPackage v1 (be3f3e9f): XPackageEnumeratePackages is at slot 28.
+        let p1 = own(&XPACKAGE, &XPACKAGE_V1_IID).expect("XPackage v1");
+        assert!(!p1.iface.main);
+        assert_eq!(bound(p1, 28, "XPackageEnumeratePackages"), main_fn("XPackageEnumeratePackages"));
+
+        // XPackage v2 (f92d8712): EnumeratePackages @ 35, RegisterPackageInstalled @ 36,
+        // callable through the vtable as a title calls it.
+        let p2 = own(&XPACKAGE, &XPACKAGE_V2_IID).expect("XPackage v2");
+        assert!(!p2.iface.main);
+        assert_eq!(bound(p2, 35, "XPackageEnumeratePackages"), main_fn("XPackageEnumeratePackages"));
+        assert_eq!(bound(p2, 36, "XPackageRegisterPackageInstalled"), main_fn("XPackageRegisterPackageInstalled"));
+        let register = |o: &Obj, token: *mut u64| unsafe {
+            slot::<Fwd>(o as *const Obj as *mut c_void, 36)(o, 0, 0, 0, token as usize, 0, 0, 0, 0, 0) as u32 as HRESULT
+        };
+        let (mut t1, mut t2) = (0u64, 0u64);
+        assert_eq!(register(p2, &mut t1), S_OK);
+        assert_eq!(register(p2, &mut t2), S_OK);
+        assert!(t1 != 0 && t2 > t1, "tokens {t1}, {t2}");
+        assert_eq!(register(p2, std::ptr::null_mut()), E_INVALIDARG);
+
+        // XPackage main: XPackageGetIdentifier at slot 27.
+        bound(pm, 27, "XPackageGetIdentifier");
+        // an XPackage interface id the table does not know gets the main vtable
+        let old = own(&XPACKAGE, &XPACKAGE_OLD_IID).expect("XPackage old iid");
+        assert!(old.iface.main);
+
+        // XSystem v3 (6fd71f09): XSystemGetAppSpecificDeviceId is at slot 4 (not SandboxId).
+        let s3 = own(&XSYSTEM, &XSYSTEM_V3_IID).expect("XSystem v3");
+        assert!(!s3.iface.main);
+        let sm = own(&XSYSTEM, &XSYSTEM).expect("XSystem main");
+        bound(sm, 4, "XSystemGetXboxLiveSandboxId");
+        assert_eq!(bound(s3, 4, "XSystemGetAppSpecificDeviceId"), bound(sm, 5, "XSystemGetAppSpecificDeviceId"));
+    }
+
+    #[test]
+    fn unimplemented_slots_report_e_notimpl() {
+        unsafe {
+            // XGameUi has no headless implementation yet: every slot is a logged stub
+            let (hr, ui) = query(XGAMEUI, XGAMEUI);
+            assert_eq!(hr, S_OK);
+            let slot_k = slot_in_table("XGameUiShowAchievementsAsync").2;
+            let show: unsafe extern "win64" fn(*mut c_void) -> HRESULT = slot(ui, slot_k);
+            assert_eq!(show(ui), E_NOTIMPL);
+            assert!(stats().unimplemented.contains_key("XGameUiShowAchievementsAsync"), "{:?}", stats().unimplemented);
+        }
+    }
+
+    #[test]
+    fn get_proc_address_resolves_the_thunk_protocol() {
+        // the game's GetProcAddress probes (and its static imports) must land on real
+        // code, never NULL and never an auto-stub thunk
+        let h = crate::modules::hle_handle(crate::hle::XGAMERUNTIME);
+        for name in ["InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"] {
+            let what = crate::pe::ImportName::Name { hint: 0, name: name.to_string() };
+            let addr = crate::resolver::get_proc_address(h, &what);
+            assert!(addr.is_some(), "{name} must resolve");
+            let addr = addr.unwrap();
+            assert_ne!(addr, 0, "{name} must be real code");
+            assert!(crate::stubs::info_of_stub(addr).is_none(), "{name} must not be an auto-stub");
+        }
+    }
+}

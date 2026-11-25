@@ -80,6 +80,10 @@ pub struct Report {
     #[cfg(windows)]
     #[serde(default)]
     pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
+    /// Same as above, Linux thunk-protocol slice (no PC runtime leg).
+    #[cfg(not(windows))]
+    #[serde(default)]
+    pub xgameruntime: crate::hle::xgameruntime_api_linux::ApiStats,
     /// DirectStorage: BCPack requests unpacked and refused (no decoder) by mode, and bytes filled under
     /// `XCL_DSTORAGE_BCPACK_FILL`
     #[cfg(windows)]
@@ -173,6 +177,8 @@ pub fn build() -> Report {
         audio: crate::hle::xaudio2::stats(),
         #[cfg(windows)]
         xgameruntime: crate::hle::xgameruntime::api::stats(),
+        #[cfg(not(windows))]
+        xgameruntime: crate::hle::xgameruntime_api_linux::stats(),
         #[cfg(windows)]
         dstorage: crate::hle::dstorage::stats(),
         notes,
