@@ -1501,3 +1501,45 @@ Verification (this host, no game files — retail SKIPPED):
   path` line on stdout (was ~10 probe lines in 17a — caching works), still
   12/0xc/29 (null device returned). `XCL_VULKAN_BACKEND=bogus` → stays null,
   same 12/0xc/29.
+
+## Critic review — step-17b vulkan-graphics-headless PASS (2026-11-25, independent re-verify)
+Task `task-1795572137-d004` (commit `10d6bdf`). Re-ran everything from scratch,
+no trust in builder notes:
+- `cargo test -p xcl --lib vulkan_graphics` → 5 passed (`synthetic_blit_draws_fullscreen_triangle`
+  executes for real on the Arc A770, `subgroupSize 32 -> split-32`; `trivial_fs` passes real
+  `spirv-val 2026.4`; fail-closed + no-spawn + retail-opt-in-skip gates pass).
+- `cargo test -p xcl --lib vulkan_runner` → 5 passed (lane agreement intact);
+  `hle::vulkan_linux` → 8 passed (7 + new `cached_selection_is_stable`).
+- `cargo test -p xcl --lib -- gpu::recomp` → 163 passed (glsl/spirv gates still green);
+  full lib → 477 passed; 0 failed; 1 ignored (matches builder).
+- `cargo check --workspace` → 0 errors; `cargo clippy -p xcl --lib` → 0 errors
+  (grep `^error` count 0; warnings pre-existing only); `git diff --check` clean.
+- No `Cargo.toml`/`Cargo.lock`/`build.rs` change in the commit → no new deps, no
+  `TRANSLATOR_SOURCES` change (`ash` MIT + `libloading` ISC pre-existing, runtime dlopen only).
+- Shipped-path audit: `Command::new`/`std::process` appear only after `#[cfg(test)]` in
+  `vulkan_graphics.rs` (lines 822+, `spirv-val` gate like the spirv/glsl suites); the
+  `shipped_path_spawns_no_compiler` test enforces this. `trivial_fs_spv` is hand-assembled
+  words, vertex words come from in-process `translate_vs_spirv` — shipped path spawns nothing.
+- Synthetic title, fresh game dir + fresh `XCL_DATA_ROOT` per run (this host, no game files):
+  default → `failures: 12`, `ExitProcess(0xc)`, `exit_code: 12`, `crash: null`,
+  `called_stubs: 29` (28 `d3d12_xs` + `XclDefinitelyMissingFunction` probe, zero
+  mfplat/xcrdapi/FormatMessage), `[PASS] DirectStorage` + `[PASS] MFPlat` hold — matches
+  the 12g/13/14/15/16/17a baseline exactly.
+- `XCL_VULKAN_BACKEND=vulkan` → one `vulkan backend: ... (device split-32 lane path)` line,
+  still 12/0xc/29 (null device returned). `XCL_VULKAN_BACKEND=bogus` → stays null, 12/0xc/29.
+  The 17a probe-spam follow-up is folded: `select_cached()` via `OnceLock`, consumed by
+  `d3d12x_linux::create_device`.
+- Deliberate deviation accepted: POSITION vertex buffer instead of bare `VertexIndex` (blit VS
+  is a fetch passthrough, unbound inputs would make coverage driver-dependent). Documented in
+  the commit message with rationale; assertions (full coverage, center pixel ±8, >32 distinct
+  colors for interpolation) all pass on-device.
+- No blocking findings.
+
+## Follow-ups (minor, no new task)
+- `cargo fmt --check` nits introduced by this commit (whole tree is not rustfmt-clean, so
+  informational only): `recomp/mod.rs` wants `vulkan_graphics` before `vulkan_runner`
+  (alphabetical); `vulkan_runner.rs:96` let-else fits on one line. `vulkan_graphics.rs` itself
+  is fmt-clean. Fold into the next touch of those lines.
+- `vulkan_graphics.rs` teardown `Scope` drops the Vulkan `device` handle's children but the
+  device/instance teardown order on the error path after `run()` returns relies on the outer
+  `destroy_instance`; fine for a test/headless path, revisit if this grows into the real backend.
