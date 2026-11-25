@@ -38,6 +38,16 @@ pub enum Decision {
     Fail(u32),
 }
 
+/// Pending commit for a staged game-file open: `rel` to finalise after the host
+/// open succeeds, and whether the stage created a new overlay entry. Only a new
+/// entry may clear a whiteout — reopening an existing entry must keep the
+/// whiteout that hides its original after delete-on-close (upstream #1038).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCommit {
+    pub rel: String,
+    pub is_new: bool,
+}
+
 pub const ERROR_FILE_NOT_FOUND: u32 = 2;
 pub const ERROR_PATH_NOT_FOUND: u32 = 3;
 pub const ERROR_ACCESS_DENIED: u32 = 5;
@@ -70,7 +80,7 @@ const WRITE_ACCESS: u32 = GENERIC_WRITE
     | 0x0008_0000; // WRITE_OWNER
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+pub(crate) const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 
 pub struct Vfs {
     game_root: String,
@@ -948,7 +958,7 @@ impl Vfs {
 
     /// Commit a staged write once the underlying file operation succeeded. The caller
     /// must hold `write_lock` (e.g. the guard returned by `open_decision_linux`); this
-    /// is the commit half of `prepare_write_staged` / `open_decision_staged_*`.
+    /// is the commit half of `stage_write`.
     pub(crate) fn commit_write_unlocked(&self, rel: &str) {
         #[cfg(not(windows))]
         if Self::checked_rel(rel).is_err() {
@@ -958,13 +968,36 @@ impl Vfs {
         self.record_write(rel);
     }
 
+    /// Commit a staged game-file open once the underlying host open succeeded. The
+    /// caller must hold `write_lock`; this is the commit half of
+    /// `open_decision_staged_*` / `open_decision_linux`.
+    pub fn commit_open(&self, rel: &str, is_new: bool) {
+        let _guard = self.write_lock.lock().unwrap();
+        self.commit_open_unlocked(rel, is_new)
+    }
+
+    /// Commit a staged game-file open once the underlying host open succeeded. The
+    /// caller must hold `write_lock` (e.g. the guard returned by `open_decision_linux`).
+    pub(crate) fn commit_open_unlocked(&self, rel: &str, is_new: bool) {
+        #[cfg(not(windows))]
+        if Self::checked_rel(rel).is_err() {
+            return;
+        }
+        // A new overlay entry replaces a whiteout. Reopening an existing entry
+        // must keep the whiteout that hides its original after delete-on-close.
+        if is_new {
+            self.remove_whiteout(rel);
+        }
+        self.record_write(rel);
+    }
+
     /// Record removal of an overlay file and hide the game file it covered.
     pub fn commit_overlay_removal(&self, rel: &str) {
         let _guard = self.write_lock.lock().unwrap();
         self.commit_overlay_removal_unlocked(rel)
     }
 
-    fn commit_overlay_removal_unlocked(&self, rel: &str) {
+    pub(crate) fn commit_overlay_removal_unlocked(&self, rel: &str) {
         #[cfg(not(windows))]
         if Self::checked_rel(rel).is_err() {
             return;
@@ -982,15 +1015,16 @@ impl Vfs {
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
-    /// without removing whiteouts or recording the write yet. Call `commit_write(rel)`
-    /// only after the underlying file operation succeeds so a failed open cannot
-    /// resurrect a whited-out original.
+    /// without removing whiteouts or recording the write yet. Call
+    /// `commit_open(rel, is_new)` only after the underlying file operation succeeds
+    /// so a failed open cannot resurrect a whited-out original.
     pub fn prepare_write_staged(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
         let _guard = self.write_lock.lock().unwrap();
-        self.prepare_write_staged_unlocked(rel, keep_content)
+        let (ov, _) = self.prepare_write_staged_unlocked(rel, keep_content)?;
+        Ok(ov)
     }
 
-    fn prepare_write_staged_unlocked(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+    fn prepare_write_staged_unlocked(&self, rel: &str, keep_content: bool) -> Result<(String, bool), u32> {
         // Linux first: reject traversals/absolute rels with the containment error
         // before the parent check below can shadow it as PATH_NOT_FOUND.
         #[cfg(not(windows))]
@@ -1011,7 +1045,10 @@ impl Vfs {
         }
         #[cfg(not(windows))]
         self.checked_overlay_path(rel)?;
-        if keep_content && !Path::new(&ov).exists() && self.visible_in_original(rel) {
+        // A new overlay entry replaces a whiteout; the commit half
+        // (`commit_open`) applies that once the host open succeeds.
+        let is_new = !Path::new(&ov).exists();
+        if is_new && keep_content && self.visible_in_original(rel) {
             #[cfg(windows)]
             let orig = self.original_path(rel);
             #[cfg(not(windows))]
@@ -1022,7 +1059,7 @@ impl Vfs {
                 std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             }
         }
-        Ok(ov)
+        Ok((ov, is_new))
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
@@ -1033,8 +1070,8 @@ impl Vfs {
     }
 
     fn prepare_write_unlocked(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
-        let ov = self.prepare_write_staged_unlocked(rel, keep_content)?;
-        self.commit_write_unlocked(rel);
+        let (ov, is_new) = self.prepare_write_staged_unlocked(rel, keep_content)?;
+        self.commit_open_unlocked(rel, is_new);
         Ok(ov)
     }
 
@@ -1067,15 +1104,15 @@ impl Vfs {
     }
 
     /// Decide how to open `target`, staging any overlay write without removing whiteouts
-    /// or recording the write yet. Callers must call `commit_write(rel)` on the returned
-    /// relative path only after the underlying open succeeds.
+    /// or recording the write yet. Callers must call `commit_open` on the returned
+    /// commit only after the underlying open succeeds.
     pub fn open_decision_staged_for(
         &self,
         target: Target,
         access: u32,
         disposition: u32,
         flags: u32,
-    ) -> (Decision, Option<String>) {
+    ) -> (Decision, Option<OpenCommit>) {
         let _guard = self.write_lock.lock().unwrap();
         self.open_decision_staged_for_unlocked(target, access, disposition, flags)
     }
@@ -1086,7 +1123,7 @@ impl Vfs {
         access: u32,
         disposition: u32,
         flags: u32,
-    ) -> (Decision, Option<String>) {
+    ) -> (Decision, Option<OpenCommit>) {
         match target {
             Target::Pass => (Decision::Pass, None),
             #[cfg(not(windows))]
@@ -1152,9 +1189,13 @@ impl Vfs {
                     && in_orig
                     && Path::new(&self.original_path(&rel)).is_file();
                 match self.prepare_write_staged_unlocked(&rel, keep) {
-                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => (Decision::UseWithDisposition(p, CREATE_ALWAYS), Some(rel)),
-                    Ok(p) if replaces_original => (Decision::CreateOverOriginal(p), Some(rel)),
-                    Ok(p) => (Decision::Use(p), Some(rel)),
+                    Ok((p, is_new)) if disposition == TRUNCATE_EXISTING && !ov_entry => {
+                        (Decision::UseWithDisposition(p, CREATE_ALWAYS), Some(OpenCommit { rel, is_new }))
+                    }
+                    Ok((p, is_new)) if replaces_original => {
+                        (Decision::CreateOverOriginal(p), Some(OpenCommit { rel, is_new }))
+                    }
+                    Ok((p, is_new)) => (Decision::Use(p), Some(OpenCommit { rel, is_new })),
                     Err(e) => (Decision::Fail(e), None),
                 }
             }
@@ -1179,14 +1220,14 @@ impl Vfs {
         disposition: u32,
         flags: u32,
     ) -> Decision {
-        let (decision, commit_rel) = self.open_decision_staged_for_unlocked(target, access, disposition, flags);
-        if let Some(rel) = commit_rel {
-            self.commit_write_unlocked(&rel);
+        let (decision, commit) = self.open_decision_staged_for_unlocked(target, access, disposition, flags);
+        if let Some(commit) = commit {
+            self.commit_open_unlocked(&commit.rel, commit.is_new);
         }
         decision
     }
 
-    pub fn open_decision_staged(&self, path: &str, access: u32, disposition: u32, flags: u32) -> (Decision, Option<String>) {
+    pub fn open_decision_staged(&self, path: &str, access: u32, disposition: u32, flags: u32) -> (Decision, Option<OpenCommit>) {
         self.open_decision_staged_for(self.classify(path), access, disposition, flags)
     }
 
@@ -1195,8 +1236,8 @@ impl Vfs {
     }
 
     /// Stage a Linux host open: decide how to open `path` without removing whiteouts
-    /// or recording the write yet. Returns the staged decision, the game-relative path
-    /// to `commit_write_unlocked` only after `open(2)` succeeds, and the `write_lock`
+    /// or recording the write yet. Returns the staged decision, the game-relative commit
+    /// to `commit_open_unlocked` only after `open(2)` succeeds, and the `write_lock`
     /// guard held across the host open so concurrent VFS writes cannot interleave.
     /// A failed host open needs no rollback: nothing was committed.
     #[cfg(not(windows))]
@@ -1206,7 +1247,7 @@ impl Vfs {
         access: u32,
         disposition: u32,
         flags: u32,
-    ) -> (Decision, Option<String>, std::sync::MutexGuard<'_, ()>) {
+    ) -> (Decision, Option<OpenCommit>, std::sync::MutexGuard<'_, ()>) {
         let guard = self.write_lock.lock().unwrap();
         let target = self.classify(path);
         let visible = match &target {
@@ -1233,9 +1274,9 @@ impl Vfs {
         {
             return (Decision::Fail(ERROR_ACCESS_DENIED), None, guard);
         }
-        let (decision, commit_rel) =
+        let (decision, commit) =
             self.open_decision_staged_for_unlocked(target, access, disposition, flags);
-        (decision, commit_rel, guard)
+        (decision, commit, guard)
     }
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
@@ -2138,6 +2179,51 @@ mod tests {
         let p = v.prepare_write("gonly\\n.txt", false).expect("game-only parent is visible");
         std::fs::write(&p, b"new").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"new");
+    }
+
+    #[test]
+    fn reopening_an_existing_overlay_entry_keeps_delete_on_close_whiteout() {
+        // Upstream #1038: an open with FILE_FLAG_DELETE_ON_CLOSE removes only the
+        // overlay file on close, so a whiteout is recorded once the open succeeds.
+        // A second handle opening the existing overlay entry must keep that
+        // whiteout instead of clearing it.
+        let f = Fixture::new("doc_whiteout");
+        let v = &f.vfs;
+        const DELETE: u32 = 0x0001_0000;
+        // First handle: DELETE_ON_CLOSE open of a game-original file (mirrors the
+        // title's GENERIC_READ|DELETE + OPEN_EXISTING open).
+        let Decision::Use(first) = v.open_decision(
+            "G:\\data\\hello.txt",
+            GENERIC_READ | DELETE,
+            OPEN_EXISTING,
+            FILE_FLAG_DELETE_ON_CLOSE,
+        ) else {
+            panic!("delete-on-close open must stage the overlay copy");
+        };
+        assert_eq!(std::fs::read(&first).unwrap(), b"original");
+        // The native open succeeded: record the whiteout the close leaves behind.
+        v.commit_overlay_removal("data\\hello.txt");
+        assert!(v.is_whiteout("data\\hello.txt"));
+        // Second handle opens the existing overlay entry; committing it must not
+        // clear the whiteout hiding the original.
+        let Decision::Use(second) =
+            v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, OPEN_EXISTING, 0)
+        else {
+            panic!("second open must reuse the existing overlay entry");
+        };
+        assert_eq!(first, second);
+        assert!(
+            v.is_whiteout("data\\hello.txt"),
+            "reopening an existing overlay entry must keep the delete-on-close whiteout"
+        );
+        // A genuinely new overlay entry still replaces a whiteout (re-creation).
+        std::fs::remove_file(&second).unwrap();
+        let Decision::Use(_) =
+            v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, CREATE_ALWAYS, 0)
+        else {
+            panic!("re-creation must succeed");
+        };
+        assert!(!v.is_whiteout("data\\hello.txt"), "a new overlay entry replaces the whiteout");
     }
 
     #[test]

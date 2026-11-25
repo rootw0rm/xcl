@@ -18,9 +18,13 @@ use crate::vfs::{
 
 /// A file opened through the VFS. `already_existed` is the Win32 `ERROR_ALREADY_EXISTS`
 /// answer `CREATE_ALWAYS` gives when it replaced a file the caller could see.
+/// `delete_on_close_rel` carries the game-relative path when the open asked for
+/// `FILE_FLAG_DELETE_ON_CLOSE` on a game-original file: the caller records a whiteout
+/// once the open succeeds and deletes the overlay copy at the last close (upstream #1038).
 pub struct Opened {
     pub file: File,
     pub already_existed: bool,
+    pub delete_on_close_rel: Option<String>,
 }
 
 /// Open `path` (a console or host path) through the process VFS, falling back to a plain host
@@ -84,17 +88,42 @@ fn open_with(
             open_host(&p, access, disposition, flags, already_existed)
         }
     };
+    // Upstream #1038: an open with FILE_FLAG_DELETE_ON_CLOSE removes only the
+    // overlay file on close. Only a new overlay entry may clear a whiteout
+    // (reopening an existing entry keeps the delete-on-close whiteout), and once
+    // the host open succeeds the original is hidden so it cannot resurface.
+    let delete_on_close_rel = if result.is_ok() && flags & vfs::FILE_FLAG_DELETE_ON_CLOSE != 0 {
+        match v.classify(path) {
+            vfs::Target::Game { rel }
+                if std::path::Path::new(&v.original_path(&rel)).is_file() =>
+            {
+                Some(rel)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     if result.is_ok() {
-        if let Some(rel) = commit_rel {
+        if let Some(commit) = commit_rel {
             // Commit only after the host open succeeded: a failed open must neither
             // clear whiteouts nor record a write (upstream #1362). The commit runs
             // under the decision's `write_lock` guard, and the guest-visible last
             // error is set by the kernelx caller afterwards from the open result, so
             // no Win32 `GetLastError` save/restore is needed on this path.
-            v.commit_write_unlocked(&rel);
+            v.commit_open_unlocked(&commit.rel, commit.is_new);
+        }
+        if let Some(rel) = &delete_on_close_rel {
+            // An existing overlay entry still wins lookups while the handle is open.
+            // Once the overlay copy is deleted on close, the original must stay
+            // hidden instead of resurfacing.
+            v.commit_overlay_removal_unlocked(rel);
         }
     }
-    result
+    result.map(|mut opened| {
+        opened.delete_on_close_rel = delete_on_close_rel;
+        opened
+    })
 }
 
 fn validate_access(access: u32, disposition: u32) -> Result<(), u32> {
@@ -131,6 +160,7 @@ fn open_host(
     Ok(Opened {
         file: unsafe { File::from_raw_fd(fd) },
         already_existed,
+        delete_on_close_rel: None,
     })
 }
 
@@ -493,10 +523,14 @@ mod tests {
 
         // Staging alone changes neither the whiteout nor the write ledger.
         for disp in [CREATE_NEW, CREATE_ALWAYS, vfs::OPEN_ALWAYS] {
-            let (decision, commit_rel) =
+            let (decision, commit) =
                 v.open_decision_staged("G:\\data\\gone.txt", GENERIC_WRITE, disp, 0);
             assert!(matches!(decision, Decision::Use(_)), "disp={disp}");
-            assert_eq!(commit_rel, Some("data\\gone.txt".to_string()), "disp={disp}");
+            assert_eq!(
+                commit,
+                Some(vfs::OpenCommit { rel: "data\\gone.txt".to_string(), is_new: true }),
+                "disp={disp}"
+            );
             assert!(v.is_whiteout("data\\gone.txt"), "staging must not clear the whiteout (disp={disp})");
             assert_eq!(v.redirected_writes(), writes_before, "staging must not record a write (disp={disp})");
             assert!(
@@ -726,5 +760,37 @@ mod tests {
         );
         assert!(!f.data.join("temp").join("read-only-open.bin").exists());
         assert!(!f.vfs.visible_in_overlay("data\\read-only-open.bin"));
+    }
+
+    #[test]
+    fn delete_on_close_open_records_a_whiteout_for_the_original() {
+        // Upstream #1038 (Linux twin): opening a game-original file with
+        // FILE_FLAG_DELETE_ON_CLOSE stages the overlay copy, and once the host
+        // open succeeds the original is whiteouted so it stays hidden after the
+        // overlay copy is deleted on close. A second handle opening the existing
+        // overlay entry must keep that whiteout.
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let f = Fixture::new("doc");
+        std::fs::write(f.game.join("data").join("delete_on_close.txt"), b"original").unwrap();
+        let v = &f.vfs;
+        let path = "G:\\data\\delete_on_close.txt";
+        let mut first = open_with(v, path, GENERIC_READ | DELETE, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE)
+            .expect("delete-on-close open must succeed");
+        let mut got = Vec::new();
+        first.file.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"original", "open handle must read the original bytes");
+        assert!(
+            v.is_whiteout("data\\delete_on_close.txt"),
+            "successful delete-on-close open must hide the original"
+        );
+        let second = open_with(v, path, GENERIC_WRITE, OPEN_EXISTING, 0)
+            .expect("second handle must open the existing overlay entry");
+        drop(first);
+        drop(second);
+        assert!(
+            v.is_whiteout("data\\delete_on_close.txt"),
+            "reopening an existing overlay entry must keep the delete-on-close whiteout"
+        );
     }
 }

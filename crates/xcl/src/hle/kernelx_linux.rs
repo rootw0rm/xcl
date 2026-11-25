@@ -3519,6 +3519,12 @@ struct FindState {
 static FILES: OnceLock<Mutex<HashMap<usize, std::sync::Arc<Mutex<std::fs::File>>>>> =
     OnceLock::new();
 static FINDS: OnceLock<Mutex<HashMap<usize, FindState>>> = OnceLock::new();
+// Delete-on-close handles (upstream #1038): file handle -> game-relative path for
+// opens that asked for `FILE_FLAG_DELETE_ON_CLOSE` on a game-original file. The
+// overlay copy is deleted when the last handle for the path closes; the whiteout
+// recorded at open keeps the original hidden afterwards. Non-game paths never
+// enter this map.
+static DELETE_ON_CLOSE: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 
 fn files() -> &'static Mutex<HashMap<usize, std::sync::Arc<Mutex<std::fs::File>>>> {
     FILES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3550,7 +3556,30 @@ fn with_file_mut<T>(h: usize, f: impl FnOnce(&mut std::fs::File) -> T) -> Option
 }
 
 fn close_file_handle(h: usize) -> bool {
-    files().lock().unwrap().remove(&h).is_some()
+    if files().lock().unwrap().remove(&h).is_none() {
+        return false;
+    }
+    // NOTE: bind before the `if let`: a `delete_on_close_handles().lock()` temporary
+    // in the scrutinee would live through the whole `if let` body and deadlock on the
+    // last-close re-lock of the same map below (`std` mutexes are not reentrant).
+    let rel = delete_on_close_handles().lock().unwrap().remove(&h);
+    if let Some(rel) = rel {
+        // Last-close semantics: finalise once no other handle still names `rel`.
+        // Other handles keep working (Linux unlinks open files lazily); lookups
+        // already hide the original behind the whiteout recorded at open.
+        if !delete_on_close_handles().lock().unwrap().values().any(|r| r == &rel) {
+            if let Some(v) = crate::vfs::get() {
+                // Best effort: drop the overlay copy so the recorded whiteout hides
+                // the original; Windows deletes the file itself on close.
+                let _ = v.delete_file(&rel);
+            }
+        }
+    }
+    true
+}
+
+fn delete_on_close_handles() -> &'static Mutex<HashMap<usize, String>> {
+    DELETE_ON_CLOSE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn close_find_handle(h: usize) -> bool {
@@ -3897,7 +3926,14 @@ fn create_file_impl(path: &str, access: u32, disposition: u32, flags: u32) -> Re
     // Directories opened with backup semantics hold an O_PATH descriptor that Rust
     // `File` cannot read; the VFS `open` already validated containment, and directory
     // reads go through Find, not ReadFile.
-    Ok(register_file(opened.file))
+    let h = register_file(opened.file);
+    // Delete-on-close (upstream #1038): track the handle so the last close for the
+    // game file deletes the overlay copy; the whiteout recorded at open keeps the
+    // original hidden afterwards. Non-game paths never carry this marker.
+    if let Some(rel) = opened.delete_on_close_rel {
+        delete_on_close_handles().lock().unwrap().insert(h, rel);
+    }
+    Ok(h)
 }
 
 unsafe fn wide_str(p: *const u16) -> Option<String> {
@@ -9437,6 +9473,63 @@ mod tests {
         );
         assert_eq!(tree_hash(global_game), global_before);
         let _ = data;
+    }
+
+    #[test]
+    fn delete_on_close_keeps_the_game_file_hidden_after_last_close() {
+        // Upstream #1038 through the exported shims (Linux twin): a title opens
+        // `G:\data\...` with FILE_FLAG_DELETE_ON_CLOSE, reads the original bytes
+        // while open, opens a second handle, closes both — the original stays
+        // hidden and the game folder stays byte-identical.
+        let _ = ensure_test_vfs();
+        let gv = crate::vfs::get().expect("global VFS initialised");
+        let global_game = std::path::Path::new(gv.game_root());
+        let probe = format!("doc_probe_{}.txt", std::process::id());
+        let rel = format!("data\\{probe}");
+        std::fs::create_dir_all(global_game.join("data")).ok();
+        std::fs::write(global_game.join("data").join(&probe), b"original").ok();
+        let before = tree_hash(global_game);
+        unsafe {
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const DELETE: u32 = 0x0001_0000;
+            const OPEN_EXISTING: u32 = 3;
+            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            let open = |access: u32, flags: u32| {
+                let w = crate::util::wide(&format!("G:\\data\\{probe}"));
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    access,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    flags,
+                    0,
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE, "open failed err {}", GetLastError());
+                h
+            };
+            // First handle carries DELETE_ON_CLOSE; the original bytes are readable.
+            let h1 = open(GENERIC_READ | DELETE, FILE_FLAG_DELETE_ON_CLOSE);
+            assert_eq!(read_all(h1), b"original");
+            // Second handle opens the existing overlay entry.
+            let h2 = open(GENERIC_WRITE, 0);
+            assert_eq!(CloseHandle(h1), 1);
+            assert_eq!(CloseHandle(h2), 1);
+            // Both handles closed: the overlay copy is gone, the whiteout hides
+            // the original, and reopening fails like a deleted file.
+            assert!(gv.is_whiteout(&rel), "delete-on-close must hide the original");
+            assert_eq!(gv.read_path_rel(&rel), None);
+            let w = crate::util::wide(&format!("G:\\data\\{probe}"));
+            assert_eq!(
+                CreateFileW(w.as_ptr(), GENERIC_READ, 0, std::ptr::null(), OPEN_EXISTING, 0, 0),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+            assert_eq!(tree_hash(global_game), before, "game folder must stay byte-identical");
+        }
+        // Transient seed: remove it so later tests see a clean game root.
+        let _ = std::fs::remove_file(global_game.join("data").join(&probe));
     }
 
     #[test]
