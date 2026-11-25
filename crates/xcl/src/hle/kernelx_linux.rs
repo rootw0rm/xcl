@@ -4725,6 +4725,17 @@ fn remove_dir_impl(path: &str) -> i32 {
     }
 }
 
+/// Win32 error for a copy/move source that does not exist, so callers can fail before
+/// staging any overlay directories. Other metadata errors are left to the host call.
+fn missing_source_error(real: &str) -> Option<u32> {
+    match std::fs::metadata(real) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(e.raw_os_error().unwrap_or(crate::vfs::ERROR_FILE_NOT_FOUND as i32) as u32)
+        }
+        _ => None,
+    }
+}
+
 fn move_impl(src: &str, dst: &str, replace: bool) -> Result<(), u32> {
     use crate::vfs::{Target, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND};
     let Some(v) = crate::vfs::get() else {
@@ -4765,6 +4776,10 @@ fn move_impl(src: &str, dst: &str, replace: bool) -> Result<(), u32> {
             Target::Translated(p) => p.clone(),
             _ => dst.to_string(),
         };
+        // Fail before creating any destination directories (upstream #1779).
+        if let Some(e) = missing_source_error(&rs) {
+            return Err(e);
+        }
         if let Some(parent) = std::path::Path::new(&rd).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -4793,10 +4808,10 @@ fn move_impl(src: &str, dst: &str, replace: bool) -> Result<(), u32> {
         #[cfg(not(windows))]
         Target::Reject(e) => return Err(*e),
     };
-    if !std::path::Path::new(&rs).exists() {
-        return Err(ERROR_FILE_NOT_FOUND);
+    if let Some(e) = missing_source_error(&rs) {
+        return Err(e); // fail before stage_write creates overlay directories
     }
-    if std::path::Path::new(&rs).is_dir() {
+    if std::fs::metadata(&rs).is_ok_and(|m| m.is_dir()) {
         return Err(crate::vfs::ERROR_ACCESS_DENIED);
     }
     // Destination bookkeeping first (without publishing), then the host move.
@@ -4809,6 +4824,10 @@ fn move_impl(src: &str, dst: &str, replace: bool) -> Result<(), u32> {
             (p.clone(), None)
         }
         Target::Game { rel } => {
+            // Exact self-move is a safe no-op (upstream #1779 move arm).
+            if srel.as_deref() == Some(rel.as_str()) {
+                return Ok(());
+            }
             if v.is_dir(rel) {
                 return Err(crate::vfs::ERROR_ACCESS_DENIED);
             }
@@ -4932,7 +4951,7 @@ fn copy_impl(src: &str, dst: &str, fail_if_exists: bool) -> Result<(), u32> {
             return Err(*e);
         }
     }
-    let (rs, _) = match &s_target {
+    let (rs, srel) = match &s_target {
         Target::Pass => (src.to_string(), None),
         Target::Translated(p) => (p.clone(), None),
         Target::Game { rel } => (
@@ -4942,8 +4961,11 @@ fn copy_impl(src: &str, dst: &str, fail_if_exists: bool) -> Result<(), u32> {
         #[cfg(not(windows))]
         Target::Reject(e) => return Err(*e),
     };
-    if !std::path::Path::new(&rs).exists() {
-        return Err(ERROR_FILE_NOT_FOUND);
+    if let Some(e) = missing_source_error(&rs) {
+        return Err(e); // fail before stage_write creates overlay directories
+    }
+    if std::fs::metadata(&rs).is_ok_and(|m| m.is_dir()) {
+        return Err(crate::vfs::ERROR_ACCESS_DENIED);
     }
     let (rd, drel) = match &d_target {
         Target::Pass => (dst.to_string(), None),
@@ -4957,6 +4979,12 @@ fn copy_impl(src: &str, dst: &str, fail_if_exists: bool) -> Result<(), u32> {
             (p.clone(), None)
         }
         Target::Game { rel } => {
+            // Copying a game file onto itself: fail without staging an overlay
+            // copy (upstream hands the same path to Win32 so the host call
+            // fails; here there is no host call to fail, so reject explicitly).
+            if srel.as_ref().is_some_and(|sr| sr.to_lowercase() == rel.to_lowercase()) {
+                return Err(crate::vfs::ERROR_ACCESS_DENIED);
+            }
             if v.is_dir(rel) {
                 return Err(crate::vfs::ERROR_ACCESS_DENIED);
             }
@@ -9512,6 +9540,81 @@ mod tests {
         assert_eq!(create_file_2_flags(1usize as *const c_void), None);
         let params = [12u32, 0x1234, 0x5678];
         assert_eq!(create_file_2_flags(params.as_ptr().cast()), Some(0x5678));
+    }
+
+    #[test]
+    fn copy_and_move_reject_bad_sources_before_staging_the_overlay() {
+        // Linux port of upstream #1779 (`copy_and_move_reject_bad_sources_...` in
+        // `vfs_hooks.rs`, Windows-only): the live Linux path is `copy_impl` /
+        // `move_impl` here, exercised through the `CopyFileW` / `MoveFileExW` shims
+        // on the shared global VFS. All legs must fail without staging anything
+        // into the overlay; game originals stay untouched.
+        use crate::vfs::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+        let _ = ensure_test_vfs();
+        let v = crate::vfs::get().expect("global VFS initialised");
+        let game_root = std::path::Path::new(v.game_root()).to_path_buf();
+        let tag = format!("badsrc_{}", std::process::id());
+        let rel = |n: &str| format!("data\\{tag}\\{n}");
+        let gpath = |n: &str| format!("G:\\data\\{tag}\\{n}");
+        std::fs::create_dir_all(game_root.join("data").join(&tag).join("sub")).unwrap();
+        std::fs::create_dir_all(game_root.join("data").join(&tag).join("dir")).unwrap();
+        std::fs::write(game_root.join("data").join(&tag).join("orig.txt"), b"original").unwrap();
+        std::fs::write(game_root.join("data").join(&tag).join("caf\u{e9}.txt"), b"original").unwrap();
+        let overlay_untouched = || {
+            assert!(
+                !std::path::Path::new(&v.overlay_path(&rel("orig.txt"))).exists(),
+                "self-copy staged an overlay file"
+            );
+            assert!(
+                !std::path::Path::new(&v.overlay_path(&rel("sub"))).exists(),
+                "a failed copy/move created overlay dirs"
+            );
+            assert!(
+                !std::path::Path::new(&v.overlay_path(&rel(""))).exists(),
+                "a failed copy/move created the overlay tag dir"
+            );
+        };
+        unsafe {
+            // Copying an un-overlaid game file onto itself (same path and
+            // case-differing, including the accented pair) must fail.
+            for (src, dst) in [
+                (gpath("orig.txt"), gpath("orig.txt")),
+                (gpath("orig.txt"), gpath("ORIG.TXT")),
+                (gpath("caf\u{e9}.txt"), gpath("CAF\u{c9}.txt")),
+            ] {
+                let (s, d) = (crate::util::wide(&src), crate::util::wide(&dst));
+                assert_eq!(CopyFileW(s.as_ptr(), d.as_ptr(), 0), 0, "self-copy {src} -> {dst} must fail");
+                overlay_untouched();
+            }
+            assert_eq!(
+                std::fs::read(game_root.join("data").join(&tag).join("orig.txt")).unwrap(),
+                b"original"
+            );
+
+            // A directory source fails with ERROR_ACCESS_DENIED.
+            let (s, d) = (
+                crate::util::wide(&gpath("dir")),
+                crate::util::wide(&gpath("sub\\d.txt")),
+            );
+            assert_eq!(CopyFileW(s.as_ptr(), d.as_ptr(), 0), 0);
+            assert_eq!(GetLastError(), ERROR_ACCESS_DENIED);
+            overlay_untouched();
+
+            // A missing external source must not create overlay dirs for the destination.
+            let missing = format!("T:\\{tag}_missing.txt");
+            let (s, d) = (crate::util::wide(&missing), crate::util::wide(&gpath("sub\\new.txt")));
+            assert_eq!(CopyFileW(s.as_ptr(), d.as_ptr(), 0), 0);
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+            overlay_untouched();
+            assert_eq!(MoveFileExW(s.as_ptr(), d.as_ptr(), 0), 0);
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+            overlay_untouched();
+
+            // An exact self-move is a safe no-op.
+            let (s, d) = (crate::util::wide(&gpath("orig.txt")), crate::util::wide(&gpath("orig.txt")));
+            assert_eq!(MoveFileExW(s.as_ptr(), d.as_ptr(), 0), 1);
+            overlay_untouched();
+        }
     }
 
     #[test]
