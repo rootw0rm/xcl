@@ -1312,3 +1312,54 @@ the null device (no title behavior change); consumes `device_lane_path()` at sel
 marked LANDED + 16 LANDED detail + new 17a section + Plan Changes entry; context.md
 current-state refresh; DEC-024 recorded. Steps 17-21 stay chained behind SKIPPED step-12;
 Phase E/F remain blocked per §4.7. No code changes in this planner pass.
+
+## Verification Notes — step-17a vulkan-backend (Builder, 2026-11-25, `linux`)
+
+Task `task-1795571368-affd` / plan.md step 17a (`linux:vulkan-backend`, DEC-024).
+
+Landed (Linux-only files + progress.md, no refactors):
+- `crates/xcl/src/hle/vulkan_linux.rs` (new): `Backend::{Null, Vulkan}` +
+  `ENV_OVERRIDE="XCL_VULKAN_BACKEND"` + `parse_override` (unset/unknown stays
+  Null, `"vulkan"` case-insensitive requests Vulkan) + `select_with` (pure,
+  injected probe: Null never probes, Vulkan maps `Ok(lane)` to Vulkan and
+  `Err(e)` to Null fallback with logged reason, never a panic) + `select()`
+  (env + `vulkan_runner::device_lane_path()` — the runner's `pick_device`
+  query, one instance per call, no second throwaway instance).
+- `crates/xcl/src/hle_linux.rs`: `#[path] pub mod vulkan_linux;` (no
+  registry/DLL change — the selector is not an export module).
+- `crates/xcl/src/hle/d3d12x_linux.rs`: `create_device` queries
+  `crate::hle::vulkan_linux::select()` and `xlog_debug!`s the result, then
+  returns the existing null device (no vtable/behavior change).
+- `crates/xcl/src/gpu/recomp/vulkan_runner.rs`: dead `_lane` follow-up
+  folded — `let lane = lane_path_for(subgroup)` + `eprintln!("vulkan:
+  dispatch {WORK_ITEMS} work-items as {lane:?}")` (both paths still dispatch
+  one group of 64; the selector owns the device-level agreement check).
+- Tests (7, deterministic without a device except where noted):
+  override-unset/unknown-null, override-vulkan-case-insensitive,
+  null-never-probes (panicking probe), vulkan-with-lane (both widths),
+  vulkan-no-device-fallback (reason contains the device error),
+  lane-agreement-with-runner (pure `lane_path_for` both widths),
+  env-null-or-unset (only Null paths touch the real env, no device needed).
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib hle::vulkan_linux` → 7 passed; 0 failed.
+- `cargo test -p xcl --lib` → 471 passed; 0 failed; 1 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only).
+- `cargo clippy -p xcl --lib` → 0 errors (pre-existing warnings only).
+- `git diff --check` clean; `rustfmt --check` clean on `vulkan_linux.rs`
+  (whole-tree drift in `d3d12x_linux.rs` is pre-existing per AGENTS.md; the
+  17a hunk itself is fmt-clean).
+- Shipped-path audit: `grep Command/process` in `vulkan_linux.rs` → no hits
+  (runner file only `cmd_*` Vulkan calls, no `std::process`);
+  `TRANSLATOR_SOURCES` untouched (`git diff` on build.rs/mod.rs/emit.rs/
+  Cargo.toml empty); no new deps (`ash` MIT + `libc`, runtime `dlopen` only).
+- Cross-built synthetic title (fresh `/tmp/vkb-game`, fresh
+  `XCL_DATA_ROOT=/tmp/vkb-data`): `xcl_testtitle: done, failures: 12`,
+  `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `crash: null`,
+  `called_stubs: 29` (28 `d3d12_xs` + `XclDefinitelyMissingFunction` probe,
+  zero `mfplat`/`FormatMessage`/`xcrdapi`), `[PASS] DirectStorage` +
+  `[PASS] MFPlat` hold. Matches the 12g/13/14/15/16 baseline; no new failure.
+- Env override probes (same fresh-game pattern): `XCL_VULKAN_BACKEND=vulkan`
+  → `vulkan backend: vulkan backend (device split-32 lane path)` on Arc A770,
+  still `failures: 12`/`ExitProcess(0xc)`/`called_stubs: 29` (null device
+  returned); `XCL_VULKAN_BACKEND=bogus` → stays null, same 12/0xc/29.

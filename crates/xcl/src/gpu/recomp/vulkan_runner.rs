@@ -204,7 +204,11 @@ pub fn dispatch_compute(spirv: &[u32], data: &[u32]) -> Result<Vec<u32>, String>
         };
         // Step-16 selection: the 64-work-item shape is kept for both paths —
         // one wave64 natively, two subgroups of 32 on the split path.
-        let _lane = lane_path_for(subgroup);
+        // The lane decision is consumed here (not dead state): both paths
+        // dispatch one group of 64, and the step-17a backend selector owns
+        // the device-level `device_lane_path()` agreement check.
+        let lane = lane_path_for(subgroup);
+        eprintln!("vulkan: dispatch {WORK_ITEMS} work-items as {lane:?}");
         // Scoped teardown for the fallible steps below: every created handle
         // is owned by `Scope` and destroyed on drop, so an early `?` return
         // cannot leak the device or a half-built pipeline (step-15 follow-up).
