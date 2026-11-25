@@ -983,6 +983,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (17, l::copy_resource_x as usize),
                 (19, l::resolve_subresource_x as usize),
                 (51, l::clear_depth_stencil_x as usize),
+                (53, l::clear_uav_uint_x as usize),
+                (54, l::clear_uav_float_x as usize),
                 (108, l::resolve_subresource_region_x as usize),
                 (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
@@ -7691,6 +7693,16 @@ mod readback_routing_tests {
             }
             RANGE_TYPES.with(|v| assert_eq!(*v.borrow(), vec![0, 2]));
         }
+    }
+
+    /// Console #53 / #54 ClearUnorderedAccessViewUint / Float translate their console handles
+    /// (not the PC #49 / #50 the remap alone gives).
+    #[test]
+    fn console_clear_uav_slots_translate_handles() {
+        use super::super::list_x as l;
+        let slots = console_slots(Kind::CommandList);
+        assert!(slots.contains(&(53, l::clear_uav_uint_x as usize)));
+        assert!(slots.contains(&(54, l::clear_uav_float_x as usize)));
     }
 
     /// Bug #6: `Kind::DmaList` must install `cl_release` so releasing a DMA command list removes

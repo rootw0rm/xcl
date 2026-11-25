@@ -1497,6 +1497,34 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
+///
+/// Compute work that coordinates across workgroups (e.g. bottom-up BVH builds: atomics,
+/// then reading what other groups wrote) relies on `GLC`/`DLC`/`SLC`, memory atomics, or
+/// cache invalidation on the console. Programs without any of those only access read-only
+/// or disjointly written memory within the dispatch, so keeping their flat memory windows
+/// un-qualified lets the GPU cache them in L1.
+pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        let name = d.inst.name;
+        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV") {
+            return true;
+        }
+        if name.starts_with("BUFFER_ATOMIC_")
+            || name.starts_with("GLOBAL_ATOMIC_")
+            || name.starts_with("FLAT_ATOMIC_")
+        {
+            return true;
+        }
+        matches!(
+            d.enc.name,
+            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) && ["GLC", "DLC", "SLC"]
+            .iter()
+            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
+    })
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
@@ -1547,6 +1575,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode

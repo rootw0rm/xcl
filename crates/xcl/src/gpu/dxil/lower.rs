@@ -260,6 +260,10 @@ pub struct Lw {
     /// When set, the wave-wide mask cross-lane instructions see (DPP source lanes,
     /// readfirstlane, ds_swizzle / bpermute) instead of the SSA EXEC.
     pub mask_override: Option<(Value, Value)>,
+    /// split form: a mask an instruction writes is built from this half's ballot alone, as
+    /// when it is never read whole. Set by a caller that reads back only each lane's own bit
+    /// (the per-lane form's bridge), so no exchange meets the other half.
+    pub local_masks: bool,
 }
 
 impl Lw {
@@ -908,7 +912,8 @@ impl Lw {
         // split form: a mask only ever read lane by lane (or going nowhere, or 0 anyway)
         // needs only this half's word (`recomp::x64_masks`, the HLSL `xcl_x_ballot_local`)
         let local = self.split
-            && (self.s.m.const_u64(cond) == Some(0)
+            && (self.local_masks
+                || self.s.m.const_u64(cond) == Some(0)
                 || match *dst {
                     Dst::S(n) => n < 126 && self.whole_live.get(&self.pc).is_some_and(|live| live & (3u128 << n) == 0),
                     Dst::Null => true,

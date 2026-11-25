@@ -238,6 +238,110 @@ struct Target {
     mapped: bool,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
+    /// its levels get their pages one by one (`map_levels`); None: all of it has pages
+    levels: Option<Levels>,
+}
+
+/// The tiles of a texture whose levels get video memory when an upload first has texels for
+/// them (`level_pages`): a group for each level with tiles of its own, in order, then one for
+/// the packed levels.
+#[derive(Clone, Debug, PartialEq)]
+struct Levels {
+    /// (the group's first subresource, its first tile in the resource, its tiles, mapped)
+    groups: Vec<(u32, u32, u32, bool)>,
+    /// the texture's levels (the last group's go up to here)
+    mips: u32,
+}
+
+impl Levels {
+    /// From the resource's tiling: `standard` (first tile, tiles) of each level with tiles of
+    /// its own, `packed` the same of the packed levels, `total` tiles in all. None: they do not
+    /// add up to the resource (it then gets all its pages at once).
+    fn new(standard: &[(u32, u32)], packed: Option<(u32, u32)>, total: u32, mips: u32) -> Option<Levels> {
+        let mut groups: Vec<(u32, u32, u32, bool)> = standard.iter().enumerate().map(|(i, &(first, n))| (i as u32, first, n, false)).collect();
+        if let Some((first, n)) = packed {
+            groups.push((standard.len() as u32, first, n, false));
+        }
+        let mut next = 0u32;
+        let mut by_tile = groups.clone();
+        by_tile.sort_by_key(|g| g.1);
+        for g in &by_tile {
+            if g.2 == 0 || g.1 != next {
+                return None;
+            }
+            next = g.1.checked_add(g.2)?;
+        }
+        (next == total && !groups.is_empty()).then_some(Levels { groups, mips })
+    }
+
+    /// The levels of group `k`.
+    fn levels_of(&self, k: usize) -> std::ops::Range<u32> {
+        self.groups[k].0..self.groups.get(k + 1).map_or(self.mips, |g| g.0)
+    }
+
+    /// The group level `level` is in (the packed levels share the last one).
+    fn group_of(&self, level: u32) -> usize {
+        self.groups.partition_point(|g| g.0 <= level).saturating_sub(1)
+    }
+}
+
+/// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture of one slice on the
+/// shared pages gets the pages of a level when an upload first has texels for it. A retail game
+/// places its streamed textures at full size and maps memory under their levels as it loads
+/// them, the small ones first; with a page for every 64 KiB a texture covers most of the pages
+/// are for levels that are not loaded.
+pub(super) fn level_pages() -> bool {
+    #[cfg(test)]
+    if LEVEL_PAGES_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_TEXTURE_LEVEL_PAGES").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_LEVEL_PAGES=1 - a sampled texture's levels get their video memory pages when an upload first has texels for them");
+        }
+        on
+    })
+}
+
+/// `level_pages` for a test (under `VRAM_TEST_LOCK`)
+#[cfg(test)]
+pub(super) static LEVEL_PAGES_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Of the textures with lazy levels there are now: how many, the tiles they stand for, and the
+/// tiles of them that have pages; and the level groups given pages so far.
+static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// (textures with lazy levels, the tiles they stand for, the tiles of them with pages, level
+/// groups given pages so far)
+fn level_stats() -> (u64, u64, u64, u64) {
+    let l = |k: usize| LEVEL_STATS[k].load(std::sync::atomic::Ordering::Relaxed);
+    (l(0), l(1), l(2), l(3))
+}
+
+impl Levels {
+    /// Its tiles that have pages.
+    fn mapped_tiles(&self) -> u64 {
+        self.groups.iter().filter(|g| g.3).map(|g| g.2 as u64).sum()
+    }
+}
+
+/// The tiling of reserved texture `res` of `mips` levels as `Levels`, and its tiles in all.
+unsafe fn level_tiling(dev: &ID3D12Device, res: &ID3D12Resource, mips: u32) -> (Option<Levels>, u32) {
+    let mut total = 0u32;
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut n = mips;
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); mips as usize];
+    dev.GetResourceTiling(res, Some(&mut total), Some(&mut packed), None, Some(&mut n), 0, tilings.as_mut_ptr());
+    let standard: Vec<(u32, u32)> = tilings
+        .iter()
+        .take((packed.NumStandardMips as usize).min(n as usize))
+        .map(|t| (t.StartTileIndexInOverallResource, t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32))
+        .collect();
+    let tail = (packed.NumPackedMips > 0).then_some((packed.StartTileIndexInOverallResource, packed.NumTilesForPackedMips));
+    let whole = standard.len() == packed.NumStandardMips as usize && packed.NumStandardMips as u32 + packed.NumPackedMips as u32 == mips;
+    (if whole { Levels::new(&standard, tail, total, mips) } else { None }, total)
 }
 
 /// Per-heap free-tile allocator for `Pages`.
@@ -591,7 +695,8 @@ impl Pages {
     }
 
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
-    unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile]) {
+    /// `tiles` for the tiles of `res` from the first one of subresource `sub` on.
+    unsafe fn map(&mut self, res: &ID3D12Resource, sub: u32, tiles: &[Tile]) {
         if tiles.is_empty() {
             return;
         }
@@ -615,7 +720,7 @@ impl Pages {
                 self.scratch_counts.push(count);
                 num_tiles += count;
             }
-            let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+            let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
             self.queue.UpdateTileMappings(
                 res,
@@ -694,13 +799,19 @@ impl Pages {
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize)
+    }
+
+    /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
 
         let mut missing = 0usize;
         let mut preferred: Option<u32> = None;
-        for i in 0..total as usize {
+        for i in range.clone() {
             let existing = if i < own {
                 self.pages.get(&(first + i * PAGE)).map(|p| p.tile.0)
             } else {
@@ -721,10 +832,10 @@ impl Pages {
         })?;
         let mut fresh_iter = fresh.into_iter();
 
-        let mut tiles = Vec::with_capacity(total as usize);
-        let mut used = Vec::with_capacity(own);
+        let mut tiles = Vec::with_capacity(range.len());
+        let mut used = Vec::with_capacity(own.min(range.len()));
         let mut used_extra = Vec::new();
-        for i in 0..total as usize {
+        for i in range {
             let tile = if i < own {
                 let a = first + i * PAGE;
                 let t = match self.pages.get_mut(&a) {
@@ -760,7 +871,7 @@ impl Pages {
             };
             tiles.push(tile);
         }
-        self.map(res, &tiles);
+        self.map(res, sub, &tiles);
         Some((used, used_extra))
     }
 }
@@ -862,6 +973,7 @@ unsafe fn place_on_pages(
     clear: *const c_void,
     console_bytes: Option<u64>,
     require_aligned: bool,
+    lazy: bool,
     riid: *const windows_sys::core::GUID,
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
@@ -900,12 +1012,25 @@ unsafe fn place_on_pages(
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
-    dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+    let levels = if lazy {
+        let (levels, n) = level_tiling(dev, res, desc.MipLevels as u32);
+        total = n;
+        levels.filter(|_| total > 0 && owned_pages(va, console_bytes, total as usize).is_some())
+    } else {
+        dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+        None
+    };
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
+            if levels.is_some() {
+                // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
+                LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                true
+            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
                 true
             } else {
                 false
@@ -938,6 +1063,10 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
         let used = std::mem::take(&mut t.used);
         let used_extra = std::mem::take(&mut t.used_extra);
         t.mapped = false;
+        if let Some(l) = t.levels.as_mut() {
+            LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+            l.groups.iter_mut().for_each(|g| g.3 = false);
+        }
         pages.unmap(res, total);
         pages.release_tiles(used, used_extra, now, true);
         return;
@@ -960,6 +1089,11 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     if mapped {
         return true;
     }
+    // (lazy levels: they get their pages again with their next texels)
+    if let Some(t) = pages.targets.get_mut(&key).filter(|t| t.levels.is_some()) {
+        t.mapped = true;
+        return true;
+    }
     let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
         return false;
     };
@@ -977,6 +1111,11 @@ fn forget_pages(resource: usize) {
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
         let Some(t) = pages.targets.remove(&resource) else { continue };
+        if let Some(l) = &t.levels {
+            LEVEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            LEVEL_STATS[1].fetch_sub(t.total as u64, std::sync::atomic::Ordering::Relaxed);
+            LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+        }
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
         }
@@ -1113,7 +1252,61 @@ pub unsafe fn place_pages(
     if console_has_packed_3d_mips(desc) {
         return None;
     }
-    place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
+    // (one slice: the tiles of an array's packed levels are not asked about here)
+    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
+}
+
+/// The levels `levels` of `res` (None: all of them) get their pages if they have none yet: a
+/// texture placed with lazy levels (any other: nothing to do). Returns the levels that got pages
+/// by this call - the queue the texture is used on next has to wait for that (`before_execute`),
+/// and what the pages held before is another texture's.
+pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) -> Vec<u32> {
+    let key = res.as_raw() as usize;
+    let mut g = PAGES.lock().unwrap();
+    for (&dev_key, pages) in g.iter_mut() {
+        let Some(pages) = pages.as_mut() else { continue };
+        let Some(t) = pages.targets.get(&key) else { continue };
+        let Some(lv) = t.levels.as_ref().filter(|_| t.mapped) else { return Vec::new() };
+        let mut wanted: Vec<usize> = match levels {
+            Some(l) => l.iter().map(|&x| lv.group_of(x)).collect(),
+            None => (0..lv.groups.len()).collect(),
+        };
+        wanted.sort_unstable();
+        wanted.dedup();
+        let todo: Vec<(usize, u32, u32, u32, std::ops::Range<u32>)> =
+            wanted.into_iter().filter(|&k| !lv.groups[k].3).map(|k| (k, lv.groups[k].0, lv.groups[k].1, lv.groups[k].2, lv.levels_of(k))).collect();
+        if todo.is_empty() {
+            return Vec::new();
+        }
+        let (va, console_bytes, total) = (t.va, t.console_bytes, t.total);
+        let d = dev_key as *mut c_void;
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
+        let mut fresh = Vec::new();
+        for (k, sub, first, n, levels) in todo {
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some(t) = pages.targets.get_mut(&key) else { return fresh };
+            t.used.extend(used);
+            t.used_extra.extend(used_extra);
+            if let Some(l) = t.levels.as_mut() {
+                l.groups[k].3 = true;
+            }
+            LEVEL_STATS[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            let groups = LEVEL_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if groups >= 1024 && groups.is_power_of_two() {
+                let (textures, stand, mapped, _) = level_stats();
+                crate::xlog_info!("D3D12.X: level pages: {textures} textures standing for {} MB have pages for {} MB ({groups} levels given pages so far)", stand >> 4, mapped >> 4);
+            }
+            fresh.extend(levels);
+        }
+        return fresh;
+    }
+    Vec::new()
+}
+
+/// Whether `resource` is a texture whose levels get their pages one by one (`map_levels`).
+pub(super) fn has_lazy_levels(resource: usize) -> bool {
+    PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).is_some_and(|t| t.levels.is_some()))
 }
 
 /// XG and the PC driver pack volume mip tails differently. Keep these textures on the
@@ -1147,7 +1340,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
         return None;
     }
     if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
-        if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, riid, ppv) {
+        if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, false, riid, ppv) {
             return Some(hr);
         }
     }
@@ -1174,6 +1367,30 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// The levels of a texture with lazy levels: a group of tiles for each level with tiles of its
+    /// own and one for the packed levels; a level past the last standard one is in the packed
+    /// group; a tiling that does not add up to the resource's tiles gives none.
+    #[test]
+    fn the_tiles_of_a_texture_are_grouped_by_its_levels() {
+        // 2048x2048 BC7, 12 levels: 64, 16, 4, 1 tiles and 1 for the 8 packed levels
+        let l = Levels::new(&[(0, 64), (64, 16), (80, 4), (84, 1)], Some((85, 1)), 86, 12).unwrap();
+        assert_eq!(l.groups, vec![(0, 0, 64, false), (1, 64, 16, false), (2, 80, 4, false), (3, 84, 1, false), (4, 85, 1, false)]);
+        assert_eq!((0..12).map(|i| l.group_of(i)).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4]);
+        assert_eq!((l.levels_of(0), l.levels_of(3), l.levels_of(4)), (0..1, 3..4, 4..12));
+        // all of it packed: one group
+        let small = Levels::new(&[], Some((0, 1)), 1, 5).unwrap();
+        assert_eq!((small.group_of(0), small.group_of(4), small.levels_of(0)), (0, 0, 0..5));
+        // no packed levels: the last level's group ends at the texture's levels
+        let plain = Levels::new(&[(0, 4), (4, 1)], None, 5, 2).unwrap();
+        assert_eq!((plain.group_of(1), plain.levels_of(1)), (1, 1..2));
+        // a gap, an overlap, a tile count that is not the resource's, nothing at all
+        assert_eq!(Levels::new(&[(0, 4), (5, 1)], None, 6, 2), None);
+        assert_eq!(Levels::new(&[(0, 4), (3, 2)], None, 5, 2), None);
+        assert_eq!(Levels::new(&[(0, 4), (4, 1)], None, 6, 2), None);
+        assert_eq!(Levels::new(&[(0, 4), (4, 0)], None, 4, 2), None);
+        assert_eq!(Levels::new(&[], None, 0, 1), None);
+    }
 
     #[test]
     fn packed_console_3d_mip_tails_use_the_detile_upload_path() {
