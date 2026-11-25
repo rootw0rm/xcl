@@ -696,6 +696,31 @@ pub unsafe extern "win64" fn strncmp(a: *const u8, b: *const u8, n: usize) -> i3
     0
 }
 
+/// `int _strnicmp(a, b, n)` — bounded case-insensitive `strcmp` (ASCII fold),
+/// `0` when the first `n` bytes match ignoring case (retail abort 0x2237179:
+/// the drive-prefix probe at `exe+0x54F8A70` compares `G:/...` against `xg:` /
+/// `xd:`; the auto-stub always reported "equal", which stripped the drive
+/// letter and broke the dump-path lookup in `sub_14056EB30`).
+pub unsafe extern "win64" fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    for i in 0..n {
+        let mut x = *a.add(i);
+        let mut y = *b.add(i);
+        if x.is_ascii_uppercase() {
+            x += 32;
+        }
+        if y.is_ascii_uppercase() {
+            y += 32;
+        }
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+    }
+    0
+}
+
 /// `int wcscmp(a, b)` — UTF-16 unit order, `0` when equal.
 pub unsafe extern "win64" fn wcscmp(a: *const u16, b: *const u16) -> i32 {
     let mut i = 0;
@@ -3005,6 +3030,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("strnlen", strnlen as usize),
         ("strcmp", strcmp as usize),
         ("strncmp", strncmp as usize),
+        ("_strnicmp", _strnicmp as usize),
         ("strcpy", strcpy as usize),
         ("strncpy", strncpy as usize),
         ("strcat", strcat as usize),
@@ -3308,6 +3334,19 @@ mod tests {
             assert_eq!(strncmp(b"abcdef\0".as_ptr(), b"abcxyz\0".as_ptr(), 3), 0);
             assert!(strncmp(b"abcdef\0".as_ptr(), b"abcxyz\0".as_ptr(), 4) < 0);
             assert_eq!(strncmp(b"abc\0".as_ptr(), b"abc\0".as_ptr(), 0), 0);
+            assert_eq!(_strnicmp(b"AbC\0".as_ptr(), b"aBc\0".as_ptr(), 3), 0);
+            assert_eq!(_strnicmp(b"abcdef\0".as_ptr(), b"ABCXYZ\0".as_ptr(), 3), 0);
+            assert!(_strnicmp(b"abcdef\0".as_ptr(), b"ABCXYZ\0".as_ptr(), 4) < 0);
+            assert!(_strnicmp(b"ABCXYZ\0".as_ptr(), b"abcdef\0".as_ptr(), 4) > 0);
+            assert_eq!(_strnicmp(b"abc\0".as_ptr(), b"abc\0".as_ptr(), 0), 0);
+            assert_eq!(_strnicmp(b"ab\0x\0".as_ptr(), b"AB\0y\0".as_ptr(), 5), 0);
+            // Retail abort 0x2237179: the drive-prefix probe in `exe+0x54F8A70`
+            // compares `G:/...` against `xg:`/`xd:` — a stub returning 0
+            // ("equal") strips the drive letter and breaks the dump-path lookup.
+            assert!(_strnicmp(b"G:/appdata0.rpf\0".as_ptr(), b"xg:\0".as_ptr(), 3) != 0);
+            assert!(_strnicmp(b"G:/appdata0.rpf\0".as_ptr(), b"xd:\0".as_ptr(), 3) != 0);
+            assert_eq!(_strnicmp(b"XD:foo\0".as_ptr(), b"xd:\0".as_ptr(), 3), 0);
+            assert_eq!(_strnicmp(b"XG:foo\0".as_ptr(), b"xg:\0".as_ptr(), 3), 0);
             let wa: [u16; 4] = [0x41, 0x42, 0x43, 0];
             let wb: [u16; 4] = [0x41, 0x42, 0x44, 0];
             assert_eq!(wcscmp(wa.as_ptr(), wa.as_ptr()), 0);
