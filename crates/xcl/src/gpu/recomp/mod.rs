@@ -74,6 +74,8 @@ pub mod runner;
 #[cfg(target_os = "linux")]
 pub mod vulkan_graphics;
 #[cfg(target_os = "linux")]
+pub mod vulkan_present;
+#[cfg(target_os = "linux")]
 pub mod vulkan_runner;
 pub mod ssa;
 #[cfg(all(test, windows))]
