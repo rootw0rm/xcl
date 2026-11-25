@@ -164,6 +164,13 @@ pub fn run(setting: &str) -> Vec<Check> {
     checks(&found)
 }
 
+/// Exit code for the `preflight` CLI: 1 when any check is an `Error`, else 0.
+/// (Same rule as the `main.rs` arm's inline check, factored so the CLI mapping
+/// is unit-testable; `main.rs` calls this.)
+pub fn exit_code(checks: &[Check]) -> i32 {
+    if checks.iter().any(|c| matches!(c.level, Level::Error)) { 1 } else { 0 }
+}
+
 /// The checks as console lines: OK ones first as `  label`, the rest as WARNING / ERROR with
 /// what to do.
 pub fn print(checks: &[Check]) {
@@ -246,6 +253,14 @@ mod tests {
         assert_eq!(levels(&found(Gpu { warp: true, ..gpu() }))[0], Level::Warning);
         let f = Found { gpu: Err("DXGI: E_FAIL".into()), ..found(gpu()) };
         assert_eq!(checks(&f)[0].level, Level::Error);
+    }
+
+    #[test]
+    fn exit_code_is_1_only_on_error() {
+        let ok = check(Level::Ok, "GPU: x", None);
+        assert_eq!(exit_code(&[ok.clone(), check(Level::Note, "n", None), check(Level::Warning, "w", Some("f"))]), 0);
+        assert_eq!(exit_code(&[ok, check(Level::Error, "e", Some("f"))]), 1);
+        assert_eq!(exit_code(&[]), 0);
     }
 
     #[test]

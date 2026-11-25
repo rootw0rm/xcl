@@ -52,6 +52,9 @@ pub mod pe;
 pub mod platform;
 #[cfg(windows)]
 pub mod preflight;
+#[cfg(not(windows))]
+#[path = "preflight_linux.rs"]
+pub mod preflight;
 pub mod report;
 #[cfg(windows)]
 pub mod resolver;
