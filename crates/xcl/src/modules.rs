@@ -65,12 +65,19 @@ pub fn unregister_mapped(base: usize) {
 
 /// Lock-free: base of the mapped image containing `addr`.
 pub fn image_base_for_addr(addr: usize) -> Option<usize> {
+    image_range_for_addr(addr).map(|(base, _)| base)
+}
+
+/// Lock-free: (base, size) of the mapped image containing `addr` (`None` when the
+/// address is in no mapped image). Crash-time readers use this instead of the
+/// table lock so a crash report never blocks behind the faulting thread.
+pub fn image_range_for_addr(addr: usize) -> Option<(usize, usize)> {
     let n = RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES);
     for i in 0..n {
         let b = RANGE_BASE[i].load(Ordering::Acquire);
         let s = RANGE_SIZE[i].load(Ordering::Acquire);
         if b != 0 && addr >= b && addr < b + s {
-            return Some(b);
+            return Some((b, s));
         }
     }
     None

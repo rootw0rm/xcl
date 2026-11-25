@@ -99,14 +99,49 @@ fn fault_pc(_context: *mut std::ffi::c_void) -> usize {
 }
 
 /// Crash description from synthetic or observed signal data: signal name and number,
-/// faulting PC with its nearest module+offset, and the fault address. Pure (no locks,
-/// no allocation beyond the string) so unit tests can check the report contents directly.
+/// faulting PC with its nearest module+offset, and the fault address. When the fault
+/// is a `SIGSEGV` at address 0 through the title's own `mov dword ptr [0], imm32`
+/// exit instruction, the line names the deliberate crash and its tag. Reads guest
+/// code through the lock-free module ranges only (never blocks the crash watchdog),
+/// so unit tests can check the report contents directly.
 pub fn format_crash(signal: libc::c_int, pc: usize, address: usize) -> String {
-    format!(
+    let mut crash = format!(
         "{} (signal {signal}) at {}; pc {pc:#x}; fault address {address:#x}",
         signal_name(signal),
         crate::modules::describe_address(pc)
-    )
+    );
+    // A title's own way to end itself: a write of a tag to address 0 (a retail game's
+    // GPU watchdog, "GPU Loc Sig", writes 0x4d8bd421; its thread's exit path writes 0).
+    // The faulting instruction itself proves the write, so no signal payload beyond
+    // SIGSEGV-at-null is needed on Linux.
+    if signal == libc::SIGSEGV && address == 0 {
+        if let Some(tag) = deliberate_tag_at_pc(pc) {
+            crash += &format!(" – the title's own deliberate crash: mov dword ptr [0], {tag:#x}");
+        }
+    }
+    crash
+}
+
+/// The tag of `mov dword ptr [0], imm32` (C7 04 25 00 00 00 00 imm32), the instruction titles
+/// use to end themselves on purpose.
+fn deliberate_null_write(code: &[u8]) -> Option<u32> {
+    (code.len() >= 11 && code[..7] == [0xC7, 0x04, 0x25, 0, 0, 0, 0])
+        .then(|| u32::from_le_bytes([code[7], code[8], code[9], code[10]]))
+}
+
+/// The deliberate-crash tag when `pc` points at that instruction inside a mapped image
+/// (`None` when `pc` is in no mapped image, when the 11 bytes would run past the image,
+/// or when the bytes are a different store). Lock-free: safe from the crash watchdog
+/// even if the faulting thread died holding the module-table lock.
+fn deliberate_tag_at_pc(pc: usize) -> Option<u32> {
+    let (base, size) = crate::modules::image_range_for_addr(pc)?;
+    if pc.checked_add(11)? > base + size {
+        return None;
+    }
+    // The 11 bytes lie inside an image the loader mapped, and the fault itself is a
+    // data access to address 0, so the code page is still resident.
+    let code = unsafe { std::slice::from_raw_parts(pc as *const u8, 11) };
+    deliberate_null_write(code)
 }
 
 fn signal_name(signal: libc::c_int) -> &'static str {
@@ -209,6 +244,65 @@ mod tests {
     );
     extern "C" {
         fn xcl_eh_test_fault();
+    }
+
+    #[test]
+    fn a_write_of_a_tag_to_address_0_is_named_a_deliberate_crash() {
+        // the two of a retail game's GPU watchdog: its tag, and 0 on its thread's exit path
+        let watchdog = [
+            0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D, 0x48, 0x83,
+        ];
+        assert_eq!(deliberate_null_write(&watchdog), Some(0x4D8B_D421));
+        assert_eq!(
+            deliberate_null_write(&[0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0xCC]),
+            Some(0)
+        );
+        let mut elsewhere = watchdog;
+        elsewhere[3] = 0x10; // mov dword ptr [0x10], imm32: an ordinary store
+        assert_eq!(deliberate_null_write(&elsewhere), None);
+        assert_eq!(
+            deliberate_null_write(&[0x89, 0x04, 0x25, 0, 0, 0, 0]),
+            None,
+            "a register store"
+        );
+        assert_eq!(deliberate_null_write(&watchdog[..10]), None, "cut short");
+    }
+
+    #[test]
+    fn sigsegv_at_null_names_the_deliberate_crash_only_for_that_store() {
+        static CODE: [u8; 13] = [
+            0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D, 0xCC, 0xCC,
+        ];
+        let pc = CODE.as_ptr() as usize;
+        crate::modules::register_mapped(std::sync::Arc::new(crate::modules::MappedModule {
+            name: "deliberate-test.exe".into(),
+            path: std::path::PathBuf::from("deliberate-test.exe"),
+            base: pc,
+            size: CODE.len(),
+            entry_rva: 0,
+            is_dll: false,
+            exports: Default::default(),
+            tls_callbacks: Default::default(),
+            no_thread_calls: Default::default(),
+            initialized: Default::default(),
+            stack_reserve: 0,
+        }));
+        let crash = format_crash(libc::SIGSEGV, pc, 0);
+        assert!(
+            crash.contains("the title's own deliberate crash: mov dword ptr [0], 0x4d8bd421"),
+            "{crash}"
+        );
+        // Gates that must stay silent while the image is still mapped.
+        let read = format_crash(libc::SIGSEGV, pc, 0x1000);
+        assert!(!read.contains("deliberate crash"), "{read}");
+        let trap = format_crash(libc::SIGTRAP, pc, 0);
+        assert!(!trap.contains("deliberate crash"), "{trap}");
+        let past_end = format_crash(libc::SIGSEGV, pc + 5, 0);
+        assert!(!past_end.contains("deliberate crash"), "{past_end}");
+        crate::modules::unregister_mapped(pc);
+        // A faulting PC in no mapped image names nothing (and reads nothing).
+        let unmapped = format_crash(libc::SIGSEGV, pc, 0);
+        assert!(!unmapped.contains("deliberate crash"), "{unmapped}");
     }
 
     #[test]
