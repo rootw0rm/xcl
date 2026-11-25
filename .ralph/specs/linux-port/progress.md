@@ -1615,3 +1615,48 @@ Verification (this host, no game files — retail SKIPPED):
   `XCL_VULKAN_BACKEND=bogus` → stays null, 12/0xc/29 (fresh dirs each;
   reusing a data dir adds the 2 known first-run overlay FAILs — harness
   note, not a code effect).
+
+## Critic review — step-17c vulkan-triangle-vertexid PASS (2026-11-25, independent re-verify)
+Task `task-1795572956-6511` (commit `8e2d38b`). Re-ran everything from scratch,
+no trust in builder notes:
+- `cargo test -p xcl --lib gpu::recomp::vulkan_graphics` → 9 passed (5 old + 4 new;
+  `title_triangle_draws_center_green_corner_blue` executes for real on the Arc A770;
+  both new word sets pass real `spirv-val 2026.4` with no skip; fail-closed + no-spawn gates pass).
+- `cargo test -p xcl --lib` → 481 passed; 0 failed; 1 ignored (matches builder).
+- `cargo test -p xcl --lib -- hle::vulkan_linux gpu::recomp::vulkan_runner` → 13 passed
+  (8 selector + 5 runner, lane agreement intact).
+- `cargo test -p xcl --lib gpu::recomp` → 167 passed (glsl/spirv gates still green).
+- `cargo check --workspace` → 0 errors (pre-existing warnings only);
+  `cargo clippy -p xcl --lib` → 0 errors (grep `^error` count 0).
+- `git diff --check` clean; `rustfmt --check` clean on `vulkan_graphics.rs` + `vulkan_runner.rs`.
+- No `Cargo.toml`/`Cargo.lock`/`build.rs` change in the commit → no new deps, no
+  `TRANSLATOR_SOURCES` change (`ash` MIT + `libloading` ISC pre-existing, runtime dlopen only).
+- Shipped-path audit: `Command::new`/`std::process` appear only after `#[cfg(test)]`
+  (enforced by the `shipped_path_spawns_no_compiler` test); bare `Command` hits are
+  `CommandPool`/`CommandBuffer` only. Vertex + fragment words are hand-assembled,
+  no compiler spawn on any shipped path.
+- Synthetic title, fresh game dir + fresh `XCL_DATA_ROOT` per run (this host, no game files):
+  default → `failures: 12`, `ExitProcess(0xc)`, `exit_code: 12`, `crash: null`,
+  `called_stubs: 29` (28 `d3d12_xs` + `XclDefinitelyMissingFunction` probe, zero
+  mfplat/xcrdapi/FormatMessage), `[PASS] DirectStorage` + `[PASS] MFPlat` hold — matches
+  the 12g/13/14/15/16/17a/17b baseline exactly. `XCL_VULKAN_BACKEND=vulkan` → single
+  `vulkan backend: ... split-32 lane path` line, still 12/0xc/29 (null device returned);
+  `XCL_VULKAN_BACKEND=bogus` → stays null, 12/0xc/29.
+- Requirements met: `triangle_vs_spv` reads `VertexIndex` (BuiltIn 42) with no vertex input,
+  bakes the title's exact NDC `(-0.5,-0.5)/(0,0.5)/(0.5,-0.5)` + `z=0/w=1` (float-bit literals
+  asserted + `bound == 26`); `green_fs_spv` writes constant `(0,1,0,1)` to exactly one
+  Location-0 out; on-device contract is center-green/corner-blue (4 centers exact green,
+  4 corners exact blue); structural magic/entry/decoration gates present for both word sets;
+  `SKIPPED` + `XCL_REQUIRE_GPU` path via runner `skip_test` preserved (fail-closed tests).
+- Fit: Linux-only files + progress.md, no D3D12.X routing change, no winit/swapchain/window.
+  Both 17b fmt follow-ups folded (mod ordering, let-else collapse); 17b teardown-order
+  follow-up folded by construction (new `Scope` owns every handle, same outer
+  `device.destroy_device` → `instance.destroy_instance` order; existing path untouched).
+- No blocking findings.
+
+## Follow-ups (minor, no new task)
+- `draw_offscreen` and `draw_triangle_offscreen` share the ~400-line image/render-pass/
+  framebuffer/readback shape by duplication (deliberate per-step slice, keeps the 17b path
+  untouched). If a third headless draw lands, factor the common image+readback helpers out.
+- Center-green asserts are exact `[0, 255, 0, 255]` (correct for a constant FS, but a future
+  recompiler-emitted VS with interpolation should use a tolerance band like the 17b blit gate).
