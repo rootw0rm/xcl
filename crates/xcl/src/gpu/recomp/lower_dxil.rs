@@ -1171,6 +1171,9 @@ mod tests {
     /// `s_and_saveexec`. #1426 would ballot the compare's mask through an exchange, a group
     /// barrier the upper half never reaches. The bridge reads back only each lane's bit, so this
     /// half's ballot is enough, and the only barrier left is the one at the start.
+    // GPU/DXC-backed translation test (disassemble + dispatch need DXC and a GPU);
+    // runner/dxc/validate are Windows-only until the SPIR-V backend lands.
+    #[cfg(windows)]
     #[test]
     fn a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier() {
         let lines: &[I] = &[
