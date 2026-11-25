@@ -385,16 +385,17 @@ impl Vfs {
         }
     }
 
-    /// `dir` is a folder of XCL's own outside the title's data folder – the shader cache, which
-    /// titles share. A console drive mount must not translate its paths either: with the cache on
-    /// the PC's D: drive ("D:" is the console's game drive) the title's process wrote its DXIL
-    /// into the overlay and looked for it in the game folder, so what `xcl shaders --precompile`
-    /// had put into the cache was never found and every run compiled again.
+    /// `dir` is a folder of XCL's own outside the title's data folder – the shader cache,
+    /// `xcl.exe`'s directory, or configured host tool DLL folders (`XCL_DXC_DIR`, …). A console
+    /// drive mount must not translate its paths either: with the cache or DXC on the PC's D: drive
+    /// ("D:" is the console's game drive) the title's process wrote its DXIL into the overlay and
+    /// looked for it or `dxcompiler.dll` in the game folder. Bare drive roots are ignored so an
+    /// empty or root path cannot disable a whole console drive mount.
     pub fn own_folder(mut self, dir: &Path) -> Vfs {
         let dir = dir.to_string_lossy();
         let dir = full_path(&dir).unwrap_or_else(|| dir.into_owned());
         let dir = trim_sep(&strip_verbatim(&norm(&dir))).to_lowercase();
-        if !dir.is_empty() {
+        if !dir.is_empty() && !(dir.len() == 2 && dir.as_bytes()[1] == b':') {
             self.own_roots_lc.push(dir);
         }
         self
@@ -540,7 +541,10 @@ impl Vfs {
         };
         #[cfg(not(windows))]
         let (p, translated) = match self.apply_mounts_checked(&p) {
-            Some(Ok(t)) => (t, true),
+            Some(Ok(t)) if !self.translated_in_own_folders(&t) => (t, true),
+            // an own folder of XCL's under the mount target stays where it is (upstream
+            // #2101: the console drive must not translate the host's tool folders)
+            Some(Ok(_)) => return Target::Pass,
             Some(Err(error)) => return Target::Reject(error),
             None => (p, false),
         };
@@ -642,6 +646,25 @@ impl Vfs {
         } else {
             Target::Pass
         }
+    }
+
+    /// A mount-translated host path inside one of XCL's own folders (the Linux twin of the
+    /// Windows `in_own_folders` exemption, on the translated side): a console drive mount
+    /// whose target contains a tool folder must not route the title into it. Only
+    /// `own_folder` roots count – the game root still classifies `Game` and data mounts
+    /// keep their `Translated` semantics in `classify_abs`.
+    /// Only a translated host path counts: Linux has no drive-letter resolution, so the
+    /// spelled console path itself can never name a host folder the way `in_own_folders`
+    /// resolves it on Windows.
+    #[cfg(not(windows))]
+    fn translated_in_own_folders(&self, translated: &str) -> bool {
+        let lc = trim_sep(&strip_verbatim(&norm(translated))).to_lowercase();
+        self.own_roots_lc.iter().any(|root| {
+            lc == *root
+                || lc
+                    .strip_prefix(root.as_str())
+                    .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
+        })
     }
 
     /// A path that already names the game folder or one of XCL's own folders on the PC (the
@@ -1641,6 +1664,60 @@ mod tests {
         assert_eq!(v.classify(&format!("{drive}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
         // a verbatim path (`std::fs::canonicalize`, which the DXIL cache uses for its folder)
         assert_eq!(v.classify(&format!("\\\\?\\{file}")), Target::Pass);
+    }
+
+    /// Linux twin of upstream #2101: a console drive mount whose target holds one of XCL's
+    /// own folders must not route the title into it. Windows pins this through
+    /// `in_own_folders` (drive-letter resolution of the spelled path); Linux has no drive
+    /// letters, so the exemption runs on the translated host path instead.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_console_drive_mount_leaves_xcls_own_folders_outside_the_game() {
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_own_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        let tools = dir.join("tools");
+        std::fs::create_dir_all(game.join("data")).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("opus.dll"), b"tool").unwrap();
+        std::fs::write(game.join("data").join("hello.txt"), b"original").unwrap();
+        // the operator mounts the drive at the parent holding both the game and the tools
+        let mounts = vec![("D:".to_string(), dir.to_string_lossy().to_string())];
+        let v = Vfs::new(&game, &dir.join("xcldata"), mounts).own_folder(&tools);
+        // the tool folder stays where it is instead of becoming title files ...
+        assert_eq!(v.classify("D:\\tools\\opus.dll"), Target::Pass);
+        assert_eq!(v.classify("D:\\tools"), Target::Pass);
+        // ... while the game beside it still classifies through the mount ...
+        assert_eq!(
+            v.classify("D:\\game\\data\\hello.txt"),
+            Target::Game { rel: "data\\hello.txt".into() }
+        );
+        assert_eq!(v.classify("D:\\game"), Target::Game { rel: String::new() });
+        // ... and a lookalike prefix is not an own folder.
+        assert!(matches!(v.classify("D:\\tools2\\opus.dll"), Target::Translated(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Upstream #2101 ignores bare drive roots in `own_folder` so an empty or root path
+    /// cannot disable a whole console drive mount. Linux absolutises `own_folder` inputs
+    /// against the cwd, so a bare `D:\` can never resolve to a matchable root – pin that
+    /// registering one still leaves the mount classifying `Game` (characterization: passes
+    /// with and without the guard; the guard itself is shared-file verbatim).
+    #[cfg(not(windows))]
+    #[test]
+    fn a_bare_drive_root_own_folder_disables_no_console_mount() {
+        let f = Fixture::new("own_root_guard");
+        let v = Vfs::new(
+            &f.game(),
+            &f.dir.join("xcldata"),
+            vec![("D:".to_string(), f.game().to_string_lossy().to_string())],
+        )
+        .own_folder(Path::new("D:\\"))
+        .own_folder(Path::new("D:\\sub\\.."));
+        assert_eq!(
+            v.classify("D:\\data\\hello.txt"),
+            Target::Game { rel: "data\\hello.txt".into() }
+        );
     }
 
     #[test]

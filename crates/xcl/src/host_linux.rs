@@ -5,9 +5,10 @@
 //! No Windows DLL is loaded; unresolved imports fail the load cleanly because
 //! `load_main` rejects them before any image code runs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Boot;
+use crate::vfs::Vfs;
 
 /// Run a prepared boot record in this process. Returns the title's exit code,
 /// or `0x7C1_xxxx` on host-side failures (mirroring the Windows host codes).
@@ -33,17 +34,17 @@ pub fn run_boot(boot: &Boot) -> u32 {
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);
 
-    let mounts: Vec<(String, String)> = boot
-        .config
-        .mounts
-        .iter()
-        .map(|(k, v)| (k.clone(), boot.expand(v)))
-        .collect();
-    crate::vfs::init(crate::vfs::Vfs::new(
-        &boot.game_root,
-        &boot.data_dir,
-        mounts,
-    ));
+    let mut extra_own: Vec<PathBuf> = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).into_iter().collect();
+    for var in ["XCL_DXC_DIR", "XCL_D3D12_DIR", "XCL_OPUS_DIR"] {
+        if let Some(dir) = std::env::var_os(var).and_then(trim_dir) {
+            extra_own.push(dir);
+        }
+    }
+    // Linux has no out-of-data shader disk cache (no DXC/D3D12: the SPIR-V path keeps no
+    // disk cache), so the data-internal cache dir is passed for shape parity – it is
+    // already covered as title data. The live own folders here are the exe directory and
+    // `XCL_OPUS_DIR` (libopus lookup, shared with Windows).
+    crate::vfs::init(build_vfs(&boot, &boot.cache_dir(), &extra_own));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     // Linux has no KERNELBASE hooks to install and no RtlPcToFileHeader hook;
@@ -108,9 +109,37 @@ pub fn host_main(boot_path: &Path) -> i32 {
     run_boot(&boot) as i32
 }
 
+fn trim_dir(raw: std::ffi::OsString) -> Option<PathBuf> {
+    match raw.to_str() {
+        Some(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| PathBuf::from(t))
+        }
+        None => Some(PathBuf::from(raw)),
+    }
+}
+
+/// Build the Linux host VFS, exempting XCL's own folders outside `boot.data_dir` (the exe
+/// directory and configured host tool folders) from console drive mounts – the Linux twin
+/// of upstream #2101's Windows `build_vfs` (whose cache dir is DXC-only, absent on Linux).
+fn build_vfs(boot: &Boot, cache_dir: &Path, extra_own: &[PathBuf]) -> Vfs {
+    let mounts: Vec<(String, String)> = boot
+        .config
+        .mounts
+        .iter()
+        .map(|(k, v)| (k.clone(), boot.expand(v)))
+        .collect();
+    let mut vfs = Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(cache_dir);
+    for dir in extra_own {
+        vfs = vfs.own_folder(dir);
+    }
+    vfs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::Target;
 
     fn tiny_exe_returning(code: u8, image_base: u64) -> Vec<u8> {
         // Minimal PE32+ EXE: one .text section, entry `mov eax, imm; ret`, no imports.
@@ -212,6 +241,7 @@ mod tests {
 
     #[test]
     fn synthetic_title_returns_its_entry_code() {
+
         const CHILD: &str = "XCL_HOST_LINUX_RUN_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let dir = std::path::PathBuf::from(std::env::var("XCL_HOST_LINUX_DIR").unwrap());
@@ -253,5 +283,55 @@ mod tests {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn trim_dir_rejects_blank_and_trims() {
+        assert_eq!(trim_dir("".into()), None);
+        assert_eq!(trim_dir("   \t  ".into()), None);
+        assert_eq!(
+            trim_dir("  /opt/xcl/sdk  ".into()),
+            Some(PathBuf::from("/opt/xcl/sdk"))
+        );
+    }
+
+    /// Linux shape of upstream #2101's `console_drive_mount_exempts_host_tool_and_exe_folders`:
+    /// drive letters are Windows-only, so the mount target is the POSIX parent holding the
+    /// game and the tool folders, and the exemption is pinned through console paths (the
+    /// only spelling that can hit a mount on Linux – POSIX tool paths already `Pass`).
+    #[test]
+    fn console_drive_mount_exempts_host_tool_and_exe_folders() {
+        let root = std::env::temp_dir().join(format!("xcl_host_own_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("game");
+        let data = root.join("xcldata");
+        let cache = root.join("dxil_cache");
+        let tool = root.join("sdk");
+        let exe_dir = root.join("bin");
+        for d in [&game, &data, &cache, &tool, &exe_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(game.join("data_marker.txt"), b"game").unwrap();
+        std::fs::write(tool.join("opus.dll"), b"tool").unwrap();
+        let mut config = crate::config::Config::default();
+        config.mounts.insert("D:".into(), root.to_string_lossy().to_string());
+        let boot = Boot {
+            title: "test".into(),
+            exe_path: game.join("test.exe"),
+            game_root: game.clone(),
+            data_dir: data,
+            config,
+        };
+
+        let vfs = build_vfs(&boot, &cache, &[exe_dir, tool]);
+        // console paths naming the tool/exe/cache folders stay on the host ...
+        assert_eq!(vfs.classify("D:\\sdk\\opus.dll"), Target::Pass);
+        assert_eq!(vfs.classify("D:\\bin\\xcl"), Target::Pass);
+        assert_eq!(vfs.classify("D:\\dxil_cache\\a.dxil"), Target::Pass);
+        // ... while the game beside them still classifies through the mount ...
+        assert_eq!(vfs.classify("D:\\game"), Target::Game { rel: String::new() });
+        // ... and a lookalike prefix is not an own folder.
+        assert!(matches!(vfs.classify("D:\\sdk2\\opus.dll"), Target::Translated(_)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
