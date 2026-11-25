@@ -1543,3 +1543,75 @@ no trust in builder notes:
 - `vulkan_graphics.rs` teardown `Scope` drops the Vulkan `device` handle's children but the
   device/instance teardown order on the error path after `run()` returns relies on the outer
   `destroy_instance`; fine for a test/headless path, revisit if this grows into the real backend.
+
+## Verification Notes — step-17c vulkan-triangle-vertexid (Builder, 2026-11-25, `linux`)
+
+Task `task-1795572956-6511` / plan.md step 17c (`linux:vulkan-triangle-vertexid`, DEC-026).
+
+Landed (Linux-only files + progress.md, no refactors):
+- `crates/xcl/src/gpu/recomp/vulkan_graphics.rs`: `triangle_vs_spv()` —
+  hand-assembled Vertex `main` reading `VertexIndex` (BuiltIn 42, no vertex
+  input), two `OpIEqual` (170, scalar `uint`) + three scalar `OpSelect` (169)
+  picking corner components, one `OpCompositeConstruct` to `Position`
+  (BuiltIn 0); bakes the title's NDC `(-0.5,-0.5)/(0,0.5)/(0.5,-0.5)`,
+  `z = 0`, `w = 1` as float-bit constants. `green_fs_spv()` — hand-assembled
+  Fragment `main` writing constant `(0,1,0,1)` to location 0, no inputs.
+  `draw_triangle_offscreen(vs_words, fs_words)`: same 64×64
+  `R8G8B8A8_UNORM` image/render-pass/framebuffer/readback shape as
+  `draw_offscreen` but cleared to `TRIANGLE_CLEAR` blue
+  (`[0.0, 0.0, 1.0, 1.0]`, the title's clear), empty vertex-input state, bare 3-vertex
+  `cmd_draw`, 5 s fence wait, `String` errors with `"no "` prefix for
+  missing Vulkan/device (skip via the runner's `skip_test`). Both word sets
+  SPIR-V 1.0, Shader capability, Logical GLSL450; no compiler, no process
+  spawn, no new deps. 4 new tests: VS structural (Vertex entry, both
+  builtins, IEqual + 3 Selects, four NDC float literals, bound 26) +
+  `spirv-val` gate; FS structural (Fragment entry, OriginUpperLeft, exactly
+  one Location-0 out, composite construct) + `spirv-val` gate; on-device
+  title contract (center 4 px exactly green, 4 corners exactly blue);
+  fail-closed on bad VS/FS magic. New `TITLE_TRIANGLE_NDC` const documents
+  the title primitive next to the builder.
+- `crates/xcl/src/gpu/recomp/mod.rs`: `vulkan_graphics` before
+  `vulkan_runner` (folds 17b fmt/mod-order follow-up).
+- `crates/xcl/src/gpu/recomp/vulkan_runner.rs`: let-else collapsed to one
+  line (folds 17b fmt follow-up). No behavior change.
+- The 17b teardown-order follow-up is folded by construction: the new
+  `Scope` owns every created handle (no vertex-buffer fields to forget) and
+  the same outer `device.destroy_device` → `instance.destroy_instance`
+  order as `draw_offscreen`; the existing path is untouched.
+
+Spirv opcode note (for the next hand-rolled backend slice): `OpSelect` is
+169 and `OpIEqual` is 170 — not 247/242 (those are `OpAtomicOr`/
+`OpAtomicXor`; first draft decoded as atomics and `spirv-val` rejected it).
+A vector `OpSelect` needs a vector condition, so the corner pick is three
+scalar selects + one composite, never control flow.
+
+Verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib gpu::recomp::vulkan_graphics` → 9 passed (5 old
+  + 4 new; `title_triangle_draws_center_green_corner_blue` executes for
+  real on the Intel Arc A770, `subgroupSize 32 -> split-32`; both new word
+  sets pass real `spirv-val`; fail-closed + no-spawn gates pass).
+- `cargo test -p xcl --lib gpu::recomp` → 167 passed (blit/glsl/spirv gates
+  still green); `hle::vulkan_linux` → 8 passed; `vulkan_runner` → 5 passed.
+- `cargo test -p xcl --lib` → 481 passed; 0 failed; 1 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only).
+- `cargo clippy -p xcl --lib` → 0 errors.
+- `rustfmt --edition 2021 --check` clean on `vulkan_graphics.rs` +
+  `vulkan_runner.rs` (leaves; `mod.rs` is a module root so it is not passed
+  to bare `rustfmt` — that reformats the whole `recomp/` tree; the swap
+  itself is 4 lines); `git diff --check` clean.
+- Shipped-path audit: the existing `shipped_path_spawns_no_compiler` test
+  (whole file before `#[cfg(test)]`) passes with the new code;
+  `Command::new`/`std::process` only under `#[cfg(test)]`; `git diff` on
+  `Cargo.toml`/`Cargo.lock`/`build.rs` empty (no new deps, no
+  `TRANSLATOR_SOURCES` change; `ash` MIT + `libloading` ISC, runtime
+  `dlopen` only).
+- Cross-built synthetic title (fresh game dir + fresh `XCL_DATA_ROOT` per
+  run): default → `failures: 12`, `ExitProcess(0xc)`, `called_stubs: 29`
+  (28 `d3d12_xs` + probe, zero `mfplat`/`xcrdapi`/`FormatMessage`),
+  `[PASS] DirectStorage` + `[PASS] MFPlat` hold — matches the
+  12g/13/14/15/16/17a/17b baseline exactly; 12 remaining FAILs are the
+  known null-device D3D12 categories, no new failure.
+- `XCL_VULKAN_BACKEND=vulkan` → still 12/0xc/29 (null device returned);
+  `XCL_VULKAN_BACKEND=bogus` → stays null, 12/0xc/29 (fresh dirs each;
+  reusing a data dir adds the 2 known first-run overlay FAILs — harness
+  note, not a code effect).

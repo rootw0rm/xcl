@@ -96,10 +96,7 @@ pub(crate) fn pick_device_for(
             .to_string_lossy()
             .into_owned();
         let queues = unsafe { instance.get_physical_device_queue_family_properties(p) };
-        let Some(qfi) = queues
-            .iter()
-            .position(|q| q.queue_flags.contains(want))
-        else {
+        let Some(qfi) = queues.iter().position(|q| q.queue_flags.contains(want)) else {
             continue;
         };
         // Step-16 lane decision: core `subgroupSize` plus the
