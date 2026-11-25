@@ -3664,6 +3664,13 @@ fn list_host_dir(path: &str, pattern: &str) -> Vec<FindDataW> {
 
 fn game_dir_entries(v: &crate::vfs::Vfs, dir_rel: &str, pattern: &str) -> Result<Vec<FindDataW>, u32> {
     use crate::vfs::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    // A mount root has no entry of its own: FindFirstFileW("G:\\") fails with
+    // ERROR_FILE_NOT_FOUND like a native drive root (upstream #761: `rel.is_empty()`
+    // in `collect_game_entries`; here `rel` arrives already split, so the empty
+    // full rel is `dir_rel` and `pattern` both empty).
+    if dir_rel.is_empty() && pattern.is_empty() {
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
     if !dir_rel.is_empty() && !v.is_dir(dir_rel) {
         return Err(ERROR_PATH_NOT_FOUND);
     }
@@ -9774,6 +9781,84 @@ mod tests {
             gate.wait();
             assert!(close_find_handle(h2));
             let _ = reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn find_first_on_mount_root_fails_like_native_drive_root() {
+        // Linux port of upstream #761 (`find_first_on_mount_root_matches_native_drive_root`
+        // in `vfs_hooks.rs`, Windows-only): a mount root has no entry of its own, so
+        // `FindFirstFileW("G:\\")` fails with ERROR_FILE_NOT_FOUND just like native
+        // `FindFirstFileW("C:\\")`. The upstream test probes a native drive via
+        // `windows_sys`, which has no Linux meaning; this exercises the live Linux
+        // path (`find_first_impl` -> `game_dir_entries`) on all four entries, and
+        // pins that a root wildcard still lists the game contents.
+        let _ = ensure_test_vfs();
+        unsafe {
+            let root_w = crate::util::wide("G:\\");
+            let root_a = std::ffi::CString::new("G:\\").unwrap();
+            let mut data: FindDataW = std::mem::zeroed();
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileW(root_w.as_ptr(), &mut data),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileA(root_a.as_ptr() as *const u8, &mut data),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileExW(
+                    root_w.as_ptr(),
+                    0,
+                    &mut data as *mut _ as *mut c_void,
+                    0,
+                    std::ptr::null(),
+                    0
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileExA(
+                    root_a.as_ptr() as *const u8,
+                    0,
+                    &mut data as *mut _ as *mut c_void,
+                    0,
+                    std::ptr::null(),
+                    0
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+
+            // A root wildcard still lists the game folder contents.
+            let star = crate::util::wide("G:\\*");
+            let mut first: FindDataW = std::mem::zeroed();
+            let fh = FindFirstFileW(star.as_ptr(), &mut first);
+            assert_ne!(fh, INVALID_HANDLE_VALUE);
+            let wname = |d: &FindDataW| {
+                let n = d.name.iter().position(|&c| c == 0).unwrap_or(d.name.len());
+                String::from_utf16_lossy(&d.name[..n])
+            };
+            let mut names = vec![wname(&first)];
+            loop {
+                let mut next: FindDataW = std::mem::zeroed();
+                if FindNextFileW(fh, &mut next) == 0 {
+                    break;
+                }
+                names.push(wname(&next));
+            }
+            assert_eq!(FindClose(fh), 1);
+            assert!(
+                names.iter().any(|n| n == "data"),
+                "root wildcard must list game contents, got {names:?}"
+            );
         }
     }
 

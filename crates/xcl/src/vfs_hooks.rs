@@ -1075,6 +1075,10 @@ fn collect_game_entries(
     rel: &str,
     collect_fn: impl Fn(&str) -> Vec<WIN32_FIND_DATAW>,
 ) -> Result<Vec<WIN32_FIND_DATAW>, u32> {
+    // A drive root has no entry of its own: FindFirstFileW("C:\\") fails with ERROR_FILE_NOT_FOUND.
+    if rel.is_empty() {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
     let (dir_rel, pattern) = match rel.rsplit_once('\\') {
         Some((d, p)) => (d.to_string(), p.to_string()),
         None => (String::new(), rel.to_string()),
