@@ -1482,6 +1482,173 @@ pub unsafe extern "win64" fn ReleaseSemaphore(
 }
 
 // ---------------------------------------------------------------------------------------
+// Condition variables: guest-memory CONDITION_VARIABLEs against the CS table.
+// ---------------------------------------------------------------------------------------
+//
+// The game probes `SleepConditionVariableCS`/`WakeAllConditionVariable` through
+// `GetProcAddress`; the auto-stub NULLs failed the probe. A Windows
+// `CONDITION_VARIABLE` is one pointer (zero-initialized); host wait state lives here
+// keyed by guest address, so static (`{0}`) and `InitializeConditionVariable` forms
+// both work. `SleepConditionVariableCS` fully releases the critical section while
+// blocked (recursion preserved) and reacquires it before returning, as on Windows;
+// wakes are a generation bump, so a `Wake` racing the release is never missed and a
+// `Wake` with no waiters is lost, as on Windows.
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+struct CondWaiter {
+    signaled: Mutex<bool>,
+    cvar: Condvar,
+}
+
+static CONDVARS: OnceLock<Mutex<HashMap<usize, Vec<std::sync::Arc<CondWaiter>>>>> =
+    OnceLock::new();
+
+fn condvars() -> &'static Mutex<HashMap<usize, Vec<std::sync::Arc<CondWaiter>>>> {
+    CONDVARS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop `me` from the guest address's waiter list, signalling it first when asked.
+fn unpark_cond_waiter(key: usize, me: &std::sync::Arc<CondWaiter>, signal: bool) {
+    if signal {
+        *me.signaled.lock().unwrap() = true;
+        me.cvar.notify_one();
+    }
+    let mut g = condvars().lock().unwrap();
+    if let Some(v) = g.get_mut(&key) {
+        v.retain(|w| !std::sync::Arc::ptr_eq(w, me));
+        if v.is_empty() {
+            g.remove(&key);
+        }
+    }
+}
+
+/// `VOID InitializeConditionVariable(PCONDITION_VARIABLE)` — zeroes the guest slot.
+pub unsafe extern "win64" fn InitializeConditionVariable(cv: *mut usize) {
+    if !cv.is_null() {
+        *cv = 0;
+    }
+}
+
+/// `BOOL SleepConditionVariableCS(PCONDITION_VARIABLE, PCRITICAL_SECTION, DWORD ms)` —
+/// releases `cs` while blocked, reacquires before returning; 1 on wake, 0 on timeout
+/// (`ERROR_TIMEOUT`) or on a null/unknown/unowned CS (`ERROR_INVALID_PARAMETER`).
+pub unsafe extern "win64" fn SleepConditionVariableCS(
+    cv: *mut usize,
+    cs: *mut CritSec,
+    timeout_ms: u32,
+) -> i32 {
+    if cv.is_null() || cs.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(st) = cs_state_for(cs as usize) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let me = current_tid();
+    // The caller must hold the CS; snapshot the recursion to restore it.
+    let saved = {
+        let g = st.owner.lock().unwrap();
+        if g.0 != me || g.1 == 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        g.1
+    };
+    let cond_key = cv as usize;
+    let waiter = std::sync::Arc::new(CondWaiter {
+        signaled: Mutex::new(false),
+        cvar: Condvar::new(),
+    });
+    condvars().lock().unwrap().entry(cond_key).or_default().push(waiter.clone());
+    // Fully release, as Windows does (a contender wakes here). A Wake that lands from
+    // here on finds us in the list, so it is never missed; a Wake from before we
+    // registered is lost, as on Windows.
+    {
+        let mut g = st.owner.lock().unwrap();
+        *g = (0, 0);
+        st.cvar.notify_one();
+    }
+    // Block on our own waiter until signalled (or the timeout lapses).
+    let woken = {
+        let mut g = waiter.signaled.lock().unwrap();
+        if *g {
+            true
+        } else if timeout_ms == 0 {
+            false
+        } else if timeout_ms == INFINITE {
+            while !*g {
+                g = waiter.cvar.wait(g).unwrap();
+            }
+            true
+        } else {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+            while !*g {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (guard, timeout) = waiter.cvar.wait_timeout(g, deadline - now).unwrap();
+                g = guard;
+                if *g {
+                    break;
+                }
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            *g
+        }
+    };
+    unpark_cond_waiter(cond_key, &waiter, false);
+    // Reacquire before returning (same order as `EnterCriticalSection`).
+    {
+        let mut g = st.owner.lock().unwrap();
+        while g.0 != 0 {
+            g = st.cvar.wait(g).unwrap();
+        }
+        *g = (me, saved);
+    }
+    if woken {
+        set_error(ERROR_SUCCESS);
+        1
+    } else {
+        set_error(ERROR_TIMEOUT);
+        0
+    }
+}
+
+fn wake_condvar(cv: *mut usize, all: bool) {
+    if cv.is_null() {
+        return;
+    }
+    let key = cv as usize;
+    if all {
+        let waiters = condvars().lock().unwrap().remove(&key).unwrap_or_default();
+        for w in waiters {
+            *w.signaled.lock().unwrap() = true;
+            w.cvar.notify_one();
+        }
+    } else {
+        let one = condvars().lock().unwrap().get(&key).and_then(|v| v.first().cloned());
+        if let Some(w) = one {
+            unpark_cond_waiter(key, &w, true);
+        }
+    }
+}
+
+/// `VOID WakeConditionVariable(PCONDITION_VARIABLE)` — wakes one waiter, if any.
+pub unsafe extern "win64" fn WakeConditionVariable(cv: *mut usize) {
+    wake_condvar(cv, false);
+}
+
+/// `VOID WakeAllConditionVariable(PCONDITION_VARIABLE)` — wakes every waiter, if any.
+pub unsafe extern "win64" fn WakeAllConditionVariable(cv: *mut usize) {
+    wake_condvar(cv, true);
+}
+
+// ---------------------------------------------------------------------------------------
 // Waitable timers + WaitOnAddress family (Phase C step 11e)
 // ---------------------------------------------------------------------------------------
 //
@@ -7780,6 +7947,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("TryEnterCriticalSection", TryEnterCriticalSection as usize),
         ("LeaveCriticalSection", LeaveCriticalSection as usize),
         ("DeleteCriticalSection", DeleteCriticalSection as usize),
+        ("InitializeConditionVariable", InitializeConditionVariable as usize),
+        ("SleepConditionVariableCS", SleepConditionVariableCS as usize),
+        ("WakeConditionVariable", WakeConditionVariable as usize),
+        ("WakeAllConditionVariable", WakeAllConditionVariable as usize),
         ("InitializeSRWLock", InitializeSRWLock as usize),
         ("AcquireSRWLockExclusive", AcquireSRWLockExclusive as usize),
         ("ReleaseSRWLockExclusive", ReleaseSRWLockExclusive as usize),
@@ -9401,6 +9572,86 @@ mod tests {
             // Closed semaphores are gone from every wait path.
             assert_eq!(WaitForSingleObject(both, 0), WAIT_FAILED);
             assert_eq!(ReleaseSemaphore(both, 1, std::ptr::null_mut()), 0);
+        }
+    }
+
+    #[test]
+    fn condition_variables_sleep_and_wake() {
+        unsafe {
+            // Nulls and an unowned CS fail cleanly, never block.
+            let mut cv_slot = 0usize;
+            let cv = &mut cv_slot as *mut usize;
+            InitializeConditionVariable(cv);
+            assert_eq!(cv_slot, 0);
+            assert_eq!(SleepConditionVariableCS(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            let cs = Box::into_raw(Box::new(std::mem::zeroed::<CritSec>()));
+            assert_eq!(InitializeCriticalSection(cs), 1);
+            assert_eq!(SleepConditionVariableCS(cv, cs, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // A short timeout releases, lapses, and reacquires (still owned once).
+            EnterCriticalSection(cs);
+            assert_eq!(SleepConditionVariableCS(cv, cs, 20), 0);
+            assert_eq!(GetLastError(), ERROR_TIMEOUT);
+            LeaveCriticalSection(cs);
+            assert_eq!(TryEnterCriticalSection(cs), 1);
+            LeaveCriticalSection(cs);
+            // A waiter blocked in Sleep wakes on WakeAll and leaves owning nothing.
+            let cs_addr = cs as usize;
+            let cv_addr = cv as usize;
+            let woken = Arc::new(AtomicU32::new(0));
+            let h = std::thread::spawn({
+                let woken = woken.clone();
+                move || unsafe {
+                    let cs = cs_addr as *mut CritSec;
+                    let cv = cv_addr as *mut usize;
+                    EnterCriticalSection(cs);
+                    let r = SleepConditionVariableCS(cv, cs, 5000);
+                    if r == 1 {
+                        woken.fetch_add(1, Ordering::SeqCst);
+                    }
+                    LeaveCriticalSection(cs);
+                }
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            WakeAllConditionVariable(cv);
+            h.join().unwrap();
+            assert_eq!(woken.load(Ordering::SeqCst), 1);
+            assert_eq!(TryEnterCriticalSection(cs), 1);
+            LeaveCriticalSection(cs);
+            // WakeSingle wakes exactly one of two waiters; the other times out.
+            let mut cv2_slot = 0usize;
+            let cv2 = &mut cv2_slot as *mut usize;
+            InitializeConditionVariable(cv2);
+            let cv2_addr = cv2 as usize;
+            let r1 = Arc::new(AtomicU32::new(2));
+            let r2 = Arc::new(AtomicU32::new(2));
+            let waiter = |out: Arc<AtomicU32>| {
+                std::thread::spawn(move || unsafe {
+                    let cs = cs_addr as *mut CritSec;
+                    let cv = cv2_addr as *mut usize;
+                    EnterCriticalSection(cs);
+                    let r = SleepConditionVariableCS(cv, cs, 800);
+                    out.store(r as u32, Ordering::SeqCst);
+                    LeaveCriticalSection(cs);
+                })
+            };
+            let h1 = waiter(r1.clone());
+            let h2 = waiter(r2.clone());
+            std::thread::sleep(Duration::from_millis(150));
+            WakeConditionVariable(cv2);
+            h1.join().unwrap();
+            h2.join().unwrap();
+            let mut got = [r1.load(Ordering::SeqCst), r2.load(Ordering::SeqCst)];
+            got.sort_unstable();
+            assert_eq!(got, [0, 1]);
+            // Wakes with no waiters (and nulls) are lost silently.
+            WakeConditionVariable(cv2);
+            WakeAllConditionVariable(cv2);
+            WakeConditionVariable(std::ptr::null_mut());
+            WakeAllConditionVariable(std::ptr::null_mut());
+            assert_eq!(DeleteCriticalSection(cs), 1);
+            let _ = Box::from_raw(cs);
         }
     }
 
