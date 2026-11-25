@@ -39,6 +39,11 @@ first (short contract); this file is the work plan. Details live in
   (command-list memory + raytracing surface flipped); remaining 10 need
   a real renderer. Retail unmoved at `0x2237179` with zero d3d12 calls —
   next retail step is game-RE on that abort, not more device stubs.
+- Ported 6 upstream fixes as individual commits (each verified against
+  the live PR head pre-commit; 2 force-pushes caught and ported fresh):
+  #1610 COM identity, #1705/#240 report poison-lock guard, #1143 page-
+  allocation boundary, #2136/#2148/#2134 recompiler soundness
+  (lib tests 534 passed).
 - **Game files are PRESENT on this host** (the drive is mounted):
   `/run/media/anon/12TB_B/torrents/GTA6.Xbox.v1.0.2.1-CYBERLEEK/`
   (`game_scarlett_master.exe`, 120 MB, + `MicrosoftGame.Config`) and
