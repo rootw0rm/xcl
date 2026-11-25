@@ -258,6 +258,49 @@ Windows behavior unchanged.
   `kernel32` stub the synthetic title calls (1 call in the 34-entry `called_stubs`;
   the rest are Phase-D D3D12 slots plus `DStorage`/`MFPlat`). Steps 13–21 stay chained
   behind SKIPPED step-12; Phase D/E/F remain blocked per §4.7.
+- Planner revise (2026-11-25, `linux` @ `6473823`, no game files on host): step 12e
+  (`linux:format-message`, `43bdabc`) closed with review (375 lib tests, title
+  `ExitProcess(0xe)`/14 fails, `called_stubs: 33` with zero `FormatMessage` entries
+  vs 34 before). Fresh triage here re-ran the title log: the only non-GPU,
+  non-probe stubs the title actually calls are `mfplat` (`MFStartup`/
+  `MFCreateDXGIDeviceManager`/`MFShutdown` x1 each; `MFResetDXGIDeviceManagerX`
+  imported but never reached because `MFCreate` fails) and `xcrdapi`
+  `DStorageGetFactory` x1, plus the expected `XclDefinitelyMissingFunction` probe;
+  the other ~27 are Phase-D D3D12 console slots. New step 12f
+  (`linux:mfplat-headless`) is the unblocked next task: a headless MF manager
+  (same pattern as GameInput/XAudio2 null objects) flips the MFPlat title check
+  without touching D3D12/DStorage. `DStorage` stays provisional after 12f (larger
+  factory/queue/status/fence surface, own slice). Steps 13–21 stay chained behind
+  SKIPPED step-12; Phase D/E/F remain blocked per §4.7.
+
+- Planner revise (2026-11-25, `linux` @ `a89e0b6`, no game files on host): step 12f
+  (`linux:mfplat-headless`, `00a9f50`) closed with review (378 lib tests, title
+  `ExitProcess(0xd)`/13 fails, `called_stubs: 30` with zero `mfplat` entries vs 33
+  before, `[PASS] MFPlat`). Fresh triage here re-ran the title
+  (`ExitProcess(0xd)`, 13 fails, `called_stubs: 30` = ~28 Phase-D D3D12 slots +
+  `DStorageGetFactory` x1 + expected probe x1). New step 12g
+  (`linux:dstorage-read`) is the unblocked next task: a Linux `dstorage_linux`
+  file-read subset (factory/queue/file/status + sync Submit + fence signal, title
+  verbs only; compression/BCPack/swizzle stay refused) that flips the DirectStorage
+  title check without touching Phase-D D3D12 slots. Steps 13–21 stay chained behind
+  SKIPPED step-12; Phase D/E/F remain blocked per §4.7.
+
+- Planner revise (2026-11-25, `linux` @ `4f6f151`, no game files on host): step 12g
+  (`linux:dstorage-read`, `4f6f151`) closed with review (383 lib tests, title
+  `ExitProcess(0xc)`/12 fails, `called_stubs: 29` with zero `xcrdapi` entries vs 30
+  before, `[PASS] DirectStorage`). Fresh triage here re-ran the title
+  (`ExitProcess(0xc)`, 12 fails, `called_stubs: 29` = 28 Phase-D D3D12 console slots +
+  expected probe x1, zero non-GPU entries): the stub-triage loop is exhausted —
+  `FormatMessage`, `mfplat`, `xcrdapi` are all resolved, kernel32/oleaut32 leftovers
+  have zero `called_stubs` (stay stubs per §4.7b), and every remaining FAIL is a
+  null-device D3D12 category (triangle/Present/command-list/sparse/coherent/
+  descriptor/depth-bias/raytracing/XG-textures). The synthetic-title `ExitProcess`
+  gate in §4.7 is therefore met on this host (retail leg vacuous — no game files).
+  New step 13 (`linux:glsl-backend`) is the unblocked next task: backend-neutral
+  emitter + GLSL 450 backend for a blit-class VS (synthetic/in-tree RDNA2 program as
+  the no-retail gate, `XCL_SAMPLE_RPF` retail sample opt-in, `glslc` bring-up only,
+  no shell-out in the shipped path). Steps 14–21 stay chained behind SKIPPED
+  step-12; Phase E/F remain blocked per §4.7.
 
 ## Phase C frontier — next CRT family
 
@@ -309,8 +352,8 @@ Windows behavior unchanged.
     This closes the last MISS UCRT import in both synthetic binaries per the 12c
     `llvm-readobj` audit (12d review re-verified 0 MISS in both binaries).
 
-12e. **kernelx FormatMessageW** — `linux:format-message` (next, ready).
-    Outcome: win64 `FormatMessageW` (plus `FormatMessageA` only if it is a trivial
+12e. **kernelx FormatMessageW** — `linux:format-message` — LANDED (`43bdabc`).
+    Outcome: win64 `FormatMessageW` (plus `FormatMessageA` as a trivial
     wrapper over the same core) in `hle/kernelx_linux.rs`, wired through `exports()`
     so the `kernel32.dll` route resolves it as `Hle(kernelx)` instead of a stub.
     Semantics: `FORMAT_MESSAGE_FROM_SYSTEM` maps the caller's `GetLastError`-style
@@ -325,11 +368,73 @@ Windows behavior unchanged.
     NULL output with no `ALLOCATE_BUFFER` is an error return. Plus a `kernelx` unit
     test (system-code message, FROM_STRING inserts incl. argument array, allocate
     buffer, truncation, unknown code, NULL args).
-    Acceptance: focused `kernelx` tests, full `cargo test -p xcl --lib` counts,
-    workspace check, and the cross-built synthetic title still reaches `ExitProcess`
-    with the 14 known null-device failures while `FormatMessageW` disappears from
-    `report.json` `called_stubs` (no retail needed). One commit, no refactors.
-    Rationale: fresh triage run here reaches `ExitProcess(0xe)` with 14 fails and
-    `called_stubs: 34` — `FormatMessageW` is the only `kernel32` stub the title
-    calls (1 call); the remaining stubs are Phase-D D3D12 slots plus
-    `DStorage`/`MFPlat`, all larger families for later slices.
+    Acceptance (met): focused `kernelx` tests, full `cargo test -p xcl --lib` counts
+    (375), workspace check, and the cross-built synthetic title still reaches
+    `ExitProcess(0xe)` with the 14 known null-device failures while `FormatMessageW`
+    disappears from `report.json` `called_stubs` (33 vs 34; PresentX FAIL now shows
+    formatted text). One commit, no refactors.
+
+12f. **mfplat headless manager** — `linux:mfplat-headless` — LANDED (`00a9f50`).
+    Outcome: headless `mfplat.dll` HLE on Linux in a new `hle/mfplat_linux.rs`
+    (same null-object pattern as `gameinput_linux`/`xaudio2_linux`): `MFStartup`
+    (accept `MF_VERSION`/`MFSTARTUP_LITE`, idempotent `S_OK`), `MFShutdown`
+    (`S_OK`), `MFCreateDXGIDeviceManager` (hands a static manager object with a
+    real vtable), and `MFResetDXGIDeviceManagerX` (validates the reset token:
+    stale token → `E_INVALIDARG`, current token → `S_OK` and records the device).
+    The manager vtable exposes the slots the title exercises (`Release` clamped
+    at 1 like the static GameInput object, `OpenDeviceHandle`/`CloseDeviceHandle`,
+    `TestDevice` `S_OK`) as win64 thunks via `stubs::make_stub_info`-style
+    logging stubs or small real functions — never NULL. Wired through
+    `mfplat_exports()` merge in `hle_linux.rs` so the `mfplat.dll` route resolves
+    as `Hle(mfplat)`; `MFCreateMediaType`/`MFCreateSample`/etc. stay stubs
+    (nothing calls them).
+    Acceptance: `mfplat` unit test (startup/shutdown idempotency, create non-null,
+    bad-token `E_INVALIDARG` vs good-token `S_OK`, open/test/close handle,
+    release clamp) + resolver `Hle(mfplat)` checks for the four names via
+    `mfplat.dll`; full `cargo test -p xcl --lib` counts, workspace check, and the
+    cross-built synthetic title still reaches `ExitProcess` with one fewer FAIL
+    (MFPlat check flips to PASS; `called_stubs` drops the 3 `mfplat` entries,
+    33 → 30) and no new failure. One commit, Linux-only files, no refactors.
+    Rationale: fresh triage run here (`ExitProcess(0xe)`, 14/16 fails,
+    `called_stubs: 33`) shows `MFStartup`/`MFCreateDXGIDeviceManager`/
+    `MFShutdown` x1 each are the smallest called family outside Phase-D D3D12
+    slots; `DStorageGetFactory` x1 is the next family after this (larger
+    factory/queue/status/fence surface, own slice). `XclDefinitelyMissingFunction`
+    is the expected probe and never implemented.
+
+12g. **dstorage file-read subset** — `linux:dstorage-read` — LANDED (`4f6f151`).
+    Outcome: Linux `xcrdapi.dll` HLE in a new `hle/dstorage_linux.rs` (win64 ABI, no
+    `windows_sys`): `DStorageGetFactory` (factory IID + newer `IID_FACTORY_X1` accepted,
+    unknown IID → `E_NOINTERFACE`, never NULL) + factory slots the title exercises
+    (`CreateQueue` 0x18 desc / `CreateQueue1` 0x20 desc, `OpenFile` by wide path via
+    host file open with Win32-mapped errors, `CreateStatusArray`, affinity/debug/staging
+    no-op successes) + queue slots (`EnqueueRequest` snapshot + `check`-style validation,
+    `EnqueueStatus`, `EnqueueSignal`, `Submit` executes synchronously in order,
+    `CancelRequestsWithTag` filters tagged requests, `Close`, error-event/GT stubs
+    fail closed) + file slots (QI/AddRef/Release/`Close`/`GetId` real, handle/unknown
+    fail closed) + status slots (`IsComplete`/`GetHResult` real). `execute` covers only
+    what the title calls: uncompressed file→memory copies (512 B exe-prefix read with
+    byte comparison), `DestinationIsPhysicalPages` via the `kernelx_linux` page homes,
+    `CancelRequestsWithTag` (cancelled destination stays zeroed); zlib/BCPack/swizzle /
+    memory-source / physical-source requests fail closed with `E_DECOMPRESSION` /
+    `E_SOURCE_TYPE` (nothing in the title exercises them — port those from
+    `hle/dstorage.rs` only when a caller needs them). Fences signal through the
+    `d3d12x_linux` null-device fence object (same `Signal` slot the Windows path uses);
+    `Submit` sets status entries (`S_OK` / first-failure / `E_PENDING` while queued) so
+    the title's `GetHResult` + `WaitForSingleObject(ev, 5000)` + byte-compare pass.
+    Wired through `xcrdapi_exports()` merge in `hle_linux.rs` so the `xcrdapi.dll`
+    route resolves as `Hle(xcrdapi)`; compressed/texture paths stay stubs.
+    Acceptance (met): `dstorage_linux` unit test (factory QI accept/refuse, open missing →
+    error, status array bounds, stale-free create/enqueue/submit/signal flow, cancel
+    filters tagged request, release clamp) + resolver `Hle(xcrdapi)` check for
+    `DStorageGetFactory` via `xcrdapi.dll`; full `cargo test -p xcl --lib` counts (383),
+    workspace check, and the cross-built synthetic title still reaches `ExitProcess(0xc)`
+    with one fewer FAIL (DirectStorage check flips to PASS; `called_stubs` drops the
+    `xcrdapi` entry, 30 → 29) and no new failure. One commit, Linux-only files, no
+    refactors.
+    Rationale: fresh triage here (`ExitProcess(0xd)`, 13 fails, `called_stubs: 30` =
+    ~28 Phase-D D3D12 slots + `DStorageGetFactory` x1 + expected probe x1, zero mfplat
+    entries) shows `DStorageGetFactory` is the only non-GPU, non-probe stub the title
+    calls. The other ~28 are Phase-D console slots (real Vulkan backend, explicitly
+    blocked per §4.7). `XclDefinitelyMissingFunction` is the expected probe and never
+    implemented.

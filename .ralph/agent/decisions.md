@@ -298,3 +298,33 @@ Template for each entry:
 - **Reasoning:** §4.7b orders families by what the exe actually calls. `FormatMessageW` is the only `kernel32` stub the title calls (1 call; the rest of the non-GPU stubs are `DStorageGetFactory` x1 and `MF*` x3, each a bigger integration). It is small, has a clear Win32 contract (FROM_SYSTEM/FROM_STRING/inserts/ALLOCATE_BUFFER/truncation), and its disappearance from `called_stubs` is a checkable e2e signal.
 - **Reversibility:** high — additive export behind the existing registry/resolver seam.
 - **Timestamp:** 2026-11-25T00:00:00Z
+
+## DEC-018 — Next slice is a headless MFPlat manager from the title's actual stub list
+
+- **Decision:** After 12e, implement headless `mfplat.dll` HLE (`MFStartup`/`MFShutdown`/`MFCreateDXGIDeviceManager`/`MFResetDXGIDeviceManagerX` + manager vtable) as step 12f, leaving `DStorage` and Phase-D D3D12 slots for later slices.
+- **Chosen Option:** triage the next family from the synthetic title's fresh `report.json` `called_stubs` (33 entries at `ExitProcess(0xe)`: ~27 Phase-D D3D12 slots, `DStorageGetFactory` x1, `mfplat` trio x1 each, `XclDefinitelyMissingFunction` probe x1) and `stubbed_imports`, not from PROMPT's examples.
+- **Confidence:** 82
+- **Alternatives Considered:** (a) `DStorageGetFactory` headless next (also x1 call, but factory/queue/file/status/fence surface is larger than one reviewable slice alongside MF); (b) Phase-D D3D12 console slots next (27 stubs across many methods, needs real Vulkan backend — explicitly blocked per §4.7); (c) kernel32 leftovers (`CreateFileMappingA`, `WriteConsoleW`, … — in `stubbed_imports` but zero calls in `called_stubs`, so per §4.7b they stay stubs).
+- **Reasoning:** §4.7b orders families by what the exe actually calls. The `mfplat` trio is the smallest called family (3 calls) with a clear headless precedent (`gameinput_linux`/`xaudio2_linux` null objects): `MFCreate` currently returns `S_OK` with a null manager so the title fails before `Reset`; a static manager with token-validated `Reset` (`E_INVALIDARG` on stale token) plus `Open/Test/Close` handle slots flips the MFPlat check to PASS with a checkable `called_stubs` 33→30 signal.
+- **Reversibility:** high — additive `mfplat_linux` module behind the existing registry/resolver seam.
+- **Timestamp:** 2026-11-25T00:00:00Z
+
+## DEC-019 — Next slice is a Linux DStorage file-read subset from the title's actual stub list
+
+- **Decision:** After 12f, implement a title-verbs-only `xcrdapi.dll` HLE (`DStorageGetFactory` + factory/queue/file/status slots + synchronous `Submit` + fence signal) as step 12g, leaving Phase-D D3D12 slots for later.
+- **Chosen Option:** triage the next family from the synthetic title's fresh `report.json` `called_stubs` (30 entries at `ExitProcess(0xd)`: ~28 Phase-D D3D12 slots, `DStorageGetFactory` x1, `XclDefinitelyMissingFunction` probe x1) and `xcl.log` `[STUB]` lines, not from PROMPT's examples.
+- **Confidence:** 78
+- **Alternatives Considered:** (a) full `hle/dstorage.rs` port next (2665 lines + `windows_sys` `DuplicateHandle`/`VirtualQuery`/`CreateEventW` surface — too large for one reviewable slice; zlib/BCPack/swizzle/memory-source paths have zero title callers); (b) Phase-D D3D12 console slots next (~28 stubs across many methods, needs real Vulkan backend — explicitly blocked per §4.7); (c) declare stub-triage done and start Phase D GLSL now (premature: one called non-GPU family remains, and its e2e PASS signal is checkable in one slice).
+- **Reasoning:** §4.7b orders families by what the exe actually calls. `DStorageGetFactory` is the only called non-GPU, non-probe stub left. The title only exercises uncompressed file→memory reads (512 B exe prefix + physical-page dest + cancel-tag), status `GetHResult`, and fence `Signal`/`SetEventOnCompletion` + 5 s wait — so a synchronous file-read subset flips the DirectStorage check to PASS with a checkable `called_stubs` 30→29 signal while compression/BCPack/swizzle stay refused behind the existing error codes.
+- **Reversibility:** high — additive `dstorage_linux` module behind the existing registry/resolver seam.
+- **Timestamp:** 2026-11-25T00:00:00Z
+
+## DEC-020 — Stub-triage exhausted; unblock Phase D GLSL backend with a synthetic gate
+
+- **Decision:** After 12g, start Phase D step 13 (`linux:glsl-backend`) as an unblocked task gated synthetically, leaving steps 14–21 chained behind SKIPPED step-12.
+- **Chosen Option:** fresh title triage here (`ExitProcess(0xc)`/12 fails, `called_stubs: 29` = 28 `d3d12_xs` console slots + `XclDefinitelyMissingFunction` probe, zero `xcrdapi`/`mfplat`/`FormatMessage`, zero non-GPU calls) shows no further one-family HLE slice: every remaining FAIL is a null-device D3D12 category needing the real Vulkan backend. PROMPT §4.7's "synthetic title runs to `ExitProcess`" gate is met (retail leg vacuous on this host), so the backend-neutral emitter + GLSL 450 backend is next, verified against a synthetic/in-tree blit-class RDNA2 program with the `XCL_SAMPLE_RPF` retail sample opt-in (no-op when unset, never a counted pass) and `glslc -fshader-stage=vert` bring-up only.
+- **Confidence:** 75
+- **Alternatives Considered:** (a) keep Phase D blocked behind SKIPPED retail-smoke and publish `review.passed` (stalls the loop — §8.7 forbids consecutive no-diff iterations, and a real Phase-D slice is ready); (b) fold step 13 into the existing chained `code-assist:linux-port:step-13:glsl-backend` by clearing its `blocked_by` (mutates the stable-key queue the replan deliberately left intact); (c) slice a smaller D3D12 null-device piece first (all 28 remaining stubs span many vtable methods and need the Vulkan backend anyway — not one reviewable slice).
+- **Reasoning:** §4.7b orders by what the exe actually calls; nothing callable outside Phase D remains. A side `linux:glsl-backend` task (like the 12a–12g side tasks) keeps the stable-key chain untouched while giving the Builder a reviewable vertical slice that runs without game files. The shipped path must not shell out to an external compiler.
+- **Reversibility:** high — additive emitter backend behind a trait; the original step-13 chain entry stays provisional.
+- **Timestamp:** 2026-11-25T00:00:00Z

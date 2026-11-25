@@ -30,3 +30,17 @@
 - task-1795566796-4e2a PASS, closed. Re-verified: mfplat 3 passed, full lib 378 passed, workspace check 0 errors, clippy 0 errors, git diff --check clean, title ExitProcess(0xd)/13 fails with [PASS] MFPlat, called_stubs 30 with zero mfplat entries (was 33), zero [STUB] mfplat lines.
 - No blocking findings; one minor filed as progress.md follow-up (manual_dangling_ptr on fake handle 1 — deliberate, warning-only). Task text said ExitProcess(0xe) but 0xd/13 is correct after the FAIL→PASS flip; noted in review.
 - Queue: task ready empty (remaining open tasks chained behind SKIPPED retail-smoke, no game files on host), so next is planner triage (plan.revise) — likely DStorage family next per plan.md 12f rationale.
+
+## 2026-11-25 planner revise (dstorage 12g)
+- 12f closed with review (378 tests, title ExitProcess(0xd)/13 fails, called_stubs 30 zero mfplat, [PASS] MFPlat). Queue otherwise blocked behind SKIPPED retail-smoke, `task ready` empty.
+- Triage (fresh run here, no code change): title fresh XCL_DATA_ROOT reaches `ExitProcess(0xd)`/13 fails, `called_stubs: 30` = ~28 Phase-D D3D12 slots + DStorageGetFactory x1 + XclDefinitelyMissingFunction probe x1 (expected). Full `hle/dstorage.rs` is 2665 lines + windows_sys surface — too large to port whole; title only uses uncompressed file→memory + phys-pages + cancel + GetHResult + fence signal.
+- New task `linux:dstorage-read` (plan.md step 12g, DEC-019): Linux dstorage_linux file-read subset (factory/queue/file/status + sync Submit + fence signal via null-device fence, compression/BCPack/swizzle refused) + unit test + resolver Hle(xcrdapi) check + title e2e gate (DirectStorage PASS, called_stubs 30→29). Docs (plan/context/decisions) updated; `tasks.ready` next.
+
+## 2026-11-25 critic review (dstorage 12g)
+- task-1795567260-be32 PASS, closed. Re-verified: dstorage 5 passed, full lib 383 passed, workspace check 0 errors, clippy 0 errors, rustfmt/diff clean, title ExitProcess(0xc)/12 fails with [PASS] DirectStorage, called_stubs 29 with zero xcrdapi entries (was 30).
+- No blocking findings; no minor filed (NULL/QI/fence paths fail closed, vtables never NULL). Queue otherwise blocked behind SKIPPED retail-smoke, so next is planner triage (plan.revise).
+
+## 2026-11-25 planner revise (glsl-backend 13)
+- 12g closed with review (383 tests, title ExitProcess(0xc)/12 fails, called_stubs 29 zero-xcrdapi, DirectStorage PASS). Queue otherwise blocked behind SKIPPED retail-smoke, `task ready` empty.
+- Triage (fresh run here, no code change): title fresh XCL_DATA_ROOT reaches `ExitProcess(0xc)`/12 fails, `called_stubs: 29` = 28 d3d12_xs console slots + XclDefinitelyMissingFunction probe x1 (expected), zero non-GPU calls. All 12 FAILs are null-device D3D12 categories (triangle/Present/command-list/sparse/coherent/descriptor/depth-bias/raytracing/XG-textures); kernel32/oleaut32 leftovers have zero calls and stay stubs per §4.7b. Stub-triage loop exhausted — §4.7 synthetic-ExitProcess gate met (retail leg vacuous, no game files on host).
+- New task `linux:glsl-backend` (plan.md step 13, DEC-020): backend-neutral emitter + GLSL 450 backend for blit-class VS (synthetic/in-tree gate, XCL_SAMPLE_RPF opt-in, glslc bring-up only, no shipped shell-out). Docs (plan/context/decisions) updated; `tasks.ready` next.

@@ -87,20 +87,56 @@ inspect, recompile, and eventually run the Xbox Series X|S title next to the mac
 - Next slice is plan.md step 12a (`linux:crt-copy`): copy/concat CRT family, one commit,
   synthetic verification. Phase D/E/F tasks stay chained behind step-12.
 
-## Current state (planner revise, 2026-11-25, `linux` @ `13b679b`)
+## Current state (planner revise, 2026-11-25, `linux` @ `6473823`)
 
 - Steps 1–11 closed (11a–11s HLE slices, CRT forwarding + follow-ups, report parity);
   12a (`linux:crt-copy`), 12b (`linux:crt-search-dup`), 12c
-  (`linux:crt-convert-onexit`), and 12d (`linux:crt-vfprintf`, `b4956ba`) closed with
-  review (374 lib tests, title reaches `ExitProcess(0xe)` with only known null-device
-  failures; 12d review re-verified 0 MISS UCRT imports in both synthetic binaries).
-- No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic title
-  (`tests/testtitle` + `testgamedll`, `gnullvm`/`gnu` targets installed) is the e2e target.
-- Next slice is plan.md step 12e (`linux:format-message`): `FormatMessageW` in
-  `kernelx_linux` — the only `kernel32` stub the title calls (triage run here:
-  `ExitProcess(0xe)`/14 fails, `called_stubs: 34`, remaining stubs are Phase-D D3D12
-  slots plus `DStorage`/`MFPlat`). One commit, synthetic verification.
-  Phase D/E/F tasks stay chained behind step-12.
+  (`linux:crt-convert-onexit`), 12d (`linux:crt-vfprintf`, `b4956ba`), and 12e
+  (`linux:format-message`, `43bdabc`) closed with review (375 lib tests, title
+  reaches `ExitProcess(0xe)` with only known null-device failures; 12e review
+  re-verified `called_stubs: 33` with zero `FormatMessage` entries, PresentX FAIL
+  now renders formatted text through the HLE).
+- No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic
+  title (`tests/testtitle` + `testgamedll`, `gnullvm`/`gnu` targets installed) is the e2e target.
+- Next slice was plan.md step 12f (`linux:mfplat-headless`): LANDED (`00a9f50`,
+  378 lib tests, `[PASS] MFPlat`, `called_stubs` 33→30).
+
+## Current state (planner revise, 2026-11-25, `linux` @ `a89e0b6`)
+
+- Steps 1–11 closed (11a–11s HLE slices, CRT forwarding + follow-ups, report parity);
+  12a (`linux:crt-copy`), 12b (`linux:crt-search-dup`), 12c
+  (`linux:crt-convert-onexit`), 12d (`linux:crt-vfprintf`, `b4956ba`), 12e
+  (`linux:format-message`, `43bdabc`), and 12f (`linux:mfplat-headless`,
+  `00a9f50`) closed with review (378 lib tests, title reaches `ExitProcess(0xd)`
+  with 13 known null-device failures; 12f review re-verified `called_stubs: 30`
+  with zero `mfplat` entries, `[PASS] MFPlat`).
+- No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic
+  title (`tests/testtitle` + `testgamedll`, `gnullvm`/`gnu` targets installed) is the e2e target.
+- Next slice is plan.md step 12g (`linux:dstorage-read`): Linux `xcrdapi.dll`
+  file-read subset in `dstorage_linux` (factory/queue/file/status + synchronous
+  `Submit` + fence signal; title verbs only — uncompressed file→memory,
+  physical-page destination, cancel; compression/BCPack/swizzle refused). Fresh
+  triage shows `called_stubs: 30` = ~28 Phase-D D3D12 slots + `DStorageGetFactory`
+  x1 + expected probe x1. One commit, synthetic verification. Phase D/E/F tasks
+  stay chained behind step-12.
+
+## Current state (planner revise, 2026-11-25, `linux` @ `4f6f151`)
+
+- Steps 1–11 closed (11a–11s HLE slices, CRT forwarding + follow-ups, report parity);
+  12a (`linux:crt-copy`), 12b (`linux:crt-search-dup`), 12c
+  (`linux:crt-convert-onexit`), 12d (`linux:crt-vfprintf`, `b4956ba`), 12e
+  (`linux:format-message`, `43bdabc`), 12f (`linux:mfplat-headless`, `00a9f50`),
+  and 12g (`linux:dstorage-read`, `4f6f151`) closed with review (383 lib tests,
+  title reaches `ExitProcess(0xc)` with 12 known null-device failures; 12g review
+  re-verified `called_stubs: 29` with zero `xcrdapi` entries, `[PASS] DirectStorage`).
+- No game files on this host: step-12 retail-smoke is SKIPPED here; the synthetic
+  title (`tests/testtitle` + `testgamedll`, `gnullvm`/`gnu` targets installed) is the e2e target.
+- Stub-triage exhausted (fresh run here: `ExitProcess(0xc)`/12 fails, `called_stubs: 29`
+  = 28 `d3d12_xs` slots + expected probe, zero non-GPU calls; all FAILs are null-device
+  D3D12 categories). Next slice is plan.md step 13 (`linux:glsl-backend`, DEC-020):
+  backend-neutral emitter + GLSL 450 backend for a blit-class VS, synthetic/in-tree gate
+  with `XCL_SAMPLE_RPF` opt-in, `glslc` bring-up only. Steps 14–21 stay chained behind
+  SKIPPED step-12; Phase E/F remain blocked per §4.7.
 
 ## Integration points
 
