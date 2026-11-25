@@ -1,39 +1,125 @@
-# XCL – Xbox Series X|S → Windows compatibility layer
+<p align="center">
+  <img src="assets/readme/banner.svg" width="100%" alt="XCL – console games you own, running natively on Windows: no CPU emulation, RDNA2 shaders recompiled to DXIL, Direct3D 12">
+</p>
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)]([https://discord.gg/xcl](https://discord.gg/D7fAUQDRyd))
-**Discord: [(https://discord.gg/D7fAUQDRyd)](https://discord.gg/D7fAUQDRyd)**
+<p align="center">
+  <a href="https://discord.gg/xcl"><img alt="Discord: join the server" src="https://img.shields.io/badge/Discord-join%20the%20server-7c5cff?style=for-the-badge"></a>
+  <a href="https://github.com/xcl-dev/xcl/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/xcl-dev/xcl/ci.yml?branch=main&style=for-the-badge&label=CI"></a>
+  <a href="LICENSE"><img alt="License: GPL-2.0-only" src="https://img.shields.io/badge/license-GPL--2.0--only-7c5cff?style=for-the-badge"></a>
+  <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-2f80ed?style=for-the-badge">
+  <img alt="Direct3D 12, Shader Model 6.6" src="https://img.shields.io/badge/D3D12-SM%206.6-1fb9d8?style=for-the-badge">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-stable--msvc-1fb9d8?style=for-the-badge">
+</p>
+
+<p align="center">
+  <b><a href="#games">Games</a></b> ·
+  <b><a href="#highlights">Highlights</a></b> ·
+  <b><a href="#how-it-works">How it works</a></b> ·
+  <b><a href="#quick-start">Quick start</a></b> ·
+  <b><a href="#what-works">What works</a></b> ·
+  <b><a href="#controls">Controls</a></b> ·
+  <b><a href="#building-and-usage">Building and usage</a></b> ·
+  <b><a href="#tests">Tests</a></b> ·
+  <b><a href="#contributing">Contributing</a></b>
+</p>
+
+# XCL – Xbox Series X|S → Windows compatibility layer
 
 XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a Windows PC - in the spirit of Wine/Proton. There is no CPU emulation: the game's x64 code runs natively, and XCL provides its own, independently written implementations of the console system libraries the PC does not have (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …). The console's GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
-XCL works only on unpacked game files you already own. It does not download, decrypt or unpack game packages (XVC / MSIXVC) and contains nothing for circumventing DRM. The repository holds no code, headers or binaries from the console SDK, no keys and no game data; the Windows components XCL relies on (XGameRuntime, XAudio2, D3D12, DXC) come from your own system or the public Windows SDK and are not distributed with XCL.
+> [!IMPORTANT]
+> XCL works only on unpacked game files you already own. It does not download, decrypt or unpack game packages (XVC / MSIXVC) and contains nothing for circumventing DRM. The repository holds no code, headers or binaries from the console SDK, no keys and no game data; the Windows components XCL relies on (XGameRuntime, XAudio2, D3D12, DXC) come from your own system or the public Windows SDK and are not distributed with XCL.
+
+<p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
 
 ## Games
 
-| Game | Package (version) | State | What works | Limits |
-|---|---|---|---|---|
-| **Minecraft Preview** | `Microsoft.MinecraftBeta` 1.18.3064.0 | ✅ | fully playable | – |
-| **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
-| **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
-| **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
-| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused |
+<p align="center">
+  <img src="assets/readme/status.svg" width="100%" alt="A newer retail game, about 65 % of the way to playable (estimate): ~4 s to its first frame, 30 fps in its menus, 14 fps on average into its 3D world, 100 % of its shaders translate">
+</p>
+
+| Game | State | What works | Limits |
+|---|---|---|---|
+| **Minecraft Preview**<br><sub>`Microsoft.MinecraftBeta` 1.18.3064.0</sub> | ✅&nbsp;playable | fully playable | – |
+| **Unicorn Overlord**<br><sub>`SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6</sub> | ✅&nbsp;playable | fully playable | – |
+| **Fortnite**<br><sub>`436609B6.FortniteClient` 2.0.1461.7919</sub> | ✅&nbsp;works | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
+| **XDefiant**<br><sub>`Ubisoft.XDefiant-Game` 1.0.0.186</sub> | ✅&nbsp;works | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
+| **A newer retail game** | 🚧&nbsp;**≈&nbsp;65&nbsp;%**<br><sub>estimate</sub> | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus). With the NVIDIA integration branch ([#2057](https://github.com/xcl-dev/xcl/pull/2057)) it goes on into its 3D world: **14 fps on average** over a 5-minute run on an RTX 5090, ~5 fps in the heaviest scene | not playable yet: the picture of the world is incomplete (its minimap and other mesh pipelines are refused), and it does not keep running there for long |
 
 ## Highlights
 
-- **100 % of a retail game's shaders translate** – all 26 698 RDNA2 programs (26 503 records) of its shader pack
-  become HLSL; random samples compile to DXIL with 0 errors.
-- **The game's own console DLLs run on the PC** – its Bink 2 video codec decodes the game's
-  movies, its ray-tracing BVH builder builds acceleration structures on a PC GPU, the AMD FSR 4
-  console upscaler runs a whole frame on a PC GPU, the GDK HTTP library initialises.
-- **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
-  textures of the game's texture archive byte for byte, its volume textures included.
-- **370+ automated tests**, including GPU tests that compare translated shaders against expected
-  results instruction by instruction.
+<table>
+  <tr>
+    <td width="33%" valign="top" align="center">
+      <img src="assets/readme/icon-native.svg" width="56" alt=""><br>
+      <p align="left"><b>No CPU emulation</b> – the game's x64 code runs natively, in the spirit of Wine / Proton.</p>
+    </td>
+    <td width="33%" valign="top" align="center">
+      <img src="assets/readme/icon-shader.svg" width="56" alt=""><br>
+      <p align="left"><b>100 % of a retail game's shaders translate</b> – all 26 698 RDNA2 programs (26 503 records) of its shader pack become HLSL; random samples compile to DXIL with 0 errors.</p>
+    </td>
+    <td width="33%" valign="top" align="center">
+      <img src="assets/readme/icon-dll.svg" width="56" alt=""><br>
+      <p align="left"><b>The game's own console DLLs run on the PC</b> – its Bink 2 video codec decodes the game's movies, its ray-tracing BVH builder builds acceleration structures on a PC GPU, the AMD FSR 4 console upscaler runs a whole frame on a PC GPU, the GDK HTTP library initialises.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top" align="center">
+      <img src="assets/readme/icon-texture.svg" width="56" alt=""><br>
+      <p align="left"><b>Console textures decode exactly</b> – the GFX10 tiling and mip layout reproduce 909 of 912 textures of the game's texture archive byte for byte, its volume textures included.</p>
+    </td>
+    <td width="33%" valign="top" align="center">
+      <img src="assets/readme/icon-storage.svg" width="56" alt=""><br>
+      <p align="left"><b>The console's storage queues</b> – DirectStorage with file and memory sources, zlib and BCPack (BC1, BC3 – BC7).</p>
+    </td>
+    <td width="33%" valign="top" align="center">
+      <img src="assets/readme/icon-test.svg" width="56" alt=""><br>
+      <p align="left"><b>370+ automated tests</b>, including GPU tests that compare translated shaders against expected results instruction by instruction.</p>
+    </td>
+  </tr>
+</table>
+
+## How it works
+
+<p align="center">
+  <img src="assets/readme/how.svg" width="100%" alt="How XCL works: the game's x64 code goes through the PE loader to the CPU and calls the console system libraries, which XCL implements; its RDNA2 shaders go through the shader recompiler to the Direct3D 12 driver and the GPU; its textures, sound and video go through XCL's memory, textures and DirectStorage">
+</p>
+
+The game's code runs on the CPU as it is; each call into a console library lands in XCL's own
+implementation of it, and each shader is translated once and cached. The details:
+[`docs/specs/2026-11-20-xcl-design.md`](docs/specs/2026-11-20-xcl-design.md), status and
+measurements: [`HANDOFF.md`](HANDOFF.md).
+
+## Quick start
+
+1. **Build** – Windows 10 / 11 x64, Rust and the Windows SDK ([all requirements](#building-and-usage)):
+
+   ```powershell
+   cargo build --release --workspace
+   ```
+
+2. **Look at your game** – its unpacked files, the folder that holds `MicrosoftGame.config`:
+
+   ```powershell
+   target\release\xcl.exe inspect D:\Game\game.exe
+   ```
+
+3. **Run it** – or open `xcl.exe` from Explorer and choose the game:
+
+   ```powershell
+   target\release\xcl.exe run D:\Game
+   ```
+
+A gamepad is recommended ([Controls](#controls)). The game folder is never modified.
+
+<p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
 
 ## What works
 
 ✅ done and verified
 
-### Running the game's code
+<details>
+<summary><b>Running the game's code</b> – PE loader, kernelx, Memory, File system, DirectStorage</summary>
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
@@ -43,7 +129,10 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
 | **DirectStorage** | ✅ | the console's DirectStorage queues: file and memory sources, zlib, and BCPack – the console's texture compression – for BC1, BC3, BC4, BC5, BC6H and BC7 (BC2 and the hardware swizzle are refused) | unit tests on synthetic streams; retail BCPack chunks of all six modes byte-identical with a reference decoder (`XCL_SAMPLE_BCPACK`) |
 
-### System services
+</details>
+
+<details>
+<summary><b>System services</b> – XGameRuntime, Input, Audio</summary>
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
@@ -51,7 +140,10 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller or a PlayStation controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft; a DualShock 4 (USB) |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
-### Graphics
+</details>
+
+<details>
+<summary><b>Graphics</b> – Shader recompiler, Pipelines, D3D12.X compute, D3D12.X graphics, Textures, Ray tracing, Upscaling</summary>
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
@@ -66,12 +158,17 @@ XCL works only on unpacked game files you already own. It does not download, dec
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
 An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
 
-### Media and tools
+</details>
+
+<details>
+<summary><b>Media and tools</b> – Video, Tools</summary>
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
 | **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
+
+</details>
 
 ## Controls
 
@@ -91,7 +188,7 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 ## Building and usage
 
 Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
-+ `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
+and `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
 `%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
 (`System32\xgameruntime.dll`, part of Windows / Gaming Services). On **Windows 10** (22H2
 KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Agility SDK
@@ -128,6 +225,9 @@ xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact com
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
+
+<details>
+<summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
@@ -172,6 +272,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+</details>
+
 ## Tests
 
 ```powershell
@@ -190,9 +292,21 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+## Contributing
+
+Help is welcome – [`CONTRIBUTING.md`](CONTRIBUTING.md) has what a pull request needs, in short: small,
+one problem, tested. Test results on your GPU go to [#42](https://github.com/xcl-dev/xcl/issues/42),
+questions and talk to the [Discord server](https://discord.gg/D7fAUQDRyd).
+
+<p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's
 machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, AnyPS5,
 libHttpClient headers). WinDurango serves only as a reference – no code is ported from it. The
 repository contains no headers or binaries from the console SDK.
+
+The artwork in `assets/readme` is drawn for this repository and under its license. XCL is an independent
+project: it is not affiliated with, endorsed or sponsored by the owners of the trademarks named here,
+which are named only to say what XCL runs and what it runs on.
