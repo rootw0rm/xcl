@@ -44,3 +44,9 @@ frame_*.bmp
 # Python bytecode of the scripts
 __pycache__/
 .worktrees/
+
+# Ralph orchestrator runtime/config (local-only)
+.ralph/
+ralph.yml
+ralph.yml.bak
+PROMPT.md
