@@ -914,3 +914,20 @@ Verification (this host, no game files — retail SKIPPED):
 - `cargo test -p xcl --lib -- --test-threads=4` → 375 passed; 0 failed; 0 ignored.
 - `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (pre-existing warnings only); `git diff --check` clean.
 - Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/fmt-gate/game`, fresh `XCL_DATA_ROOT=/tmp/fmt-gate/data`): `XCL_DATA_ROOT=... ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)` (rc=14), `report.json` `called_stubs: 33` with no `FormatMessageW` entry and no `[STUB] ... FormatMessageW` line (was 34 with the stub). The `PresentX` FAIL line now shows formatted text (`The operation completed successfully. (0x00000000)`) proving the HLE served the call. All 14 FAILs are the known null-device categories; no new failure.
+
+## Critic review — step-12e kernelx-format-message (Fresh-Eyes, 2026-11-25, `linux` @ `43bdabc`)
+
+Task `task-1795566077-cb3a` (`linux:format-message`) — PASS, already closed.
+
+Independent re-verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib kernelx_linux::tests::format_message -- --test-threads=4` → 1 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 375 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (pre-existing warnings only).
+- Resolver/HLE spot checks are in-tree: `kernelx_core_imports_resolve_to_hle` covers `kernel32!FormatMessageW/A` + the `api-ms-win-core-localization` contract, `hle_linux` spot list covers both names — both pass inside the 375.
+- Synthetic title (fresh `/tmp/fmt-critic/game` from `tests/data/testgame` + prebuilt exes, fresh `XCL_DATA_ROOT=/tmp/fmt-critic/data`): `XCL_DATA_ROOT=... ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `called_stubs: 33` with zero `FormatMessage` entries and zero `[STUB] FormatMessageW` lines (was 34 with the stub). All 14 FAILs are the known null-device categories; no new failure.
+- Adversarial path exercised for real: `PresentX` FAIL line now renders formatted text through the HLE instead of an empty string, proving the title's failure-path formatting call is served (not just resolved).
+
+Requirements: met — win64 `FormatMessageW` + `FormatMessageA` (ANSI twin over shared helpers) in `hle/kernelx_linux.rs`, wired through `exports()` so the `kernel32.dll` route resolves `Hle(kernelx)`; `FROM_SYSTEM` table + `HRESULT_FROM_WIN32` low-word decode + `E_NOTIMPL` + unknown-code fallback text; `FROM_STRING` `%1..%99` with `!s!/!d!/!x!/!X!/!o!/!u!/!c!/!p!` (`%%`, `%0` terminator); `ARGUMENT_ARRAY` direct vs `va_list*` double-deref; `ALLOCATE_BUFFER` via process heap with pointer write-back; truncation → `ERROR_INSUFFICIENT_BUFFER`, NULL output without allocate → `ERROR_INVALID_PARAMETER`. One commit (`43bdabc`), Linux-only files + progress.md, no refactors.
+
+## Follow-ups (minor, non-blocking)
+- `format_truncate_at_terminator` scans raw bytes for `%0` before `%%` unescaping, so `"%%0"` truncates to `"%"` instead of rendering `"%0"`. Safe direction (shorter string, still NUL-terminated, no crash) on unrealistic input; fix next time the function is touched.

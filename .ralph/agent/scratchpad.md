@@ -12,3 +12,11 @@
 - 12d closed with review (374 tests, title ExitProcess(0xe)/14 fails, 0 MISS UCRT re-verified). Queue otherwise blocked behind SKIPPED retail-smoke (`ls /run/media/...` absent), `task ready` empty.
 - Triage (fresh run here, no code change): `llvm-readobj` shows all CRT imports in both synthetic binaries resolve (0 MISS); title e2e with fresh XCL_DATA_ROOT reaches `ExitProcess(0xe)`/14 fails, `called_stubs: 34` — ~27 Phase-D D3D12 slots + FormatMessageW x1 + DStorageGetFactory x1 + MF* x3 + XclDefinitelyMissingFunction x1 (expected probe).
 - New task `linux:format-message` (plan.md step 12e, DEC-017): FormatMessageW in kernelx_linux (Hle(kernelx) via kernel32 route), FROM_SYSTEM/FROM_STRING/inserts/ALLOCATE_BUFFER/truncation + unit test + resolver check + title e2e gate (FormatMessageW gone from called_stubs). Docs (plan/context/decisions) updated; `tasks.ready` next.
+
+## 2026-11-25 builder (format-message 12e)
+- task-1795566077-cb3a DONE, commit 43bdabc. FormatMessageW/A in kernelx_linux (FROM_SYSTEM table + HRESULT decode + unknown fallback, FROM_STRING %1 inserts + !specs + %%/%0, ARGUMENT_ARRAY vs va_list, ALLOCATE_BUFFER via HeapAlloc, truncation→122, NULL→87), exports + resolver + hle spot list + kernelx unit test.
+- Verify: kernelx format test 1 passed, full lib 375 passed, workspace check 0 errors, clippy 0 errors, title fresh XCL_DATA_ROOT → ExitProcess(0xe)/14 fails, called_stubs 33 (FormatMessageW gone; PresentX FAIL line now shows formatted text). No refactors, Linux-only files + progress.md.
+
+## 2026-11-25 critic review (format-message 12e)
+- task-1795566077-cb3a PASS, already closed. Re-verified: format test 1 passed, full lib 375 passed, workspace check 0 errors, clippy 0 errors, title ExitProcess(0xe)/14 fails, called_stubs 33 with zero FormatMessage entries (was 34).
+- No blocking findings; one minor filed as progress.md follow-up (%%0 truncation ordering). Queue has open tasks but `task ready` empty (all blocked), so next is planner triage (plan.revise).
