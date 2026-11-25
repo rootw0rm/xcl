@@ -59,6 +59,7 @@ pub mod lane_masks;
 pub mod lower;
 pub mod lower_dxil;
 pub(crate) mod emit;
+pub mod glsl;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod x64_masks;

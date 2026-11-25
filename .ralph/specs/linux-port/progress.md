@@ -1008,3 +1008,35 @@ Verification (this host, no game files — retail SKIPPED):
 - `cargo test -p xcl --lib -- --test-threads=4` → 383 passed; 0 failed; 0 ignored (was 378; +4 dstorage +1 resolver).
 - `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (pre-existing warnings only); `git diff --check` clean; `rustfmt --check` clean on new file.
 - Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/xcl-dst-fresh-game`, fresh `XCL_DATA_ROOT=/tmp/xcl-dst-fresh-data`): `XCL_DATA_ROOT=... timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `called_stubs: 29` with zero `xcrdapi` entries (was 30) and zero `[STUB] xcrdapi` lines. `[PASS] DirectStorage (xcrdapi)` (was FAIL), `[PASS] MFPlat` stays PASS. All 12 remaining FAILs are the known null-device D3D12 categories; no new failure. (Reused-dir rerun shows 14 fails with 2 first-run overlay quirks `files: delete` + `PLS drive root` — fresh-dir counts are the comparator per 12a notes.)
+
+## Critic review — step-12g dstorage-read (Fresh-Eyes, 2026-11-25, `linux` @ `4f6f151`)
+
+Task `task-1795567260-be32` (`linux:dstorage-read`) — PASS, closed.
+
+Independent re-verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib dstorage -- --test-threads=4` → 5 passed; 0 failed.
+- `cargo test -p xcl --lib -- --test-threads=4` → 383 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors (529 pre-existing-class warnings); `git diff --check` clean; `rustfmt --check` clean on new file.
+- Resolver/HLE spot checks are in-tree: `dstorage_imports_resolve_to_hle` (`xcrdapi.dll!DStorageGetFactory` → `Hle`, callable, non-stub + direct factory QI ABI check) and the `hle_linux` spot list — both pass inside the 383.
+- Synthetic title (fresh `/tmp/dst-critic-game` from `tests/data/testgame` + prebuilt exes, fresh `XCL_DATA_ROOT=/tmp/dst-critic-data`, `timeout 120 ./target/debug/xcl run "$GAME" -- --hello`) → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)` (rc=12), `report.json` `exit_code: 12`, `crash: null`, `called_stubs: 29` with zero `xcrdapi` entries (was 30) and zero `[STUB] xcrdapi` lines (log shows `[PASS] DirectStorage (xcrdapi)`). `[PASS] MFPlat` stays PASS. All 12 remaining FAILs are the known null-device D3D12 categories plus the expected probe in `called_stubs` (28 D3D12 slots + `XclDefinitelyMissingFunction`); no new failure.
+- Adversarial paths exercised for real: NULL `out` → `E_POINTER` and unknown IID → `E_NOINTERFACE` are in-unit-test alongside stale-token/filtered-cancel and missing-file/status-bounds fail-closed; queue/file/status vtables verified never-NULL (unknown slots are logging `E_NOTIMPL` stubs via `make_stub_info`, not null calls); title itself hits the cancel-tag and physical-pages paths.
+
+Requirements: met — win64 `DStorageGetFactory` (factory + `IID_FACTORY_X1` accept, unknown IID → `E_NOINTERFACE`, NULL out → `E_POINTER`) + factory/queue/file/status vtables in new `hle/dstorage_linux.rs` (win64, no `windows_sys`, never NULL slots) + `read/write_physical_pages` helpers in `kernelx_linux` (validate-before-write, all-or-nothing) + `xcrdapi_exports()` merge so `xcrdapi.dll` resolves `Hle(xcrdapi)`; `execute` covers title verbs only (uncompressed file→memory, physical pages, cancel zero-preservation; zlib/BCPack/swizzle/memory-source refused). One commit (`4f6f151`), Linux-only files + progress.md, no refactors.
+
+## Follow-ups (minor, non-blocking)
+- None. NULL/QI/fence paths fail closed, `rustfmt --check` clean, no new warnings attributable to the slice.
+
+## Verification Notes — step-13 glsl-backend (Builder, 2026-11-25, `linux`)
+
+Task `task-1795567789-dc8b` (`linux:glsl-backend`, plan.md step 13, DEC-020).
+Retail-smoke SKIPPED here: `/run/media/...` absent (no game files on host); synthetic title is the e2e gate.
+
+Landed (one commit, no refactors):
+- `crates/xcl/src/gpu/recomp/glsl.rs` (new): `VsBackend` trait (`HlslVsBackend` via `super::translate` + vertex mode, `GlslVsBackend` via the new emitter — same interface/bytes in, shading language out) + `GlslTranslation` (`glsl`, `unsupported`/`unsupported_why`/`ignored`, `instructions`, `complete()`) + `translate_vs_glsl` (decode, reject branches, straight-line blit subset: SALU mov/add/sub/and/or/not/min/max, VALU mov/not/and/or/xor/shift/add/sub/mul/min/max/fma/mad/cvt, `exp pos0` → `gl_Position`, `exp param N` → ranked `out_p` params with `vs_param_register`/`elements_at` register semantics, `s_endpgm` ends; full-EXEC bring-up assumption documented, everything else recorded + emitted as a comment so output still compiles) + `#version 450` header (`layout(location)` ins/outs, `uint(gl_VertexIndex)`/`uint(gl_InstanceIndex)` VGPR init via `input_vgpr`, EXEC all-ones/SCC zero, `floatBitsToUint`/`uintBitsToFloat` instead of `asuint`/`asfloat`, no `WaveGetLaneIndex`/`SV_Position`). `glslc` lives only in `#[cfg(test)]`; the shipped path never spawns a compiler.
+- `crates/xcl/src/gpu/recomp/mod.rs`: `pub mod glsl;` (one line). No `TRANSLATOR_SOURCES` change (new file does not affect the HLSL disk cache).
+
+Verification (this host, no game files — retail opt-in no-ops):
+- `cargo test -p xcl --lib -- gpu::recomp::glsl` → 2 passed; 0 failed (synthetic blit structural + `glslc -fshader-stage=vert` compile, `glslc 2026.4 / 1.4.363.0`; retail `XCL_SAMPLE_RPF` unset → skip).
+- `cargo test -p xcl --lib -- --test-threads=4` → 387 passed; 0 failed; 0 ignored (was 385; +2 glsl).
+- `cargo check --workspace` → 0 errors (pre-existing warnings only); `cargo clippy -p xcl --lib` → 0 errors, no new warnings (one `manual_is_multiple_of` fixed in-slice); `git diff --check` clean; `rustfmt --check` clean on the new file (whole-tree `rustfmt --check` drift in `dxc.rs`/`upper_lanes.rs`/`x64_masks.rs` is pre-existing per AGENTS.md).
+- Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh `/tmp/glsl-fresh-game`, fresh `XCL_DATA_ROOT=/tmp/glsl-fresh-data`): `XCL_DATA_ROOT=... timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 12`, `ExitProcess(0xc)`, `report.json` `exit_code: 12`, `called_stubs: 29` (28 `d3d12_xs` console slots + expected `XclDefinitelyMissingFunction` probe, zero `xcrdapi`/`mfplat`/`FormatMessage`) — matches the 12g baseline; no new failure.
