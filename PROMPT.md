@@ -24,6 +24,11 @@ first (short contract); this file is the work plan. Details live in
   `0x1455e2a70` returns negative — its 4 `GetProcAddress`es for
   xgameruntime `QueryApiImpl`/`InitializeApiImpl*` all return NULL.
   Next family: those xgameruntime exports.
+- Stream B landed 17d review (PASS, no changes) + step 16/selector
+  verified already-in-tree + windowed present of the recompiler-driven
+  triangle via raw X11/`dlopen` (`fb58739`, no `winit` — Apache-only;
+  lib tests 502 passed). Remaining for the 12 GPU FAILs: route D3D12.X
+  device creation to the Vulkan backend (rest of step 17).
 - **Game files are PRESENT on this host** (the drive is mounted):
   `/run/media/anon/12TB_B/torrents/GTA6.Xbox.v1.0.2.1-CYBERLEEK/`
   (`game_scarlett_master.exe`, 120 MB, + `MicrosoftGame.Config`) and
