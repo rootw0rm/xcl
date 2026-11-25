@@ -798,3 +798,20 @@ Verification (this host, no game files — retail SKIPPED):
 - `cargo test -p xcl --lib -- --test-threads=4` → 373 passed; 0 failed; 0 ignored.
 - `cargo check --workspace` → 0 errors, 6 pre-existing warnings; `cargo clippy -p xcl --lib` → 0 errors (only pre-existing `missing_safety_doc`/style warnings).
 - Synthetic title (copied `tests/data/testgame` + `target/debug/xcl_testtitle.exe`/`testgame_mw.dll` into fresh temp game dir, fresh `XCL_DATA_ROOT`, `XCL_DUMP_SHADERS=1`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `crash: null`, `exit_code: 14`, `called_stubs: 34`, `imports_by_source` includes `hle-cross:ucrtbase.dll: 68`. All 14 FAILs are the known null-device categories; no CRT regression.
+
+## Critic review — step-12c crt-convert-onexit (Fresh-Eyes, 2026-11-25, `linux` @ `24d6820`)
+
+Task `task-1795564858-c38a` (`linux:crt-convert-onexit`) — PASS, closed.
+
+Independent re-verification (this host, no game files — retail SKIPPED):
+- `cargo test -p xcl --lib crt -- --test-threads=4` → 20 passed; 0 failed (includes `convert_and_onexit_match_ucrt` + both resolver forwarding tests with the new convert/runtime entries and the `wcsdup` follow-up additions).
+- `cargo test -p xcl --lib -- --test-threads=4` → 373 passed; 0 failed; 0 ignored.
+- `cargo check --workspace` → 0 errors, 6 pre-existing warnings; `cargo clippy -p xcl --lib` → 0 errors; `git diff HEAD~1 HEAD --check` clean.
+- Synthetic title (fresh temp game dir from `tests/data/testgame` + prebuilt exes, fresh `XCL_DATA_ROOT`, `XCL_DUMP_SHADERS=1`): `timeout 120 ./target/debug/xcl run "$GAME" -- --hello` → `xcl_testtitle: done, failures: 14`, `ExitProcess(0xe)`, `report.json` `crash: null`, `exit_code: 14`, `called_stubs: 34` incl. `XclDefinitelyMissingFunction`, `hle-cross:ucrtbase.dll: 68`. All 14 FAILs are the known null-device categories; no CRT regression.
+- Abuse probe (temporary integration test, since removed): overlong `E0 80 AF`, surrogate `ED A0 80`, out-of-range `F4 90 80 80` → `-1` + `errno 42`; truncated 4-byte with `n=2` → `-2` with errno untouched; valid astral → lead surrogate `0xD83D` + len 4; `wcrtomb` lone high without `ps`, pending-high + BMP, low without pending → `-1` + `errno 42` with pending cleared; `_execute_onexit_table(0)` and `(0xdeadbeef)` → `0`, no crash. 1 passed; 0 failed.
+
+Requirements: met — win64 `mbrtowc`/`wcrtomb` (ASCII fast path + strict UTF-8 via shared `utf8_decode_one`: `C0/C1` + continuation-lead rejection, `F5+` rejection, `n<len` → `-2`, overlong/surrogate/`>0x10FFFF` → `-1` with `errno=42`, NUL/`s==NULL` handling, surrogate pairing through `*ps`) + `_execute_onexit_table` no-op `0`, wired through `exports()` + HLE spot list + `api-ms-win-crt-convert`/`-runtime` contract and bundled-DLL resolver checks + unit test + the 12b `wcsdup` follow-up in both resolver lists. One commit (`24d6820`), no refactors, Linux-only files so Windows untouched. `llvm-readobj` confirms the only remaining MISS UCRT import in both synthetic binaries is `__stdio_common_vfprintf`.
+
+## Follow-ups (minor, non-blocking)
+- `mbrtowc` ignores `ps` and stores only the lead surrogate for astral input (no trail-half state); correct for the single-`wchar_t` destination and the stateless title path, but a restartable stream over astral text would need `ps` stashing. Revisit only if a caller shows it.
+- `mbrtowc` takes `ps` as `*mut u8` while `wcrtomb` takes `*mut u32` for the same `mbstate_t`; harmless (both treat it opaquely) but worth unifying next time the file is touched.
