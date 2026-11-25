@@ -278,6 +278,19 @@ fn win32_hresult(code: i32) -> HRESULT {
     (0x8007_0000u32 | (code as u32 & 0xFFFF)) as HRESULT
 }
 
+/// Resolve a DirectStorage open path through the VFS on Linux.
+///
+/// Console paths (`G:\…`, `GAME:…`, `T:\…`) are not host paths: the Windows
+/// factory reaches them through the hooked `CreateFileW`, but the Linux
+/// factory opens with libc, so it must translate first (retail abort
+/// 0x2237179: the title opens `G:\appdata0.rpf`, which exists in the game
+/// folder, yet the raw open failed with ENOENT). Host paths pass through
+/// unchanged; with no VFS installed (unit tests) the name is returned as-is.
+fn resolved_open_path(vfs: Option<&crate::vfs::Vfs>, name: &str) -> String {
+    vfs.and_then(|v| v.real_path_for_read(name))
+        .unwrap_or_else(|| name.to_string())
+}
+
 unsafe extern "win64" fn factory_open_file(
     _p: *mut c_void,
     path: *const u16,
@@ -292,7 +305,8 @@ unsafe extern "win64" fn factory_open_file(
     let Some(name) = from_wide_ptr(path) else {
         return E_INVALIDARG;
     };
-    let file = match std::fs::File::open(&name) {
+    let real = resolved_open_path(crate::vfs::get(), &name);
+    let file = match std::fs::File::open(&real) {
         Ok(f) => f,
         Err(e) => {
             crate::xlog_warn!("DirectStorage: OpenFile '{name}': {e}");
@@ -1039,6 +1053,47 @@ mod tests {
                 assert_ne!(slot(f, i), 0, "factory slot {i} must not be NULL");
             }
         }
+    }
+
+    #[test]
+    fn open_file_resolves_console_drive_through_vfs() {
+        // Retail abort 0x2237179: the title opens `G:\appdata0.rpf` (present in
+        // the game folder) through DirectStorage, but the Linux factory opened
+        // the raw console path and failed with ENOENT. The factory must resolve
+        // console drives via the VFS first.
+        let dir = std::env::temp_dir().join(format!(
+            "xcl-dstorage-vfs-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let game = dir.join("game");
+        let data = dir.join("xcldata");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::create_dir_all(data.join("temp")).unwrap();
+        std::fs::write(game.join("blob.bin"), b"vfs-bytes").unwrap();
+        let mounts = vec![
+            ("G:".to_string(), game.to_string_lossy().to_string()),
+            (
+                "T:".to_string(),
+                data.join("temp").to_string_lossy().to_string(),
+            ),
+        ];
+        let vfs = crate::vfs::Vfs::new(&game, &data, mounts);
+        // The raw console path never opens on Linux (backslash is a filename char).
+        assert!(std::fs::File::open("G:\\blob.bin").is_err());
+        // Through the VFS it resolves to the real file.
+        let real = vfs
+            .real_path_for_read("G:\\blob.bin")
+            .expect("G: must translate");
+        assert_eq!(std::fs::read(&real).unwrap(), b"vfs-bytes");
+        // The factory helper must use that resolution (fails before the fix).
+        assert_eq!(super::resolved_open_path(Some(&vfs), "G:\\blob.bin"), real);
+        // Host paths pass through unchanged.
+        assert_eq!(
+            super::resolved_open_path(Some(&vfs), "/tmp/xcl-dstorage-host.bin"),
+            "/tmp/xcl-dstorage-host.bin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
