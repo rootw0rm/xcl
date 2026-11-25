@@ -61,12 +61,12 @@ fn open_with(
     flags: u32,
 ) -> Result<Opened, u32> {
     validate_access(access, disposition)?;
-    let (decision, rollback, _write_guard) =
+    let (decision, commit_rel, _write_guard) =
         v.open_decision_linux(path, access, disposition, flags);
     let already_existed = match &decision {
         Decision::CreateOverOriginal(_) => true,
         Decision::Use(path) | Decision::UseWithDisposition(path, _)
-            if disposition == vfs::CREATE_ALWAYS =>
+            if disposition == vfs::CREATE_ALWAYS || disposition == vfs::OPEN_ALWAYS =>
         {
             Path::new(path).exists()
         }
@@ -84,9 +84,14 @@ fn open_with(
             open_host(&p, access, disposition, flags, already_existed)
         }
     };
-    if result.is_err() {
-        if let Some(rollback) = rollback {
-            v.restore_failed_write(&rollback);
+    if result.is_ok() {
+        if let Some(rel) = commit_rel {
+            // Commit only after the host open succeeded: a failed open must neither
+            // clear whiteouts nor record a write (upstream #1362). The commit runs
+            // under the decision's `write_lock` guard, and the guest-visible last
+            // error is set by the kernelx caller afterwards from the open result, so
+            // no Win32 `GetLastError` save/restore is needed on this path.
+            v.commit_write_unlocked(&rel);
         }
     }
     result
@@ -469,6 +474,78 @@ mod tests {
             ]
         );
         assert!(!overlay_data.join("gone.txt").exists());
+    }
+
+    /// Linux twin of upstream `failed_create_file_preserves_whiteout_and_last_error`
+    /// (#1362): staging a CreateFile* decision must not clear the whiteout or record a
+    /// write, a failed host open must leave both untouched, and only a successful open
+    /// commits.
+    #[cfg(unix)]
+    #[test]
+    fn failed_create_file_preserves_whiteout_and_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new("failed_create_whiteout");
+        let v = &f.vfs;
+        v.delete_file("data\\gone.txt").unwrap();
+        assert!(v.is_whiteout("data\\gone.txt"));
+        let writes_before = v.redirected_writes();
+
+        // Staging alone changes neither the whiteout nor the write ledger.
+        for disp in [CREATE_NEW, CREATE_ALWAYS, vfs::OPEN_ALWAYS] {
+            let (decision, commit_rel) =
+                v.open_decision_staged("G:\\data\\gone.txt", GENERIC_WRITE, disp, 0);
+            assert!(matches!(decision, Decision::Use(_)), "disp={disp}");
+            assert_eq!(commit_rel, Some("data\\gone.txt".to_string()), "disp={disp}");
+            assert!(v.is_whiteout("data\\gone.txt"), "staging must not clear the whiteout (disp={disp})");
+            assert_eq!(v.redirected_writes(), writes_before, "staging must not record a write (disp={disp})");
+            assert!(
+                v.real_path_for_read("G:\\data\\gone.txt").is_none(),
+                "deleted original must stay hidden while staged (disp={disp})"
+            );
+        }
+
+        // A failed host open preserves the whiteout and records nothing further.
+        let overlay_data = f.data.join("overlay").join("data");
+        std::fs::create_dir_all(&overlay_data).unwrap();
+        std::fs::set_permissions(&overlay_data, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // A failed CREATE_ALWAYS over a visible game file must not record a write either.
+        let visible_before = v.redirected_writes();
+        assert_eq!(
+            open_with(v, "G:\\data\\hello.txt", GENERIC_WRITE, CREATE_ALWAYS, 0).err(),
+            Some(ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(v.redirected_writes(), visible_before);
+        for disp in [CREATE_NEW, CREATE_ALWAYS, vfs::OPEN_ALWAYS] {
+            assert_eq!(
+                open_with(v, "G:\\data\\gone.txt", GENERIC_WRITE, disp, 0).err(),
+                Some(ERROR_ACCESS_DENIED),
+                "disp={disp}"
+            );
+            assert!(v.is_whiteout("data\\gone.txt"), "whiteout must remain after failed open (disp={disp})");
+            assert!(
+                v.real_path_for_read("G:\\data\\gone.txt").is_none(),
+                "deleted original must not resurrect (disp={disp})"
+            );
+        }
+        assert_eq!(v.redirected_writes(), writes_before);
+        assert!(!overlay_data.join("gone.txt").exists());
+        // Restore write permission before assertions so fixture cleanup always works.
+        std::fs::set_permissions(&overlay_data, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Once the host open actually succeeds, the whiteout clears.
+        let mut w = open_with(v, "G:\\data\\gone.txt", GENERIC_WRITE, CREATE_ALWAYS, 0).unwrap();
+        w.file.write_all(b"").unwrap();
+        drop(w);
+        assert!(!v.is_whiteout("data\\gone.txt"));
+        assert_eq!(
+            std::fs::read(overlay_data.join("gone.txt")).unwrap(),
+            b""
+        );
+
+        // Re-opening the overlay file with OPEN_ALWAYS still reports that it existed.
+        let again = open_with(v, "G:\\data\\gone.txt", GENERIC_WRITE, vfs::OPEN_ALWAYS, 0).unwrap();
+        assert!(again.already_existed);
     }
 
     #[test]

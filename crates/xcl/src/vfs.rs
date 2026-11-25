@@ -47,14 +47,6 @@ pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
 pub const ERROR_DIRECTORY: u32 = 267;
 
-/// State to restore when a Linux host open fails after the VFS staged a game write.
-#[cfg(not(windows))]
-pub(crate) struct FailedWriteRollback {
-    rel: String,
-    whiteouts: Vec<String>,
-    was_recorded: bool,
-}
-
 pub(crate) const CREATE_NEW: u32 = 1;
 pub(crate) const CREATE_ALWAYS: u32 = 2;
 pub(crate) const OPEN_EXISTING: u32 = 3;
@@ -733,19 +725,6 @@ impl Vfs {
         }
     }
 
-    #[cfg(not(windows))]
-    pub(crate) fn restore_failed_write(&self, rollback: &FailedWriteRollback) {
-        {
-            let mut g = self.whiteouts.lock().unwrap();
-            g.clear();
-            g.extend(rollback.whiteouts.iter().cloned());
-            self.persist_whiteouts(&g);
-        }
-        if !rollback.was_recorded {
-            self.writes.lock().unwrap().remove(&rollback.rel);
-        }
-    }
-
     fn remove_whiteout(&self, rel: &str) {
         #[cfg(not(windows))]
         if Self::checked_rel(rel).is_err() {
@@ -873,8 +852,7 @@ impl Vfs {
     /// without removing whiteouts or recording the write yet. Call `commit_write(rel)`
     /// only after the underlying file operation succeeds so a failed operation cannot
     /// resurrect a whited-out original.
-    pub fn stage_write(&self, rel: &str) -> Result<String, u32> {
-        let _guard = self.write_lock.lock().unwrap();
+    pub fn stage_write(&self, rel: &str) -> Result<String, u32> {        let _guard = self.write_lock.lock().unwrap();
         self.stage_write_unlocked(rel)
     }
 
@@ -902,7 +880,10 @@ impl Vfs {
         self.commit_write_unlocked(rel)
     }
 
-    fn commit_write_unlocked(&self, rel: &str) {
+    /// Commit a staged write once the underlying file operation succeeded. The caller
+    /// must hold `write_lock` (e.g. the guard returned by `open_decision_linux`); this
+    /// is the commit half of `prepare_write_staged` / `open_decision_staged_*`.
+    pub(crate) fn commit_write_unlocked(&self, rel: &str) {
         #[cfg(not(windows))]
         if Self::checked_rel(rel).is_err() {
             return;
@@ -935,13 +916,15 @@ impl Vfs {
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
-    /// and return the overlay path.
-    pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+    /// without removing whiteouts or recording the write yet. Call `commit_write(rel)`
+    /// only after the underlying file operation succeeds so a failed open cannot
+    /// resurrect a whited-out original.
+    pub fn prepare_write_staged(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
         let _guard = self.write_lock.lock().unwrap();
-        self.prepare_write_unlocked(rel, keep_content)
+        self.prepare_write_staged_unlocked(rel, keep_content)
     }
 
-    fn prepare_write_unlocked(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+    fn prepare_write_staged_unlocked(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
         // Linux first: reject traversals/absolute rels with the containment error
         // before the parent check below can shadow it as PATH_NOT_FOUND.
         #[cfg(not(windows))]
@@ -973,8 +956,19 @@ impl Vfs {
                 std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             }
         }
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        Ok(ov)
+    }
+
+    /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
+    /// and return the overlay path.
+    pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        let _guard = self.write_lock.lock().unwrap();
+        self.prepare_write_unlocked(rel, keep_content)
+    }
+
+    fn prepare_write_unlocked(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        let ov = self.prepare_write_staged_unlocked(rel, keep_content)?;
+        self.commit_write_unlocked(rel);
         Ok(ov)
     }
 
@@ -1006,6 +1000,101 @@ impl Vfs {
         access & (GENERIC_READ | 0x1000_0000 | FILE_READ_DATA) != 0
     }
 
+    /// Decide how to open `target`, staging any overlay write without removing whiteouts
+    /// or recording the write yet. Callers must call `commit_write(rel)` on the returned
+    /// relative path only after the underlying open succeeds.
+    pub fn open_decision_staged_for(
+        &self,
+        target: Target,
+        access: u32,
+        disposition: u32,
+        flags: u32,
+    ) -> (Decision, Option<String>) {
+        let _guard = self.write_lock.lock().unwrap();
+        self.open_decision_staged_for_unlocked(target, access, disposition, flags)
+    }
+
+    fn open_decision_staged_for_unlocked(
+        &self,
+        target: Target,
+        access: u32,
+        disposition: u32,
+        flags: u32,
+    ) -> (Decision, Option<String>) {
+        match target {
+            Target::Pass => (Decision::Pass, None),
+            #[cfg(not(windows))]
+            Target::Reject(error) => (Decision::Fail(error), None),
+            Target::Translated(p) => {
+                if Self::is_write(access, disposition, flags) || disposition == OPEN_ALWAYS {
+                    if let Some(parent) = Path::new(&p).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+                (Decision::Use(p), None)
+            }
+            Target::Game { rel } => {
+                let in_ov = self.visible_in_overlay(&rel);
+                let in_orig = self.visible_in_original(&rel);
+                let visible = in_ov || in_orig;
+                let write = Self::is_write(access, disposition, flags) || (disposition == OPEN_ALWAYS && !visible);
+                if !write {
+                    let decision = match self.read_path_rel(&rel) {
+                        Some(p) => Decision::Use(p),
+                        None => Decision::Fail(ERROR_FILE_NOT_FOUND),
+                    };
+                    return (decision, None);
+                }
+                // Win32 CreateFile requires GENERIC_WRITE for TRUNCATE_EXISTING before checking existence.
+                if disposition == TRUNCATE_EXISTING && access & GENERIC_WRITE == 0 {
+                    return (Decision::Fail(ERROR_INVALID_PARAMETER), None);
+                }
+                match disposition {
+                    CREATE_NEW if visible => return (Decision::Fail(ERROR_FILE_EXISTS), None),
+                    OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return (Decision::Fail(ERROR_FILE_NOT_FOUND), None),
+                    _ => {}
+                }
+                let ov_entry = in_ov || {
+                    #[cfg(windows)]
+                    let overlay_entry = Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
+                    #[cfg(not(windows))]
+                    let overlay_entry = match self.checked_overlay_path(&rel) {
+                        Ok(path) => Path::new(&path).symlink_metadata().is_ok(),
+                        Err(error) => return (Decision::Fail(error), None),
+                    };
+                    overlay_entry
+                };
+                if disposition == TRUNCATE_EXISTING {
+                    let check_path = if in_ov { self.overlay_path(&rel) } else { self.original_path(&rel) };
+                    let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
+                        Path::new(&check_path).symlink_metadata().is_ok_and(|m| m.is_dir())
+                    } else {
+                        Path::new(&check_path).is_dir()
+                    };
+                    if is_dir {
+                        let err = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 {
+                            ERROR_INVALID_PARAMETER
+                        } else {
+                            ERROR_ACCESS_DENIED
+                        };
+                        return (Decision::Fail(err), None);
+                    }
+                }
+                let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
+                let replaces_original = disposition == CREATE_ALWAYS
+                    && !ov_entry
+                    && in_orig
+                    && Path::new(&self.original_path(&rel)).is_file();
+                match self.prepare_write_staged_unlocked(&rel, keep) {
+                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => (Decision::UseWithDisposition(p, CREATE_ALWAYS), Some(rel)),
+                    Ok(p) if replaces_original => (Decision::CreateOverOriginal(p), Some(rel)),
+                    Ok(p) => (Decision::Use(p), Some(rel)),
+                    Err(e) => (Decision::Fail(e), None),
+                }
+            }
+        }
+    }
+
     pub fn open_decision_for(
         &self,
         target: Target,
@@ -1024,86 +1113,26 @@ impl Vfs {
         disposition: u32,
         flags: u32,
     ) -> Decision {
-        match target {
-            Target::Pass => Decision::Pass,
-            #[cfg(not(windows))]
-            Target::Reject(error) => Decision::Fail(error),
-            Target::Translated(p) => {
-                if Self::is_write(access, disposition, flags) || disposition == OPEN_ALWAYS {
-                    if let Some(parent) = Path::new(&p).parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                }
-                Decision::Use(p)
-            }
-            Target::Game { rel } => {
-                let in_ov = self.visible_in_overlay(&rel);
-                let in_orig = self.visible_in_original(&rel);
-                let visible = in_ov || in_orig;
-                let write = Self::is_write(access, disposition, flags) || (disposition == OPEN_ALWAYS && !visible);
-                if !write {
-                    return match self.read_path_rel(&rel) {
-                        Some(p) => Decision::Use(p),
-                        None => Decision::Fail(ERROR_FILE_NOT_FOUND),
-                    };
-                }
-                // Win32 CreateFile requires GENERIC_WRITE for TRUNCATE_EXISTING before checking existence.
-                if disposition == TRUNCATE_EXISTING && access & GENERIC_WRITE == 0 {
-                    return Decision::Fail(ERROR_INVALID_PARAMETER);
-                }
-                match disposition {
-                    CREATE_NEW if visible => return Decision::Fail(ERROR_FILE_EXISTS),
-                    OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return Decision::Fail(ERROR_FILE_NOT_FOUND),
-                    _ => {}
-                }
-                let ov_entry = in_ov || {
-                    #[cfg(windows)]
-                    let overlay_entry = Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
-                    #[cfg(not(windows))]
-                    let overlay_entry = match self.checked_overlay_path(&rel) {
-                        Ok(path) => Path::new(&path).symlink_metadata().is_ok(),
-                        Err(error) => return Decision::Fail(error),
-                    };
-                    overlay_entry
-                };
-                if disposition == TRUNCATE_EXISTING {
-                    let check_path = if in_ov { self.overlay_path(&rel) } else { self.original_path(&rel) };
-                    let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
-                        Path::new(&check_path).symlink_metadata().is_ok_and(|m| m.is_dir())
-                    } else {
-                        Path::new(&check_path).is_dir()
-                    };
-                    if is_dir {
-                        let err = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 {
-                            ERROR_INVALID_PARAMETER
-                        } else {
-                            ERROR_ACCESS_DENIED
-                        };
-                        return Decision::Fail(err);
-                    }
-                }
-                let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
-                let replaces_original = disposition == CREATE_ALWAYS
-                    && !ov_entry
-                    && in_orig
-                    && Path::new(&self.original_path(&rel)).is_file();
-                match self.prepare_write_unlocked(&rel, keep) {
-                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
-                    Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
-                    Ok(p) => Decision::Use(p),
-                    Err(e) => Decision::Fail(e),
-                }
-            }
+        let (decision, commit_rel) = self.open_decision_staged_for_unlocked(target, access, disposition, flags);
+        if let Some(rel) = commit_rel {
+            self.commit_write_unlocked(&rel);
         }
+        decision
+    }
+
+    pub fn open_decision_staged(&self, path: &str, access: u32, disposition: u32, flags: u32) -> (Decision, Option<String>) {
+        self.open_decision_staged_for(self.classify(path), access, disposition, flags)
     }
 
     pub fn open_decision(&self, path: &str, access: u32, disposition: u32, flags: u32) -> Decision {
         self.open_decision_for(self.classify(path), access, disposition, flags)
     }
 
-    /// Linux host opens can fail after `prepare_write` has removed a whiteout. Return the
-    /// affected game-relative path so the shim can restore it if `open(2)` does not create
-    /// the overlay entry successfully.
+    /// Stage a Linux host open: decide how to open `path` without removing whiteouts
+    /// or recording the write yet. Returns the staged decision, the game-relative path
+    /// to `commit_write_unlocked` only after `open(2)` succeeds, and the `write_lock`
+    /// guard held across the host open so concurrent VFS writes cannot interleave.
+    /// A failed host open needs no rollback: nothing was committed.
     #[cfg(not(windows))]
     pub(crate) fn open_decision_linux(
         &self,
@@ -1111,7 +1140,7 @@ impl Vfs {
         access: u32,
         disposition: u32,
         flags: u32,
-    ) -> (Decision, Option<FailedWriteRollback>, std::sync::MutexGuard<'_, ()>) {
+    ) -> (Decision, Option<String>, std::sync::MutexGuard<'_, ()>) {
         let guard = self.write_lock.lock().unwrap();
         let target = self.classify(path);
         let visible = match &target {
@@ -1138,21 +1167,9 @@ impl Vfs {
         {
             return (Decision::Fail(ERROR_ACCESS_DENIED), None, guard);
         }
-        let rollback = match &target {
-            Target::Game { rel } if self.is_whiteout(rel) && !self.visible_in_overlay(rel) => {
-                Some(FailedWriteRollback {
-                    rel: rel.clone(),
-                    whiteouts: self.whiteouts(),
-                    was_recorded: self.writes.lock().unwrap().contains(rel),
-                })
-            }
-            _ => None,
-        };
-        (
-            self.open_decision_for_unlocked(target, access, disposition, flags),
-            rollback,
-            guard,
-        )
+        let (decision, commit_rel) =
+            self.open_decision_staged_for_unlocked(target, access, disposition, flags);
+        (decision, commit_rel, guard)
     }
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
@@ -1491,10 +1508,10 @@ mod tests {
 
         let f = Fixture::new("write_serialization");
         let v = &f.vfs;
-        let (decision, rollback, guard) =
+        let (decision, commit_rel, guard) =
             v.open_decision_linux("G:\\data\\hello.txt", GENERIC_READ, OPEN_EXISTING, 0);
         assert!(matches!(decision, Decision::Use(_)));
-        assert!(rollback.is_none());
+        assert!(commit_rel.is_none());
 
         let (tx, rx) = mpsc::channel();
         std::thread::scope(|scope| {
