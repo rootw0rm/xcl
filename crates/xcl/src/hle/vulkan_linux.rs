@@ -108,6 +108,140 @@ pub fn select_cached() -> &'static Selection {
     CACHED.get_or_init(select)
 }
 
+/// A real Vulkan device behind a console D3D12.X device object (step 17,
+/// device slice): the `ash` instance + logical device with one graphics queue,
+/// picked through the runner's shared graphics query (no second throwaway
+/// instance beyond the one `select()` already probed — the set cannot change
+/// mid-process, so this is created once and intentionally leaked like the
+/// null device objects).
+pub struct VulkanState {
+    /// Adapter name (`pick_graphics_device`), for logs.
+    pub name: String,
+    /// Compute lane path from the device `subgroupSize` (step-16 decision).
+    pub lane: LanePath,
+    /// Raw `subgroupSize` the lane was derived from (self-consistency gate).
+    pub subgroup_size: u32,
+    /// Graphics queue family index (the single queue this device owns).
+    pub queue_family: u32,
+    /// Whether swapchain presentation is available (instance WSI extensions
+    /// plus the `VK_KHR_swapchain` device extension; false stays headless).
+    pub wsi: bool,
+    /// Owns the loader lifetime: must outlive `device` (never dropped —
+    /// the state lives in a process singleton).
+    #[allow(dead_code)]
+    instance: ash::Instance,
+    /// Owns `libvulkan.so.1` itself: `Instance`/`Device` hold bare function
+    /// pointers into it, so dropping the `Entry` would `dlclose` the loader
+    /// (and its ICDs) under the live device.
+    #[allow(dead_code)]
+    entry: ash::Entry,
+    device: ash::Device,
+}
+
+/// Acquire the process Vulkan device (`None` when unavailable — missing
+/// loader, no device, no graphics queue — never a panic). Cached: one
+/// instance + one logical device per process, whatever the title creates.
+pub fn acquire() -> Option<&'static VulkanState> {
+    static STATE: std::sync::OnceLock<Result<VulkanState, String>> = std::sync::OnceLock::new();
+    STATE.get_or_init(create_state).as_ref().ok()
+}
+
+/// The single queue of [`acquire()`] (cheap `get_device_queue` wrapper for
+/// future submit paths; the handle stays valid while the state lives).
+#[allow(dead_code)]
+pub fn queue_of(state: &VulkanState) -> ash::vk::Queue {
+    unsafe { state.device.get_device_queue(state.queue_family, 0) }
+}
+
+fn create_state() -> Result<VulkanState, String> {
+    unsafe {
+        let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
+        let app = std::ffi::CString::new("xcl").unwrap();
+        let app_info = ash::vk::ApplicationInfo::default()
+            .application_name(&app)
+            .api_version(ash::vk::make_api_version(0, 1, 3, 0));
+        // WSI extensions are enabled unconditionally (never probed with the
+        // racy global `enumerate_instance_extension_properties` query — see
+        // `vulkan_present`): absence fails closed at `create_instance` and
+        // retries headless below.
+        let surface_fn = std::ffi::CString::new("VK_KHR_surface").unwrap();
+        let xlib_fn = std::ffi::CString::new("VK_KHR_xlib_surface").unwrap();
+        let with_wsi = [surface_fn.as_ptr(), xlib_fn.as_ptr()];
+        let bare_info = ash::vk::InstanceCreateInfo::default().application_info(&app_info);
+        let wsi_info = ash::vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&with_wsi);
+        let (instance, wsi) = match entry.create_instance(&wsi_info, None) {
+            Ok(i) => (i, true),
+            Err(ash::vk::Result::ERROR_EXTENSION_NOT_PRESENT) => (
+                entry
+                    .create_instance(&bare_info, None)
+                    .map_err(|e| format!("no Vulkan: create_instance: {e}"))?,
+                false,
+            ),
+            Err(e) => return Err(format!("no Vulkan: create_instance: {e}")),
+        };
+        let picked = vulkan_runner::pick_graphics_device(&instance).map_err(|e| {
+            instance.destroy_instance(None);
+            e
+        });
+        let (phys, qfi, name, subgroup) = match picked {
+            Ok(v) => v,
+            Err(e) => {
+                instance.destroy_instance(None);
+                return Err(e);
+            }
+        };
+        let lane = vulkan_runner::lane_path_for(subgroup);
+        // Logical device with one graphics queue; the swapchain extension
+        // rides along only when the instance has WSI, and its absence fails
+        // closed to a headless device (never to no device at all).
+        let prio = [1.0f32];
+        let queue_info = ash::vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(qfi)
+            .queue_priorities(&prio);
+        let swap_fn = std::ffi::CString::new("VK_KHR_swapchain").unwrap();
+        let swap_ext = [swap_fn.as_ptr()];
+        let mk_dev = |with_swap: bool| {
+            let mut info = ash::vk::DeviceCreateInfo::default()
+                .queue_create_infos(std::slice::from_ref(&queue_info));
+            if with_swap {
+                info = info.enabled_extension_names(&swap_ext);
+            }
+            instance.create_device(phys, &info, None)
+        };
+        let (device, wsi) = match mk_dev(wsi) {
+            Ok(d) => (d, wsi),
+            Err(ash::vk::Result::ERROR_EXTENSION_NOT_PRESENT) if wsi => {
+                (mk_dev(false).map_err(|e| format!("create_device: {e}"))?, false)
+            }
+            Err(e) => {
+                instance.destroy_instance(None);
+                return Err(format!("create_device: {e}"));
+            }
+        };
+        // Validate the queue right away (proves the logical device works);
+        // the handle is re-queried per use via `queue_of`.
+        let q = device.get_device_queue(qfi, 0);
+        if q == ash::vk::Queue::null() {
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+            return Err("no device: null graphics queue".into());
+        }
+        eprintln!("vulkan: device {name} subgroupSize {subgroup} -> {lane:?} (wsi {wsi})");
+        Ok(VulkanState {
+            name,
+            lane,
+            subgroup_size: subgroup,
+            queue_family: qfi,
+            wsi,
+            instance,
+            entry,
+            device,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +295,23 @@ mod tests {
             let lane = vulkan_runner::lane_path_for(size);
             let sel = select_with(Backend::Vulkan, || Ok(lane));
             assert_eq!(sel.lane, Some(vulkan_runner::lane_path_for(size)));
+        }
+    }
+
+    #[test]
+    fn acquire_returns_real_device_or_skips() {
+        // Step-17 device slice: one process Vulkan device (graphics queue,
+        // lane from the real subgroupSize), or a clean skip with no device.
+        match acquire() {
+            Some(st) => {
+                assert!(!st.name.is_empty(), "device name must not be empty");
+                assert_eq!(st.lane, vulkan_runner::lane_path_for(st.subgroup_size));
+                let q = queue_of(st);
+                assert!(q != ash::vk::Queue::null(), "graphics queue must exist");
+            }
+            None => {
+                vulkan_runner::skip_test("no Vulkan");
+            }
         }
     }
 

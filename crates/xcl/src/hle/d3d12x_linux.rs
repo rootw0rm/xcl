@@ -21,6 +21,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::hle::vulkan_linux::{Backend, Selection, VulkanState, acquire, select_cached};
 use crate::util::{E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, S_FALSE, S_OK};
 
 const VTBL_SLOTS: usize = 256;
@@ -29,6 +30,12 @@ const DLL: &str = "d3d12_xs.dll";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Device,
+    /// A console device backed by a real Vulkan device (step 17): same vtable
+    /// shape as [`Kind::Device`] today (every method delegates to the null
+    /// implementation), but the object's `value` holds the
+    /// [`VulkanState`] pointer and future slices override creation slots here
+    /// without touching the headless default.
+    VulkanDevice,
     CommandQueue,
     CommandAllocator,
     CommandList,
@@ -51,7 +58,7 @@ pub enum Kind {
 impl Kind {
     fn iface(self) -> &'static str {
         match self {
-            Kind::Device => "ID3D12Device",
+            Kind::Device | Kind::VulkanDevice => "ID3D12Device",
             Kind::CommandQueue => "ID3D12CommandQueue",
             Kind::CommandAllocator => "ID3D12CommandAllocator",
             Kind::CommandList => "ID3D12GraphicsCommandList",
@@ -115,7 +122,7 @@ fn vtable(kind: Kind) -> *const usize {
         }
     }
     match kind {
-        Kind::Device => {
+        Kind::Device | Kind::VulkanDevice => {
             v[7] = Device_GetNodeCount as usize;
             v[8] = Device_CreateCommandQueue as usize;
             v[9] = Device_CreateCommandAllocator as usize;
@@ -228,6 +235,21 @@ unsafe fn out_obj(ppv: *mut *mut c_void, kind: Kind) -> HRESULT {
 fn device() -> *mut NullObj {
     static DEV: OnceLock<usize> = OnceLock::new();
     *DEV.get_or_init(|| new_obj(Kind::Device) as usize) as *mut NullObj
+}
+
+/// The process Vulkan device object (step 17): a singleton like [`device()`),
+/// created only when the backend selection requests Vulkan and a real device
+/// exists. The object's `value` holds the [`VulkanState`] pointer; `0` when no
+/// Vulkan device is available (the caller falls back to [`device()`]).
+fn vulkan_device(state: &'static VulkanState) -> *mut NullObj {
+    static VDEV: OnceLock<usize> = OnceLock::new();
+    *VDEV.get_or_init(|| {
+        let o = new_obj(Kind::VulkanDevice);
+        unsafe {
+            (*o).value.store(state as *const VulkanState as u64, Ordering::Relaxed);
+        }
+        o as usize
+    }) as *mut NullObj
 }
 
 // ---------------------------------------------------------------------------------------
@@ -886,13 +908,41 @@ pub(crate) unsafe fn new_blob_from(src: *const u8, len: usize, out: *mut *mut c_
 static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn create_device(ppv: *mut *mut c_void) -> HRESULT {
-    // Step-17a: query the Vulkan backend selector (cached: one probe per
-    // process, not one per device creation); this slice still returns
-    // the existing null device (no vtable/behavior change for the title).
-    // `select_cached()` probes the real device only when `XCL_VULKAN_BACKEND=vulkan`
-    // is set, otherwise it stays headless with no Vulkan instance.
-    let sel = crate::hle::vulkan_linux::select_cached();
+    // Step-17: query the Vulkan backend selector (cached: one probe per
+    // process, not one per device creation); the Vulkan request path hands out
+    // the real-device object below, the default stays the null device.
+    create_device_for(select_cached(), acquire(), ppv)
+}
+
+/// Device creation for an explicit selection + device state (pure wiring, for
+/// tests): `Null` always hands out the null device; `Vulkan` hands out the
+/// Vulkan device object when `state` is `Some`, and falls back to the null
+/// device with a logged reason when it is `None`. Never a panic.
+pub(crate) unsafe fn create_device_for(
+    sel: &Selection,
+    state: Option<&'static VulkanState>,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     crate::xlog_debug!("D3D12.X backend: {:?} ({})", sel.backend, sel.reason);
+    if sel.backend == Backend::Vulkan {
+        if let Some(st) = state {
+            if ANNOUNCED.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_warn!(
+                    "D3D12.X: Vulkan device '{}' ({:?}) – console device calls route to the Vulkan backend",
+                    st.name,
+                    st.lane,
+                );
+            }
+            if ppv.is_null() {
+                return S_FALSE;
+            }
+            let d = vulkan_device(st);
+            (*d).refs.fetch_add(1, Ordering::AcqRel);
+            *ppv = d as *mut c_void;
+            return S_OK;
+        }
+        crate::xlog_warn!("D3D12.X: Vulkan requested but no device – falling back to the null device");
+    }
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_warn!("D3D12.X: creating a FALLBACK DEVICE (null device) – graphics are not rendered in milestone M1");
     }
@@ -1146,6 +1196,47 @@ mod tests {
             assert_ne!(pool, u32::MAX);
             assert_eq!(unreg(dev, pool as u64), S_OK);
             assert!(unreg(dev, pool as u64) < 0);
+        }
+    }
+
+    #[test]
+    fn vulkan_routing_hands_out_the_matching_device() {
+        // Step-17 device slice: the selection decides which singleton the
+        // title gets; a Vulkan request without a device falls back to null.
+        // Pure wiring except the `Some` arm, which skips without hardware.
+        unsafe {
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let vulkan_sel = Selection {
+                backend: Backend::Vulkan,
+                lane: None,
+                reason: "test".into(),
+            };
+            // a null request never touches Vulkan state (present or not)
+            for state in [None, acquire()] {
+                let mut p = std::ptr::null_mut();
+                assert_eq!(create_device_for(&null_sel, state, &mut p), S_OK);
+                assert_eq!((*(p as *mut NullObj)).kind, Kind::Device);
+            }
+            // a Vulkan request without a device falls back to the null device
+            let mut p = std::ptr::null_mut();
+            assert_eq!(create_device_for(&vulkan_sel, None, &mut p), S_OK);
+            assert_eq!((*(p as *mut NullObj)).kind, Kind::Device);
+            // a Vulkan request with a device hands out the Vulkan object
+            match acquire() {
+                Some(st) => {
+                    let mut p = std::ptr::null_mut();
+                    assert_eq!(create_device_for(&vulkan_sel, Some(st), &mut p), S_OK);
+                    assert_eq!((*(p as *mut NullObj)).kind, Kind::VulkanDevice);
+                    assert_eq!(
+                        (*(p as *mut NullObj)).value.load(Ordering::Relaxed),
+                        st as *const _ as u64
+                    );
+                }
+                None => crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan"),
+            }
+            // a null out-pointer stays S_FALSE on every path
+            assert_eq!(create_device_for(&null_sel, acquire(), std::ptr::null_mut()), S_FALSE);
+            assert_eq!(create_device_for(&vulkan_sel, None, std::ptr::null_mut()), S_FALSE);
         }
     }
 
