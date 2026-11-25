@@ -1016,10 +1016,33 @@ struct MergedFind {
     pos: usize,
 }
 
-static MERGED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static MERGED: Mutex<Option<std::collections::HashMap<usize, MergedFind>>> = Mutex::new(None);
+static NEXT_MERGED_HANDLE: AtomicUsize = AtomicUsize::new(0x7F50_0001);
 
-fn is_merged(h: HANDLE) -> bool {
-    MERGED.lock().ok().and_then(|g| g.as_ref().map(|s| s.contains(&(h as usize)))).unwrap_or(false)
+fn insert_merged(m: MergedFind) -> HANDLE {
+    // Odd synthetic handles never collide with real kernel handles or INVALID_HANDLE_VALUE.
+    let h = (NEXT_MERGED_HANDLE.fetch_add(1, Ordering::Relaxed) << 2) | 3;
+    MERGED.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(h, m);
+    h as HANDLE
+}
+
+enum MergedNext {
+    NotMerged,
+    Entry(WIN32_FIND_DATAW),
+    End,
+}
+
+fn merged_next(h: HANDLE) -> MergedNext {
+    let Ok(mut g) = MERGED.lock() else { return MergedNext::NotMerged };
+    let Some(map) = g.as_mut() else { return MergedNext::NotMerged };
+    let Some(m) = map.get_mut(&(h as usize)) else { return MergedNext::NotMerged };
+    match m.items.get(m.pos).copied() {
+        Some(d) => {
+            m.pos += 1;
+            MergedNext::Entry(d)
+        }
+        None => MergedNext::End,
+    }
 }
 
 fn name_of(d: &WIN32_FIND_DATAW) -> String {
@@ -1106,14 +1129,15 @@ unsafe fn find_first_vfs(path: &str, out: *mut WIN32_FIND_DATAW) -> Option<Resul
             Some(if h == INVALID_HANDLE_VALUE { Err(windows_sys::Win32::Foundation::GetLastError()) } else { Ok(h) })
         }
         Target::Game { rel } => {
+            if out.is_null() {
+                return Some(Err(87)); // ERROR_INVALID_PARAMETER
+            }
             let items = match collect_game_entries(v, &rel, |p| collect(p)) {
                 Ok(items) => items,
                 Err(e) => return Some(Err(e)),
             };
             *out = items[0];
-            let h = Box::into_raw(Box::new(MergedFind { items, pos: 1 })) as HANDLE;
-            MERGED.lock().unwrap().get_or_insert_with(HashSet::new).insert(h as usize);
-            Some(Ok(h))
+            Some(Ok(insert_merged(MergedFind { items, pos: 1 })))
         }
     }
 }
@@ -1154,6 +1178,9 @@ unsafe extern "system" fn hk_find_first_w(n: *const u16, data: *mut WIN32_FIND_D
 
 unsafe fn w_to_a(w: &WIN32_FIND_DATAW, a: *mut WIN32_FIND_DATAA) {
     use windows_sys::Win32::Globalization::{WideCharToMultiByte, CP_ACP};
+    if a.is_null() {
+        return;
+    }
     let a = &mut *a;
     a.dwFileAttributes = w.dwFileAttributes;
     a.ftCreationTime = w.ftCreationTime;
@@ -1187,53 +1214,58 @@ unsafe extern "system" fn hk_find_first_a(n: *const u8, data: *mut WIN32_FIND_DA
     }
 }
 
-unsafe fn merged_next(h: HANDLE) -> Option<WIN32_FIND_DATAW> {
-    let m = &mut *(h as *mut MergedFind);
-    let r = m.items.get(m.pos).copied();
-    m.pos += 1;
-    r
-}
-
 unsafe extern "system" fn hk_find_next_w(h: HANDLE, data: *mut WIN32_FIND_DATAW) -> i32 {
-    if is_merged(h) {
-        return match merged_next(h) {
-            Some(d) => {
-                *data = d;
-                1
+    if data.is_null() {
+        if let Ok(g) = MERGED.lock() {
+            if g.as_ref().is_some_and(|m| m.contains_key(&(h as usize))) {
+                SetLastError(87); // ERROR_INVALID_PARAMETER
+                return 0;
             }
-            None => {
-                SetLastError(18); // ERROR_NO_MORE_FILES
-                0
-            }
-        };
+        }
+        return orig!(O_FIND_NEXT_W as FnFindNextW)(h, data);
     }
-    orig!(O_FIND_NEXT_W as FnFindNextW)(h, data)
+    match merged_next(h) {
+        MergedNext::Entry(d) => {
+            *data = d;
+            1
+        }
+        MergedNext::End => {
+            SetLastError(18); // ERROR_NO_MORE_FILES
+            0
+        }
+        MergedNext::NotMerged => orig!(O_FIND_NEXT_W as FnFindNextW)(h, data),
+    }
 }
 
 unsafe extern "system" fn hk_find_next_a(h: HANDLE, data: *mut WIN32_FIND_DATAA) -> i32 {
-    if is_merged(h) {
-        return match merged_next(h) {
-            Some(d) => {
-                w_to_a(&d, data);
-                1
+    if data.is_null() {
+        if let Ok(g) = MERGED.lock() {
+            if g.as_ref().is_some_and(|m| m.contains_key(&(h as usize))) {
+                SetLastError(87); // ERROR_INVALID_PARAMETER
+                return 0;
             }
-            None => {
-                SetLastError(18);
-                0
-            }
-        };
+        }
+        return orig!(O_FIND_NEXT_A as FnFindNextA)(h, data);
     }
-    orig!(O_FIND_NEXT_A as FnFindNextA)(h, data)
+    match merged_next(h) {
+        MergedNext::Entry(d) => {
+            w_to_a(&d, data);
+            1
+        }
+        MergedNext::End => {
+            SetLastError(18);
+            0
+        }
+        MergedNext::NotMerged => orig!(O_FIND_NEXT_A as FnFindNextA)(h, data),
+    }
 }
 
 unsafe extern "system" fn hk_find_close(h: HANDLE) -> i32 {
-    let was = MERGED
+    let removed = MERGED
         .lock()
         .ok()
-        .and_then(|mut g| g.as_mut().map(|s| s.remove(&(h as usize))))
-        .unwrap_or(false);
-    if was {
-        drop(Box::from_raw(h as *mut MergedFind));
+        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(&(h as usize))));
+    if removed.is_some() {
         return 1;
     }
     orig!(O_FIND_CLOSE as FnFindClose)(h)
@@ -1920,5 +1952,30 @@ mod tests {
             .collect();
         after.sort();
         assert_eq!(after, vec![".", ".."]);
+    }
+
+    #[test]
+    fn merged_find_null_data_and_close_are_safe() {
+        unsafe {
+            let mut item: WIN32_FIND_DATAW = std::mem::zeroed();
+            item.cFileName[0] = b'a' as u16;
+            let h = insert_merged(MergedFind { items: vec![item, item], pos: 1 });
+
+            // Null output pointers must fail cleanly instead of dereferencing null.
+            windows_sys::Win32::Foundation::SetLastError(0);
+            assert_eq!(hk_find_next_w(h, std::ptr::null_mut()), 0);
+            assert_eq!(windows_sys::Win32::Foundation::GetLastError(), 87);
+
+            windows_sys::Win32::Foundation::SetLastError(0);
+            assert_eq!(hk_find_next_a(h, std::ptr::null_mut()), 0);
+            assert_eq!(windows_sys::Win32::Foundation::GetLastError(), 87);
+
+            // Valid next returns entry, then close removes it and subsequent merged_next sees NotMerged.
+            let mut out: WIN32_FIND_DATAW = std::mem::zeroed();
+            assert_eq!(hk_find_next_w(h, &mut out), 1);
+            assert_eq!(out.cFileName[0], b'a' as u16);
+            assert_eq!(hk_find_close(h), 1);
+            assert!(matches!(merged_next(h), MergedNext::NotMerged));
+        }
     }
 }

@@ -3738,6 +3738,9 @@ fn split_find_rel(rel: &str) -> (String, String) {
 
 fn find_first_impl(path: &str, out: *mut FindDataW) -> Result<usize, u32> {
     use crate::vfs::Target;
+    if out.is_null() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
     let v = crate::vfs::get();
     let Some(v) = v else {
         // No VFS yet: plain host listing.
@@ -5097,8 +5100,15 @@ pub unsafe extern "win64" fn FindFirstFileA(name: *const u8, data: *mut FindData
         return INVALID_HANDLE_VALUE;
     };
     // Reuse the wide path: encode back is unnecessary, call the impl directly.
+    // A NULL data pointer must fail with ERROR_INVALID_PARAMETER instead of
+    // faulting: forward the null so the shared `find_first_impl` guard sees it.
     let mut w = std::mem::zeroed::<FindDataW>();
-    match find_first_impl(&path, &mut w) {
+    let out_ptr: *mut FindDataW = if data.is_null() {
+        std::ptr::null_mut()
+    } else {
+        &mut w
+    };
+    match find_first_impl(&path, out_ptr) {
         Ok(h) => {
             if !data.is_null() {
                 *data = w;
@@ -9614,6 +9624,156 @@ mod tests {
             let (s, d) = (crate::util::wide(&gpath("orig.txt")), crate::util::wide(&gpath("orig.txt")));
             assert_eq!(MoveFileExW(s.as_ptr(), d.as_ptr(), 0), 1);
             overlay_untouched();
+        }
+    }
+
+    #[test]
+    fn find_first_null_data_fails_instead_of_faulting() {
+        // Linux port of upstream #1662's `merged_find_null_data_and_close_are_safe`
+        // (`vfs_hooks.rs`, Windows-only): the live Linux path is `find_first_impl`
+        // here. A NULL data pointer must fail with ERROR_INVALID_PARAMETER (87) +
+        // INVALID_HANDLE_VALUE instead of dereferencing null. Pre-fix this test
+        // faults the test process (SIGSEGV), which is the red signal.
+        let _ = ensure_test_vfs();
+        unsafe {
+            let pat_w = crate::util::wide("G:\\data\\*");
+            let pat_a = std::ffi::CString::new("G:\\data\\*").unwrap();
+
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileW(pat_w.as_ptr(), std::ptr::null_mut()),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileA(
+                    pat_a.as_ptr() as *const u8,
+                    std::ptr::null_mut()
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileExW(
+                    pat_w.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    0
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            SetLastError(0);
+            assert_eq!(
+                FindFirstFileExA(
+                    pat_a.as_ptr() as *const u8,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    0
+                ),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            // Invalid-handle Next/Close legs were already correct: pin them.
+            let mut out: FindDataW = std::mem::zeroed();
+            SetLastError(0);
+            assert_eq!(FindNextFileW(usize::MAX - 7, &mut out), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            SetLastError(0);
+            assert_eq!(FindNextFileA(usize::MAX - 7, &mut out), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            SetLastError(0);
+            assert_eq!(FindClose(usize::MAX - 7), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            // A NULL Next on a merged (VFS-owned) handle also fails 87.
+            let mut first: FindDataW = std::mem::zeroed();
+            let fh = FindFirstFileW(pat_w.as_ptr(), &mut first);
+            assert_ne!(fh, INVALID_HANDLE_VALUE);
+            SetLastError(0);
+            assert_eq!(FindNextFileW(fh, std::ptr::null_mut()), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(FindClose(fh), 1);
+        }
+    }
+
+    #[test]
+    fn find_iteration_serializes_against_close() {
+        // #1415-shape concurrency test: the Box-retaining intermediate shape from
+        // upstream #1415 is superseded by #1662's HashMap design on both sides.
+        // Linux already holds it (`FINDS: Mutex<HashMap<usize, FindState>>` at
+        // kernelx_linux.rs:3521, no `Box::into_raw` on the Linux find path;
+        // `FindNextFileW` keeps the `finds()` lock across lookup+increment and
+        // `FindClose` removes under the same lock via `close_find_handle`).
+        // This test proves the property: concurrent iteration delivers each
+        // entry exactly once, and close-vs-reader never faults.
+        let items: Vec<FindDataW> = (0..512u32)
+            .map(|n| {
+                let mut d: FindDataW = unsafe { std::mem::zeroed() };
+                d.attrs = n;
+                d
+            })
+            .collect();
+        let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        finds().lock().unwrap().insert(h, FindState { items, pos: 0 });
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut seen = Vec::new();
+                    loop {
+                        let mut d: FindDataW = unsafe { std::mem::zeroed() };
+                        let r = unsafe { FindNextFileW(h, &mut d) };
+                        if r == 0 {
+                            break;
+                        }
+                        seen.push(d.attrs);
+                    }
+                    seen
+                })
+            })
+            .collect();
+        let mut all: Vec<u32> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..512u32).collect::<Vec<_>>());
+        assert!(close_find_handle(h));
+        // After close the handle is unknown: Next/Close fail 87, no fault.
+        unsafe {
+            let mut d: FindDataW = std::mem::zeroed();
+            assert_eq!(FindNextFileW(h, &mut d), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(FindClose(h), 0);
+        }
+
+        for _ in 0..100 {
+            let d: FindDataW = unsafe { std::mem::zeroed() };
+            let h2 = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+            finds()
+                .lock()
+                .unwrap()
+                .insert(h2, FindState { items: vec![d], pos: 0 });
+            let gate = Arc::new(Barrier::new(2));
+            let other = Arc::clone(&gate);
+            let reader = std::thread::spawn(move || {
+                other.wait();
+                let mut out: FindDataW = unsafe { std::mem::zeroed() };
+                unsafe { FindNextFileW(h2, &mut out) }
+            });
+            gate.wait();
+            assert!(close_find_handle(h2));
+            let _ = reader.join().unwrap();
         }
     }
 
