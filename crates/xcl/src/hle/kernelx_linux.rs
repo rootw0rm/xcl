@@ -4491,6 +4491,18 @@ pub unsafe extern "win64" fn CreateDirectoryA(name: *const u8, _sa: *const c_voi
     create_dir_impl(&path)
 }
 
+fn host_mkdir_error(e: std::io::Error) -> u32 {
+    // A reused data root replays `CreateDirectoryW` on an existing dir (the title's
+    // `create_dir_all("S:/Users/xcl/games")` runs every boot). Windows reports that
+    // as ERROR_ALREADY_EXISTS (183); the raw host EEXIST (17) must never leak, or the
+    // guest std maps it to `os error 17` and the PLS check fails on the 2nd boot.
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        crate::vfs::ERROR_ALREADY_EXISTS
+    } else {
+        e.raw_os_error().unwrap_or(3) as u32
+    }
+}
+
 fn create_dir_impl(path: &str) -> i32 {
     let Some(v) = crate::vfs::get() else {
         return match std::fs::create_dir(path) {
@@ -4499,7 +4511,7 @@ fn create_dir_impl(path: &str) -> i32 {
                 1
             }
             Err(e) => {
-                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                set_error(host_mkdir_error(e));
                 0
             }
         };
@@ -4512,7 +4524,7 @@ fn create_dir_impl(path: &str) -> i32 {
                 1
             }
             Err(e) => {
-                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                set_error(host_mkdir_error(e));
                 0
             }
         },
@@ -4522,7 +4534,7 @@ fn create_dir_impl(path: &str) -> i32 {
                 1
             }
             Err(e) => {
-                set_error(e.raw_os_error().unwrap_or(3) as u32);
+                set_error(host_mkdir_error(e));
                 0
             }
         },
@@ -9229,6 +9241,35 @@ mod tests {
         );
         assert_eq!(tree_hash(global_game), global_before);
         let _ = data;
+    }
+
+    #[test]
+    fn create_directory_second_create_reports_already_exists() {
+        // Reused data roots hit this: the title runs `create_dir_all("S:/Users/xcl/games")`
+        // on every boot, so the 2nd boot's `CreateDirectoryW` on the existing PLS dir
+        // must report Win32 ERROR_ALREADY_EXISTS (183), not the raw host EEXIST (17).
+        use crate::vfs::{Target, ERROR_ALREADY_EXISTS};
+        static PROBE_SEQ: AtomicU32 = AtomicU32::new(0);
+        let _ = ensure_test_vfs();
+        // `S:\` itself (the host `pls` dir) may not exist in the fixture yet; the
+        // launcher creates it on a real boot, and `create_dir_all` in the title
+        // creates each level in turn. Ensure the root so the single-level
+        // `CreateDirectoryW` probe below tests EEXIST, not ENOENT.
+        if let Target::Translated(root) = crate::vfs::get().unwrap().classify("S:\\") {
+            std::fs::create_dir_all(&root).unwrap();
+        }
+        unsafe {
+            let n = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = format!("S:\\eexist_probe_{}_{n}", std::process::id());
+            let w = crate::util::wide(&path);
+            assert_eq!(CreateDirectoryW(w.as_ptr(), std::ptr::null()), 1, "{path}");
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+            let w2 = crate::util::wide(&path);
+            assert_eq!(CreateDirectoryW(w2.as_ptr(), std::ptr::null()), 0, "{path}");
+            assert_eq!(GetLastError(), ERROR_ALREADY_EXISTS, "{path}");
+            let w3 = crate::util::wide(&path);
+            assert_eq!(RemoveDirectoryW(w3.as_ptr()), 1, "{path}");
+        }
     }
 
     #[test]
