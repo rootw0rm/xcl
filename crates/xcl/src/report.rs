@@ -192,27 +192,34 @@ fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
     }
 }
 
-/// Write a crash-only report from outside signal context. The Linux signal handler records
-/// fixed-size values and wakes a watchdog thread; keeping allocation, locks and file I/O in
-/// that thread avoids doing non-async-signal-safe work in the handler itself.
-pub fn write_crash(crash: String) {
+/// Full crash report for the watchdog thread: everything `build()` collects
+/// (called stubs, imports, modules, VFS) plus the crash description and the
+/// signal's exit code. Runs off-signal (watchdog thread), so locks, allocation
+/// and file I/O are fine here – unlike in the signal handler itself.
+pub fn write_crash_with_code(crash: String, code: i64) {
     if let Some(mut g) = lock_within(&CRASH, Duration::from_secs(2)) {
         g.get_or_insert(crash.clone());
     }
     let Some(_g) = lock_within(&WRITE_LOCK, Duration::from_secs(2)) else { return };
     let Some(boot) = crate::state::boot() else { return };
-    let report = Report {
-        xcl_version: env!("CARGO_PKG_VERSION").to_string(),
-        title: boot.title.clone(),
-        exe: boot.exe_path.to_string_lossy().into_owned(),
-        crash: Some(crash),
-        #[cfg(not(windows))]
-        notes: vec!["Linux reports fatal signals; Windows .pdata/C++ unwinding is not ported yet.".into()],
-        ..Default::default()
-    };
+    let mut report = build();
+    // `build()` re-reads CRASH above, so the description is already in place.
+    report.crash = Some(crash);
+    report.exit_code = Some(code);
+    // The boot record is the watchdog's only ground truth; `build()` fills the
+    // same fields from the same source, but keep these pinned regardless.
+    report.title = boot.title.clone();
+    report.exe = boot.exe_path.to_string_lossy().into_owned();
     if let Ok(s) = serde_json::to_string_pretty(&report) {
         let _ = std::fs::write(boot.report_path(), s);
     }
+}
+
+/// Write a crash-only report from outside signal context. The Linux signal handler records
+/// fixed-size values and wakes a watchdog thread; keeping allocation, locks and file I/O in
+/// that thread avoids doing non-async-signal-safe work in the handler itself.
+pub fn write_crash(crash: String) {
+    write_crash_with_code(crash, 128 + libc::SIGSEGV as i64);
 }
 
 /// Write `report.json` (host side) with an explicit exit code. `ExitProcess` uses
@@ -281,5 +288,85 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(CRASH.lock().unwrap().as_deref(), Some("boom"));
         *CRASH.lock().unwrap() = None;
+    }
+
+    /// Synthetic SIGTRAP data (game exe + retail-style offset) goes through the
+    /// watchdog's write path in a child process (boot/module globals are per-process)
+    /// and the JSON must carry the crash site, the signal exit code and the stubs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_report_carries_signal_module_offset_and_stubs() {
+        const CHILD: &str = "XCL_REPORT_CRASH_CHILD";
+        const DIR_ENV: &str = "XCL_REPORT_CRASH_DIR";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = std::path::PathBuf::from(std::env::var(DIR_ENV).unwrap());
+            std::fs::create_dir_all(dir.join("logs")).unwrap();
+            crate::state::set_boot(crate::config::Boot {
+                title: "signal-test".into(),
+                exe_path: dir.join("signal-test.exe"),
+                game_root: dir.clone(),
+                data_dir: dir.clone(),
+                config: crate::config::Config::default(),
+            });
+            let base = 0x6E5F_0000_0000usize;
+            let offset = 0x16624a5usize;
+            crate::modules::register_mapped(std::sync::Arc::new(crate::modules::MappedModule {
+                name: "game_scarlett_master.exe".into(),
+                path: dir.join("game_scarlett_master.exe"),
+                base,
+                size: 0x200_0000,
+                entry_rva: 0,
+                is_dll: false,
+                exports: Default::default(),
+                tls_callbacks: Default::default(),
+                no_thread_calls: Default::default(),
+                initialized: Default::default(),
+                stack_reserve: 0,
+            }));
+            let crash = crate::eh::format_crash(libc::SIGTRAP, base + offset, base + offset);
+            crate::report::write_crash_with_code(crash, 128 + libc::SIGTRAP as i64);
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "xcl-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "report::tests::crash_report_carries_signal_module_offset_and_stubs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(DIR_ENV, &dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let raw = std::fs::read_to_string(dir.join("logs").join("report.json")).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let crash = report["crash"].as_str().expect("crash description");
+        assert!(crash.contains("SIGTRAP"), "{crash}");
+        assert!(crash.contains("signal 5"), "{crash}");
+        assert!(crash.contains("game_scarlett_master.exe+0x16624a5"), "{crash}");
+        assert_eq!(report["exit_code"], serde_json::json!(133));
+        assert!(report["called_stubs"].is_array(), "{raw}");
+        assert!(report["imports_by_source"].is_object(), "{raw}");
+        assert!(
+            report["modules"].as_array().is_some_and(|m| m
+                .iter()
+                .any(|m| m["name"] == "game_scarlett_master.exe")),
+            "{raw}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

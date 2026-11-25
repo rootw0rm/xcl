@@ -7,7 +7,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
-const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGSEGV, libc::SIGILL, libc::SIGFPE, libc::SIGBUS];
+const FATAL_SIGNALS: [libc::c_int; 6] =
+    [libc::SIGSEGV, libc::SIGILL, libc::SIGFPE, libc::SIGBUS, libc::SIGTRAP, libc::SIGABRT];
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static HANDLING: AtomicBool = AtomicBool::new(false);
 static CRASH_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -97,12 +98,25 @@ fn fault_pc(_context: *mut std::ffi::c_void) -> usize {
     0
 }
 
+/// Crash description from synthetic or observed signal data: signal name and number,
+/// faulting PC with its nearest module+offset, and the fault address. Pure (no locks,
+/// no allocation beyond the string) so unit tests can check the report contents directly.
+pub fn format_crash(signal: libc::c_int, pc: usize, address: usize) -> String {
+    format!(
+        "{} (signal {signal}) at {}; pc {pc:#x}; fault address {address:#x}",
+        signal_name(signal),
+        crate::modules::describe_address(pc)
+    )
+}
+
 fn signal_name(signal: libc::c_int) -> &'static str {
     match signal {
         libc::SIGSEGV => "SIGSEGV",
         libc::SIGILL => "SIGILL",
         libc::SIGFPE => "SIGFPE",
         libc::SIGBUS => "SIGBUS",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
         _ => "fatal signal",
     }
 }
@@ -164,12 +178,8 @@ fn crash_watchdog(read_fd: libc::c_int) {
     let signal = CRASH_SIGNAL.load(Ordering::Acquire);
     let pc = CRASH_PC.load(Ordering::Acquire);
     let address = CRASH_ADDRESS.load(Ordering::Acquire);
-    let message = format!(
-        "{} (signal {signal}) at {}; pc {pc:#x}; fault address {address:#x}",
-        signal_name(signal),
-        crate::modules::describe_address(pc)
-    );
-    crate::report::write_crash(message);
+    // Shell exit-code convention for fatal signals, so the report carries exit_code too.
+    crate::report::write_crash_with_code(format_crash(signal, pc, address), 128 + signal as i64);
     terminate_with_signal(signal);
 }
 
@@ -205,6 +215,40 @@ mod tests {
     fn pc_hook_is_an_explicit_unsupported_path() {
         let error = install_pc_hook().unwrap_err();
         assert!(error.contains("not available on Linux"), "{error}");
+    }
+
+    #[test]
+    fn trap_and_abort_are_fatal_signals() {
+        assert!(FATAL_SIGNALS.contains(&libc::SIGTRAP));
+        assert!(FATAL_SIGNALS.contains(&libc::SIGABRT));
+        assert_eq!(signal_name(libc::SIGTRAP), "SIGTRAP");
+        assert_eq!(signal_name(libc::SIGABRT), "SIGABRT");
+    }
+
+    #[test]
+    fn sigtrap_formats_with_module_offset() {
+        // Synthetic SIGTRAP data shaped like the retail trap (game exe + offset).
+        let base = 0x6E5E_0000_0000usize;
+        let offset = 0x16624a5usize;
+        crate::modules::register_mapped(std::sync::Arc::new(crate::modules::MappedModule {
+            name: "game_scarlett_master.exe".into(),
+            path: std::path::PathBuf::from("game_scarlett_master.exe"),
+            base,
+            size: 0x200_0000,
+            entry_rva: 0,
+            is_dll: false,
+            exports: Default::default(),
+            tls_callbacks: Default::default(),
+            no_thread_calls: Default::default(),
+            initialized: Default::default(),
+            stack_reserve: 0,
+        }));
+        let crash = format_crash(libc::SIGTRAP, base + offset, base + offset);
+        crate::modules::unregister_mapped(base);
+        assert!(crash.contains("SIGTRAP"), "{crash}");
+        assert!(crash.contains("signal 5"), "{crash}");
+        assert!(crash.contains("game_scarlett_master.exe+0x16624a5"), "{crash}");
+        assert!(crash.contains(&format!("pc {:#x}", base + offset)), "{crash}");
     }
 
     #[test]
