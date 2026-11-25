@@ -2136,6 +2136,126 @@ pub unsafe extern "win64" fn SleepEx(ms: u32, _alertable: i32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------------------
+// Processor topology + system info (retail `GetLogicalProcessorInformation` path).
+// ---------------------------------------------------------------------------------------
+//
+// The game's startup validation calls `GetLogicalProcessorInformation` through the
+// sysinfo API set and executes a deliberate `int3` when it returns FALSE (the stub
+// did). These shims report the host topology the process actually runs on (through
+// the same `process_affinity` the affinity calls fit to): one `RelationProcessorCore`
+// entry per online processor plus a single `RelationProcessorPackage` entry, and a
+// `SYSTEM_INFO` with AMD64 architecture, 4 KiB pages and 64 KiB granularity.
+// `GetLogicalProcessorInformation` follows the Windows size-probe contract (NULL or
+// short buffer → FALSE with `ERROR_INSUFFICIENT_BUFFER`, required size out).
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+/// `SYSTEM_INFO` (48 bytes on x86-64). Field order matches the Windows definition.
+#[repr(C)]
+pub struct SystemInfo {
+    pub arch: u16,
+    pub reserved: u16,
+    pub page: u32,
+    pub min_app: usize,
+    pub max_app: usize,
+    pub active_mask: usize,
+    pub num_processors: u32,
+    pub processor_type: u32,
+    pub allocation_granularity: u32,
+    pub processor_level: u16,
+    pub processor_revision: u16,
+}
+
+fn system_info_for() -> SystemInfo {
+    let allowed = process_affinity();
+    SystemInfo {
+        arch: 9, // PROCESSOR_ARCHITECTURE_AMD64
+        reserved: 0,
+        page: page_size() as u32,
+        min_app: 0x1_0000,
+        max_app: 0x7FFF_FFFE_FFFF,
+        active_mask: allowed,
+        num_processors: allowed.count_ones(),
+        processor_type: 8664, // PROCESSOR_AMD_X8664
+        allocation_granularity: 0x1_0000,
+        processor_level: 6,
+        processor_revision: 0,
+    }
+}
+
+/// `VOID GetSystemInfo(LPSYSTEM_INFO)` — always succeeds.
+pub unsafe extern "win64" fn GetSystemInfo(out: *mut SystemInfo) {
+    if out.is_null() {
+        return;
+    }
+    *out = system_info_for();
+}
+
+/// `VOID GetNativeSystemInfo(LPSYSTEM_INFO)` — same answers (never WOW64 here).
+pub unsafe extern "win64" fn GetNativeSystemInfo(out: *mut SystemInfo) {
+    GetSystemInfo(out)
+}
+
+const RELATION_PROCESSOR_CORE: u32 = 0;
+#[allow(dead_code)]
+const RELATION_NUMA_NODE: u32 = 1;
+#[allow(dead_code)]
+const RELATION_CACHE: u32 = 2;
+const RELATION_PROCESSOR_PACKAGE: u32 = 3;
+
+/// One `SYSTEM_LOGICAL_PROCESSOR_INFORMATION` (32 bytes on x86-64).
+fn write_processor_info_entry(buf: *mut u8, mask: usize, relation: u32) {
+    unsafe {
+        (buf as *mut usize).write_unaligned(mask);
+        (buf.add(8) as *mut u32).write_unaligned(relation);
+        (buf.add(12) as *mut u32).write_unaligned(0);
+        // The 16-byte union: zero except `ProcessorCore.Flags` (1 = hyperthreaded
+        // when the package holds more logical processors than core entries).
+        std::ptr::write_bytes(buf.add(16), 0, 16);
+    }
+}
+
+/// `BOOL GetLogicalProcessorInformation(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION, PDWORD)` —
+/// one core entry per online processor plus one package entry. Size probes follow the
+/// Windows contract; the entries' masks are the process affinity (a zero affinity —
+/// the host refused the query — fails with `ERROR_INVALID_PARAMETER`).
+pub unsafe extern "win64" fn GetLogicalProcessorInformation(
+    out: *mut u8,
+    ret_len: *mut u32,
+) -> i32 {
+    if ret_len.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let allowed = process_affinity();
+    if allowed == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let cpus: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
+    let need = ((cpus.len() + 1) * 32) as u32;
+    if out.is_null() || *ret_len < need {
+        *ret_len = need;
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    let hyperthreaded = cpus.len() > 1;
+    for (i, &cpu) in cpus.iter().enumerate() {
+        let entry = out.add(i * 32);
+        write_processor_info_entry(entry, 1usize << cpu, RELATION_PROCESSOR_CORE);
+        if hyperthreaded {
+            unsafe {
+                (entry.add(16) as *mut u8).write_unaligned(1u8);
+            }
+        }
+    }
+    write_processor_info_entry(out.add(cpus.len() * 32), allowed, RELATION_PROCESSOR_PACKAGE);
+    *ret_len = need;
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+// ---------------------------------------------------------------------------------------
 // Console identity, memory budget, debug output, registry stub, exception filter
 // ---------------------------------------------------------------------------------------
 
@@ -7923,6 +8043,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("SleepEx", SleepEx as usize),
         ("GetTickCount", GetTickCount as usize),
         ("GetTickCount64", GetTickCount64 as usize),
+        ("GetSystemInfo", GetSystemInfo as usize),
+        ("GetNativeSystemInfo", GetNativeSystemInfo as usize),
+        ("GetLogicalProcessorInformation", GetLogicalProcessorInformation as usize),
         ("QueryPerformanceCounter", QueryPerformanceCounter as usize),
         ("QueryPerformanceFrequency", QueryPerformanceFrequency as usize),
         ("GetSystemTimeAsFileTime", GetSystemTimeAsFileTime as usize),
@@ -8294,6 +8417,62 @@ mod tests {
             assert_eq!(CloseHandle(wake), 1);
             // Unknown handles fail instead of blocking forever.
             assert_eq!(WaitForSingleObject(0xDEAD_BEEF, 0), WAIT_FAILED);
+        }
+    }
+
+    #[test]
+    fn system_info_reports_the_host_topology() {
+        unsafe {
+            // SYSTEM_INFO: AMD64, host page size, sane processor count.
+            let mut info: SystemInfo = std::mem::zeroed();
+            GetSystemInfo(&mut info);
+            assert_eq!(
+                (info.arch, info.page, info.allocation_granularity),
+                (9, page_size() as u32, 0x1_0000)
+            );
+            assert!(info.num_processors >= 1);
+            assert_eq!(info.num_processors, info.active_mask.count_ones());
+            GetNativeSystemInfo(&mut info);
+            assert_eq!(info.arch, 9);
+            GetSystemInfo(std::ptr::null_mut()); // null is a no-op, not a fault.
+            // Size probe: NULL buffer reports the required size with INSUFFICIENT_BUFFER.
+            let mut need = 0u32;
+            assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), &mut need), 0);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            assert!(need >= 64 && need % 32 == 0);
+            // Short buffer reports the same requirement.
+            let mut half = vec![0u8; (need - 32) as usize];
+            let mut half_len = half.len() as u32;
+            assert_eq!(GetLogicalProcessorInformation(half.as_mut_ptr(), &mut half_len), 0);
+            assert_eq!(half_len, need);
+            // Full buffer: core entries plus one package entry; masks cover the affinity.
+            let mut full = vec![0u8; need as usize];
+            let mut full_len = need;
+            assert_eq!(GetLogicalProcessorInformation(full.as_mut_ptr(), &mut full_len), 1);
+            assert_eq!((full_len, GetLastError()), (need, ERROR_SUCCESS));
+            let n = need as usize / 32;
+            let mut cores = 0u32;
+            let mut or_mask = 0usize;
+            for i in 0..n {
+                let base = i * 32;
+                let mask = usize::from_le_bytes(full[base..base + 8].try_into().unwrap());
+                let rel = u32::from_le_bytes(full[base + 8..base + 12].try_into().unwrap());
+                or_mask |= mask;
+                if rel == RELATION_PROCESSOR_CORE {
+                    cores += 1;
+                    assert_eq!(mask.count_ones(), 1);
+                } else {
+                    assert_eq!(rel, RELATION_PROCESSOR_PACKAGE);
+                }
+            }
+            assert_eq!(cores as usize, n - 1);
+            assert_eq!(or_mask, process_affinity());
+            // Null length fails cleanly.
+            assert_eq!(
+                GetLogicalProcessorInformation(full.as_mut_ptr(), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
         }
     }
 
