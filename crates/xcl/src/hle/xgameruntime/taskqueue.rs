@@ -80,6 +80,8 @@ impl Port {
 
 struct QueueState {
     terminated: bool,
+    /// Pending async termination callbacks not yet pushed onto `PORT_COMPLETION`.
+    termination_cb_pending: usize,
     inflight: [usize; 2],
 }
 
@@ -206,7 +208,7 @@ impl Queue {
         Arc::new(Queue {
             ports: [Port::new(work_mode), Port::new(completion_mode)],
             owns_ports: true,
-            state: Mutex::new(QueueState { terminated: false, inflight: [0, 0] }),
+            state: Mutex::new(QueueState { terminated: false, termination_cb_pending: 0, inflight: [0, 0] }),
             idle_cv: Condvar::new(),
             monitors: Mutex::new(Vec::new()),
         })
@@ -216,7 +218,7 @@ impl Queue {
         Arc::new(Queue {
             ports: [work, completion],
             owns_ports: false,
-            state: Mutex::new(QueueState { terminated: false, inflight: [0, 0] }),
+            state: Mutex::new(QueueState { terminated: false, termination_cb_pending: 0, inflight: [0, 0] }),
             idle_cv: Condvar::new(),
             monitors: Mutex::new(Vec::new()),
         })
@@ -274,13 +276,21 @@ fn drain_serialized(p: Arc<Port>) {
 /// Lock order is always `p.items` (or `timer`) -> `q.state` so submission and `XTaskQueueTerminate`
 /// cannot race or deadlock.
 pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
+    submit(q, port, item, false)
+}
+
+/// `submit_now`, but `terminating` also lets the termination callback through once `q` is terminated.
+fn submit(q: &Arc<Queue>, port: u32, item: Item, terminating: bool) -> bool {
     let p = &q.ports[port as usize];
     match p.mode {
         MODE_IMMEDIATE => {
             {
                 let mut state = q.state.lock().unwrap();
-                if state.terminated {
+                if state.terminated && !terminating {
                     return false;
+                }
+                if terminating {
+                    state.termination_cb_pending = state.termination_cb_pending.saturating_sub(1);
                 }
                 state.inflight[port as usize] += 1;
             }
@@ -291,8 +301,11 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
         MODE_THREAD_POOL => {
             {
                 let mut state = q.state.lock().unwrap();
-                if state.terminated {
+                if state.terminated && !terminating {
                     return false;
+                }
+                if terminating {
+                    state.termination_cb_pending = state.termination_cb_pending.saturating_sub(1);
                 }
                 state.inflight[port as usize] += 1;
             }
@@ -305,8 +318,11 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
                 let mut items = p.items.lock().unwrap();
                 {
                     let mut state = q.state.lock().unwrap();
-                    if state.terminated {
+                    if state.terminated && !terminating {
                         return false;
+                    }
+                    if terminating {
+                        state.termination_cb_pending = state.termination_cb_pending.saturating_sub(1);
                     }
                     state.inflight[port as usize] += 1;
                 }
@@ -323,14 +339,21 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
                 let mut items = p.items.lock().unwrap();
                 {
                     let mut state = q.state.lock().unwrap();
-                    if state.terminated {
+                    if state.terminated && !terminating {
                         return false;
+                    }
+                    if terminating {
+                        state.termination_cb_pending = state.termination_cb_pending.saturating_sub(1);
                     }
                     state.inflight[port as usize] += 1;
                 }
                 items.push_back(QueuedItem { item, queue: q.clone(), port });
             }
-            p.cv.notify_one();
+            if terminating {
+                p.cv.notify_all();
+            } else {
+                p.cv.notify_one();
+            }
             q.notify_monitors(port);
         }
     }
@@ -379,7 +402,10 @@ pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
     if g.is_empty() && timeout_ms != 0 {
         let dur = if timeout_ms == u32::MAX { Duration::from_secs(u64::MAX / 4) } else { Duration::from_millis(timeout_ms as u64) };
         let deadline = Instant::now() + dur.min(Duration::from_secs(365 * 24 * 3600));
-        while g.is_empty() && !q.is_terminated() {
+        while g.is_empty() && {
+            let state = q.state.lock().unwrap();
+            !state.terminated || (port == PORT_COMPLETION && state.termination_cb_pending > 0)
+        } {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -585,7 +611,13 @@ pub unsafe extern "system" fn XTaskQueueIsEmpty(h: *mut c_void, port: u32) -> bo
 
 pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ctx: *mut c_void, cb: usize) -> HRESULT {
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
-    q.state.lock().unwrap().terminated = true;
+    {
+        let mut state = q.state.lock().unwrap();
+        state.terminated = true;
+        if !wait && cb != 0 {
+            state.termination_cb_pending += 1;
+        }
+    }
     // Cancel only queued items submitted through `q`; sibling queues sharing a composite port
     // keep their pending work untouched. Wake any manual-port dispatchers waiting on this port.
     for port in 0..2 {
@@ -631,9 +663,19 @@ pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ct
             g = q.idle_cv.wait(g).unwrap();
         }
         drop(g);
-        if cb != 0 {
+        if cb == 0 {
+            return;
+        }
+        if wait {
+            // Run here: on a manual completion port nobody may dispatch while the caller
+            // waits (the docs warn that wait = true there may deadlock).
             let f: XTaskQueueTerminatedCallback = std::mem::transmute(cb);
             f(ctx as *mut c_void);
+        } else {
+            // The callback is queued to the completion port, like libHttpClient's termination
+            // entry: on a manual port it runs from the title's own XTaskQueueDispatch.
+            let item = Item { cb: run_terminated as usize, ctx: Box::into_raw(Box::new((cb, ctx))) as usize };
+            submit(&q, PORT_COMPLETION, item, true);
         }
     };
     if wait {
@@ -642,6 +684,13 @@ pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ct
         spawn(Box::new(finish));
     }
     S_OK
+}
+
+/// Runs a termination callback queued by `XTaskQueueTerminate`; `ctx` is its boxed `(cb, ctx)`.
+unsafe extern "system" fn run_terminated(ctx: *mut c_void, _canceled: bool) {
+    let (cb, ctx) = *Box::from_raw(ctx as *mut (usize, usize));
+    let f: XTaskQueueTerminatedCallback = std::mem::transmute(cb);
+    f(ctx as *mut c_void);
 }
 
 pub unsafe extern "system" fn XTaskQueueGetCurrentProcessTaskQueue(out: *mut *mut c_void) -> bool {
@@ -864,6 +913,61 @@ mod tests {
             assert_eq!(*ORDER.lock().unwrap(), ["delayed, canceled", "terminated"]);
             XTaskQueueCloseHandle(h);
         }
+    }
+
+    #[test]
+    fn termination_callback_runs_from_a_manual_completion_port_dispatch() {
+        unsafe extern "system" fn terminated(ctx: *mut c_void) {
+            *(*(ctx as *const Mutex<Option<std::thread::ThreadId>>)).lock().unwrap() = Some(std::thread::current().id());
+        }
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_MANUAL, &mut h), S_OK);
+            let ran_on: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+            let ctx = &ran_on as *const _ as *mut c_void;
+            assert_eq!(XTaskQueueTerminate(h, false, ctx, terminated as usize), S_OK);
+            // Wait until the callback is queued (or, wrongly, has already run elsewhere).
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while XTaskQueueIsEmpty(h, PORT_COMPLETION) && ran_on.lock().unwrap().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(*ran_on.lock().unwrap(), None, "the termination callback ran before the completion port was dispatched");
+            assert!(XTaskQueueDispatch(h, PORT_COMPLETION, 0));
+            assert_eq!(*ran_on.lock().unwrap(), Some(std::thread::current().id()));
+            XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn infinite_completion_pump_receives_termination_callback() {
+        unsafe extern "system" fn terminated(ctx: *mut c_void) {
+            (*(ctx as *const AtomicBool)).store(true, Ordering::SeqCst);
+        }
+        let mut missed = 0u32;
+        for _ in 0..50 {
+            unsafe {
+                let mut h = std::ptr::null_mut();
+                assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_MANUAL, &mut h), S_OK);
+                let ran = AtomicBool::new(false);
+                let hp = h as usize;
+                let pump = std::thread::spawn(move || {
+                    while XTaskQueueDispatch(hp as *mut c_void, PORT_COMPLETION, u32::MAX) {}
+                });
+                std::thread::sleep(Duration::from_millis(2));
+                assert_eq!(XTaskQueueTerminate(h, false, &ran as *const _ as *mut c_void, terminated as usize), S_OK);
+                pump.join().unwrap();
+                if !ran.load(Ordering::SeqCst) {
+                    missed += 1;
+                    // Drain so `ran` outlives the queued callback if the pump exited early.
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !ran.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        XTaskQueueDispatch(h, PORT_COMPLETION, 1);
+                    }
+                }
+                XTaskQueueCloseHandle(h);
+            }
+        }
+        assert_eq!(missed, 0, "pump exited before termination callback in {missed} of 50 runs");
     }
 
     #[test]
