@@ -1166,6 +1166,10 @@ unsafe extern "system" fn install_chunks_async(_id: usize, _count: u32, _sel: us
 }
 
 unsafe extern "system" fn install_chunks_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 0;
     XAsyncGetResult(b, &INSTALL_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
 }
 
@@ -1187,6 +1191,10 @@ unsafe extern "system" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock
 }
 
 unsafe extern "system" fn mount_with_ui_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 0;
     XAsyncGetResult(b, &MOUNT_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
 }
 

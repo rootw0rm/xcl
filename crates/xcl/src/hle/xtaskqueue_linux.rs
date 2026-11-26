@@ -521,7 +521,11 @@ pub fn process_queue() -> Option<Arc<Queue>> {
 }
 
 pub unsafe extern "win64" fn XTaskQueueCreate(work: u32, completion: u32, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() || work > 3 || completion > 3 {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = std::ptr::null_mut();
+    if work > 3 || completion > 3 {
         return E_INVALIDARG;
     }
     *out = new_handle(Queue::new(work, completion)) as *mut c_void;
@@ -529,7 +533,11 @@ pub unsafe extern "win64" fn XTaskQueueCreate(work: u32, completion: u32, out: *
 }
 
 pub unsafe extern "win64" fn XTaskQueueGetPort(h: *mut c_void, port: u32, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() || port > 1 {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = std::ptr::null_mut();
+    if port > 1 {
         return E_INVALIDARG;
     }
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
@@ -545,6 +553,7 @@ pub unsafe extern "win64" fn XTaskQueueCreateComposite(
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
     let (Some(w), Some(c)) = (port_from_handle(work_port), port_from_handle(completion_port)) else {
         return E_INVALIDARG;
     };
@@ -556,6 +565,7 @@ pub unsafe extern "win64" fn XTaskQueueDuplicateHandle(h: *mut c_void, out: *mut
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
     match queue_from(h) {
         Some(q) => {
             *out = new_handle(q) as *mut c_void;
@@ -1443,6 +1453,31 @@ mod tests {
             assert_eq!(hits.load(Ordering::SeqCst), 0, "waiter fired after Terminate");
             assert_eq!(CloseHandle(event), 1);
             XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn taskqueue_functions_null_outptrs_on_failure() {
+        unsafe {
+            let mut q_out = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XTaskQueueCreate(99, 0, &mut q_out), E_INVALIDARG);
+            assert_eq!(q_out, std::ptr::null_mut());
+
+            let mut p_out = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XTaskQueueGetPort(0x1234 as *mut c_void, 0, &mut p_out), E_INVALIDARG);
+            assert_eq!(p_out, std::ptr::null_mut());
+
+            let mut p_out2 = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XTaskQueueGetPort(std::ptr::null_mut(), 99, &mut p_out2), E_INVALIDARG);
+            assert_eq!(p_out2, std::ptr::null_mut());
+
+            let mut comp_out = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XTaskQueueCreateComposite(std::ptr::null_mut(), std::ptr::null_mut(), &mut comp_out), E_INVALIDARG);
+            assert_eq!(comp_out, std::ptr::null_mut());
+
+            let mut dup_out = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XTaskQueueDuplicateHandle(0x1234 as *mut c_void, &mut dup_out), E_INVALIDARG);
+            assert_eq!(dup_out, std::ptr::null_mut());
         }
     }
 }

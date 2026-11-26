@@ -811,6 +811,7 @@ pub unsafe extern "win64" fn XPackageMount(id: *const u8, out: *mut *mut c_void)
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
     let id = crate::util::from_cstr_ptr(id).unwrap_or_default();
     if !id.is_empty() && !id.eq_ignore_ascii_case(&package_identifier()) {
         crate::xlog_warn!("XPackageMount({id}) – unknown package (DLC?)");
@@ -984,6 +985,10 @@ unsafe extern "win64" fn install_chunks_async(_id: usize, _count: u32, _sel: usi
 }
 
 unsafe extern "win64" fn install_chunks_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 0;
     xu::XAsyncGetResult(b, &INSTALL_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
 }
 
@@ -1005,6 +1010,10 @@ unsafe extern "win64" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock)
 }
 
 unsafe extern "win64" fn mount_with_ui_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 0;
     xu::XAsyncGetResult(b, &MOUNT_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
 }
 
@@ -1483,6 +1492,25 @@ mod tests {
             assert_ne!(handle, 0);
             XPackageCloseMountHandle(handle as *mut c_void);
             assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before);
+        }
+    }
+
+    #[test]
+    fn package_result_functions_null_outptrs_on_failure() {
+        unsafe {
+            let mut mount_ptr = 0xDEADBEEF as *mut c_void;
+            let bad_id = b"unknown_package_id_12345\0";
+            assert_eq!(XPackageMount(bad_id.as_ptr(), &mut mount_ptr), crate::util::E_NOT_FOUND);
+            assert_eq!(mount_ptr, std::ptr::null_mut());
+
+            let mut install_out = 0xDEADBEEFusize;
+            let mut b_bad: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(install_chunks_result(&mut b_bad, &mut install_out), E_INVALIDARG);
+            assert_eq!(install_out, 0);
+
+            let mut mount_out = 0xDEADBEEFusize;
+            assert_eq!(mount_with_ui_result(&mut b_bad, &mut mount_out), E_INVALIDARG);
+            assert_eq!(mount_out, 0);
         }
     }
 }

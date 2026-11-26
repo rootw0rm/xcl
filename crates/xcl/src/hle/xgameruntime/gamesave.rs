@@ -207,6 +207,7 @@ pub unsafe extern "system" fn XGameSaveInitializeProviderResult(b: *mut XAsyncBl
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
     let mut p = 0usize;
     let hr = XAsyncGetResult(b, &INIT_ID as *const u8 as *const c_void, 8, &mut p as *mut usize as *mut c_void, std::ptr::null_mut());
     if hr >= 0 {
@@ -300,10 +301,11 @@ pub unsafe extern "system" fn XGameSaveDeleteContainerResult(b: *mut XAsyncBlock
 }
 
 pub unsafe extern "system" fn XGameSaveCreateContainer(p: *mut Provider, name: *const u8, out: *mut *mut Container) -> HRESULT {
-    let (Some(pr), Some(n)) = (provider(p), from_cstr_ptr(name)) else { return E_INVALIDARG };
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
+    let (Some(pr), Some(n)) = (provider(p), from_cstr_ptr(name)) else { return E_INVALIDARG };
     if !valid_container_name_length(&n) {
         return E_GS_INVALID_CONTAINER_NAME;
     }
@@ -529,10 +531,11 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, s
 }
 
 pub unsafe extern "system" fn XGameSaveCreateUpdate(c: *mut Container, display: *const u8, out: *mut *mut Update) -> HRESULT {
-    let Some(c) = container(c) else { return E_INVALIDARG };
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
+    let Some(c) = container(c) else { return E_INVALIDARG };
     let _ = &c.name;
     *out = Box::into_raw(Box::new(Update { magic: MAGIC_UPDATE, dir: c.dir.clone(), display: from_cstr_ptr(display), ops: Vec::new() }));
     S_OK
@@ -1182,6 +1185,24 @@ mod tests {
         let (reads, mixed) = reader.join().unwrap();
         assert!(reads > 0, "the reader never enumerated blobs");
         assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
+    }
+
+    #[test]
+    fn gamesave_functions_null_outptrs_on_failure() {
+        unsafe {
+            let mut p_out = 0xDEADBEEF as *mut Provider;
+            let mut b_bad: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XGameSaveInitializeProviderResult(&mut b_bad, &mut p_out), E_INVALIDARG);
+            assert_eq!(p_out, std::ptr::null_mut());
+
+            let mut c_out = 0xDEADBEEF as *mut Container;
+            assert_eq!(XGameSaveCreateContainer(std::ptr::null_mut(), b"slot\0".as_ptr(), &mut c_out), E_INVALIDARG);
+            assert_eq!(c_out, std::ptr::null_mut());
+
+            let mut u_out = 0xDEADBEEF as *mut Update;
+            assert_eq!(XGameSaveCreateUpdate(std::ptr::null_mut(), std::ptr::null(), &mut u_out), E_INVALIDARG);
+            assert_eq!(u_out, std::ptr::null_mut());
+        }
     }
 
 }

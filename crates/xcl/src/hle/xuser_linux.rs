@@ -538,6 +538,7 @@ pub unsafe extern "win64" fn XUserAddResult(b: *mut XAsyncBlock, out: *mut *mut 
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
     let hr = XAsyncGetResult(b, &USER_ADD_IDENTITY as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut());
     if hr >= 0 {
         user_signed_in();
@@ -546,7 +547,11 @@ pub unsafe extern "win64" fn XUserAddResult(b: *mut XAsyncBlock, out: *mut *mut 
 }
 
 pub unsafe extern "win64" fn XUserDuplicateHandle(h: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-    if !valid_user(h) || out.is_null() {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = std::ptr::null_mut();
+    if !valid_user(h) {
         return E_INVALIDARG;
     }
     USER.refs.fetch_add(1, Ordering::AcqRel);
@@ -595,6 +600,7 @@ pub unsafe extern "win64" fn XUserFindUserByLocalId(id: u64, out: *mut *mut c_vo
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
     if id != LOCAL_ID {
         return E_NOT_FOUND;
     }
@@ -607,6 +613,7 @@ pub unsafe extern "win64" fn XUserFindUserById(id: u64, out: *mut *mut c_void) -
     if out.is_null() {
         return E_INVALIDARG;
     }
+    *out = std::ptr::null_mut();
     if id != crate::state::config().user_id {
         return E_NOT_FOUND;
     }
@@ -796,6 +803,9 @@ pub unsafe extern "win64" fn XUserGetTokenAndSignatureResult(
     ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureData,
     buffer_used: *mut usize,
 ) -> HRESULT {
+    if !ptr_to_buffer.is_null() {
+        *ptr_to_buffer = std::ptr::null_mut();
+    }
     let hr = XAsyncGetResult(b, &TOKEN_UTF8_ID as *const u8 as *const c_void, buffer_size, buffer, buffer_used);
     if hr >= 0 && !ptr_to_buffer.is_null() {
         *ptr_to_buffer = buffer as *mut XUserGetTokenAndSignatureData;
@@ -838,6 +848,9 @@ pub unsafe extern "win64" fn XUserGetTokenAndSignatureUtf16Result(
     ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureUtf16Data,
     buffer_used: *mut usize,
 ) -> HRESULT {
+    if !ptr_to_buffer.is_null() {
+        *ptr_to_buffer = std::ptr::null_mut();
+    }
     let hr = XAsyncGetResult(b, &TOKEN_UTF16_ID as *const u8 as *const c_void, buffer_size, buffer, buffer_used);
     if hr >= 0 && !ptr_to_buffer.is_null() {
         *ptr_to_buffer = buffer as *mut XUserGetTokenAndSignatureUtf16Data;
@@ -1568,6 +1581,42 @@ mod tests {
             assert_eq!(XUserCompare(hi, lo), 1);
             assert_eq!(XUserCompare(null, max), -1);
             assert_eq!(XUserCompare(max, null), 1);
+        }
+    }
+
+    #[test]
+    fn result_and_lookup_functions_null_outptrs_on_failure() {
+        unsafe {
+            let mut user_ptr = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XUserFindUserByLocalId(LOCAL_ID + 999, &mut user_ptr), E_NOT_FOUND);
+            assert_eq!(user_ptr, std::ptr::null_mut());
+
+            let mut user_ptr2 = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XUserFindUserById(0x12345678, &mut user_ptr2), E_NOT_FOUND);
+            assert_eq!(user_ptr2, std::ptr::null_mut());
+
+            let mut dup_ptr = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XUserDuplicateHandle(std::ptr::null_mut(), &mut dup_ptr), E_INVALIDARG);
+            assert_eq!(dup_ptr, std::ptr::null_mut());
+
+            let mut add_ptr = 0xDEADBEEF as *mut c_void;
+            let mut b_bad: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XUserAddResult(&mut b_bad, &mut add_ptr), E_INVALIDARG);
+            assert_eq!(add_ptr, std::ptr::null_mut());
+
+            let mut token_ptr = 0xDEADBEEF as *mut XUserGetTokenAndSignatureData;
+            assert_eq!(
+                XUserGetTokenAndSignatureResult(&mut b_bad, 0, std::ptr::null_mut(), &mut token_ptr, std::ptr::null_mut()),
+                E_INVALIDARG
+            );
+            assert_eq!(token_ptr, std::ptr::null_mut());
+
+            let mut token16_ptr = 0xDEADBEEF as *mut XUserGetTokenAndSignatureUtf16Data;
+            assert_eq!(
+                XUserGetTokenAndSignatureUtf16Result(&mut b_bad, 0, std::ptr::null_mut(), &mut token16_ptr, std::ptr::null_mut()),
+                E_INVALIDARG
+            );
+            assert_eq!(token16_ptr, std::ptr::null_mut());
         }
     }
 }
