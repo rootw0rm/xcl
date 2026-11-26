@@ -66,7 +66,7 @@ def main(src, dst):
         fl = i.find("InstructionFlags")
         flag = 0
         for bit, tag in enumerate(["IsBranch", "IsConditionalBranch", "IsIndirectBranch", "IsProgramTerminator", "IsImmediatelyExecuted"]):
-            if (fl.findtext(tag) or "FALSE").upper() == "TRUE":
+            if (fl.findtext(tag) or "FALSE").strip().upper() == "TRUE":
                 flag |= 1 << bit
         encs = []
         always_lit = False
