@@ -486,7 +486,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     };
     match pe.delay_imports() {
         Ok(v) => all.extend(v),
-        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
+        Err(e) => {
+            // same as a broken import table: do not leave a half-mapped module registered
+            modules::unregister_mapped(base);
+            return Err(format!("{name}: delay-import table: {e}"));
+        }
     }
     for dll in &all {
         for e in &dll.entries {
@@ -1486,9 +1490,58 @@ mod tests {
         println!("synthetic dll run: ok");
     }
 
+    /// TLS AddressOfCallbacks past SizeOfImage fails the load before registration.
+    /// The Linux walk is already image-bounded (checked_rva + at+8>size + per-target
+    /// va_to_rva, stricter than upstream's 256-entry cap which validates no targets),
+    /// so this pins the bound rather than adding a cap.
     #[test]
-    fn load_game_dll_rejects_an_occupied_base() {
-        let len = page_size() * 2;
+    fn tls_callbacks_past_the_image_fail_to_load() {
+        let base = 0x6E54_0000_0000u64;
+        let mut bytes = tiny_dll(base, &[0xB8, 1, 0, 0, 0, 0xC3], None);
+        // TLS directory at RVA 0x2000 (.data); AddressOfCallbacks = base + SizeOfImage - 4
+        let o = 0x58usize;
+        p32(&mut bytes, o + 0x70 + 9 * 8, 0x2000);
+        p32(&mut bytes, o + 0x70 + 9 * 8 + 4, 40);
+        // AddressOfCallbacks at +24; the rest stays zero (index 0, empty template range)
+        p64(&mut bytes, 0x400 + 24, base + 0x3000 - 4);
+        let p = write("xcl_bad_tls_cb.dll", &bytes);
+        let e = load_game_dll(&p).err().expect("past-image callbacks must fail");
+        assert!(e.contains("TLS callback"), "{e}");
+        assert!(modules::find_mapped_by_base(base as usize).is_none());
+        assert!(modules::find_mapped_by_name("xcl_bad_tls_cb.dll").is_none());
+    }
+
+    /// A delay-import table that does not parse fails the load like a broken import
+    /// table (before: warn-only, half-mapped module stayed registered) and a second
+    /// load fails again instead of finding the leftover registration.
+    #[test]
+    fn a_broken_delay_import_table_is_not_left_registered() {
+        let mut code = vec![0xB8, 1, 0, 0, 0, 0xC3];
+        code.resize(0x10, 0xCC);
+        // IMAGE_DELAYLOAD_DESCRIPTOR at RVA 0x1010: attrs=1 (RVAs), Name outside the image
+        for v in [1u32, 0x7FFF_0000, 0, 0x1000, 0x1000, 0, 0, 0] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut bytes = tiny_dll(0x6E55_0000_0000, &code, None);
+        // data directory #13 = delay import
+        let delay_dir = 0x58 + 0x70 + 13 * 8;
+        p32(&mut bytes, delay_dir, 0x1010);
+        p32(&mut bytes, delay_dir + 4, 64);
+        let p = write("xcl_bad_delay.dll", &bytes);
+        let key = crate::util::dll_key("xcl_bad_delay.dll");
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(
+                r.as_ref().is_err_and(|e| e.contains("delay-import table")),
+                "attempt {attempt}: {:?}",
+                r.map(|m| m.base)
+            );
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
+    }
+
+    #[test]
+    fn load_game_dll_rejects_an_occupied_base() {        let len = page_size() * 2;
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

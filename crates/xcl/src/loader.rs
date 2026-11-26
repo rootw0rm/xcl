@@ -191,7 +191,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     };
     match pe.delay_imports() {
         Ok(v) => all.extend(v),
-        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
+        Err(e) => {
+            // same as a broken import table: do not leave a half-mapped module registered
+            modules::unregister_mapped(base);
+            return fail(format!("{name}: delay-import table: {e}"));
+        }
     }
     for dll in &all {
         for e in &dll.entries {
@@ -214,11 +218,36 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             // game DLLs loaded while its imports were resolved may point into it: its memory stays
             tls_install(&module, template, template_len, t.total_len(), index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
             if t.address_of_callbacks != 0 {
-                let mut cb = adj(t.address_of_callbacks) as *const u64;
+                // Cap and stay inside the image: an unterminated or out-of-image list
+                // used to walk forever / read past the mapping.
+                const MAX_TLS_CALLBACKS: usize = 256;
+                let Some(mut rva) = pe.va_to_rva(t.address_of_callbacks) else {
+                    modules::unregister_mapped(base);
+                    return fail(format!("{name}: TLS AddressOfCallbacks outside the image"));
+                };
                 let mut list = module.tls_callbacks.lock().unwrap();
-                while *cb != 0 {
-                    list.push(*cb as usize);
-                    cb = cb.add(1);
+                let mut capped = true;
+                for _ in 0..MAX_TLS_CALLBACKS {
+                    let end = match rva.checked_add(8) {
+                        Some(e) if e <= pe.size_of_image => e,
+                        _ => {
+                            drop(list);
+                            modules::unregister_mapped(base);
+                            return fail(format!("{name}: TLS callback array past the image end"));
+                        }
+                    };
+                    let cb = ((base + rva as usize) as *const u64).read_unaligned();
+                    if cb == 0 {
+                        capped = false;
+                        break;
+                    }
+                    list.push(cb as usize);
+                    rva = end;
+                }
+                if capped {
+                    drop(list);
+                    modules::unregister_mapped(base);
+                    return fail(format!("{name}: TLS callback array not terminated within {MAX_TLS_CALLBACKS} entries"));
                 }
             }
         }
@@ -604,5 +633,60 @@ mod tests {
         let patched = unsafe { ((m.base + 0x1010) as *const u64).read_unaligned() };
         assert_eq!(patched, (m.base as u64).wrapping_sub(BASE));
         unsafe { VirtualFree(blocker, 0, MEM_RELEASE) };
+    }
+
+    /// A delay-import table that does not parse used to only warn and leave the module loaded.
+    /// It must fail like a broken import table and not stay registered.
+    #[test]
+    fn a_dll_with_a_broken_delay_import_table_is_not_left_registered() {
+        let mut code = vec![0xB8, 1, 0, 0, 0, 0xC3];
+        code.resize(0x10, 0xCC);
+        // IMAGE_DELAYLOAD_DESCRIPTOR at RVA 0x1010: attrs=1 (RVAs), Name outside the image
+        for v in [1u32, 0x7FFF_0000, 0, 0x1000, 0x1000, 0, 0, 0] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut bytes = tiny_dll(0x7E54_0000_0000, &code, None);
+        // data directory #13 = delay import
+        let delay_dir = 0x58 + 0x70 + 13 * 8;
+        bytes[delay_dir..delay_dir + 4].copy_from_slice(&0x1010u32.to_le_bytes());
+        bytes[delay_dir + 4..delay_dir + 8].copy_from_slice(&64u32.to_le_bytes());
+        let p = write("xcl_bad_delay.dll", &bytes);
+        let key = crate::util::dll_key("xcl_bad_delay.dll");
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(
+                r.as_ref().is_err_and(|e| e.contains("delay-import table")),
+                "attempt {attempt}: {:?}",
+                r.map(|m| m.base)
+            );
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
+    }
+
+    /// AddressOfCallbacks past SizeOfImage: the old unbounded walk read outside the mapping.
+    #[test]
+    fn a_dll_with_tls_callbacks_past_the_image_fails_to_load() {
+        let image_base = 0x7E55_0000_0000u64;
+        let mut bytes = tiny_dll(image_base, &[0xB8, 1, 0, 0, 0, 0xC3], None);
+        // TLS directory at RVA 0x1010 (in .text); AddressOfCallbacks = image_base + SizeOfImage - 4
+        let tls_rva = 0x1010u32;
+        let size_of_image = 0x2000u32;
+        let cb_rva = size_of_image - 4;
+        let o = 0x58usize;
+        let tls_dir = o + 0x70 + 9 * 8;
+        bytes[tls_dir..tls_dir + 4].copy_from_slice(&tls_rva.to_le_bytes());
+        bytes[tls_dir + 4..tls_dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        let tls_off = 0x200 + (tls_rva - 0x1000) as usize;
+        // AddressOfCallbacks at +24; leave AddressOfIndex 0 so TLS install skips the index write
+        bytes[tls_off + 24..tls_off + 32].copy_from_slice(&(image_base + cb_rva as u64).to_le_bytes());
+        let p = write("xcl_bad_tls_cb.dll", &bytes);
+        let key = crate::util::dll_key("xcl_bad_tls_cb.dll");
+        let r = load_game_dll(&p);
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("TLS callback")),
+            "{:?}",
+            r.as_ref().err()
+        );
+        assert!(modules::find_mapped_by_name(&key).is_none());
     }
 }
