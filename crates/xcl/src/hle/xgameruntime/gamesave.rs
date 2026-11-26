@@ -15,9 +15,15 @@ const TMP_PREFIX: &str = "~xcltmp.";
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
+pub const E_GS_OUT_OF_LOCAL_STORAGE: HRESULT = 0x8083_0003u32 as i32;
+pub const E_GS_UPDATE_TOO_BIG: HRESULT = 0x8083_0005u32 as i32;
+pub const E_GS_QUOTA_EXCEEDED: HRESULT = 0x8083_0006u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
 pub const E_GS_BLOB_NOT_FOUND: HRESULT = 0x8083_0008u32 as i32;
 pub const E_GS_CONTAINER_NOT_FOUND: HRESULT = 0x8083_0010u32 as i32;
+
+pub const GS_MAX_BLOB_NAME_SIZE: usize = 1024;
+pub const GS_MAX_BLOB_SIZE: usize = 16 << 20; // 16 MiB
 /// quota reported to the title (the GDK default)
 pub const QUOTA: i64 = 256 << 20;
 
@@ -69,6 +75,13 @@ pub struct Blob {
 type ContainerCb = unsafe extern "system" fn(*const ContainerInfo, *mut c_void) -> bool;
 type BlobCb = unsafe extern "system" fn(*const BlobInfo, *mut c_void) -> bool;
 
+fn is_reserved_device_name(base: &str) -> bool {
+    matches!(base, "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit())
+}
+
 /// File-name form of a container / blob name: unusual characters as %XX.
 fn enc(name: &str) -> String {
     let mut out: String = name
@@ -79,9 +92,7 @@ fn enc(name: &str) -> String {
     // any extension) opens the device, "." and ".." are the folder itself and its parent, and a
     // trailing dot or space is dropped.
     let base = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
-    let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (base.len() == 4 && (base.starts_with("COM") || base.starts_with("LPT")) && base.as_bytes()[3].is_ascii_digit());
-    if !name.is_empty() && (device || name.bytes().all(|b| b == b'.')) {
+    if !name.is_empty() && (is_reserved_device_name(&base) || name.bytes().all(|b| b == b'.')) {
         out.replace_range(..1, &format!("%{:02X}", name.as_bytes()[0]));
     }
     if out.ends_with('.') || out.ends_with(' ') {
@@ -91,14 +102,23 @@ fn enc(name: &str) -> String {
     out
 }
 
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn dec(file: &str) -> String {
     let b = file.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&file[i + 1..i + 3], 16) {
-                out.push(v);
+            if let (Some(h1), Some(h2)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push((h1 << 4) | h2);
                 i += 3;
                 continue;
             }
@@ -232,6 +252,7 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuota(p: *mut Provider, quota
     if quota.is_null() {
         return E_INVALIDARG;
     }
+    let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let used: u64 = std::fs::read_dir(&pr.root).into_iter().flatten().flatten().flat_map(|e| blobs_of(&e.path())).map(|b| b.2).sum();
     *quota = (QUOTA - used as i64).max(0);
     static LAST: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
@@ -253,6 +274,9 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuotaAsync(p: *mut Provider, 
 }
 
 pub unsafe extern "system" fn XGameSaveGetRemainingQuotaResult(b: *mut XAsyncBlock, quota: *mut i64) -> HRESULT {
+    if quota.is_null() {
+        return E_INVALIDARG;
+    }
     XAsyncGetResult(b, &QUOTA_ID as *const u8 as *const c_void, 8, quota as *mut c_void, std::ptr::null_mut())
 }
 
@@ -451,6 +475,10 @@ fn read_layout(dir: &Path, names: &[String]) -> Result<(Vec<u8>, u32), HRESULT> 
     Ok((out, picked.len() as u32))
 }
 
+fn valid_blob_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= GS_MAX_BLOB_NAME_SIZE
+}
+
 unsafe fn names_of(names: *const *const u8, count: u32) -> Result<Vec<String>, HRESULT> {
     if count == 0 {
         return Ok(Vec::new());
@@ -458,7 +486,15 @@ unsafe fn names_of(names: *const *const u8, count: u32) -> Result<Vec<String>, H
     if names.is_null() {
         return Err(E_INVALIDARG);
     }
-    (0..count as usize).map(|i| from_cstr_ptr(*names.add(i)).ok_or(E_INVALIDARG)).collect()
+    (0..count as usize)
+        .map(|i| {
+            let n = from_cstr_ptr(*names.add(i)).ok_or(E_INVALIDARG)?;
+            if !valid_blob_name(&n) {
+                return Err(E_INVALIDARG);
+            }
+            Ok(n)
+        })
+        .collect()
 }
 
 /// Turn the offsets of a copied layout into pointers.
@@ -563,6 +599,12 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobWrite(u: *mut Update, name: *co
     if data.is_null() && size > 0 {
         return E_INVALIDARG;
     }
+    if !valid_blob_name(&n) {
+        return E_INVALIDARG;
+    }
+    if size > GS_MAX_BLOB_SIZE {
+        return E_GS_UPDATE_TOO_BIG;
+    }
     let bytes = if size == 0 { Vec::new() } else { std::slice::from_raw_parts(data, size).to_vec() };
     u.ops.push((n, Some(bytes)));
     S_OK
@@ -570,12 +612,67 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobWrite(u: *mut Update, name: *co
 
 pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *const u8) -> HRESULT {
     let (Some(u), Some(n)) = (update(u), from_cstr_ptr(name)) else { return E_INVALIDARG };
+    if !valid_blob_name(&n) {
+        return E_INVALIDARG;
+    }
     u.ops.push((n, None));
     S_OK
 }
 
+fn calculate_projected_quota(root: &Path, dir: &Path, ops: &[(String, Option<Vec<u8>>)]) -> Result<u64, HRESULT> {
+    let total_used: u64 = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|e| blobs_of(&e.path()))
+        .map(|b| b.2)
+        .sum();
+
+    let current_blobs = blobs_of(dir);
+
+    let mut final_ops: Vec<(&str, Option<u64>)> = Vec::new();
+    for (name, data) in ops {
+        let size = data.as_ref().map(|d| d.len() as u64);
+        if let Some(existing) = final_ops.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            *existing = (name.as_str(), size);
+        } else {
+            final_ops.push((name.as_str(), size));
+        }
+    }
+
+    let mut net_delta: i128 = 0;
+    for (name, new_size) in final_ops {
+        let old_size = current_blobs
+            .iter()
+            .find(|b| b.0.eq_ignore_ascii_case(name))
+            .map(|b| b.2)
+            .unwrap_or(0);
+        match new_size {
+            Some(s) => {
+                net_delta += (s as i128) - (old_size as i128);
+            }
+            None => {
+                net_delta -= old_size as i128;
+            }
+        }
+    }
+
+    let projected = (total_used as i128) + net_delta;
+    if projected > QUOTA as i128 {
+        return Err(E_GS_QUOTA_EXCEEDED);
+    }
+
+    Ok(projected.max(0) as u64)
+}
+
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(root) = dir.parent() else { return crate::util::E_FAIL };
+
+    if let Err(hr) = calculate_projected_quota(root, dir, ops) {
+        return hr;
+    }
+
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
@@ -868,6 +965,42 @@ mod tests {
 
     /// Names Windows does not keep as file names (device names, a trailing dot or space,
     /// "." / "..") come back as they were written.
+    /// #325: '%' followed by a multi-byte character stays literal instead of panicking, a sign is
+    /// not a hex digit, and every name `enc` writes still decodes to itself.
+    #[test]
+    fn dec_keeps_bad_escapes_literal() {
+        assert_eq!(dec("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(dec("%\u{e9}a"), "%\u{e9}a");
+        assert_eq!(dec("%+1"), "%+1");
+        assert_eq!(dec("%-1x"), "%-1x");
+        assert_eq!(dec("a%4"), "a%4");
+        assert_eq!(dec("%41%42c"), "ABc");
+        assert_eq!(dec("%c3%A9"), "\u{e9}");
+        for name in ["%a\u{e9}", "sauvegarde \u{e9}t\u{e9}", "\u{4fdd}\u{5b58}1", "100%", "%+1", "save.", "aux"] {
+            assert_eq!(dec(&enc(name)), name);
+        }
+    }
+
+    /// #325: a container folder named "%a\u{e9}" (made outside XCL) is enumerated, not a panic across
+    /// the `extern "system"` call that aborts the process.
+    #[test]
+    fn enumerating_a_container_with_a_bad_escape_does_not_abort() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-325-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let dir = (*p).root.join("%a\u{e9}");
+            std::fs::create_dir_all(dir.join("b")).unwrap();
+            std::fs::write(dir.join("b").join("data"), b"x").unwrap();
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(list.iter().any(|c| c.0 == "%a\u{e9}"), "{list:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+            XGameSaveCloseProvider(p);
+        }
+    }
+
     #[test]
     fn names_windows_would_change_round_trip() {
         let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1343,6 +1476,133 @@ mod tests {
             let mut u_out = 0xDEADBEEF as *mut Update;
             assert_eq!(XGameSaveCreateUpdate(std::ptr::null_mut(), std::ptr::null(), &mut u_out), E_INVALIDARG);
             assert_eq!(u_out, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn url_encoding_safety_dec_non_ascii_and_malformed_percent_does_not_panic() {
+        // Must never panic on non-ASCII characters or malformed percent escapes
+        assert_eq!(dec("test%€"), "test%€");
+        assert_eq!(dec("test%ü"), "test%ü");
+        assert_eq!(dec("%"), "%");
+        assert_eq!(dec("%2"), "%2");
+        assert_eq!(dec("%2G"), "%2G");
+        assert_eq!(dec("%+1"), "%+1");
+        assert_eq!(dec("%20"), " ");
+        assert_eq!(dec("%C3%A9"), "é");
+        assert_eq!(dec("prefix%2Fmiddle%20suffix"), "prefix/middle suffix");
+    }
+
+    #[test]
+    fn url_encoding_device_names_and_windows_specials() {
+        for special in ["CONIN$", "CONOUT$", "CLOCK$", "CONIN$.txt", "CONOUT$.dat", "aux", "PRN", "..", "."] {
+            let encoded = enc(special);
+            assert_ne!(encoded, special);
+            assert_eq!(dec(&encoded), special, "failed to roundtrip: {special}");
+        }
+    }
+
+    #[test]
+    fn blob_name_bounds_and_empty_validation() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-blob-bounds-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slot\0".as_ptr(), &mut c), S_OK);
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+
+            // Empty blob name is rejected
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"\0".as_ptr(), b"data".as_ptr(), 4), E_INVALIDARG);
+            assert_eq!(XGameSaveSubmitBlobDelete(u, b"\0".as_ptr()), E_INVALIDARG);
+
+            // Overlong blob name (> 1024) is rejected
+            let long_name = format!("{}\0", "a".repeat(1025));
+            assert_eq!(XGameSaveSubmitBlobWrite(u, long_name.as_ptr(), b"data".as_ptr(), 4), E_INVALIDARG);
+            assert_eq!(XGameSaveSubmitBlobDelete(u, long_name.as_ptr()), E_INVALIDARG);
+
+            // Blob size > 16 MiB returns E_GS_UPDATE_TOO_BIG
+            assert_eq!(
+                XGameSaveSubmitBlobWrite(u, b"big\0".as_ptr(), b"a".as_ptr(), GS_MAX_BLOB_SIZE + 1),
+                E_GS_UPDATE_TOO_BIG
+            );
+
+            // Empty blob name in read is rejected
+            let empty_name = [b"\0".as_ptr()];
+            let mut count = 1u32;
+            let mut buf = vec![0u64; 16];
+            assert_eq!(
+                XGameSaveReadBlobData(c, empty_name.as_ptr(), &mut count, 128, buf.as_mut_ptr() as *mut Blob),
+                E_INVALIDARG
+            );
+
+            XGameSaveCloseUpdate(u);
+            XGameSaveCloseContainer(c);
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn container_quota_validation_enforces_limit_and_atomicity() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-quota-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slot\0".as_ptr(), &mut c), S_OK);
+
+            // Write 1 MiB save
+            let data_1mb = vec![0x42u8; 1 << 20];
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"Display\0".as_ptr(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"save1\0".as_ptr(), data_1mb.as_ptr(), data_1mb.len()), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+
+            let mut remaining = 0i64;
+            assert_eq!(XGameSaveGetRemainingQuota(p, &mut remaining), S_OK);
+            assert_eq!(remaining, QUOTA - (1 << 20));
+
+            // Exceed quota by queueing multiple max-size blobs whose sum > remaining
+            let mut u_over = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u_over), S_OK);
+            // 17 blobs * 16 MiB = 272 MiB > 256 MiB
+            let chunk = vec![0x55u8; GS_MAX_BLOB_SIZE];
+            for i in 0..17 {
+                let bname = format!("big_{i}\0");
+                assert_eq!(XGameSaveSubmitBlobWrite(u_over, bname.as_ptr(), chunk.as_ptr(), chunk.len()), S_OK);
+            }
+            // Update must fail with E_GS_QUOTA_EXCEEDED
+            assert_eq!(XGameSaveSubmitUpdate(u_over), E_GS_QUOTA_EXCEEDED);
+            XGameSaveCloseUpdate(u_over);
+
+            // Verify atomicity: container still only has original 1 MiB save
+            let mut list: Vec<(String, u32)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateBlobInfo(c, &mut list as *mut _ as *mut c_void, Some(blob_names)), S_OK);
+            assert_eq!(list, vec![("save1".to_string(), 1 << 20)]);
+
+            // Overwrite original blob with 512 KiB: net reduction in used space
+            let mut u_shrink = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u_shrink), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u_shrink, b"save1\0".as_ptr(), data_1mb[..512 << 10].as_ptr(), 512 << 10), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u_shrink), S_OK);
+            XGameSaveCloseUpdate(u_shrink);
+
+            assert_eq!(XGameSaveGetRemainingQuota(p, &mut remaining), S_OK);
+            assert_eq!(remaining, QUOTA - (512 << 10));
+
+            // Quota query with null pointer returns E_INVALIDARG
+            assert_eq!(XGameSaveGetRemainingQuota(p, std::ptr::null_mut()), E_INVALIDARG);
+
+            XGameSaveCloseContainer(c);
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
         }
     }
 
