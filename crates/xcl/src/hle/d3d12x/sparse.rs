@@ -197,10 +197,67 @@ struct UploadSlot {
     fence_val: u64,
 }
 
-struct RetiredTiles {
+struct RetiredTiles<F> {
     tiles: Vec<(u32, u32)>,
-    /// Fence marks on `self.queue` and every known title queue (`None` = signal failed, keep held).
-    marks: Option<Vec<(ID3D12Fence, u64)>>,
+    /// Fence marks on the sparse queue and every known title queue (`None` = signal failed, keep held).
+    marks: Option<Vec<(F, u64)>>,
+}
+
+struct TileRetirement<F> {
+    /// Last pin dropped after the window unmap. Wait to signal fences outside Release.
+    unpinned: Vec<(u32, u32)>,
+    /// Unmapped tiles awaiting the sparse and title queues before entering the free list.
+    quarantined: VecDeque<RetiredTiles<F>>,
+}
+
+impl<F> TileRetirement<F> {
+    fn new() -> Self {
+        Self { unpinned: Vec::new(), quarantined: VecDeque::new() }
+    }
+
+    fn unpin(
+        &mut self,
+        tile: (u32, u32),
+        pinned: &mut FxHashMap<(u32, u32), u32>,
+        mapped: &FxHashMap<usize, TileEntry>,
+        parked: &FxHashMap<usize, (u32, u32)>,
+    ) {
+        let Some(count) = pinned.get_mut(&tile) else { return };
+        *count -= 1;
+        if *count != 0 {
+            return;
+        }
+        pinned.remove(&tile);
+        if !mapped.values().any(|e| e.pool == tile)
+            && !parked.values().any(|&p| p == tile)
+            && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
+        {
+            self.unpinned.push(tile);
+        }
+    }
+
+    fn drain(
+        &mut self,
+        pinned: &FxHashMap<(u32, u32), u32>,
+        free: &mut Vec<(u32, u32)>,
+        mut completed: impl FnMut(&F) -> u64,
+    ) -> bool {
+        let mut freed = false;
+        while let Some(front) = self.quarantined.front() {
+            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| completed(f) >= *v));
+            if !ready {
+                break;
+            }
+            let batch = self.quarantined.pop_front().unwrap();
+            for tile in batch.tiles {
+                if !pinned.contains_key(&tile) {
+                    free.push(tile);
+                    freed = true;
+                }
+            }
+        }
+        freed
+    }
 }
 
 struct State {
@@ -232,10 +289,9 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
-    /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before entering `free`
-    quarantined: VecDeque<RetiredTiles>,
-    /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
-    queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
+    retirement: TileRetirement<ID3D12Fence>,
+    /// per-title-queue fences used to mark in-flight GPU work (non-owning raw queue key → fence + value)
+    queue_fences: FxHashMap<usize, (ID3D12Fence, u64)>,
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
@@ -556,7 +612,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
-            quarantined: VecDeque::new(),
+            retirement: TileRetirement::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
@@ -606,6 +662,7 @@ impl State {
     }
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+        self.quarantine_unpinned_with(None);
         self.drain_quarantined();
         if self.free.is_empty() && self.flush_parked() {
             self.drain_quarantined();
@@ -1250,7 +1307,6 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
-    s.note_queue(queue);
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
     if filtered.is_empty() {
         return;
@@ -1407,87 +1463,73 @@ impl State {
         }
     }
 
-    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
-    fn release_if_unused(&mut self, tile: (u32, u32)) {
-        if !self.pinned.contains_key(&tile)
-            && !self.mapped.values().any(|e| e.pool == tile)
-            && !self.parked.values().any(|&p| p == tile)
-            && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
-        {
-            self.free.push(tile);
-        }
-    }
-
-    unsafe fn note_queue(&mut self, q: &ID3D12CommandQueue) -> bool {
-        let key = q.as_raw() as usize;
-        if self.queue_fences.contains_key(&key) {
-            return true;
-        }
-        // Ignore queues belonging to a different device (e.g. isolated unit tests).
-        let mut qdev: Option<ID3D12Device> = None;
-        if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
-            return true;
-        }
-        match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
-            Ok(fence) => {
-                self.queue_fences.insert(key, (q.clone(), fence, 0));
-                true
+    unsafe fn quarantine_tiles_for(&mut self, tiles: Vec<(u32, u32)>, queues: &[&ID3D12CommandQueue]) {
+        // Pass 1 (before signaling): deduplicate live same-device title queues and prune stale
+        // queue fences unconditionally so an early error cannot prune another live queue.
+        let self_q = self.queue.as_raw() as usize;
+        let mut active: Vec<(usize, &ID3D12CommandQueue)> = Vec::with_capacity(queues.len());
+        let mut live_keys: Vec<usize> = Vec::with_capacity(queues.len());
+        for &q in queues {
+            let key = q.as_raw() as usize;
+            if key == 0 || key == self_q || live_keys.contains(&key) {
+                continue;
             }
-            Err(_) => false,
-        }
-    }
-
-    unsafe fn sync_known_queues(&mut self) -> bool {
-        let mut ok = true;
-        for raw in super::present::known_queues() {
-            if !self.queue_fences.contains_key(&raw) {
-                let ptr = raw as *mut c_void;
-                if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) {
-                    ok &= self.note_queue(q);
-                }
+            let mut qdev: Option<ID3D12Device> = None;
+            if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
+                continue;
             }
+            live_keys.push(key);
+            active.push((key, q));
         }
-        ok
-    }
-
-    unsafe fn quarantine_tiles(&mut self, tiles: Vec<(u32, u32)>) {
+        self.queue_fences.retain(|k, _| live_keys.contains(k));
         if tiles.is_empty() {
             return;
         }
-        let mut ok = self.sync_known_queues();
-        let mut marks = Vec::with_capacity(1 + self.queue_fences.len());
+        let mut ok = true;
+        let mut marks = Vec::with_capacity(1 + active.len());
         marks.push((self.fence.clone(), self.value));
-        if ok {
-            for (q, fence, val) in self.queue_fences.values_mut() {
-                let next = *val + 1;
-                if q.Signal(&*fence, next).is_ok() {
-                    *val = next;
-                    marks.push((fence.clone(), next));
-                } else {
-                    ok = false;
-                    break;
-                }
+        for (key, q) in active {
+            let entry = match self.queue_fences.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                    Ok(fence) => e.insert((fence, 0)),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                },
+            };
+            let next = entry.1 + 1;
+            if q.Signal(&entry.0, next).is_ok() {
+                entry.1 = next;
+                marks.push((entry.0.clone(), next));
+            } else {
+                ok = false;
+                break;
             }
         }
-        self.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks) });
+        self.retirement.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks) });
+    }
+
+    /// Mark the queues after the last pin dropped. A placed buffer can be used after the
+    /// window's unmap was issued, so the unmap's original marks would be too early.
+    /// `extra`: the queue submitting now, quarantined with every known title queue.
+    unsafe fn quarantine_unpinned_with(&mut self, extra: Option<&ID3D12CommandQueue>) {
+        let tiles = std::mem::take(&mut self.retirement.unpinned);
+        let mut raw_ptrs: Vec<*mut c_void> =
+            super::present::known_queues().into_iter().filter(|&raw| raw != 0).map(|raw| raw as *mut c_void).collect();
+        if let Some(q) = extra {
+            let p = q.as_raw();
+            if !p.is_null() && !raw_ptrs.contains(&p) {
+                raw_ptrs.push(p);
+            }
+        }
+        let borrowed: Vec<&ID3D12CommandQueue> = raw_ptrs.iter().filter_map(|p| ID3D12CommandQueue::from_raw_borrowed(p)).collect();
+        self.quarantine_tiles_for(tiles, &borrowed);
     }
 
     unsafe fn drain_quarantined(&mut self) -> bool {
-        let mut freed = false;
-        while let Some(front) = self.quarantined.front() {
-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v));
-            if !ready {
-                break;
-            }
-            let batch = self.quarantined.pop_front().unwrap();
-            for tile in batch.tiles {
-                if !self.pinned.contains_key(&tile) {
-                    self.free.push(tile);
-                    freed = true;
-                }
-            }
-        }
-        freed
+        self.retirement.drain(&self.pinned, &mut self.free, |f| f.GetCompletedValue())
     }
 
     /// The parked tiles unmapped from their windows (one call per window) and their unpinned
@@ -1495,6 +1537,26 @@ impl State {
     /// Pools left all free are not retired here: callers do that (`retire_free_pools`) unless
     /// they take a tile right away.
     unsafe fn flush_parked(&mut self) -> bool {
+        self.flush_parked_with(None)
+    }
+
+    unsafe fn flush_parked_with(&mut self, extra: Option<&ID3D12CommandQueue>) -> bool {
+        if self.parked.is_empty() {
+            return false;
+        }
+        let mut raw_ptrs: Vec<*mut c_void> =
+            super::present::known_queues().into_iter().filter(|&raw| raw != 0).map(|raw| raw as *mut c_void).collect();
+        if let Some(q) = extra {
+            let p = q.as_raw();
+            if !p.is_null() && !raw_ptrs.contains(&p) {
+                raw_ptrs.push(p);
+            }
+        }
+        let borrowed: Vec<&ID3D12CommandQueue> = raw_ptrs.iter().filter_map(|p| ID3D12CommandQueue::from_raw_borrowed(p)).collect();
+        self.flush_parked_for(&borrowed)
+    }
+
+    unsafe fn flush_parked_for(&mut self, queues: &[&ID3D12CommandQueue]) -> bool {
         if self.parked.is_empty() {
             return false;
         }
@@ -1513,7 +1575,7 @@ impl State {
             self.unmap_tiles(&r, b, &ts);
         }
         self.signal();
-        self.quarantine_tiles(tiles);
+        self.quarantine_tiles_for(tiles, queues);
         true
     }
 }
@@ -1555,9 +1617,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
-    s.note_queue(queue);
     // the title's work sees what was decommitted unmapped, as it was
-    let flushed = s.flush_parked();
+    let flushed = s.flush_parked_with(Some(queue));
+    s.quarantine_unpinned_with(Some(queue));
     let drained = s.drain_quarantined();
     if flushed || drained {
         s.retire_free_pools();
@@ -1791,19 +1853,51 @@ fn forget_buffer_in(state: &Mutex<Option<State>>, forgotten: &Mutex<Vec<usize>>,
 fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
     for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
-            }
-        }
+        s.retirement.unpin(tile, &mut s.pinned, &s.mapped, &s.parked);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpinned_sparse_tiles_wait_for_every_queue_before_reuse() {
+        let tile = (0, 3);
+        let mapped = FxHashMap::default();
+        let parked = FxHashMap::default();
+        let marks = [12, 23];
+        for [first, second] in [[0, 1], [1, 0]] {
+            let mut retirement = TileRetirement::new();
+            let mut pinned = [(tile, 2)].into_iter().collect();
+            let mut free = Vec::new();
+
+            retirement.unpin(tile, &mut pinned, &mapped, &parked);
+            assert_eq!(pinned[&tile], 1);
+            assert!(retirement.unpinned.is_empty());
+            retirement.unpin(tile, &mut pinned, &mapped, &parked);
+            assert!(pinned.is_empty());
+            assert!(free.is_empty(), "the last unpin cannot make the tile available");
+
+            // Model the marks taken by the next allocation or submit. The title queue's mark
+            // follows all its work before unpinning, including work after the window unmap.
+            let tiles = std::mem::take(&mut retirement.unpinned);
+            assert_eq!(tiles, [tile]);
+            retirement.quarantined.push_back(RetiredTiles {
+                tiles,
+                marks: Some(vec![(0, marks[0]), (1, marks[1])]),
+            });
+            let mut completed = [11, 22];
+            assert!(!retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            completed[first] = marks[first];
+            assert!(!retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            assert!(free.is_empty(), "both marks must complete");
+            completed[second] = marks[second];
+            assert!(retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            assert!(!retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            assert_eq!(free, [tile], "the tile returns to the free list exactly once");
+        }
+    }
 
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
@@ -1994,7 +2088,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
-                quarantined: VecDeque::new(),
+                retirement: TileRetirement::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2202,7 +2296,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
-                quarantined: VecDeque::new(),
+                retirement: TileRetirement::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2299,7 +2393,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
-                quarantined: VecDeque::new(),
+                retirement: TileRetirement::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2331,8 +2425,10 @@ mod tests {
             assert_eq!(s.parked.get(&base), Some(&tile));
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");
-            s.release_if_unused(tile);
+            s.pinned.insert(tile, 1);
+            s.retirement.unpin(tile, &mut s.pinned, &s.mapped, &s.parked);
             assert!(!s.free.contains(&tile), "a parked tile is not free");
+            assert!(s.retirement.unpinned.is_empty(), "a parked tile is retired by the unmap");
 
             // committed again: the same tile, cleared, no new mapping
             s.to_zero.clear();
@@ -2390,7 +2486,9 @@ mod tests {
 
         let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
         let mut dev: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+        if std::env::var("XCL_WARP").ok().as_deref() == Some("1")
+            || D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err()
+        {
             let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
             D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
         }
@@ -2424,7 +2522,7 @@ mod tests {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
-            quarantined: VecDeque::new(),
+            retirement: TileRetirement::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
@@ -2492,7 +2590,6 @@ mod tests {
         unsafe {
             let (base, mut s) = test_state_with_reserved(2);
             let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
-            assert!(s.note_queue(&title_q));
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
@@ -2504,7 +2601,7 @@ mod tests {
 
             s.decommit_range(base, TILE);
             s.free.clear();
-            assert!(s.flush_parked());
+            assert!(s.flush_parked_for(&[&title_q]));
 
             // Even after `s.queue` finishes `unmap_tiles`, `title_q` is still gated behind `title_gate`.
             s.wait_for(s.value);
@@ -2522,6 +2619,107 @@ mod tests {
             assert!(s.free.contains(&tile), "tile must return to free list after title queue completes");
             drop(_unblock);
             s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    unsafe fn com_refcount(q: &ID3D12CommandQueue) -> u32 {
+        let raw = q.as_raw() as *mut *const *const c_void;
+        let vt = *raw;
+        let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+        let _ = add_ref(raw as *mut c_void);
+        release(raw as *mut c_void)
+    }
+
+    #[test]
+    fn flush_parked_does_not_retain_title_queue_com_refs() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let before = com_refcount(&title_q);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            s.decommit_range(base, TILE);
+            assert!(s.flush_parked_for(&[&title_q]));
+            assert_eq!(com_refcount(&title_q), before, "flush_parked must not retain a strong COM ref on title queues");
+            assert_eq!(s.queue_fences.len(), 1);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn flush_parked_prunes_stale_queue_fences_while_inflight_batches_stay_gated() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let title_gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let _unblock = SignalOnDrop(title_gate.clone(), 1);
+            title_q.Wait(&title_gate, 1).expect("gate title queue");
+
+            s.commit_range(base, TILE);
+            let tile_a = s.mapped[&base].pool;
+            s.commit_range(base + TILE, TILE);
+            let tile_b = s.mapped[&(base + TILE)].pool;
+            s.wait_for(s.value);
+
+            s.decommit_range(base, TILE);
+            s.free.clear();
+            assert!(s.flush_parked_for(&[&title_q]));
+            assert_eq!(s.queue_fences.len(), 1);
+
+            // Simulate title_q release before the next flush: stale fence entry is pruned,
+            // while batch A keeps its own fence clone in `marks` and stays gated.
+            s.decommit_range(base + TILE, TILE);
+            assert!(s.flush_parked_for(&[]));
+            assert!(s.queue_fences.is_empty(), "stale queue fence must be pruned");
+            s.wait_for(s.value);
+            assert!(!s.drain_quarantined() && !s.free.contains(&tile_a), "in-flight batch A must stay gated");
+
+            title_gate.Signal(1).expect("release title queue");
+            let start = std::time::Instant::now();
+            while (!s.free.contains(&tile_a) || !s.free.contains(&tile_b)) && start.elapsed() < std::time::Duration::from_secs(5) {
+                s.drain_quarantined();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(s.free.contains(&tile_a) && s.free.contains(&tile_b), "both batches must drain after title_q completes");
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn repeated_queue_quarantine_and_release_does_not_leak_queues_or_fences() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            for i in 0..80usize {
+                let q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap_or_else(|e| panic!("queue {i}: {e}"));
+                let before = com_refcount(&q);
+                s.commit_range(base, TILE);
+                s.decommit_range(base, TILE);
+                assert!(s.flush_parked_for(&[&q]));
+                assert_eq!(com_refcount(&q), before, "queue {i} refcount leaked");
+                drop(q);
+                s.commit_range(base + TILE, TILE);
+                s.decommit_range(base + TILE, TILE);
+                assert!(s.flush_parked_for(&[]));
+                assert!(s.queue_fences.is_empty(), "stale fence leaked at iteration {i}");
+                s.wait_for(s.value);
+                let start = std::time::Instant::now();
+                while !s.quarantined.is_empty() && start.elapsed() < std::time::Duration::from_secs(5) {
+                    s.drain_quarantined();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(s.quarantined.is_empty(), "quarantine failed to drain at iteration {i}");
+            }
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
