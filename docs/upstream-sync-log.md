@@ -637,3 +637,86 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-127 (task-1795719862-9e56): #2853 + #2854 + #2855 + #2856 triaged, all SKIP, probe past #2855
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) tops out at #2856 (`e29306f4`) — one past the
+  critic step-126 handoff top (#2855). Per-PR sequential probe #2830..#2970
+  (widened past the sixth gap per mem-1795712765-78dc): #2830 `d6cf64c1` /
+  #2831 `965806a0` / #2832 `e2ecdfa9` / #2833 `f5a352c3` /
+  #2834 `653f8f13` / #2836 `43a4eb9d` / #2837 `9d967cf8` /
+  #2838 `ef36b7df` / #2842 `344ce7b5` / #2843 `932e689c` /
+  #2844 `fc007a96` / #2845 `76b17593` / #2846 `a4421e06` /
+  #2847 `4b1780e8` / #2848 `88e56f93` / #2849 `4e93173` /
+  #2850 `cdff8f72` / #2851 `7e6e2f09` / #2852 `69ebece8` /
+  #2853 `bee0dab9` / #2854 `080e973d` / #2855 `651fc050` /
+  #2856 `e29306f4` (all 23 pins match batched + sequential,
+  `merge-base --is-ancestor` exit 1 each — all still OPEN, unmerged);
+  #2835, #2839..#2841, #2857..#2970 ALL MISSING — scan complete.
+  All four new heads predate this task window (task created 19:04:22 UTC;
+  #2853 18:59 UTC / #2854 18:52 UTC / #2855 18:20 UTC / #2856 18:49:52 UTC),
+  so no push-race in this window — three are the critic step-126 handoff,
+  #2856 is the one genuinely new arrival since the critic's scan.
+- Triage (four new PRs, all SKIP with hunk evidence):
+  - #2853 `bee0dab9` (D3D12.X: StorePipeline gives the driver the
+    pipeline behind a stand-in; single commit on `8b957bec`):
+    `pso_async.rs` +23 (`Built` enum + `built()` non-waiting probe),
+    `real.rs` +153 (`pipeline_to_store` / `store_pipeline` /
+    `lib_store_pipeline` + `store_pipeline_tests`), `standin.rs` +8 —
+    ALL three files under `hle/d3d12x/`. SKIP — Windows-only: whole
+    `hle` is `#[cfg(windows)]` (`lib.rs:30-34`, `hle_linux` swap on
+    Linux), zero `Built::` / `lib_store_pipeline` / `is_shell` refs in
+    `hle_linux.rs` / `d3d12x_linux.rs`. Nothing to port.
+  - #2854 `080e973d` (thread-limit tests run on a wave32-only GPU;
+    stacked mega-branch, 410 commits, merge-base `b49be183` — the tip
+    commit itself is 2 files +4/−2): `gpu/recomp/tests.rs` adds
+    `wave64: false` to the "HLSL wave32" form, `tests/gpu_compute_e2e.rs`
+    `XCL_DIRECT_SPLIT_INSTRUCTIONS` 12→16 with comment. SKIP — blocked
+    on the unlanded `f9bcafd` thread-limit stack: the lib-test target
+    `gpu_compute_thread_limits_leave_the_lanes_past_them_out` is ABSENT
+    from the tree (grep count 0; no `thread limit` commit in log), and
+    our e2e region matches the upstream PRE-image exactly, so the 12→16
+    bump (which compensates entry-block growth from thread-limit code
+    we do not have) would mis-tune our test. Revisit when `f9bcafd`
+    lands.
+  - #2855 `651fc050` (Direct DXIL: saturate `v_pk_*_i16` CLAMP with masked
+    select; single commit stacked on `e120925e`): `lower_wide.rs` +185/−4
+    replaces `IMax(IMin(t, 0x7FFF), -32768) & 0xFFFF` with
+    SGt/SLt-compare + `select` (NVIDIA Ampere 610.88/616.56 drops the
+    `& 0xFFFF`, clobbering bits [31:16]). Our tree holds the PRE-image
+    (`lower_wide.rs:182-185` still `imin`/`imax`/`andc`). SKIP —
+    DXIL-emit-side driver workaround with no Linux driver consumer:
+    Linux device execution is Vulkan/SPIR-V (`hle/vulkan_linux`), and
+    Direct-DXIL bytes on Linux go only to offline stats/dumps
+    (`shaders.rs:450` form counters) — no driver ever compiles them
+    here. The SPIR-V emitter has no parallel pattern (it lowers
+    `v_pk_add/sub_i16` CLAMP via the `clamp()` builtin,
+    `emit.rs:3321-3322`). The new unit test vacuous-passes on Linux
+    (`validator_supported()` false → early return) and the GPU test
+    skips without a wave32 device — porting is unobservable here.
+  - #2856 `e29306f4` (D3D12.X: keep logic ops on UINT render targets;
+    single commit stacked on `e120925e`, sibling of #2855):
+    `hle/d3d12x/real.rs` +143/−15 — `probe_logic_op` caches
+    `OutputMergerLogicOp`, `sanitize_integer_rt_blend` gains the
+    `logic_op_supported` param (7 `windows::Win32` / `ID3D12Device`
+    refs in the diff). SKIP — Windows-only file and API: whole `hle`
+    is `#[cfg(windows)]`, zero `logic_op` / `sanitize_integer` /
+    `is_uint_dxgi` refs in `hle_linux.rs` / `d3d12x_linux.rs`.
+    Nothing to port.
+  Earlier pins stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed;
+  #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim
+  in `aa59e8ac`; #2843/#2844-new-head/#2845/#2846/#2847/#2848/#2849/#2850/
+  #2851/#2852 SKIP.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step127r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
