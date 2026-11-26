@@ -96,6 +96,64 @@ pub(crate) fn known(path: &str) -> Option<(Layout, &'static str)> {
         .map(|&(_, layout, name)| (layout, name))
 }
 
+#[repr(C)]
+struct HidpCaps {
+    usage: u16,
+    usage_page: u16,
+    input_report_byte_length: u16,
+    output_report_byte_length: u16,
+    feature_report_byte_length: u16,
+    reserved: [u16; 17],
+    number_link_collection_nodes: u16,
+    number_input_button_caps: u16,
+    number_input_value_caps: u16,
+    number_input_data_indices: u16,
+    number_output_button_caps: u16,
+    number_output_value_caps: u16,
+    number_output_data_indices: u16,
+    number_feature_button_caps: u16,
+    number_feature_value_caps: u16,
+    number_feature_data_indices: u16,
+}
+
+const HIDP_STATUS_SUCCESS: i32 = 0x0011_0000;
+/// Fallback `ReadFile` buffer size when `HIDP_CAPS` cannot be queried. A DualShock 4 over
+/// Bluetooth advertises `InputReportByteLength = 547` (report `0x19`), and `hidclass.sys`
+/// fails smaller `ReadFile` buffers with `ERROR_INVALID_USER_BUFFER`.
+const FALLBACK_INPUT_REPORT_LEN: usize = 1024;
+const MIN_INPUT_REPORT_LEN: usize = 64;
+
+#[link(name = "hid", kind = "raw-dylib")]
+extern "system" {
+    fn HidD_GetPreparsedData(device: *mut c_void, preparsed_data: *mut *mut c_void) -> u8;
+    fn HidD_FreePreparsedData(preparsed_data: *mut c_void) -> u8;
+    fn HidP_GetCaps(preparsed_data: *mut c_void, caps: *mut HidpCaps) -> i32;
+}
+
+/// Queries the HID device's `HIDP_CAPS.InputReportByteLength` so `ReadFile` is always given a
+/// buffer at least as large as the driver requires.
+fn input_report_byte_length(handle: *mut c_void) -> Option<u16> {
+    let mut preparsed: *mut c_void = std::ptr::null_mut();
+    if unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } == 0 || preparsed.is_null() {
+        return None;
+    }
+    let mut caps = std::mem::MaybeUninit::<HidpCaps>::zeroed();
+    let status = unsafe { HidP_GetCaps(preparsed, caps.as_mut_ptr()) };
+    unsafe { HidD_FreePreparsedData(preparsed) };
+    if status == HIDP_STATUS_SUCCESS {
+        Some(unsafe { caps.assume_init() }.input_report_byte_length)
+    } else {
+        None
+    }
+}
+
+fn read_buffer_len(caps_input_len: Option<u16>) -> usize {
+    match caps_input_len {
+        Some(n) if n > 0 => (n as usize).max(MIN_INPUT_REPORT_LEN),
+        _ => FALLBACK_INPUT_REPORT_LEN,
+    }
+}
+
 fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
@@ -108,7 +166,7 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
         return;
     }
     crate::xlog_info!("GameInput: a {name} is read as the title's gamepad when no XInput controller answers");
-    let mut buf = [0u8; 128];
+    let mut buf = vec![0u8; read_buffer_len(input_report_byte_length(h as *mut c_void))];
     let mut odd = false;
     loop {
         let mut n = 0u32;
@@ -119,7 +177,8 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
             Some(s) => *STATE.lock().unwrap() = Some(s),
             None if !odd => {
                 odd = true;
-                crate::xlog_info!("GameInput: the {name} sent a report this does not read (id {:#x}, {n} bytes)", buf[0]);
+                let id = if n > 0 { buf[0] } else { 0 };
+                crate::xlog_info!("GameInput: the {name} sent a report this does not read (id {id:#x}, {n} bytes)");
             }
             None => {}
         }
@@ -208,5 +267,32 @@ mod tests {
         assert_eq!(known(&format!("{bt}09cc#9&1#{{4d1e55b2-f16f-11cf-88cb-001111000030}}")).map(|k| k.0), Some(Layout::DualShock4));
         assert_eq!(known(&format!("{bt}0ce6#9&1#{{4d1e55b2-f16f-11cf-88cb-001111000030}}")), None, "a DualSense over Bluetooth is not read");
         assert_eq!(known(r"\\?\hid#vid_045e&pid_0b13#1#{4d1e55b2-f16f-11cf-88cb-001111000030}"), None);
+    }
+}
+
+#[cfg(test)]
+mod read_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn hidp_caps_layout_and_read_buffer_sizing() {
+        assert_eq!(std::mem::size_of::<HidpCaps>(), 64);
+        assert_eq!(std::mem::offset_of!(HidpCaps, input_report_byte_length), 4);
+
+        // USB DS4 / DualSense (64 B), Bluetooth DualSense (78 B), Bluetooth DS4 (547 B), and larger descriptors.
+        assert_eq!(read_buffer_len(Some(64)), 64);
+        assert_eq!(read_buffer_len(Some(78)), 78);
+        assert_eq!(read_buffer_len(Some(547)), 547);
+        assert_eq!(read_buffer_len(Some(2048)), 2048);
+        // Tiny reported length is clamped to MIN_INPUT_REPORT_LEN; missing/zero caps fall back to >= 547 B.
+        assert_eq!(read_buffer_len(Some(10)), MIN_INPUT_REPORT_LEN);
+        assert!(read_buffer_len(Some(0)) >= 547);
+        assert!(read_buffer_len(None) >= 547);
+    }
+
+    #[test]
+    fn input_report_byte_length_handles_invalid_handle() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        assert_eq!(input_report_byte_length(INVALID_HANDLE_VALUE as *mut c_void), None);
     }
 }
