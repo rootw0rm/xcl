@@ -2821,10 +2821,38 @@ fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
 
-/// first page index → (pages in the block, pages still allocated, home base)
-static PHYS_BLOCKS: OnceLock<Mutex<BTreeMap<usize, (usize, usize, usize)>>> = OnceLock::new();
+struct PhysicalBlock {
+    count: usize,
+    live: usize,
+    home: usize,
+    freed: Vec<usize>,
+}
 
-fn phys_blocks() -> &'static Mutex<BTreeMap<usize, (usize, usize, usize)>> {
+impl PhysicalBlock {
+    const WORD_BITS: usize = usize::BITS as usize;
+
+    fn new(count: usize, home: usize) -> Self {
+        Self { count, live: count, home, freed: vec![0; count.div_ceil(Self::WORD_BITS)] }
+    }
+
+    fn is_live(&self, offset: usize) -> bool {
+        offset < self.count && self.freed[offset / Self::WORD_BITS] & (1 << (offset % Self::WORD_BITS)) == 0
+    }
+
+    fn free_page(&mut self, offset: usize) -> bool {
+        if !self.is_live(offset) {
+            return false;
+        }
+        self.freed[offset / Self::WORD_BITS] |= 1 << (offset % Self::WORD_BITS);
+        self.live -= 1;
+        true
+    }
+}
+
+/// first page index → its physical page allocation
+static PHYS_BLOCKS: OnceLock<Mutex<BTreeMap<usize, PhysicalBlock>>> = OnceLock::new();
+
+fn phys_blocks() -> &'static Mutex<BTreeMap<usize, PhysicalBlock>> {
     PHYS_BLOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -2846,22 +2874,29 @@ fn away() -> &'static Mutex<Option<Away>> {
 fn page_home(page: usize) -> Option<usize> {
     let index = page_index(page)?;
     let blocks = phys_blocks().lock().ok()?;
-    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
-    (live > 0 && index < first.checked_add(count)?)
-        .then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?))
-        .flatten()
+    let (&first, block) = blocks.range(..=index).next_back()?;
+    let offset = index - first;
+    block.is_live(offset).then(|| block.home.checked_add(offset.checked_mul(PHYS_PAGE)?)).flatten()
 }
 
 /// The contiguous home address of `pages` when they are consecutive pages of one live allocation.
-fn contiguous_home_in(blocks: &std::collections::BTreeMap<usize, (usize, usize, usize)>, pages: &[usize]) -> Option<usize> {
+fn contiguous_home_in(blocks: &std::collections::BTreeMap<usize, PhysicalBlock>, pages: &[usize]) -> Option<usize> {
     let first_page = *pages.first()?;
     if first_page == 0 || !(1..pages.len()).all(|i| i.checked_mul(FRAMES).and_then(|d| first_page.checked_add(d)) == Some(pages[i])) {
         return None;
     }
     let index = page_index(first_page)?;
     let end = index.checked_add(pages.len())?;
-    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
-    (live > 0 && end <= first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+    let (&first, block) = blocks.range(..=index).next_back()?;
+    if end > first.checked_add(block.count)? {
+        return None;
+    }
+    // Every page in the span must still be allocated: a freed middle page
+    // breaks the contiguous home even though the block itself is alive.
+    if !(0..pages.len()).all(|i| block.is_live(index - first + i)) {
+        return None;
+    }
+    block.home.checked_add((index - first).checked_mul(PHYS_PAGE)?)
 }
 
 fn contiguous_home(pages: &[usize]) -> Option<usize> {
@@ -3058,7 +3093,7 @@ pub unsafe extern "win64" fn AllocateTitlePhysicalPages(
     for i in 0..n {
         unsafe { *arr.add(i) = page_number(first + i) };
     }
-    phys_blocks().lock().unwrap().insert(first, (n, n, home));
+    phys_blocks().lock().unwrap().insert(first, PhysicalBlock::new(n, home));
     crate::memstat::note(crate::memstat::PHYSICAL, bytes);
     set_error(ERROR_SUCCESS);
     1
@@ -3069,29 +3104,33 @@ pub unsafe extern "win64" fn FreeTitlePhysicalPages(_proc: usize, n: usize, arr:
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    // Freed pages mapped elsewhere keep their VA contents; only the mapping goes.
-    if let Some(st) = away().lock().unwrap().as_mut() {
-        for i in 0..n {
-            let p = unsafe { *arr.add(i) };
+    // Use the same lock order as map and read (AWAY then blocks) so they
+    // cannot see a partially freed page. Homes free after both locks drop.
+    let mut away_guard = away().lock().unwrap();
+    let mut blocks_guard = phys_blocks().lock().unwrap();
+    let mut homes = Vec::new();
+    for i in 0..n {
+        let p = unsafe { *arr.add(i) };
+        let Some(index) = page_index(p) else { continue };
+        let Some((&first, block)) = blocks_guard.range_mut(..=index).next_back() else { continue };
+        if !block.free_page(index - first) {
+            continue;
+        }
+        // A mapped address keeps its contents after free, but no longer tracks this page.
+        if let Some(st) = away_guard.as_mut() {
             if let Some(at) = st.page.remove(&p) {
                 st.at.remove(&at);
             }
         }
+        if block.live == 0 {
+            homes.push(block.home);
+            blocks_guard.remove(&first);
+        }
     }
-    let mut blocks = phys_blocks().lock().unwrap();
-    for i in 0..n {
-        let p = unsafe { *arr.add(i) };
-        let Some(index) = page_index(p) else { continue };
-        let Some((&first, &(count, _, home))) = blocks.range(..=index).next_back() else { continue };
-        if index >= first + count {
-            continue;
-        }
-        let e = blocks.get_mut(&first).unwrap();
-        e.1 = e.1.saturating_sub(1);
-        if e.1 == 0 {
-            blocks.remove(&first);
-            unsafe { libc::free(home as *mut libc::c_void) };
-        }
+    drop(blocks_guard);
+    drop(away_guard);
+    for home in homes {
+        unsafe { libc::free(home as *mut libc::c_void) };
     }
     set_error(ERROR_SUCCESS);
     1
@@ -11727,11 +11766,11 @@ mod tests {
     #[test]
     fn contiguous_home_requires_one_allocation() {
         let mut blocks = std::collections::BTreeMap::new();
-        blocks.insert(10, (3, 3, 0x1_0000_0000));
+        blocks.insert(10, PhysicalBlock::new(3, 0x1_0000_0000));
         // separate allocation whose page numbers immediately follow, with a non-adjacent home
-        blocks.insert(13, (2, 2, 0x2_0000_0000));
+        blocks.insert(13, PhysicalBlock::new(2, 0x2_0000_0000));
         // separate allocation whose home happens to be adjacent (still a distinct reservation)
-        blocks.insert(15, (1, 1, 0x2_0002_0000));
+        blocks.insert(15, PhysicalBlock::new(1, 0x2_0002_0000));
 
         let p = |i| page_number(i);
         assert_eq!(contiguous_home_in(&blocks, &[p(10), p(11), p(12)]), Some(0x1_0000_0000));
@@ -11962,6 +12001,59 @@ mod tests {
             assert_eq!(XMemFreePhysicalPages(1, other.as_mut_ptr()), 1);
             assert_eq!(VirtualFree(h0 as *mut c_void, 0, 0x8000), 1);
             assert_eq!(VirtualFree(h_other as *mut c_void, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn physical_page_liveness_crosses_bitmap_words() {
+        let boundary = PhysicalBlock::WORD_BITS;
+        let mut block = PhysicalBlock::new(boundary + 1, 0);
+        assert!(block.free_page(boundary - 1));
+        assert!(block.is_live(boundary));
+        assert!(block.free_page(boundary));
+        assert!(!block.free_page(boundary));
+        assert!(!block.is_live(boundary - 1));
+        assert!(!block.free_page(boundary + 1));
+        assert!(block.is_live(0));
+        assert_eq!(block.live, boundary - 1);
+    }
+
+    #[test]
+    fn repeated_physical_page_release_preserves_live_siblings() {
+        // Linux twin of upstream #608's `repeated_physical_page_release_*`:
+        // no UMA gate (Linux homes are `calloc` + the graphics pool, always
+        // available), same double-free-then-mixed-free shape through the
+        // Linux `AllocateTitlePhysicalPages` / `FreeTitlePhysicalPages` /
+        // `MapTitlePhysicalPages` entry points. Only own pages and VAs are
+        // asserted, so other tests may run alongside.
+        unsafe {
+            let mut n = 3usize;
+            let mut pages = [0usize; 3];
+            assert_eq!(AllocateTitlePhysicalPages(0, 0, &mut n, pages.as_mut_ptr()), 1);
+            let [mut first, second, mut sibling] = pages;
+            assert!(write_physical_pages(&[sibling], 0, &[0x7d]));
+            assert!(write_physical_pages(&[sibling], PHYS_PAGE - 1, &[0x4a]));
+
+            let mut duplicate = [first, first];
+            assert_eq!(FreeTitlePhysicalPages(0, 2, duplicate.as_mut_ptr()), 1);
+            let mut bytes = [0u8; 2];
+            assert!(!read_physical_pages(&[first], 0, &mut bytes));
+            assert!(!write_physical_pages(&[first], 0, &[0]));
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 0, &mut first).is_null());
+            assert!(page_home(second).is_some());
+
+            let mut mixed = [first, second];
+            assert_eq!(FreeTitlePhysicalPages(0, 2, mixed.as_mut_ptr()), 1);
+            assert!(page_home(second).is_none());
+            assert!(read_physical_pages(&[sibling, sibling], PHYS_PAGE - 1, &mut bytes));
+            assert_eq!(bytes, [0x4a, 0x7d]);
+            let home = MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 0, &mut sibling);
+            assert!(!home.is_null());
+            assert_eq!(MapTitlePhysicalPages(home, 1, 0, 0, &mut sibling), home);
+
+            assert_eq!(FreeTitlePhysicalPages(0, 1, &mut sibling), 1);
+            assert!(page_home(sibling).is_none());
+            assert_eq!(VirtualFree(home, 0, 0x8000), 1);
         }
     }
 }
