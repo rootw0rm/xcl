@@ -629,9 +629,9 @@ pub const GAMERTAG_SIZES: [usize; 4] = [16, 97, 15, 101]; // Classic, Modern, Mo
 /// the user has no modern suffix, so ModernSuffix is empty and UniqueModern is the gamertag
 /// without '#'. Each fits the component's buffer size (`GAMERTAG_SIZES`, terminator included),
 /// which titles allocate: a longer configured gamertag is cut at a character boundary.
-fn gamertag_component(tag: &str, component: u32) -> String {
+fn gamertag_component(tag: &str, component: u32) -> &str {
     if component == 2 {
-        return String::new(); // ModernSuffix: none
+        return ""; // ModernSuffix: none
     }
     let max = match component {
         0 => 15, // Classic: 15 characters
@@ -639,13 +639,13 @@ fn gamertag_component(tag: &str, component: u32) -> String {
         _ => GAMERTAG_SIZES[1] - 1,
     };
     let mut end = 0;
-    for (i, c) in tag.char_indices() {
-        if i + c.len_utf8() > GAMERTAG_SIZES[component as usize] - 1 || tag[..i].chars().count() >= max {
+    for (count, (i, c)) in tag.char_indices().enumerate() {
+        if i + c.len_utf8() > GAMERTAG_SIZES[component as usize] - 1 || count >= max {
             break;
         }
         end = i + c.len_utf8();
     }
-    tag[..end].to_string()
+    &tag[..end]
 }
 
 pub unsafe extern "system" fn XUserGetGamertag(h: *mut c_void, component: u32, size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
@@ -659,7 +659,7 @@ pub unsafe extern "system" fn XUserGetGamertag(h: *mut c_void, component: u32, s
         }
         return E_NOT_SUFFICIENT_BUFFER;
     }
-    write_cstr_out(&value, buf, size, used)
+    write_cstr_out(value, buf, size, used)
 }
 
 pub unsafe extern "system" fn XUserGetAgeGroup(h: *mut c_void, out: *mut u32) -> HRESULT {
@@ -1119,7 +1119,7 @@ mod tests {
     #[test]
     fn gamertag_components_are_consistent_and_fit_their_buffers() {
         // no modern suffix: UniqueModern is the gamertag itself, not "Player1#0001"
-        let parts: Vec<String> = (0..4).map(|c| gamertag_component("Player1", c)).collect();
+        let parts: Vec<&str> = (0..4).map(|c| gamertag_component("Player1", c)).collect();
         assert_eq!(parts, ["Player1", "Player1", "", "Player1"]);
         // a long configured gamertag still fits each documented buffer
         let long = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";

@@ -633,9 +633,9 @@ pub unsafe extern "win64" fn XUserGetState(h: *mut c_void, out: *mut u32) -> HRE
 
 pub const GAMERTAG_SIZES: [usize; 4] = [16, 97, 15, 101];
 
-fn gamertag_component(tag: &str, component: u32) -> String {
+fn gamertag_component(tag: &str, component: u32) -> &str {
     if component == 2 {
-        return String::new();
+        return "";
     }
     let max = match component {
         0 => 15,
@@ -643,13 +643,13 @@ fn gamertag_component(tag: &str, component: u32) -> String {
         _ => GAMERTAG_SIZES[1] - 1,
     };
     let mut end = 0;
-    for (i, c) in tag.char_indices() {
-        if i + c.len_utf8() > GAMERTAG_SIZES[component as usize] - 1 || tag[..i].chars().count() >= max {
+    for (count, (i, c)) in tag.char_indices().enumerate() {
+        if i + c.len_utf8() > GAMERTAG_SIZES[component as usize] - 1 || count >= max {
             break;
         }
         end = i + c.len_utf8();
     }
-    tag[..end].to_string()
+    &tag[..end]
 }
 
 pub unsafe extern "win64" fn XUserGetGamertag(h: *mut c_void, component: u32, size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
@@ -663,7 +663,7 @@ pub unsafe extern "win64" fn XUserGetGamertag(h: *mut c_void, component: u32, si
         }
         return E_NOT_SUFFICIENT_BUFFER;
     }
-    write_cstr_out(&value, buf, size, used)
+    write_cstr_out(value, buf, size, used)
 }
 
 pub unsafe extern "win64" fn XUserGetAgeGroup(h: *mut c_void, out: *mut u32) -> HRESULT {
@@ -1331,6 +1331,23 @@ mod tests {
 
             xtaskqueue_linux::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
             xtaskqueue_linux::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn gamertag_components_are_consistent_and_fit_their_buffers() {
+        // no modern suffix: UniqueModern is the gamertag itself, not "Player1#0001"
+        let parts: Vec<&str> = (0..4).map(|c| gamertag_component("Player1", c)).collect();
+        assert_eq!(parts, ["Player1", "Player1", "", "Player1"]);
+        // a long configured gamertag still fits each documented buffer
+        let long = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        assert_eq!(gamertag_component(long, 0), "ABCDEFGHIJKLMNO");
+        assert_eq!(gamertag_component(long, 1), long);
+        assert_eq!(gamertag_component(long, 3), "ABCDEFGHIJKLMNOP");
+        // cut at a character boundary
+        assert_eq!(gamertag_component("ÁÉÍÓÚÁÉÍÓÚÁÉÍÓÚÁÉ", 0), "ÁÉÍÓÚÁÉÍÓÚÁÉÍÓÚ".chars().take(7).collect::<String>());
+        for c in 0..4 {
+            assert!(gamertag_component(&long.repeat(10), c).len() < GAMERTAG_SIZES[c as usize]);
         }
     }
 
