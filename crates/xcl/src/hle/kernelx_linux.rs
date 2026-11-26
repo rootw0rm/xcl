@@ -3236,19 +3236,29 @@ pub unsafe extern "win64" fn XMemMapPhysicalPages(
     MapTitlePhysicalPages(va, n, 0, 0, arr as *mut usize)
 }
 
-/// `BOOL XMemMapPhysicalPagesScatter(void**, SIZE_T, ULONG64*)`: one page per address.
+/// `BOOL XMemMapPhysicalPagesScatter(void**, SIZE_T, ULONG64*)`: one page per address
+/// (page 0: the address is unmapped). No page array unmaps every address: a
+/// retail game unmaps that way while it streams its world and stops on its own
+/// `int3` when the call fails.
 pub unsafe extern "win64" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
     pages: *mut u64,
 ) -> i32 {
-    if addresses.is_null() || pages.is_null() {
+    if addresses.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
     for i in 0..n {
         let at = unsafe { *addresses.add(i) } as usize;
-        let p = unsafe { *(pages.add(i) as *mut usize) };
+        // No page array: page 0 (unmap) for every address.
+        let p = unsafe {
+            if pages.is_null() {
+                0
+            } else {
+                *(pages.add(i) as *mut usize)
+            }
+        };
         let one = vec![p];
         if map_pages(at, 1, Some(one)).is_null() {
             return 0;
@@ -3427,6 +3437,26 @@ pub unsafe extern "win64" fn QueryProcessorSchedulingStatistics(out: *mut [u64; 
     *out = [busy, idle, busy + idle];
 }
 
+/// The field at +48 of `XMEM_BASIC_INFORMATION` is 16 bytes; callers inspect more
+/// than its low u32. Zero all of it, then write the flags we know: bit 0 is
+/// CPU-cached/readable memory, bit 1 is GPU-accessible memory. Never leave
+/// stack garbage in the rest of the field.
+unsafe fn write_xmem_flags(info: *mut u8, flags: u32) {
+    let p = info.add(48);
+    std::ptr::write_bytes(p, 0, 16);
+    p.cast::<u32>().write_unaligned(flags);
+}
+
+/// Whether the address is memory the title can use from the GPU: inside the
+/// Linux graphics pool (the local counterpart of upstream's coherent UMA /
+/// sparse-VRAM windows — `gpu::uma` is `cfg(windows)`-only, so its
+/// `is_committed || is_title_address` helper has no Linux twin; the pool is
+/// exactly the title's GPU-addressable reservation set, and plain host memory
+/// that merely falls in a wide numeric window is never reported here).
+fn xmem_gpu_visible(address: *const c_void) -> bool {
+    gfx_contains(address as usize)
+}
+
 /// Query a mapped range's state for `XMemVirtualQuery`-style callers (minimal Linux twin:
 /// parses `/proc/self/maps` for the containing run).
 pub unsafe extern "win64" fn XMemVirtualQuery(
@@ -3442,9 +3472,15 @@ pub unsafe extern "win64" fn XMemVirtualQuery(
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    // Minimal MEMORY_BASIC_INFORMATION (28 bytes on 64-bit Windows layout used here:
-    // BaseAddress, AllocationBase, AllocationProtect, RegionSize, State, Protect, Type).
-    // The caller also reads a CPU-readable bit at +48; only that and State/Protect matter.
+    // The caller reads a CPU-readable bit at +48 plus the GPU-visible bit 1;
+    // only those and State/Protect matter. The 64-byte zero above already
+    // covers the 16-byte flags field (a superset of upstream's 16-byte zero),
+    // and `write_xmem_flags` re-zeroes +48..+64 before writing the flags.
+    // No committed-window fast path on Linux: the general path already
+    // reports 3 for committed graphics memory (`rw` maps + pool membership),
+    // and the pool's commit flag is not cleared by scatter-unmap decommits,
+    // so a cached fast path would go stale (upstream's 40 ms VirtualQuery
+    // walk concern is a Windows-D3D12-heap artifact).
     let va = address as usize;
     let mut state = 0x10000u32; // MEM_FREE
     let mut protect = PAGE_NOACCESS;
@@ -3480,15 +3516,16 @@ pub unsafe extern "win64" fn XMemVirtualQuery(
             }
         }
     }
-    // Zero the 64-byte caller buffer, then write State/Protect and the CPU bit.
+    // Zero the 64-byte caller buffer, then write State/Protect and the flags.
     std::ptr::write_bytes(info, 0, 64);
     // Offsets in the Windows struct (64-bit): State +16, Protect +20.
     (info.add(16) as *mut u32).write_unaligned(state);
     (info.add(20) as *mut u32).write_unaligned(protect);
     const READABLE: u32 = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
         | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    let cpu = (state == 0x1000 && protect & READABLE != 0) as u32;
-    (info.add(48) as *mut u32).write_unaligned(cpu);
+    let cpu = (state == 0x1000 && (protect & PAGE_GUARD) == 0 && protect & READABLE != 0) as u32;
+    let gpu = xmem_gpu_visible(address) as u32;
+    write_xmem_flags(info, cpu | (gpu << 1));
     set_error(ERROR_SUCCESS);
     1
 }
@@ -12001,6 +12038,118 @@ mod tests {
             assert_eq!(XMemFreePhysicalPages(1, other.as_mut_ptr()), 1);
             assert_eq!(VirtualFree(h0 as *mut c_void, 0, 0x8000), 1);
             assert_eq!(VirtualFree(h_other as *mut c_void, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn scatter_without_pages_unmaps_each_address() {
+        // Linux twin of upstream #495's `scatter_without_pages_unmaps`: a NULL
+        // page array means page 0 (unmap) for every address — a retail title
+        // unmaps this way while streaming and stopped on its own `int3` when
+        // the call was refused with ERROR_INVALID_PARAMETER. Only own pages
+        // and VAs are asserted, so other tests may run alongside.
+        unsafe {
+            let page = PHYS_PAGE;
+            let (mut n, mut pages) = (2usize, [0u64; 2]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            let mp = XMemMapPhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()) as *mut u32;
+            assert!(!mp.is_null());
+            *mp.add(page / 4 * 0) = 7;
+            *mp.add(page / 4 * 1) = 9;
+            let addrs = [mp as *mut c_void, ((mp as usize) + page) as *mut c_void];
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()),
+                1,
+                "no page array: unmapped, not refused"
+            );
+            // The pages kept what was written: mapped again, they read it.
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, pages.as_mut_ptr() as *mut u64),
+                1
+            );
+            assert_eq!((*mp.add(page / 4 * 0), *mp.add(page / 4 * 1)), (7, 9));
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()),
+                1
+            );
+            // No addresses: the same answer with and without a page array.
+            let mut none = [0u64; 1];
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, std::ptr::null_mut()),
+                XMemMapPhysicalPagesScatter(
+                    addrs.as_ptr(),
+                    0,
+                    none.as_mut_ptr() as *mut u64
+                )
+            );
+            assert_eq!(XMemFreePhysicalPages(2, pages.as_mut_ptr() as *mut u64), 1);
+            assert_eq!(VirtualFree(mp as *mut c_void, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn xmem_virtual_query_writes_the_whole_flag_field_and_gpu_visibility() {
+        // Linux twin of upstream #2048's
+        // `xmem_virtual_query_writes_the_whole_flag_field_and_gpu_visibility`:
+        // the field at +48 is a 16-byte flags field, not just the low u32.
+        // Bit 0 marks committed readable memory (CPU cached), bit 1 marks
+        // GPU-accessible UMA / sparse-VRAM memory. The tail (+52..+64) is
+        // written as zero, never left as the caller's buffer contents. Only
+        // own addresses are asserted, so other tests may run alongside.
+        unsafe {
+            let proc_ = current_process_handle();
+            let x = 5u32;
+            let mut info = [0xCCu8; 64];
+            assert_eq!(
+                XMemVirtualQuery(proc_, &x as *const u32 as *const c_void, info.as_mut_ptr()),
+                1
+            );
+            let flags0 = u32::from_ne_bytes(info[48..52].try_into().unwrap());
+            assert_eq!(flags0 & 3, 1, "first flags were {flags0:#x}");
+            assert_eq!(flags0 & 2, 0, "plain stack memory is not GPU-visible");
+            assert!(
+                info[52..64].iter().all(|&b| b == 0),
+                "flag tail was not written: {:?}",
+                &info[48..64]
+            );
+
+            // A reserved page has no CPU-readable flag either, but the tail is still written.
+            let r = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!r.is_null());
+            let mut info = [0xCCu8; 64];
+            assert_eq!(XMemVirtualQuery(proc_, r, info.as_mut_ptr()), 1);
+            assert_eq!(u32::from_ne_bytes(info[48..52].try_into().unwrap()) & 3, 0);
+            assert!(info[52..64].iter().all(|&b| b == 0));
+            assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
+
+            // Coherent graphics-pool memory is visible to both the CPU and the
+            // GPU (Linux counterpart of upstream's coherent-UMA leg: the
+            // graphics pool is the title's GPU-addressable reservation set;
+            // `gpu::uma` is `cfg(windows)`-only so there is no UMA twin to
+            // allocate from here). Unmapped-but-reserved graphics memory keeps
+            // the GPU bit without the CPU bit (upstream's sparse-VRAM shape).
+            let (mut mn, mut mpgs) = (1usize, [0u64; 1]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut mn, mpgs.as_mut_ptr()), 1);
+            let gx = XMemMapPhysicalPages(std::ptr::null_mut(), 1, mpgs.as_mut_ptr());
+            assert!(!gx.is_null());
+            let mut info = [0xCCu8; 64];
+            assert_eq!(XMemVirtualQuery(proc_, gx, info.as_mut_ptr()), 1);
+            let flags = u32::from_ne_bytes(info[48..52].try_into().unwrap());
+            assert_eq!(flags & 3, 3, "graphics-pool memory must be CPU- and GPU-visible: {flags:#x}");
+            assert!(info[52..64].iter().all(|&b| b == 0));
+            // Unmap (decommit, still a graphics reservation): GPU bit stays, CPU bit clears.
+            let gaddrs = [gx];
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(gaddrs.as_ptr(), 1, std::ptr::null_mut()),
+                1
+            );
+            let mut info = [0xCCu8; 64];
+            assert_eq!(XMemVirtualQuery(proc_, gx, info.as_mut_ptr()), 1);
+            let flags = u32::from_ne_bytes(info[48..52].try_into().unwrap());
+            assert_eq!(flags & 3, 2, "unmapped graphics reservation must stay GPU-visible: {flags:#x}");
+            assert!(info[52..64].iter().all(|&b| b == 0));
+            assert_eq!(XMemFreePhysicalPages(1, mpgs.as_mut_ptr() as *mut u64), 1);
+            assert_eq!(VirtualFree(gx, 0, MEM_RELEASE), 1);
         }
     }
 
