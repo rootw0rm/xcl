@@ -36,6 +36,8 @@ pub enum PeError {
     BadMagic(&'static str),
     NotX64(u16),
     BadRva(u32),
+    /// A directory-derived write (IAT slot, delay-load HMODULE, TLS index) lands in the headers.
+    HeaderWriteTarget(u32),
 }
 
 impl fmt::Display for PeError {
@@ -45,6 +47,9 @@ impl fmt::Display for PeError {
             PeError::BadMagic(w) => write!(f, "invalid signature {w} (not a PE file)"),
             PeError::NotX64(m) => write!(f, "architecture 0x{m:04x} is not x64 (0x8664)"),
             PeError::BadRva(r) => write!(f, "RVA 0x{r:x} outside the image"),
+            PeError::HeaderWriteTarget(r) => {
+                write!(f, "RVA 0x{r:x} is a write target inside the headers")
+            }
         }
     }
 }
@@ -415,6 +420,20 @@ impl<'a> Pe<'a> {
         u32::try_from(r).ok()
     }
 
+    /// Refuse an RVA the loader would write into when it still needs the headers intact
+    /// (IAT thunks, delay-load module handles, TLS `AddressOfIndex`). The whole write of
+    /// `width` bytes must lie in `[size_of_headers, size_of_image)`.
+    fn ensure_data_write_rva(&self, rva: u32, width: u32) -> Result<(), PeError> {
+        if rva < self.size_of_headers {
+            return Err(PeError::HeaderWriteTarget(rva));
+        }
+        let end = rva.checked_add(width).ok_or(PeError::BadRva(rva))?;
+        if end > self.size_of_image {
+            return Err(PeError::BadRva(rva));
+        }
+        Ok(())
+    }
+
     fn thunks(&self, int_rva: u32, iat_rva: u32) -> Result<Vec<ImportEntry>, PeError> {
         let mut out = Vec::new();
         let names_rva = if int_rva != 0 { int_rva } else { iat_rva };
@@ -447,6 +466,7 @@ impl<'a> Pe<'a> {
             if self.size_of_image != 0 && entry_iat_rva.saturating_add(8) > self.size_of_image {
                 return Err(PeError::BadRva(entry_iat_rva));
             }
+            self.ensure_data_write_rva(entry_iat_rva, 8)?;
             out.push(ImportEntry { iat_rva: entry_iat_rva, what });
         }
         Ok(out)
@@ -520,6 +540,9 @@ impl<'a> Pe<'a> {
                 int_rva = fix(int_rva);
             }
             let dll = self.cstr_at(name_rva).ok_or(PeError::BadRva(name_rva))?;
+            if hmod_rva != 0 {
+                self.ensure_data_write_rva(hmod_rva, 8)?;
+            }
             let entries = self.thunks(int_rva, iat_rva)?;
             out.push(ImportDll { dll, delay: true, entries, module_handle_rva: hmod_rva });
         }
@@ -579,10 +602,17 @@ impl<'a> Pe<'a> {
             let rva = field(o)?;
             self.u64_at(rva).ok_or(PeError::BadRva(rva))
         };
+        let address_of_index = r(16)?;
+        // The loader writes the TLS slot into AddressOfIndex; RVA 0 is "no index" (VA 0),
+        // but image_base+0 (RVA 0) would overwrite the DOS header – refuse it too.
+        if address_of_index != 0 {
+            let index_rva = self.va_to_rva(address_of_index).ok_or(PeError::BadRva(0))?;
+            self.ensure_data_write_rva(index_rva, 4)?;
+        }
         Ok(Some(TlsDir {
             start_raw: r(0)?,
             end_raw: r(8)?,
-            address_of_index: r(16)?,
+            address_of_index,
             address_of_callbacks: r(24)?,
             size_of_zero_fill: self.u32_at(field(32)?).ok_or(PeError::BadRva(d.rva))?,
             characteristics: self.u32_at(field(36)?).ok_or(PeError::BadRva(d.rva))?,
@@ -1014,5 +1044,192 @@ mod tests {
         data[0x58 + 56..0x58 + 60].copy_from_slice(&0x2000u32.to_le_bytes());
         let pe = Pe::parse(&data, Layout::File).unwrap();
         assert!(matches!(pe.imports(), Err(PeError::BadRva(_))));
+    }
+
+    /// Minimal PE32+ with `SizeOfHeaders = 0x400`, one section at 0x1000, and room for a
+    /// directory payload. Used to pin IAT / TLS write targets inside the headers (#836).
+    fn pe_with_headers(size_of_headers: u32, image_base: u64, payload_rva: u32, payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; 0x400 + payload.len().max(0x100)];
+        data[..2].copy_from_slice(b"MZ");
+        data[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        data[0x40..0x44].copy_from_slice(b"PE\0\0");
+        data[0x44..0x46].copy_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        data[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+        data[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        let opt = 0x58;
+        data[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        data[opt + 24..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+        data[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes()); // SizeOfImage
+        data[opt + 60..opt + 64].copy_from_slice(&size_of_headers.to_le_bytes());
+        data[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let sec = opt + 240;
+        data[sec..sec + 5].copy_from_slice(b".text");
+        data[sec + 8..sec + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[sec + 12..sec + 16].copy_from_slice(&payload_rva.to_le_bytes());
+        data[sec + 16..sec + 20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        data[sec + 20..sec + 24].copy_from_slice(&size_of_headers.to_le_bytes());
+        let off = size_of_headers as usize;
+        if data.len() < off + payload.len() {
+            data.resize(off + payload.len(), 0);
+        }
+        data[off..off + payload.len()].copy_from_slice(payload);
+        data
+    }
+
+    #[test]
+    fn import_address_table_in_headers_is_error() {
+        // INT + name live past the headers; FirstThunk (IAT) at 0x80 overwrites them.
+        let mut payload = vec![0u8; 0x80];
+        // IMAGE_IMPORT_DESCRIPTOR at payload+0: OriginalFirstThunk, Name, FirstThunk
+        let int_rva: u32 = 0x1000 + 0x20;
+        let name_rva: u32 = 0x1000 + 0x40;
+        let iat_rva = 0x80u32;
+        payload[0..4].copy_from_slice(&int_rva.to_le_bytes());
+        payload[12..16].copy_from_slice(&name_rva.to_le_bytes());
+        payload[16..20].copy_from_slice(&iat_rva.to_le_bytes());
+        // one ordinal thunk, then null
+        payload[0x20..0x28].copy_from_slice(&(1u64 << 63 | 1).to_le_bytes());
+        payload[0x40..0x44].copy_from_slice(b"a\0\0\0");
+        let mut data = pe_with_headers(0x400, 0x140000000, 0x1000, &payload);
+        // point the import directory at the descriptor
+        let opt = 0x58usize;
+        let d = opt + 112 + DIR_IMPORT * 8;
+        data[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&0x28u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.size_of_headers, 0x400);
+        assert_eq!(pe.imports().unwrap_err(), PeError::HeaderWriteTarget(0x80));
+    }
+
+    #[test]
+    fn tls_index_in_headers_is_error() {
+        let image_base = 0x140000000u64;
+        let mut payload = vec![0u8; 40];
+        // AddressOfIndex = image_base + 0x80 (inside SizeOfHeaders = 0x400)
+        payload[16..24].copy_from_slice(&(image_base + 0x80).to_le_bytes());
+        let mut data = pe_with_headers(0x400, image_base, 0x1000, &payload);
+        let opt = 0x58usize;
+        let d = opt + 112 + DIR_TLS * 8;
+        data[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&40u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.tls(), Err(PeError::HeaderWriteTarget(0x80)));
+    }
+
+    #[test]
+    fn delay_import_module_handle_in_headers_is_error() {
+        // Delay-load HMODULE slot at 0x80; IAT/INT/name sit past the headers.
+        let mut payload = vec![0u8; 0x80];
+        let name_rva: u32 = 0x1000 + 0x40;
+        let hmod_rva = 0x80u32;
+        let iat_rva: u32 = 0x1000 + 0x50;
+        let int_rva: u32 = 0x1000 + 0x60;
+        // IMAGE_DELAYLOAD_DESCRIPTOR: attrs=1 (RVA-based), Name, ModuleHandle, IAT, INT
+        payload[0..4].copy_from_slice(&1u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&name_rva.to_le_bytes());
+        payload[8..12].copy_from_slice(&hmod_rva.to_le_bytes());
+        payload[12..16].copy_from_slice(&iat_rva.to_le_bytes());
+        payload[16..20].copy_from_slice(&int_rva.to_le_bytes());
+        payload[0x40..0x44].copy_from_slice(b"c\0\0\0");
+        // empty IAT/INT (null terminator only) – the HMODULE write is still refused
+        let mut data = pe_with_headers(0x400, 0x140000000, 0x1000, &payload);
+        let opt = 0x58usize;
+        let d = opt + 112 + DIR_DELAY_IMPORT * 8;
+        data[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&0x40u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.delay_imports().unwrap_err(), PeError::HeaderWriteTarget(0x80));
+    }
+
+    #[test]
+    fn import_address_table_straddling_image_end_is_error() {
+        // FirstThunk at SizeOfImage - 4: start is in-range, the 8-byte write is not.
+        let size_of_image = 0x2000u32;
+        let iat_rva = size_of_image - 4;
+        let mut payload = vec![0u8; 0x80];
+        let int_rva: u32 = 0x1000 + 0x20;
+        let name_rva: u32 = 0x1000 + 0x40;
+        payload[0..4].copy_from_slice(&int_rva.to_le_bytes());
+        payload[12..16].copy_from_slice(&name_rva.to_le_bytes());
+        payload[16..20].copy_from_slice(&iat_rva.to_le_bytes());
+        payload[0x20..0x28].copy_from_slice(&(1u64 << 63 | 1).to_le_bytes());
+        payload[0x40..0x44].copy_from_slice(b"a\0\0\0");
+        let mut data = pe_with_headers(0x400, 0x140000000, 0x1000, &payload);
+        // pe_with_headers already sets SizeOfImage to 0x2000
+        let opt = 0x58usize;
+        let d = opt + 112 + DIR_IMPORT * 8;
+        data[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&0x28u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.size_of_image, size_of_image);
+        assert_eq!(pe.imports().unwrap_err(), PeError::BadRva(iat_rva));
+    }
+
+    #[test]
+    fn tls_index_straddling_image_end_is_error() {
+        let image_base = 0x140000000u64;
+        let size_of_image = 0x2000u32;
+        let index_rva = size_of_image - 2; // 4-byte write past the end
+        let mut payload = vec![0u8; 40];
+        payload[16..24].copy_from_slice(&(image_base + index_rva as u64).to_le_bytes());
+        let mut data = pe_with_headers(0x400, image_base, 0x1000, &payload);
+        let opt = 0x58usize;
+        let d = opt + 112 + DIR_TLS * 8;
+        data[d..d + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&40u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.tls().unwrap_err(), PeError::BadRva(index_rva));
+    }
+
+    #[test]
+    fn write_targets_at_size_of_headers_are_accepted() {
+        // Boundary: an IAT slot and a TLS index at exactly SizeOfHeaders must load (#836).
+        let image_base = 0x140000000u64;
+        let headers = 0x400u32;
+        let mut mapped = vec![0u8; 0x2000];
+        mapped[..2].copy_from_slice(b"MZ");
+        mapped[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        mapped[0x40..0x44].copy_from_slice(b"PE\0\0");
+        mapped[0x44..0x46].copy_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        mapped[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+        mapped[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        let opt = 0x58usize;
+        mapped[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        mapped[opt + 24..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+        mapped[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        mapped[opt + 60..opt + 64].copy_from_slice(&headers.to_le_bytes());
+        mapped[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let sec = opt + 240;
+        mapped[sec..sec + 5].copy_from_slice(b".text");
+        mapped[sec + 8..sec + 12].copy_from_slice(&0x1C00u32.to_le_bytes());
+        mapped[sec + 12..sec + 16].copy_from_slice(&headers.to_le_bytes());
+        mapped[sec + 16..sec + 20].copy_from_slice(&0x1C00u32.to_le_bytes());
+        mapped[sec + 20..sec + 24].copy_from_slice(&headers.to_le_bytes());
+
+        mapped[headers as usize..headers as usize + 8]
+            .copy_from_slice(&(1u64 << 63 | 7).to_le_bytes());
+        mapped[headers as usize + 0x10..headers as usize + 0x14].copy_from_slice(b"b\0\0\0");
+        let desc = headers as usize + 0x20;
+        mapped[desc..desc + 4].copy_from_slice(&headers.to_le_bytes());
+        mapped[desc + 12..desc + 16].copy_from_slice(&(headers + 0x10).to_le_bytes());
+        mapped[desc + 16..desc + 20].copy_from_slice(&headers.to_le_bytes());
+        let di = opt + 112 + DIR_IMPORT * 8;
+        mapped[di..di + 4].copy_from_slice(&(headers + 0x20).to_le_bytes());
+        mapped[di + 4..di + 8].copy_from_slice(&0x28u32.to_le_bytes());
+
+        let tls_rva = 0x1800u32;
+        let tls_at = tls_rva as usize;
+        mapped[tls_at + 16..tls_at + 24]
+            .copy_from_slice(&(image_base + headers as u64).to_le_bytes());
+        let dt = opt + 112 + DIR_TLS * 8;
+        mapped[dt..dt + 4].copy_from_slice(&tls_rva.to_le_bytes());
+        mapped[dt + 4..dt + 8].copy_from_slice(&40u32.to_le_bytes());
+
+        let pe = Pe::parse(&mapped, Layout::Mapped).unwrap();
+        let imps = pe.imports().unwrap();
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].entries[0].iat_rva, headers);
+        let tls = pe.tls().unwrap().unwrap();
+        assert_eq!(pe.va_to_rva(tls.address_of_index), Some(headers));
     }
 }
