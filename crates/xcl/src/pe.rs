@@ -29,6 +29,7 @@ pub const IMAGE_REL_BASED_DIR64: u16 = 10;
 pub const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 pub const SCN_MEM_READ: u32 = 0x4000_0000;
 pub const SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub const SCN_ALIGN_MASK: u32 = 0x00F0_0000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeError {
@@ -143,6 +144,38 @@ impl TlsDir {
     }
     pub fn total_len(&self) -> u64 {
         self.template_len().saturating_add(self.size_of_zero_fill as u64)
+    }
+    /// Alignment in bytes encoded in `Characteristics` bits 20..23
+    /// (`IMAGE_SCN_ALIGN_*BYTES`, nibble `1..=14` → `1..=8192` bytes), or `1`
+    /// when unspecified (`0`) or invalid (`15`).
+    pub fn alignment(&self) -> u32 {
+        tls_alignment_from_characteristics(self.characteristics)
+    }
+    /// `Characteristics` masked down to a valid `IMAGE_SCN_ALIGN_*BYTES` value
+    /// (nibble `1..=14`), clearing reserved bits and the invalid `0xF` mask value.
+    pub fn align_characteristics(&self) -> u32 {
+        sanitize_tls_characteristics(self.characteristics)
+    }
+}
+
+/// Decode `IMAGE_SCN_ALIGN_*BYTES` (bits 20..23) into a byte alignment (`1..=8192`).
+pub fn tls_alignment_from_characteristics(characteristics: u32) -> u32 {
+    let nibble = (characteristics & SCN_ALIGN_MASK) >> 20;
+    if (1..=14).contains(&nibble) {
+        1u32 << (nibble - 1)
+    } else {
+        1
+    }
+}
+
+/// Mask `IMAGE_TLS_DIRECTORY64.Characteristics` to a valid `IMAGE_SCN_ALIGN_*BYTES`
+/// value (nibble `1..=14`), clearing reserved bits and the invalid `0xF` mask value.
+pub fn sanitize_tls_characteristics(characteristics: u32) -> u32 {
+    let nibble = (characteristics & SCN_ALIGN_MASK) >> 20;
+    if (1..=14).contains(&nibble) {
+        nibble << 20
+    } else {
+        0
     }
 }
 
@@ -973,7 +1006,56 @@ mod tests {
         assert!(!pe.is_dll());
         let tls = pe.tls().unwrap().expect("rust binaries have a TLS directory");
         assert!(tls.end_raw >= tls.start_raw);
+        assert!(tls.alignment().is_power_of_two());
         assert!(pe.va_to_rva(tls.address_of_index).is_some());
+    }
+
+    #[test]
+    fn tls_characteristics_alignment_decoding() {
+        assert_eq!(tls_alignment_from_characteristics(0), 1);
+        assert_eq!(sanitize_tls_characteristics(0), 0);
+        for nibble in 1..=14u32 {
+            let expected_align = 1u32 << (nibble - 1);
+            let raw = (nibble << 20) | (0xDEAD_BEEF & !SCN_ALIGN_MASK); // include reserved noise bits outside mask
+            let dir = TlsDir { characteristics: raw, ..Default::default() };
+            assert_eq!(dir.alignment(), expected_align, "nibble {nibble}");
+            assert_eq!(dir.align_characteristics(), nibble << 20, "nibble {nibble}");
+        }
+        // Specific common PE alignment flags:
+        assert_eq!(tls_alignment_from_characteristics(0x0060_0000), 32);
+        assert_eq!(tls_alignment_from_characteristics(0x0070_0000), 64);
+        assert_eq!(tls_alignment_from_characteristics(0x00D0_0000), 4096);
+        assert_eq!(tls_alignment_from_characteristics(0x00E0_0000), 8192);
+        // Invalid nibble 0xF (IMAGE_SCN_ALIGN_MASK itself) maps to 1 / 0:
+        assert_eq!(tls_alignment_from_characteristics(SCN_ALIGN_MASK), 1);
+        assert_eq!(sanitize_tls_characteristics(SCN_ALIGN_MASK), 0);
+    }
+
+    // Builds a carrier DLL: Windows-only (the builder lives in the
+    // `cfg(windows)` TLS carrier module; same reason as the `system_file`
+    // tests above).
+    #[cfg(windows)]
+    #[test]
+    fn parses_tls_characteristics_from_pe() {
+        let mut bytes = crate::tls::build_carrier_dll_with(
+            0x100,
+            crate::tls::CarrierOpts { characteristics: 0x0070_0000, ..Default::default() },
+        );
+        let pe = Pe::parse(&bytes, Layout::File).unwrap();
+        let tls = pe.tls().unwrap().unwrap();
+        assert_eq!(tls.characteristics, 0x0070_0000);
+        assert_eq!(tls.alignment(), 64);
+        assert_eq!(tls.align_characteristics(), 0x0070_0000);
+
+        // Patch raw Characteristics field directly in the PE to verify Pe::tls reads offset +36 verbatim.
+        let tls_off = pe.rva_to_offset(pe.dir(DIR_TLS).rva).unwrap();
+        drop(pe);
+        bytes[tls_off + 36..tls_off + 40].copy_from_slice(&0x1260_00ABu32.to_le_bytes());
+        let pe = Pe::parse(&bytes, Layout::File).unwrap();
+        let tls = pe.tls().unwrap().unwrap();
+        assert_eq!(tls.characteristics, 0x1260_00AB);
+        assert_eq!(tls.alignment(), 32);
+        assert_eq!(tls.align_characteristics(), 0x0060_0000);
     }
 
     #[test]
