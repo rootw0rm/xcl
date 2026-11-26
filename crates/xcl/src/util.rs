@@ -18,6 +18,44 @@ pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007Au32 as i32;
 pub const E_NOT_FOUND: HRESULT = 0x8007_0490u32 as i32;
 pub const E_NOT_SUPPORTED: HRESULT = 0x8007_0032u32 as i32;
 
+/// Win32 `ERROR_INSUFFICIENT_BUFFER` as a plain code for the cfg-gated helpers below.
+pub const WIN32_INSUFFICIENT_BUFFER: u32 = 122;
+
+/// Set the calling thread's last-error code. Windows writes the real OS state;
+/// Linux writes the process-local twin state (see below).
+#[cfg(windows)]
+pub fn set_last_error(code: u32) {
+    unsafe {
+        windows_sys::Win32::Foundation::SetLastError(code);
+    }
+}
+
+/// Read the calling thread's last-error code.
+#[cfg(windows)]
+pub fn get_last_error() -> u32 {
+    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+/// Linux twin last-error state: `windows_sys` never compiles here, so the shared
+/// string helpers record `122` through this instead. `hle::kernelx_linux` forwards
+/// its `GetLastError`/`SetLastError` exports to the same cell, keeping one state.
+#[cfg(not(windows))]
+thread_local! {
+    static UTIL_LAST_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the calling thread's last-error code (Linux twin).
+#[cfg(not(windows))]
+pub fn set_last_error(code: u32) {
+    UTIL_LAST_ERROR.with(|c| c.set(code));
+}
+
+/// Read the calling thread's last-error code (Linux twin).
+#[cfg(not(windows))]
+pub fn get_last_error() -> u32 {
+    UTIL_LAST_ERROR.with(|c| c.get())
+}
+
 /// Win32's HRESULT_FROM_WIN32: preserve zero and existing failure HRESULTs.
 pub fn hresult_from_win32(code: u32) -> HRESULT {
     if (code as HRESULT) <= 0 {
@@ -201,7 +239,11 @@ pub unsafe fn write_cstr_out(src: &str, buf: *mut u8, size: usize, used: *mut us
 /// Win32-style "copy wide string" (GetModuleFileNameW semantics): returns chars written
 /// (without terminator) or `size` when truncated.
 pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
-    if buf.is_null() || size == 0 {
+    if size == 0 {
+        set_last_error(WIN32_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if buf.is_null() {
         return 0;
     }
     let w: Vec<u16> = src.encode_utf16().collect();
@@ -209,8 +251,7 @@ pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
     std::ptr::copy_nonoverlapping(w.as_ptr(), buf, n);
     *buf.add(n) = 0;
     if w.len() >= size as usize {
-        #[cfg(windows)]
-        windows_sys::Win32::Foundation::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
+        set_last_error(WIN32_INSUFFICIENT_BUFFER);
         size
     } else {
         n as u32
@@ -223,10 +264,13 @@ pub unsafe fn write_wide_out(src: &str, buf: *mut u16, size: u32) -> u32 {
 /// boundary so multi-byte sequences (DBCS / UTF-8) and UTF-16 surrogate pairs are never split.
 #[cfg(windows)]
 unsafe fn write_codepage_out(src: &str, codepage: u32, buf: *mut u8, size: u32) -> u32 {
-    use windows_sys::Win32::Foundation::{SetLastError, ERROR_INSUFFICIENT_BUFFER};
     use windows_sys::Win32::Globalization::WideCharToMultiByte;
 
-    if buf.is_null() || size == 0 {
+    if size == 0 {
+        set_last_error(WIN32_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if buf.is_null() {
         return 0;
     }
     let w: Vec<u16> = src.encode_utf16().collect();
@@ -326,7 +370,7 @@ unsafe fn write_codepage_out(src: &str, codepage: u32, buf: *mut u8, size: u32) 
     };
     // SAFETY: `written <= cap <= size - 1`, so `buf.add(written)` is in bounds.
     *buf.add(written) = 0;
-    SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    set_last_error(WIN32_INSUFFICIENT_BUFFER);
     size
 }
 
@@ -342,7 +386,11 @@ pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
 /// splits a character.
 #[cfg(not(windows))]
 pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
-    if buf.is_null() || size == 0 {
+    if size == 0 {
+        set_last_error(WIN32_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if buf.is_null() {
         return 0;
     }
     let cap = size as usize - 1;
@@ -354,6 +402,7 @@ pub unsafe fn write_ansi_out(src: &str, buf: *mut u8, size: u32) -> u32 {
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
     *buf.add(n) = 0;
     if bytes.len() > cap {
+        set_last_error(WIN32_INSUFFICIENT_BUFFER);
         size
     } else {
         n as u32
@@ -369,6 +418,36 @@ unsafe impl Sync for SendPtr {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_size_module_filename_buffers_report_insufficient_buffer() {
+        // Port of upstream #1200: size==0 reports ERROR_INSUFFICIENT_BUFFER (122)
+        // without touching the buffer; null-buf stays a silent 0 (covered below).
+        // Linux adaptation: `windows_sys` never compiles here, so the shared
+        // `set_last_error`/`get_last_error` helpers stand in for
+        // `SetLastError`/`GetLastError` with identical (code, untouched) semantics.
+        unsafe {
+            let mut ansi = [0xAAu8; 2];
+            set_last_error(0x1234);
+            let result = write_ansi_out("C:\\game.exe", ansi.as_mut_ptr(), 0);
+            let error = get_last_error();
+            assert_eq!((result, error), (0, WIN32_INSUFFICIENT_BUFFER));
+            assert_eq!(ansi, [0xAA; 2]);
+
+            let mut wide = [0xAAAAu16; 2];
+            set_last_error(0x1234);
+            let result = write_wide_out("C:\\game.exe", wide.as_mut_ptr(), 0);
+            let error = get_last_error();
+            assert_eq!((result, error), (0, WIN32_INSUFFICIENT_BUFFER));
+            assert_eq!(wide, [0xAAAA; 2]);
+
+            // Null buffer keeps the silent-0 contract (no error forced here).
+            set_last_error(0x1234);
+            let result = write_wide_out("C:\\game.exe", std::ptr::null_mut(), 4);
+            assert_eq!(result, 0);
+            assert_eq!(get_last_error(), 0x1234);
+        }
+    }
 
     #[test]
     fn dll_keys() {

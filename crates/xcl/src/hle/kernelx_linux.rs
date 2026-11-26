@@ -36,16 +36,12 @@ use crate::util::{from_ansi_ptr, from_wide_ptr};
 // Last error (per-thread, as on Windows)
 // ---------------------------------------------------------------------------------------
 
-thread_local! {
-    static LAST_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 fn set_error(e: u32) {
-    LAST_ERROR.with(|c| c.set(e));
+    crate::util::set_last_error(e);
 }
 
 fn get_error() -> u32 {
-    LAST_ERROR.with(|c| c.get())
+    crate::util::get_last_error()
 }
 
 pub unsafe extern "win64" fn GetLastError() -> u32 {
@@ -6872,7 +6868,11 @@ pub unsafe extern "win64" fn GetModuleFileNameW(h: usize, buf: *mut u16, size: u
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     };
-    if buf.is_null() || size == 0 {
+    if size == 0 {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if buf.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -6891,7 +6891,11 @@ pub unsafe extern "win64" fn GetModuleFileNameA(h: usize, buf: *mut u8, size: u3
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     };
-    if buf.is_null() || size == 0 {
+    if size == 0 {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if buf.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
