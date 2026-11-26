@@ -204,7 +204,11 @@ fn host_path_string(s: &str) -> String {
 
 #[cfg(not(windows))]
 fn host_path_string(s: &str) -> String {
-    let s = strip_verbatim(&s.replace('\\', "/"));
+    // Strip the verbatim prefix before replacing separators: the prefixes are
+    // backslash-spelled (`\\?\`, `\??\`), so replacing first would hide them
+    // behind forward slashes (upstream #316).
+    let s = strip_verbatim(s);
+    let s = s.replace('\\', "/");
     let path = Path::new(&s);
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -290,16 +294,51 @@ fn checked_mount_path(root: &str, tail: &str) -> Result<String, u32> {
 }
 
 fn strip_verbatim(p: &str) -> String {
-    if let Some(r) = p.strip_prefix("\\\\?\\UNC\\") {
-        return format!("\\\\{r}");
-    }
-    if let Some(r) = p.strip_prefix("\\\\?\\") {
-        return r.to_string();
-    }
-    if let Some(r) = p.strip_prefix("\\??\\") {
+    if let Some(r) = p.strip_prefix("\\\\?\\").or_else(|| p.strip_prefix("\\??\\")) {
+        if r.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("UNC\\")) {
+            return format!("\\\\{}", &r[4..]);
+        }
         return r.to_string();
     }
     p.to_string()
+}
+
+/// Match `root_lc` (lowercased, no trailing separator) against the leading
+/// separator-separated components of `abs` (normalized, no trailing
+/// separator), returning the relative tail in `abs`'s original casing.
+/// Matching per component avoids slicing `abs` with a byte offset from
+/// `.to_lowercase()`, which changes UTF-8 byte lengths for characters like
+/// `İ`, `ẞ`, `K`. Either separator matches either side: Linux host paths use
+/// `/` while console spellings use `\`.
+fn strip_path_prefix_ci<'a>(abs: &'a str, root_lc: &str) -> Option<&'a str> {
+    if root_lc.is_empty() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut first = true;
+    for root_comp in root_lc.split(|c| c == '\\' || c == '/') {
+        if !first {
+            if abs.as_bytes().get(pos).is_some_and(|b| *b == b'\\' || *b == b'/') {
+                pos += 1;
+            } else {
+                return None;
+            }
+        }
+        first = false;
+        let rest = &abs[pos..];
+        let len = rest.find(|c| c == '\\' || c == '/').unwrap_or(rest.len());
+        if rest[..len].to_lowercase() != root_comp {
+            return None;
+        }
+        pos += len;
+    }
+    if pos == abs.len() {
+        Some("")
+    } else if abs.as_bytes().get(pos).is_some_and(|b| *b == b'\\' || *b == b'/') {
+        Some(abs[pos + 1..].trim_start_matches(|c| c == '\\' || c == '/'))
+    } else {
+        None
+    }
 }
 
 fn is_device(p: &str) -> bool {
@@ -361,7 +400,7 @@ fn logical_drives() -> u32 {
 
 impl Vfs {
     pub fn new(game_root: &Path, data_dir: &Path, mounts: Vec<(String, String)>) -> Vfs {
-        let game_root = trim_sep(&host_path_string(&game_root.to_string_lossy()));
+        let game_root = trim_sep(&strip_verbatim(&host_path_string(&game_root.to_string_lossy())));
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
@@ -383,10 +422,10 @@ impl Vfs {
         let data_root = data_dir.to_string_lossy();
         let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
         let pls_root = Path::new(&data_root).join("pls");
-        let pls_root_lc = strip_verbatim(&norm(&pls_root.to_string_lossy())).to_lowercase();
+        let pls_root_lc = trim_sep(&strip_verbatim(&norm(&pls_root.to_string_lossy()))).to_lowercase();
         Vfs {
             game_root_lc: game_root.to_lowercase(),
-            data_root_lc: trim_sep(&norm(&data_root)).to_lowercase(),
+            data_root_lc: trim_sep(&strip_verbatim(&norm(&data_root))).to_lowercase(),
             pls_root,
             pls_root_lc,
             own_roots_lc: Vec::new(),
@@ -541,13 +580,17 @@ impl Vfs {
                 // here: the game root returns `Game` (copy-on-write, as
                 // `classify_abs` yields on Windows), data/own folders `Pass`
                 // (what `classify_abs` yields there for untranslated paths).
-                // The remainder keeps the title's case; the length math
-                // assumes lowercasing preserves offsets, as `classify_abs` does.
+                // The remainder keeps the title's case; match per component
+                // like `classify_abs` (upstream #316) — slicing `trimmed` at
+                // the lowercased `game` length would split fold-expanding
+                // chars such as ẞ, whose lowercase is shorter in bytes.
                 if under(game) {
-                    let trimmed = p.trim_start_matches('\\');
-                    let rest = &trimmed[game.len()..];
-                    let rel = rest.strip_prefix('\\').unwrap_or(rest).to_string();
-                    return Target::Game { rel };
+                    let folded = p.replace('/', "\\");
+                    let trimmed = folded.trim_start_matches('\\');
+                    if let Some(rel) = strip_path_prefix_ci(trimmed, game) {
+                        return Target::Game { rel: rel.to_string() };
+                    }
+                    return Target::Pass;
                 }
                 return Target::Pass;
             }
@@ -640,24 +683,18 @@ impl Vfs {
 
     fn classify_abs(&self, abs: &str, translated: bool) -> Target {
         let abs = trim_sep(&strip_verbatim(&norm(abs)));
-        let lc = abs.to_lowercase();
-        if lc == self.game_root_lc {
+        // Match the game root per component (upstream #316): slicing `abs`
+        // at a lowercased byte offset would split fold-expanding chars such
+        // as ẞ/İ/K, whose lowercase forms differ in byte length, and corrupt
+        // the rel (or panic on the slice).
+        if let Some(rel) = strip_path_prefix_ci(&abs, &self.game_root_lc) {
             #[cfg(not(windows))]
             if ensure_mount_contained(Path::new(&self.game_root), Path::new(&abs)).is_err() {
                 return Target::Reject(ERROR_ACCESS_DENIED);
             }
-            return Target::Game { rel: String::new() };
-        }
-        if let Some(rest) = lc.strip_prefix(&self.game_root_lc) {
-            if rest.starts_with(std::path::MAIN_SEPARATOR) {
-                #[cfg(not(windows))]
-                if ensure_mount_contained(Path::new(&self.game_root), Path::new(&abs)).is_err() {
-                    return Target::Reject(ERROR_ACCESS_DENIED);
-                }
-                return Target::Game {
-                    rel: rel_from_host(&abs[self.game_root.len() + 1..]),
-                };
-            }
+            return Target::Game {
+                rel: rel_from_host(rel),
+            };
         }
         if translated {
             Target::Translated(abs)
@@ -2309,5 +2346,144 @@ mod tests {
             v.classify_with(r"\\other_server\share\Game\save.dat", full),
             Target::Pass
         );
+    }
+
+    #[test]
+    fn classify_handles_unicode_case_folding_and_verbatim_roots() {
+        // Upstream #316: match the game root per separator-separated component
+        // against its lowercased form, so folding-expanding chars (ẞ: 3 bytes
+        // -> ß: 2 bytes, İ: 2 -> 3, K: 3 -> 1) classify to the same
+        // `Game{rel}` in the input's original casing instead of slicing a
+        // lowercased string at a stale byte offset; verbatim-prefixed roots
+        // (`\\?\`, `\??\`, `UNC` case-insensitive) normalise like plain roots.
+
+        // The matcher itself: upstream table, with the root lowercased the way
+        // `Vfs::new` stores it.
+        for (root, abs, want) in [
+            ("C:\\Games\\GROẞẞ", "C:\\Games\\großß\\Data\\a.bin", Some("Data\\a.bin")),
+            ("C:\\Games\\großß", "C:\\Games\\GROẞẞ\\Data\\a.bin", Some("Data\\a.bin")),
+            ("C:\\Games\\İİ", "C:\\Games\\i\u{307}i\u{307}\\Sub\\b.bin", Some("Sub\\b.bin")),
+            ("C:\\Games\\i\u{307}i\u{307}", "C:\\Games\\İİ\\Sub\\b.bin", Some("Sub\\b.bin")),
+            ("C:\\Games\\K", "C:\\Games\\k\\c.bin", Some("c.bin")),
+            ("C:\\Games\\k", "C:\\Games\\K\\c.bin", Some("c.bin")),
+            ("C:\\Games\\GROẞ", "C:\\Games\\groß", Some("")),
+            ("C:\\Games\\Title", "C:\\Games\\Title\\\\Data\\x.bin", Some("Data\\x.bin")),
+            ("C:\\Games\\GROẞ", "C:\\Games\\groß2\\a.bin", None),
+            // Either separator matches either side (Linux host paths use `/`).
+            ("C:\\Games\\GROẞẞ", "C:/Games/großß/Data/a.bin", Some("Data/a.bin")),
+        ] {
+            assert_eq!(
+                strip_path_prefix_ci(abs, &root.to_lowercase()).map(|s| s.to_string()),
+                want.map(|s| s.to_string()),
+                "root={root:?} abs={abs:?}"
+            );
+        }
+
+        // Verbatim prefixes strip case-insensitively (upstream #316).
+        for (input, want) in [
+            ("\\\\?\\C:\\Games\\Title", "C:\\Games\\Title"),
+            ("\\\\?\\UNC\\server\\share\\f.bin", "\\\\server\\share\\f.bin"),
+            ("\\\\?\\unc\\server\\share\\f.bin", "\\\\server\\share\\f.bin"),
+            ("\\??\\UNC\\server\\share\\f.bin", "\\\\server\\share\\f.bin"),
+            ("\\??\\C:\\Games\\Title", "C:\\Games\\Title"),
+            ("C:\\Games\\Title", "C:\\Games\\Title"),
+        ] {
+            assert_eq!(strip_verbatim(input), want, "input={input:?}");
+        }
+
+        // Verbatim-spelled roots normalise like plain roots (upstream #316).
+        for (verbatim, plain) in [
+            ("\\\\?\\C:\\Games\\Title", "C:\\Games\\Title"),
+            ("\\\\?\\unc\\server\\share\\Game", "\\\\server\\share\\Game"),
+            ("\\??\\UNC\\server\\share\\Game", "\\\\server\\share\\Game"),
+        ] {
+            let a = Vfs::new(Path::new(verbatim), Path::new("C:\\Data\\Title"), vec![]);
+            let b = Vfs::new(Path::new(plain), Path::new("C:\\Data\\Title"), vec![]);
+            assert_eq!(
+                a.game_root(),
+                b.game_root(),
+                "verbatim root {verbatim:?} must normalise like {plain:?}"
+            );
+        }
+
+        // End to end through `classify_with` / `classify`.
+        #[cfg(windows)]
+        {
+            // Upstream test as-is (drive letters resolve on Windows).
+            let id = |p: &str| Some(p.to_string());
+            for (root, input, want_rel) in [
+                ("C:\\Games\\GROẞẞ", "C:\\Games\\großß\\Data\\a.bin", "Data\\a.bin"),
+                ("C:\\Games\\großß", "C:\\Games\\GROẞẞ\\Data\\a.bin", "Data\\a.bin"),
+                ("C:\\Games\\İİ", "C:\\Games\\i\u{307}i\u{307}\\Sub\\b.bin", "Sub\\b.bin"),
+                ("C:\\Games\\i\u{307}i\u{307}", "C:\\Games\\İİ\\Sub\\b.bin", "Sub\\b.bin"),
+                ("C:\\Games\\K", "C:\\Games\\k\\c.bin", "c.bin"),
+                ("C:\\Games\\k", "C:\\Games\\K\\c.bin", "c.bin"),
+                ("C:\\Games\\GROẞ", "C:\\Games\\groß", ""),
+                ("C:\\Games\\GROẞẞ", "C:/Games/großß/Data/a.bin", "Data\\a.bin"),
+                ("C:\\Games\\Title", "C:\\Games\\Title\\\\Data\\a.bin", "Data\\a.bin"),
+                ("\\\\?\\C:\\Games\\Title", "C:\\Games\\Title\\Data\\x.bin", "Data\\x.bin"),
+                ("\\\\?\\C:\\Games\\Title", "\\\\?\\C:\\Games\\Title\\Data\\x.bin", "Data\\x.bin"),
+            ] {
+                let v = Vfs::new(Path::new(root), Path::new("\\\\?\\C:\\Data\\Title"), vec![]);
+                assert_eq!(
+                    v.classify_with(input, id),
+                    Target::Game { rel: want_rel.to_string() },
+                    "root={root:?} input={input:?}"
+                );
+            }
+
+            // Sibling directories sharing a prefix must not match.
+            let v = Vfs::new(Path::new("C:\\Games\\GROẞ"), Path::new("C:\\Data\\Title"), vec![]);
+            assert_eq!(v.classify_with("C:\\Games\\groß2\\a.bin", id), Target::Pass);
+            // Case-insensitive verbatim UNC prefixes stay UNC and never resolve relative to game_root.
+            let rel_to_game = |p: &str| {
+                if p.starts_with("\\\\") || p.as_bytes().get(1) == Some(&b':') {
+                    Some(p.to_string())
+                } else {
+                    Some(format!("C:\\Games\\GROẞ\\{p}"))
+                }
+            };
+            assert_eq!(v.classify_with("\\\\?\\unc\\server\\share\\file.bin", rel_to_game), Target::Pass);
+            assert_eq!(v.classify_with("\\??\\UNC\\server\\share\\file.bin", rel_to_game), Target::Pass);
+            // Verbatim roots still recognise own folders in in_own_folders (prevents C: mount hijack).
+            let vc = Vfs::new(
+                Path::new("\\\\?\\C:\\Games\\Title"),
+                Path::new("\\\\?\\C:\\Data\\Title"),
+                vec![("C:".into(), "C:\\Games\\Title".into())],
+            );
+            assert_eq!(vc.classify_with("C:\\Data\\Title\\saves\\s.dat", id), Target::Pass);
+            assert_eq!(vc.classify_with("C:\\Games\\Title\\Data\\x.bin", id), Target::Game { rel: "Data\\x.bin".into() });
+        }
+        #[cfg(not(windows))]
+        {
+            // Linux has no drive letters: an untranslated `C:\...` console
+            // path is Reject, so the same spellings run through UNC roots
+            // (which keep `\` separators on both sides) and real temp-dir
+            // roots instead.
+            let id = |p: &str| Some(p.to_string());
+            // A folding-expanding UNC root classifies a differently-cased
+            // input to the same rel (the old byte-offset slice panicked here).
+            let v = Vfs::new(Path::new("\\\\server\\share\\groß"), Path::new("C:\\Data\\Title"), vec![]);
+            assert_eq!(
+                v.classify_with("\\\\server\\share\\GROẞ\\a.bin", id),
+                Target::Game { rel: "a.bin".into() }
+            );
+            // Sibling directories sharing a prefix must not match.
+            let v = Vfs::new(Path::new("\\\\server\\share\\GROẞ"), Path::new("C:\\Data\\Title"), vec![]);
+            assert_eq!(v.classify_with("\\\\server\\share\\groß2\\a.bin", id), Target::Pass);
+            // Case-insensitive verbatim UNC prefixes stay UNC and never
+            // resolve relative to the game root.
+            assert_eq!(v.classify_with("\\\\?\\unc\\server\\share\\file.bin", id), Target::Pass);
+            assert_eq!(v.classify_with("\\??\\UNC\\server\\share\\file.bin", id), Target::Pass);
+            // Unicode roots through real host paths keep their rel casing.
+            let dir = std::env::temp_dir().join(format!("xcl_vfs_fold_{}", std::process::id()));
+            let game = dir.join("GROẞẞ");
+            std::fs::create_dir_all(game.join("Data")).unwrap();
+            std::fs::write(game.join("Data").join("a.bin"), b"x").unwrap();
+            let v = Vfs::new(&game, &dir.join("xcldata"), vec![]);
+            let abs = game.join("Data").join("a.bin").to_string_lossy().into_owned();
+            assert_eq!(v.classify(&abs), Target::Game { rel: "Data\\a.bin".into() });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
