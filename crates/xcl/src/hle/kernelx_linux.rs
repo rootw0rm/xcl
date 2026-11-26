@@ -406,6 +406,7 @@ type ThreadStart = unsafe extern "win64" fn(*mut c_void) -> u32;
 struct ThreadRecord {
     tid: AtomicU32,
     priority: AtomicU32,
+    boost: AtomicU32,
     name: Mutex<String>,
     suspended_gate: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>,
 }
@@ -552,6 +553,7 @@ pub unsafe extern "win64" fn CreateThread(
     let record = std::sync::Arc::new(ThreadRecord {
         tid: AtomicU32::new(0),
         priority: AtomicU32::new(0),
+        boost: AtomicU32::new(0),
         name: Mutex::new(format!("xcl-game-{handle:x}")),
         suspended_gate: gate,
     });
@@ -634,7 +636,48 @@ pub unsafe extern "win64" fn SuspendThread(_handle: usize) -> u32 {
 
 /// Remember `prio` per handle; the host scheduler change is best-effort and its failure
 /// (e.g. `EPERM` without `CAP_SYS_NICE`) never fails the call.
+pub const THREAD_PRIORITY_ERROR_RETURN: i32 = 0x7FFF_FFFF;
+
+// Win32 thread-priority constants (mirrors `windows_sys::Win32::System::Threading` values,
+// which never compile on Linux).
+pub const THREAD_PRIORITY_IDLE: i32 = -15;
+pub const THREAD_PRIORITY_LOWEST: i32 = -2;
+pub const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+pub const THREAD_PRIORITY_NORMAL: i32 = 0;
+pub const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
+pub const THREAD_PRIORITY_HIGHEST: i32 = 2;
+pub const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+pub const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;
+pub const THREAD_MODE_BACKGROUND_END: i32 = 0x0002_0000;
+
+static CURRENT_PRIO: AtomicU32 = AtomicU32::new(0);
+static CURRENT_BOOST: AtomicU32 = AtomicU32::new(0);
+
+/// Map console / non-standard thread priority levels to valid Win32 priority constants.
+/// Pure function (mirrors the Windows helper) so unit tests pin the mapping.
+pub fn map_thread_priority(priority: i32) -> i32 {
+    match priority {
+        THREAD_PRIORITY_IDLE
+        | THREAD_PRIORITY_LOWEST
+        | THREAD_PRIORITY_BELOW_NORMAL
+        | THREAD_PRIORITY_NORMAL
+        | THREAD_PRIORITY_ABOVE_NORMAL
+        | THREAD_PRIORITY_HIGHEST
+        | THREAD_PRIORITY_TIME_CRITICAL
+        | THREAD_MODE_BACKGROUND_BEGIN
+        | THREAD_MODE_BACKGROUND_END => priority,
+
+        p if p <= -15 => THREAD_PRIORITY_IDLE,
+        p if p < -2 => THREAD_PRIORITY_LOWEST,
+        p if (3..=6).contains(&p) => THREAD_PRIORITY_HIGHEST,
+        p if p >= 7 => THREAD_PRIORITY_TIME_CRITICAL,
+
+        _ => priority,
+    }
+}
+
 pub unsafe extern "win64" fn SetThreadPriority(handle: usize, prio: i32) -> i32 {
+    let mapped = map_thread_priority(prio);
     if handle == current_thread_handle() || handle == 0 {
         // Best effort: lowering niceness requires no privilege only for raising it.
         // Attempt, ignore the result, and always succeed like the degraded path.
@@ -644,15 +687,15 @@ pub unsafe extern "win64" fn SetThreadPriority(handle: usize, prio: i32) -> i32 
             crate::xlog_info!("SetThreadPriority({prio}): host scheduling is best-effort on Linux");
         }
         // Remember per pseudo-handle? Pseudo handles are process-wide; keep a single slot.
-        static CURRENT_PRIO: AtomicU32 = AtomicU32::new(0);
-        CURRENT_PRIO.store(prio as u32, Ordering::Relaxed);
+        // Stored mapped so GetThreadPriority returns a conformant Win32 value.
+        CURRENT_PRIO.store(mapped as u32, Ordering::Relaxed);
         set_error(ERROR_SUCCESS);
         return 1;
     }
     let g = threads().lock().unwrap();
     match g.get(&handle) {
         Some(rec) => {
-            rec.priority.store(prio as u32, Ordering::Relaxed);
+            rec.priority.store(mapped as u32, Ordering::Relaxed);
             set_error(ERROR_SUCCESS);
             1
         }
@@ -665,14 +708,61 @@ pub unsafe extern "win64" fn SetThreadPriority(handle: usize, prio: i32) -> i32 
 
 pub unsafe extern "win64" fn GetThreadPriority(handle: usize) -> i32 {
     if handle == current_thread_handle() || handle == 0 {
+        return CURRENT_PRIO.load(Ordering::Relaxed) as i32;
+    }
+    let g = threads().lock().unwrap();
+    match g.get(&handle) {
+        Some(rec) => rec.priority.load(Ordering::Relaxed) as i32,
+        None => {
+            set_error(ERROR_INVALID_HANDLE);
+            THREAD_PRIORITY_ERROR_RETURN
+        }
+    }
+}
+
+pub unsafe extern "win64" fn SetThreadPriorityBoost(handle: usize, disable: i32) -> i32 {
+    let known = handle == current_thread_handle()
+        || handle == 0
+        || threads().lock().unwrap().contains_key(&handle);
+    if !known {
+        set_error(ERROR_INVALID_HANDLE);
         return 0;
     }
-    threads()
-        .lock()
-        .unwrap()
-        .get(&handle)
-        .map(|r| r.priority.load(Ordering::Relaxed) as i32)
-        .unwrap_or(0)
+    if handle == current_thread_handle() || handle == 0 {
+        CURRENT_BOOST.store(disable as u32, Ordering::Relaxed);
+    } else {
+        let g = threads().lock().unwrap();
+        if let Some(rec) = g.get(&handle) {
+            rec.boost.store(disable as u32, Ordering::Relaxed);
+        }
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+pub unsafe extern "win64" fn GetThreadPriorityBoost(handle: usize, disable: *mut i32) -> i32 {
+    let rec_opt = if handle == current_thread_handle() || handle == 0 {
+        None
+    } else {
+        threads().lock().unwrap().get(&handle).cloned()
+    };
+    let is_current = handle == current_thread_handle() || handle == 0;
+    if !is_current && rec_opt.is_none() {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if disable.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let v = if is_current {
+        CURRENT_BOOST.load(Ordering::Relaxed)
+    } else {
+        rec_opt.unwrap().boost.load(Ordering::Relaxed)
+    };
+    *disable = v as i32;
+    set_error(ERROR_SUCCESS);
+    1
 }
 
 /// A mask from the PC's processors passes through; a console mask naming processors outside
@@ -9148,6 +9238,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("TerminateProcess", TerminateProcess as usize),
         ("GetThreadPriority", GetThreadPriority as usize),
         ("SetThreadPriority", SetThreadPriority as usize),
+        ("GetThreadPriorityBoost", GetThreadPriorityBoost as usize),
+        ("SetThreadPriorityBoost", SetThreadPriorityBoost as usize),
         ("GetLastError", GetLastError as usize),
         ("SetLastError", SetLastError as usize),
         ("Sleep", Sleep as usize),
@@ -9655,6 +9747,71 @@ mod tests {
             // Unknown handles fail cleanly.
             assert_eq!(SetThreadPriority(0xDEAD_BEEF, 0), 0);
             assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn thread_priority_tiers_map_to_win32_priorities() {
+        // Pure mapping: standard constants and background flags pass through.
+        assert_eq!(map_thread_priority(THREAD_PRIORITY_IDLE), THREAD_PRIORITY_IDLE);
+        assert_eq!(map_thread_priority(THREAD_PRIORITY_LOWEST), THREAD_PRIORITY_LOWEST);
+        assert_eq!(map_thread_priority(THREAD_PRIORITY_BELOW_NORMAL), THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(map_thread_priority(THREAD_PRIORITY_NORMAL), THREAD_PRIORITY_NORMAL);
+        assert_eq!(map_thread_priority(THREAD_PRIORITY_ABOVE_NORMAL), THREAD_PRIORITY_ABOVE_NORMAL);
+        assert_eq!(map_thread_priority(THREAD_PRIORITY_HIGHEST), THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(THREAD_PRIORITY_TIME_CRITICAL), THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(map_thread_priority(THREAD_MODE_BACKGROUND_BEGIN), THREAD_MODE_BACKGROUND_BEGIN);
+        assert_eq!(map_thread_priority(THREAD_MODE_BACKGROUND_END), THREAD_MODE_BACKGROUND_END);
+        assert_eq!(map_thread_priority(-16), THREAD_PRIORITY_IDLE);
+        assert_eq!(map_thread_priority(-100), THREAD_PRIORITY_IDLE);
+        assert_eq!(map_thread_priority(-7), THREAD_PRIORITY_LOWEST);
+        assert_eq!(map_thread_priority(-3), THREAD_PRIORITY_LOWEST);
+        assert_eq!(map_thread_priority(3), THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(6), THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(7), THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(map_thread_priority(31), THREAD_PRIORITY_TIME_CRITICAL);
+        unsafe {
+            // Per-handle storage keeps the mapped value, not the raw tier.
+            let h = CreateThread(
+                std::ptr::null(),
+                0,
+                thread_exit_zero as usize,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h, 0);
+            assert_eq!(SetThreadPriority(h, 3), 1);
+            assert_eq!(GetThreadPriority(h), THREAD_PRIORITY_HIGHEST);
+            assert_eq!(SetThreadPriority(h, 7), 1);
+            assert_eq!(GetThreadPriority(h), THREAD_PRIORITY_TIME_CRITICAL);
+            assert_eq!(SetThreadPriority(h, -7), 1);
+            assert_eq!(GetThreadPriority(h), THREAD_PRIORITY_LOWEST);
+            assert_eq!(SetThreadPriority(h, THREAD_PRIORITY_NORMAL), 1);
+            assert_eq!(GetThreadPriority(h), THREAD_PRIORITY_NORMAL);
+            // Current pseudo-handle stores the mapped tier too.
+            assert_eq!(SetThreadPriority(current_thread_handle(), 5), 1);
+            assert_eq!(GetThreadPriority(current_thread_handle()), THREAD_PRIORITY_HIGHEST);
+            assert_eq!(SetThreadPriority(current_thread_handle(), THREAD_PRIORITY_NORMAL), 1);
+            // Unknown handles fail cleanly with the error return.
+            assert_eq!(GetThreadPriority(0xDEAD_BEEF), THREAD_PRIORITY_ERROR_RETURN);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            // Boost is remembered per handle; bad handles and null out-pointers fail.
+            assert_eq!(SetThreadPriorityBoost(h, 1), 1);
+            let mut disabled = 0;
+            assert_eq!(GetThreadPriorityBoost(h, &mut disabled), 1);
+            assert_eq!(disabled, 1);
+            assert_eq!(SetThreadPriorityBoost(h, 0), 1);
+            assert_eq!(GetThreadPriorityBoost(h, &mut disabled), 1);
+            assert_eq!(disabled, 0);
+            assert_eq!(SetThreadPriorityBoost(0xDEAD_BEEF, 1), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            assert_eq!(GetThreadPriorityBoost(0xDEAD_BEEF, &mut disabled), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            assert_eq!(GetThreadPriorityBoost(h, std::ptr::null_mut()), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(WaitForSingleObject(h, 5000), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(h), 1);
         }
     }
 
