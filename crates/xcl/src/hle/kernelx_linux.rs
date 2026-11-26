@@ -12769,4 +12769,33 @@ mod tests {
             assert_eq!(VirtualFree(home, 0, 0x8000), 1);
         }
     }
+
+    #[test]
+    fn failed_physical_page_read_or_write_leaves_earlier_bytes_untouched() {
+        // Linux twin of upstream #1781's
+        // `failed_physical_page_read_or_write_does_not_commit_earlier_sparse_homes`:
+        // Linux homes are always-committed `calloc` memory — there is no
+        // `home_again` / `sparse_pages` lazy-commit leg, so the Windows
+        // partial-commit class (commit-then-fail inside the resolve loop)
+        // cannot occur: `resolve_physical_pages` returns `None` before either
+        // copy loop runs. Pin that a trailing unmapped page fails the call
+        // and leaves the earlier page's bytes exactly as before.
+        unsafe {
+            let mut n = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(0, 0, &mut n, pages.as_mut_ptr()), 1);
+            let page = pages[0];
+            // Page 0 is never a live allocation (`page_index(0)` is `None`),
+            // so it plays the trailing-unmapped leg of the upstream test.
+            assert!(write_physical_pages(&[page], 0, &vec![0xA5u8; PHYS_PAGE]));
+            assert!(!write_physical_pages(&[page, 0], 0, &vec![0x5Au8; PHYS_PAGE + 1]));
+            let mut check = vec![0u8; PHYS_PAGE];
+            assert!(read_physical_pages(&[page], 0, &mut check));
+            assert_eq!(check, vec![0xA5u8; PHYS_PAGE], "a failed write leaves earlier bytes untouched");
+            let mut dst = vec![0xCCu8; PHYS_PAGE + 1];
+            assert!(!read_physical_pages(&[page, 0], 0, &mut dst));
+            assert_eq!(dst, vec![0xCCu8; PHYS_PAGE + 1], "a failed read leaves the destination untouched");
+            assert_eq!(FreeTitlePhysicalPages(0, 1, pages.as_mut_ptr()), 1);
+        }
+    }
 }
