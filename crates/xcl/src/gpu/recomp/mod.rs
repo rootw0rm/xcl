@@ -52,6 +52,7 @@
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
 pub mod cfg;
+pub mod code_loads;
 #[cfg(windows)]
 pub mod dxc;
 #[cfg(windows)]
@@ -244,6 +245,13 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// High dword `s_getpc_b64` gives a program that has constant data in its code region
+/// (`Options::rodata`) and a load that may or may not read it (`code_loads::CodeLoad::Maybe`),
+/// with any number of memory windows: its code addresses are then above every
+/// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
+/// told from a load of the title's memory at the same low dword (descriptor tables in window 0,
+/// any memory with one window, which ignores the high dword).
+pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -568,11 +576,17 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// constant data the console compiler put in the code region after the program
+    /// (`xbox::Fssm::rodata`): (address from the program's start, dwords). The program finds
+    /// it with `s_getpc_b64` and reads it with `s_load` / `global_load`; the title's memory does
+    /// not hold the code, so a load at a code address in one of these ranges takes the dwords
+    /// from the shader (`CODE_ADDRESS_HI`)
+    pub rodata: Vec<(u32, Vec<u32>)>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, rodata: Vec::new() }
     }
 }
 
