@@ -297,6 +297,35 @@ pub fn known_queues() -> Vec<usize> {
     QUEUES.lock().unwrap().clone()
 }
 
+/// Retained COM handles for the queues the title submitted work to.
+pub(super) unsafe fn known_queue_refs() -> Vec<ID3D12CommandQueue> {
+    QUEUES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|&raw| {
+            let raw = raw as *mut c_void;
+            ID3D12CommandQueue::from_raw_borrowed(&raw).cloned()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) unsafe fn forget_queue_for_test(queue: usize) {
+    let removed = {
+        let mut q = QUEUES.lock().unwrap();
+        if let Some(pos) = q.iter().position(|&x| x == queue) {
+            Some(q.swap_remove(pos))
+        } else {
+            None
+        }
+    };
+    if let Some(raw) = removed {
+        release(raw);
+    }
+    super::late_release::forget_queue_for_test(queue);
+}
+
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
 
 /// (PresentX calls, ExecuteCommandLists calls) so far

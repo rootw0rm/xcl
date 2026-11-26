@@ -95,13 +95,15 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
-        let resolved_pso = super::pso_async::resolve_for_bind(pso);
-        let hr = real::dev_create_command_list(this, node, ty, alloc, resolved_pso, riid, ppv);
+        let resolved_pso = super::pso_async::resolve_for_bind_retained(pso);
+        let resolved_ptr = resolved_pso.ptr();
+        let hr = real::dev_create_command_list(this, node, ty, alloc, resolved_ptr, riid, ppv);
         if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
             super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+            super::list_x::retain_pso(*ppv, resolved_pso);
             super::dred::reset(*ppv);
             if pso != 0 {
-                super::dred::mark_pipeline(*ppv, pso, resolved_pso);
+                super::dred::mark_pipeline(*ppv, pso, resolved_ptr);
             }
         }
         hr

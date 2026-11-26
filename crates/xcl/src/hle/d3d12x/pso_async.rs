@@ -11,24 +11,28 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
+struct State {
+    done: bool,
+    orphan: bool,
+    released: bool,
+    /// the real pipeline state (raw pointer), 0 while building or when building failed
+    real: usize,
+    /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
+    driver: usize,
+}
+
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
-    /// the real pipeline state (raw pointer), 0 while building or when building failed
-    real: AtomicUsize,
-    /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
-    driver: AtomicUsize,
-    done: Mutex<bool>,
+    state: Mutex<State>,
     cv: Condvar,
     compute: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
-    /// the stand-in was released before the real pipeline was built
-    orphan: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
@@ -127,6 +131,21 @@ impl Pending {
             used::note(self.key);
         }
     }
+
+    /// Mark the stand-in released under `st`, take its built pipeline if done (or mark it
+    /// orphaned so any worker drops its result), and wake waiters.
+    fn finish_release(&self, st: &mut State) -> (bool, usize) {
+        st.released = true;
+        let real = if st.done {
+            std::mem::take(&mut st.real)
+        } else {
+            // the worker stores its result into a Pending nobody will read: mark it orphaned
+            st.orphan = true;
+            0
+        };
+        self.cv.notify_all();
+        (st.orphan, real)
+    }
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -140,16 +159,16 @@ fn complete(p: &Pending, real: usize) {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
     let orphan = {
-        let mut done = p.done.lock().unwrap();
-        let orphan = p.orphan.load(Ordering::Acquire);
+        let mut st = p.state.lock().unwrap();
+        let orphan = st.orphan;
         if !orphan {
-            p.real.store(real, Ordering::Release);
+            st.real = real;
         }
-        *done = true;
+        st.done = true;
         p.cv.notify_all();
         orphan
     };
-    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    // outside `state`: the Release override takes PENDING (`counts` takes PENDING, then `state`)
     if orphan {
         release(real);
     }
@@ -294,8 +313,8 @@ fn drop_unstarted_job(p: &Pending) {
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         {
-            let mut done = p.done.lock().unwrap();
-            *done = true;
+            let mut st = p.state.lock().unwrap();
+            st.done = true;
             p.cv.notify_all();
         }
         drop(job);
@@ -332,7 +351,7 @@ fn enqueue(p: Arc<Pending>) {
 
 fn build_queued(p: &Arc<Pending>) {
     // (released by the title meanwhile)
-    if p.orphan.load(Ordering::Acquire) {
+    if p.state.lock().unwrap().orphan {
         drop_unstarted_job(p);
         return;
     }
@@ -372,8 +391,28 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
 pub fn release(p: usize) {
-    if p != 0 {
-        unsafe { drop(<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState as windows::core::Interface>::from_raw(p as *mut std::ffi::c_void)) };
+    if p == 0 {
+        return;
+    }
+    unsafe {
+        if !is_com_pso(p) {
+            return;
+        }
+        if super::late_release::enabled() && !super::real::is_adopted(p as *mut std::ffi::c_void) {
+            let raw = p as *mut std::ffi::c_void;
+            let vt = *(raw as *const *const usize);
+            let add: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vt.add(1));
+            let rel: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            if add(raw) == 2 {
+                rel(raw);
+                super::late_release::hold_deferred(p);
+                return;
+            }
+            rel(raw);
+            rel(raw);
+            return;
+        }
+        drop(<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState as windows::core::Interface>::from_raw(p as *mut std::ffi::c_void));
     }
 }
 
@@ -402,14 +441,11 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
-        real: AtomicUsize::new(0),
-        driver: AtomicUsize::new(0),
-        done: Mutex::new(false),
+        state: Mutex::new(State { done: false, orphan: false, released: false, real: 0, driver: 0 }),
         cv: Condvar::new(),
         compute,
         key,
         used: Default::default(),
-        orphan: Default::default(),
         late: Default::default(),
         spared: Default::default(),
         demand: Default::default(),
@@ -549,7 +585,7 @@ fn preload() -> Option<&'static Preload> {
                         }
                     };
                     // (released by the title meanwhile)
-                    if p.orphan.load(Ordering::Acquire) {
+                    if p.state.lock().unwrap().orphan {
                         drop_unstarted_job(&p);
                         continue;
                     }
@@ -1035,16 +1071,253 @@ mod used_tests {
             let _ = released(standin);
         }
     }
+
+    #[test]
+    fn concurrent_resolve_retained_and_release_never_exposes_freed_pipeline() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+        use std::sync::Barrier;
+        use windows::core::GUID;
+
+        #[repr(C)]
+        struct TestComPso {
+            vt: *const [usize; 3],
+            refs: AtomicU32,
+            drops: Arc<AtomicUsize>,
+        }
+        unsafe extern "system" fn qi(_: *mut c_void, _: *const GUID, out: *mut *mut c_void) -> i32 {
+            if !out.is_null() {
+                *out = std::ptr::null_mut();
+            }
+            -2147467262 // E_NOINTERFACE
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let prev = (&*(this as *const TestComPso)).refs.fetch_add(1, Ordering::AcqRel);
+            assert!(prev >= 1, "AddRef after final release");
+            prev + 1
+        }
+        unsafe extern "system" fn dec_only(this: *mut c_void) -> u32 {
+            let prev = (&*(this as *const TestComPso)).refs.fetch_sub(1, Ordering::AcqRel);
+            assert!(prev >= 1, "double Release");
+            let n = prev - 1;
+            if n == 0 {
+                let b = Box::from_raw(this as *mut TestComPso);
+                b.drops.fetch_add(1, Ordering::AcqRel);
+            }
+            n
+        }
+        unsafe extern "system" fn pso_release_sim(this: *mut c_void) -> u32 {
+            let probe = || -> (bool, bool, u32) {
+                let n = dec_only(this);
+                (n == 0, false, n)
+            };
+            if let Some((n, _, real)) = try_release_standin(this as usize, probe) {
+                if n == 0 {
+                    release(real);
+                }
+                return n;
+            }
+            let (is_zero, _, n) = probe();
+            if is_zero {
+                release(released(this as usize));
+            }
+            n
+        }
+        struct UnstartedReal(usize);
+        impl Drop for UnstartedReal {
+            fn drop(&mut self) {
+                if self.0 != 0 {
+                    unsafe { dec_only(self.0 as *mut c_void) };
+                }
+            }
+        }
+        let vt: *const [usize; 3] = Box::leak(Box::new([qi as usize, add_ref as usize, pso_release_sim as usize]));
+
+        let total_drops = Arc::new(AtomicUsize::new(0));
+        let iterations = 80usize;
+        for i in 0..iterations {
+            let standin_raw = Box::into_raw(Box::new(TestComPso {
+                vt,
+                refs: AtomicU32::new(1),
+                drops: total_drops.clone(),
+            })) as usize;
+            let real_raw = Box::into_raw(Box::new(TestComPso {
+                vt,
+                refs: AtomicU32::new(1),
+                drops: total_drops.clone(),
+            })) as usize;
+            let real_guard = UnstartedReal(real_raw);
+            let build_now = i % 2 == 0;
+            submit(standin_raw, i % 3 == 0, Box::new(move || {
+                let ptr = real_guard.0;
+                std::mem::forget(real_guard);
+                ptr
+            }));
+            if build_now {
+                let _ = resolve_wait_retained(standin_raw);
+            }
+            let p = entry(standin_raw).expect("tracked standin");
+
+            let barrier = Arc::new(Barrier::new(5));
+            let mut readers = Vec::with_capacity(4);
+            for t in 0..4 {
+                let b = barrier.clone();
+                let p = p.clone();
+                readers.push(std::thread::spawn(move || {
+                    b.wait();
+                    let res = match t % 2 {
+                        0 => resolve_pending(&p, standin_raw),
+                        _ => resolve_wait_for_pending(&p, standin_raw, None),
+                    };
+                    if let Some(com) = res.into_com() {
+                        // Calling through the retained COM handle must still find a live object.
+                        let live = unsafe {
+                            use windows::core::Interface;
+                            let ptr = com.as_raw();
+                            let prev = (&*(ptr as *const TestComPso)).refs.load(Ordering::Acquire);
+                            assert!(prev >= 1, "retained COM object was prematurely released");
+                            com
+                        };
+                        drop(live);
+                    }
+                }));
+            }
+            barrier.wait();
+            unsafe {
+                drop(<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState as windows::core::Interface>::from_raw(
+                    standin_raw as *mut c_void,
+                ));
+            }
+            for h in readers {
+                h.join().unwrap();
+            }
+        }
+
+        // Wait for any background orphan jobs to finish releasing `real`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let expected = iterations * 2;
+        while total_drops.load(Ordering::Acquire) < expected && std::time::Instant::now() < deadline {
+            unsafe { crate::hle::d3d12x::late_release::drain_known(true) };
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(total_drops.load(Ordering::Acquire), expected, "every stand-in and real PSO must be released cleanly");
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+/// Pipeline pointer resolved from a stand-in, holding a COM reference when `ptr` points to a
+/// live `ID3D12PipelineState` / stand-in COM object tracked by `pso_async`.
+#[derive(Clone, Default)]
+pub struct Resolved {
+    ptr: usize,
+    com: Option<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>,
+    settled: bool,
+}
+
+impl Resolved {
+    pub const fn none() -> Self {
+        Self { ptr: 0, com: None, settled: false }
+    }
+
+    pub const fn unretained_settled(ptr: usize) -> Self {
+        Self { ptr, com: None, settled: true }
+    }
+
+    pub fn ptr(&self) -> usize {
+        self.ptr
+    }
+
+    pub fn has_com(&self) -> bool {
+        self.com.is_some()
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.settled
+    }
+
+    pub fn into_com(self) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState> {
+        self.com
+    }
+}
+
+/// Whether `pso` is currently registered as an async/lazy pending pipeline stand-in.
+pub fn is_tracked(pso: usize) -> bool {
+    entry(pso).is_some()
+}
+
+/// Resolve `pso`, reusing `saved` if `pso` was already resolved and released from `PENDING`
+/// (or is already COM-retained by `saved`).
+pub fn resolve_cached_wait(pso: usize, saved: &Resolved) -> Resolved {
+    if !is_tracked(pso) && saved.ptr() != 0 && (saved.ptr() != pso || saved.has_com()) {
+        return saved.clone();
+    }
+    let resolved = resolve_wait_retained(pso);
+    if resolved.ptr() == 0 && saved.ptr() != 0 {
+        return saved.clone();
+    }
+    resolved
+}
+
+/// `resolve_for_bind_retained`, reusing `saved` if `pso` was already resolved and released.
+pub fn resolve_cached_for_bind(pso: usize, saved: &Resolved) -> Resolved {
+    if !is_tracked(pso) && saved.ptr() != 0 && (saved.ptr() != pso || saved.has_com()) {
+        return saved.clone();
+    }
+    let resolved = resolve_for_bind_retained(pso);
+    if resolved.ptr() == 0 && saved.ptr() != 0 {
+        return saved.clone();
+    }
+    resolved
+}
+
+/// Whether `ptr` points to a readable COM object whose vtable has readable AddRef/Release slots.
+unsafe fn is_com_pso(ptr: usize) -> bool {
+    if ptr < 0x1_0000 || (ptr & (std::mem::align_of::<usize>() - 1)) != 0 || !crate::gpu::shader::readable(ptr, std::mem::size_of::<usize>()) {
+        return false;
+    }
+    let vt = *(ptr as *const usize);
+    if !crate::gpu::shader::readable(vt, 3 * std::mem::size_of::<usize>()) {
+        return false;
+    }
+    let slots = std::slice::from_raw_parts(vt as *const usize, 3);
+    crate::gpu::shader::readable(slots[1], 1) && crate::gpu::shader::readable(slots[2], 1)
+}
+
+/// Retain a COM reference on `ptr` if it points to a live COM object with an `IUnknown` vtable.
+/// Synthetic non-pointer test addresses (e.g. `0x1234`) stay unretained (`None`).
+unsafe fn retain_com(ptr: usize) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+    if !is_com_pso(ptr) {
+        return None;
+    }
+    let raw = ptr as *mut std::ffi::c_void;
+    ID3D12PipelineState::from_raw_borrowed(&raw).cloned()
+}
+
+fn resolve_from_state(st: &State, pso: usize) -> Resolved {
+    if st.released {
+        return Resolved::none();
+    }
+    let target = if st.real != 0 {
+        st.real
+    } else if st.driver != 0 {
+        st.driver
+    } else {
+        pso
+    };
+    Resolved { ptr: target, com: unsafe { retain_com(target) }, settled: st.done }
+}
+
 impl Pending {
     /// What a bind of the stand-in `pso` gives the driver while the pipeline is not built.
+    #[cfg(test)]
     fn stand(&self, pso: usize) -> usize {
-        match self.driver.load(Ordering::Acquire) {
+        match self.state.lock().unwrap().driver {
             0 => pso,
             d => d,
         }
@@ -1055,59 +1328,95 @@ impl Pending {
 /// Told before the title has the stand-in.
 pub fn shared(standin: usize, driver: usize) {
     if let Some(p) = entry(standin) {
-        p.driver.store(driver, Ordering::Release);
+        p.state.lock().unwrap().driver = driver;
     }
+}
+
+/// Resolve a pending pipeline if tracked, retaining its COM reference before `released()` can
+/// drop it. When `pso` is not in `PENDING`, returns `pso` unretained without touching it.
+pub fn resolve_if_pending(pso: usize) -> Resolved {
+    let Some(p) = entry(pso) else {
+        return Resolved::unretained_settled(pso);
+    };
+    p.note_use();
+    resolve_pending(&p, pso)
+}
+
+fn resolve_pending(p: &Arc<Pending>, pso: usize) -> Resolved {
+    let st = p.state.lock().unwrap();
+    let out = resolve_from_state(&st, pso);
+    let should_enqueue = !st.done && !st.released && st.real == 0;
+    drop(st);
+    if should_enqueue && !p.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p.clone());
+    }
+    out
 }
 
 /// The pipeline to use for `pso` now: the real one once built, else the stand-in's driver
 /// pipeline (`pso` itself when it is one).
 pub fn resolve(pso: usize) -> usize {
-    let Some(p) = entry(pso) else { return pso };
-    p.note_use();
-    match p.real.load(Ordering::Acquire) {
-        0 => {
-            // a lazy one is wanted now: to the workers
-            let stand = p.stand(pso);
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p);
-            }
-            stand
-        }
-        r => r,
-    }
+    resolve_if_pending(pso).ptr()
 }
 
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    resolve_wait_with(pso, wait_budget()).ptr()
+}
+
+/// `resolve_wait`, returning a retained COM pipeline handle that outlives concurrent `released()`.
+pub fn resolve_wait_retained(pso: usize) -> Resolved {
+    resolve_wait_with(pso, wait_budget())
+}
+
+#[cfg(test)]
+fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+    resolve_wait_with(pso, budget).ptr()
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
-fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+fn resolve_wait_with(pso: usize, budget: Option<std::time::Duration>) -> Resolved {
+    let Some(p) = entry(pso) else {
+        return Resolved::unretained_settled(pso);
+    };
     p.note_use();
+    resolve_wait_for_pending(&p, pso, budget)
+}
+
+fn resolve_wait_for_pending(p: &Arc<Pending>, pso: usize, budget: Option<std::time::Duration>) -> Resolved {
     if p.spared.load(Ordering::Acquire) {
-        return resolve_spared(&p, pso);
+        return resolve_spared(p, pso);
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
+    let _held = (!p.state.lock().unwrap().done).then(Held::new);
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+        return resolve_within(p, pso, budget);
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        let already_released = {
+            let mut st = p.state.lock().unwrap();
+            if st.released {
+                st.done = true;
+                p.cv.notify_all();
+                true
+            } else {
+                false
+            }
+        };
+        if already_released {
+            drop(job);
+        } else {
+            complete(p, job());
+        }
     }
     p.want();
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
+    let mut st = p.state.lock().unwrap();
+    while !st.done && !st.released {
+        st = p.cv.wait(st).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
-        0 => p.stand(pso),
-        r => r,
-    }
+    resolve_from_state(&st, pso)
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -1122,33 +1431,34 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
-    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
-        0 => p.stand(pso),
-        r => r,
-    };
-    if *p.done.lock().unwrap() {
-        return built(p);
+fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> Resolved {
+    {
+        let st = p.state.lock().unwrap();
+        if st.done || st.released {
+            return resolve_from_state(&st, pso);
+        }
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
         enqueue(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
-        return p.stand(pso);
+        let st = p.state.lock().unwrap();
+        return resolve_from_state(&st, pso);
     }
     p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    if *done {
-        return built(p);
+    let (st, _) = p.cv.wait_timeout_while(p.state.lock().unwrap(), budget, |st| !st.done && !st.released).unwrap();
+    if st.done || st.released {
+        return resolve_from_state(&st, pso);
     }
-    drop(done);
+    drop(st);
     p.late.store(true, Ordering::Release);
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
-    p.stand(pso)
+    let st = p.state.lock().unwrap();
+    resolve_from_state(&st, pso)
 }
 
 /// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
@@ -1175,31 +1485,54 @@ pub fn image_only(standin: usize) {
 /// `resolve_wait` for a pipeline binds do not wait for (`image_only`): the real one once built,
 /// else the stand-in, with the build sent to the workers. Nobody waits, so the build is not
 /// `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
-fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
-    match p.real.load(Ordering::Acquire) {
-        0 => {
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p.clone());
-            }
-            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
-                static N: AtomicUsize = AtomicUsize::new(0);
-                let n = N.fetch_add(1, Ordering::Relaxed);
-                if n < 16 || n.is_power_of_two() {
-                    crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
-                }
-            }
-            p.stand(pso)
+fn resolve_spared(p: &Arc<Pending>, pso: usize) -> Resolved {
+    {
+        let st = p.state.lock().unwrap();
+        if st.real != 0 || st.done || st.released {
+            return resolve_from_state(&st, pso);
         }
-        r => r,
     }
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p.clone());
+    }
+    let st = p.state.lock().unwrap();
+    if !st.done && !st.released && !p.late.swap(true, Ordering::AcqRel) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
+        }
+    }
+    resolve_from_state(&st, pso)
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
+        Some(p) if p.compute => {
+            p.note_use();
+            resolve_wait_for_pending(&p, pso, wait_budget()).ptr()
+        }
+        Some(p) => {
+            p.note_use();
+            resolve_pending(&p, pso).ptr()
+        }
         None => pso,
+    }
+}
+
+/// `resolve_for_bind`, returning a retained COM pipeline handle that outlives concurrent `released()`.
+pub fn resolve_for_bind_retained(pso: usize) -> Resolved {
+    match entry(pso) {
+        Some(p) if p.compute => {
+            p.note_use();
+            resolve_wait_for_pending(&p, pso, wait_budget())
+        }
+        Some(p) => {
+            p.note_use();
+            resolve_pending(&p, pso)
+        }
+        None => Resolved::unretained_settled(pso),
     }
 }
 
@@ -1208,21 +1541,52 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
-    {
-        let done = p.done.lock().unwrap();
-        if *done {
-            return p.real.swap(0, Ordering::AcqRel);
-        }
-        // the worker stores its result into a Pending nobody will read: mark it orphaned
-        p.orphan.store(true, Ordering::Release);
+    let (orphan, real) = {
+        let mut st = p.state.lock().unwrap();
+        p.finish_release(&mut st)
+    };
+    if orphan {
+        drop_unstarted_job(&p);
     }
-    drop_unstarted_job(&p);
-    0
+    real
+}
+
+/// Retire a tracked adopted stand-in under its `Pending::state` lock, so `resolve*_retained`
+/// cannot `AddRef` `pso` concurrently with its final COM reference dropping to zero.
+pub fn try_release_standin(
+    pso: usize,
+    probe: impl FnOnce() -> (bool, bool, u32),
+) -> Option<(u32, bool, usize)> {
+    let p = entry(pso)?;
+    let (held, orphan, real) = {
+        let mut st = p.state.lock().unwrap();
+        if st.released {
+            return None;
+        }
+        let (is_zero, held, n) = probe();
+        if !is_zero {
+            return Some((n, false, 0));
+        }
+        let (orphan, real) = p.finish_release(&mut st);
+        (held, orphan, real)
+    };
+    if let Some(m) = PENDING.lock().unwrap().as_mut() {
+        if m.get(&pso).is_some_and(|cur| Arc::ptr_eq(cur, &p)) {
+            m.remove(&pso);
+        }
+    }
+    if orphan {
+        drop_unstarted_job(&p);
+    }
+    Some((0, held, real))
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
-    entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
+    entry(pso).is_some_and(|p| {
+        let st = p.state.lock().unwrap();
+        !st.done && !st.released
+    })
 }
 
 /// One of the title's threads is about to wait for `pso`.
@@ -1243,6 +1607,13 @@ pub fn need_by_submit(pso: usize) {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
+    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| {
+        m.values()
+            .filter(|p| {
+                let st = p.state.lock().unwrap();
+                !st.done && !st.released
+            })
+            .count()
+    });
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }

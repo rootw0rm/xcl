@@ -301,6 +301,8 @@ struct ListState {
     uma: Vec<usize>,
     /// where the next draw's argument table and io go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// Retained PC pipeline objects bound to this recording, dropped on Reset or Release.
+    retained_psos: HashMap<usize, ID3D12PipelineState>,
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
@@ -389,7 +391,8 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     })
     .unwrap_or(0);
     if left == 0 {
-        if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
+        let dead = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj));
+        if let Some(st) = dead {
             free_uma(&st.uma);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
             release(st.pc);
@@ -422,20 +425,36 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {
     let obj = this as usize;
-    let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
+    let Some((pc, old_alloc, blocks, old_psos)) = with_list(obj, |st| {
         st.chunks.clear();
         st.arena = Default::default();
-        (st.pc, std::mem::replace(&mut st.allocator, allocator as usize), std::mem::take(&mut st.uma))
+        (
+            st.pc,
+            std::mem::replace(&mut st.allocator, allocator as usize),
+            std::mem::take(&mut st.uma),
+            std::mem::take(&mut st.retained_psos),
+        )
     }) else {
         return crate::util::E_FAIL;
     };
+    drop(old_psos);
     // what the previous recording left in unified memory lives until its allocator resets
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
     }
     with_list(obj, |st| new_chunk(obj, st));
+    let init_pso = super::pso_async::resolve_for_bind_retained(pc_pso(pso) as usize);
+    let init_ptr = init_pso.ptr();
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
-    f(pc, allocator, pc_pso(pso))
+    let hr = f(pc, allocator, init_ptr as *mut c_void);
+    if hr >= 0 {
+        if let Some(com) = init_pso.into_com() {
+            with_list(obj, |st| {
+                st.retained_psos.entry(init_ptr).or_insert(com);
+            });
+        }
+    }
+    hr
 }
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -606,7 +625,15 @@ pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
 pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> *mut c_void {
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
-    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default() };
+    let mut st = ListState {
+        pc: pc as usize,
+        allocator: allocator as usize,
+        refs: 1,
+        chunks: Vec::new(),
+        uma: Vec::new(),
+        arena: Default::default(),
+        retained_psos: HashMap::new(),
+    };
     new_chunk(obj, &mut st);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
@@ -881,12 +908,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // a pipeline still being built in the background is waited for; if
                         // the background translation failed, skip instead of binding XCL's
                         // ABI root signature onto the stand-in
-                        let real = super::pso_async::resolve_wait((*p).pc);
-                        if !super::real::is_translated_compute(real) {
+                        let real = super::pso_async::resolve_wait_retained((*p).pc);
+                        let real_ptr = real.ptr();
+                        if !super::real::is_translated_compute(real_ptr) {
                             out.skipped_dispatches += 1;
                             continue;
                         }
-                        let user_sgprs = super::real::pso_user_sgprs(real);
+                        let user_sgprs = super::real::pso_user_sgprs(real_ptr);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
@@ -898,7 +926,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
-                        let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
+                        let own = super::real::pso_root_signature(real_ptr).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
@@ -909,10 +937,15 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         for k in 0..4 {
                             list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
                         }
-                        let raw = real as *mut c_void;
+                        let raw = real_ptr as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
-                        super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z])?;
+                        if !st.retained_psos.contains_key(&real_ptr) {
+                            if let Some(com) = real.clone().into_com() {
+                                st.retained_psos.insert(real_ptr, com);
+                            }
+                        }
+                        super::real::dispatch_chain::dispatch(&list, real_ptr, st.allocator, [x, y, z])?;
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,

@@ -1716,9 +1716,51 @@ pub(super) fn standin_released(pso: usize) {
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    let probe = || -> (bool, bool, u32) {
+        if super::late_release::enabled() {
+            if add(this) == 2 {
+                f(this);
+                (true, true, 0)
+            } else {
+                f(this);
+                let n = f(this);
+                (n == 0, false, n)
+            }
+        } else {
+            // The last reference: forgotten while the object has its address. A pipeline another thread
+            // makes can get that address as soon as it is free, and must keep its own entries.
+            let last = add(this) == 2;
+            if last {
+                forget_pso(this as usize);
+                super::pso_async::release(super::pso_async::released(this as usize));
+            }
+            f(this);
+            let n = f(this);
+            // (two last-but-one releases at once: neither saw itself as the last)
+            if n == 0 && !last {
+                forget_pso(this as usize);
+                super::pso_async::release(super::pso_async::released(this as usize));
+            }
+            (n == 0, false, n)
+        }
+    };
+    if let Some((n, held, real)) = super::pso_async::try_release_standin(this as usize, probe) {
+        if n == 0 {
+            forget_pso(this as usize);
+            if held {
+                super::late_release::hold_deferred(this as usize);
+            }
+            super::pso_async::release(real);
+        }
+        return n;
+    }
+    let (is_zero, held, n) = probe();
+    if is_zero {
         forget_pso(this as usize);
+        if held {
+            super::late_release::hold_deferred(this as usize);
+        }
         super::pso_async::release(super::pso_async::released(this as usize));
     }
     n
@@ -3006,14 +3048,16 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
-    let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
-    let hr = f(this, allocator, resolved);
+    let resolved = super::pso_async::resolve_for_bind_retained(initial_state as usize);
+    let resolved_ptr = resolved.ptr();
+    let hr = f(this, allocator, resolved_ptr as *mut c_void);
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::list_x::retain_pso(this, resolved);
         super::dred::reset(this);
         if !initial_state.is_null() {
-            super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
+            super::dred::mark_pipeline(this, initial_state as usize, resolved_ptr);
         }
     }
     hr
@@ -3912,14 +3956,36 @@ static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
-    let pso = super::pso_async::resolve(pso);
-    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+    let empty = {
+        let g = PSO_USER_SGPRS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return None };
+        if let Some(&v) = m.get(&pso) {
+            return Some(v);
+        }
+        m.is_empty()
+    };
+    if empty {
+        return None;
+    }
+    let pso = super::pso_async::resolve_if_pending(pso);
+    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso.ptr()).copied()
 }
 
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
-    let pso = super::pso_async::resolve(pso);
-    PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
+    let empty = {
+        let g = PSO_RS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return None };
+        if let Some(&v) = m.get(&pso) {
+            return Some(v);
+        }
+        m.is_empty()
+    };
+    if empty {
+        return None;
+    }
+    let pso = super::pso_async::resolve_if_pending(pso);
+    PSO_RS.lock().unwrap().as_ref()?.get(&pso.ptr()).copied()
 }
 
 /// ABI root signatures with static samplers, by sampler set (owned here, never released).
@@ -5957,8 +6023,19 @@ static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mut
 
 /// The compute pass of a pipeline state XCL built from console MS / GS code.
 pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
-    let pso = super::pso_async::resolve(pso);
-    TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
+    let empty = {
+        let g = TWO_PASS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return None };
+        if let Some(tp) = m.get(&pso) {
+            return Some(tp.clone());
+        }
+        m.is_empty()
+    };
+    if empty {
+        return None;
+    }
+    let pso = super::pso_async::resolve_if_pending(pso);
+    TWO_PASS.lock().unwrap().as_ref()?.get(&pso.ptr()).cloned()
 }
 
 pub fn two_pass_count() -> usize {
@@ -7304,10 +7381,12 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    let bound = super::pso_async::resolve(pso as usize);
-    f(this, bound as *mut c_void);
-    super::dred::mark_pipeline(this, pso as usize, bound);
-    super::list_x::on_set_pipeline_state(this, pso as usize);
+    let bound = super::pso_async::resolve_if_pending(pso as usize);
+    let bound_ptr = bound.ptr();
+    f(this, bound_ptr as *mut c_void);
+    super::dred::mark_pipeline(this, pso as usize, bound_ptr);
+    super::list_x::on_set_pipeline_state_resolved(this, pso as usize, &bound);
+    super::bind::note_resolved(this, pso as usize, &bound);
 }
 
 /// The title's markers are counted for `XCL_DRED=1`'s pipeline labels (`dred`).
@@ -7321,13 +7400,16 @@ unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
-    let bound = super::pso_async::resolve_for_bind(pso as usize);
-    f(this, bound as *mut c_void);
+    let bound = super::pso_async::resolve_for_bind_retained(pso as usize);
+    let bound_ptr = bound.ptr();
+    f(this, bound_ptr as *mut c_void);
     if !pso.is_null() {
-        super::dred::mark_pipeline(this, pso as usize, bound);
+        super::dred::mark_pipeline(this, pso as usize, bound_ptr);
     }
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
+    super::bind::note_resolved(this, pso as usize, &bound);
+    super::list_x::retain_pso(this, bound);
 }
 
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
@@ -8212,6 +8294,329 @@ mod readback_routing_tests {
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt(raw).add(2));
             assert_eq!(release(raw), 0);
             assert!(!super::super::list_x::has_list_state(key), "releasing DMA list must remove its list_x::LISTS entry");
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_pso_lifetime_tests {
+    use super::*;
+
+    unsafe fn setup_test_device() -> Option<(ID3D12Device, ID3D12RootSignature)> {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let warp_dev = || {
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).ok()
+        };
+        let dev = if crate::gpu::adapter::Selector::from_env_or("auto") == crate::gpu::adapter::Selector::Warp {
+            warp_dev()?
+        } else {
+            crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0).ok().or_else(warp_dev)?
+        };
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).ok()?;
+        let ser = ser?;
+        let rs: ID3D12RootSignature = dev
+            .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+            .ok()?;
+        Some((dev, rs))
+    }
+
+    unsafe fn make_compute_pso(dev: &ID3D12Device, rs: &ID3D12RootSignature, cs: &[u8]) -> ID3D12PipelineState {
+        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+            ..Default::default()
+        };
+        let pso = dev.CreateComputePipelineState(&desc).expect("CreateComputePipelineState");
+        std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+        pso
+    }
+
+    #[test]
+    fn async_pso_stays_alive_across_standin_release_while_recorded_on_command_list() {
+        unsafe {
+            let Some((dev, rs)) = setup_test_device() else {
+                return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+            };
+            let cs = dummy_cs_bytecode();
+            let standin_pso = make_compute_pso(&dev, &rs, cs);
+            let real_pso = make_compute_pso(&dev, &rs, cs);
+            adopt(standin_pso.as_raw(), Kind::PipelineState);
+            adopt(real_pso.as_raw(), Kind::PipelineState);
+
+            let standin_raw = standin_pso.as_raw() as usize;
+            let real_raw = real_pso.into_raw() as usize;
+            TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(real_raw);
+            super::super::pso_async::submit(standin_raw, true, Box::new(move || real_raw));
+            assert_eq!(super::super::pso_async::resolve_wait(standin_raw), real_raw);
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).expect("list");
+            let list_raw = list.as_raw();
+            adopt(list_raw, Kind::CommandList);
+            super::super::list_x::on_create(list_raw, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            // Bind standin while the list is open; cl_set_pipeline_state resolves standin -> real_raw.
+            cl_set_pipeline_state(list_raw, standin_raw as *mut c_void);
+
+            // Title releases the stand-in while the open recording still references `real_raw`.
+            drop(standin_pso);
+            assert!(
+                is_translated_compute(real_raw),
+                "resolved async PSO must stay alive while still bound on an open command list"
+            );
+
+            // Releasing the command list drops its retained reference and cleans up `real_raw`.
+            list.Close().expect("close");
+            drop(list);
+            assert!(!is_translated_compute(real_raw), "real PSO must be released once the command list ends");
+        }
+    }
+
+    #[test]
+    fn async_pso_stays_alive_through_command_list_reset_and_gpu_retirement() {
+        struct QueueGateGuard {
+            gate: ID3D12Fence,
+            queue: usize,
+        }
+        impl Drop for QueueGateGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = self.gate.Signal(1);
+                    super::super::present::forget_queue_for_test(self.queue);
+                    super::super::late_release::drain_known(true);
+                }
+            }
+        }
+
+        unsafe {
+            let Some((dev, rs)) = setup_test_device() else {
+                return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+            };
+            let cs = dummy_cs_bytecode();
+            let queue: ID3D12CommandQueue =
+                dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).expect("queue");
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            queue.Wait(&gate, 1).expect("wait");
+            let _guard = QueueGateGuard { gate: gate.clone(), queue: queue.as_raw() as usize };
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let standin_pso = make_compute_pso(&dev, &rs, cs);
+            let real_pso = make_compute_pso(&dev, &rs, cs);
+            adopt(standin_pso.as_raw(), Kind::PipelineState);
+            adopt(real_pso.as_raw(), Kind::PipelineState);
+
+            let standin_raw = standin_pso.as_raw() as usize;
+            let real_raw = real_pso.into_raw() as usize;
+            TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(real_raw);
+            super::super::pso_async::submit(standin_raw, true, Box::new(move || real_raw));
+            assert_eq!(super::super::pso_async::resolve_wait(standin_raw), real_raw);
+
+            let alloc1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc1");
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc2");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc1, None).expect("list");
+            let list_raw = list.as_raw();
+            adopt(list_raw, Kind::CommandList);
+            super::super::list_x::on_create(list_raw, alloc1.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            cl_set_pipeline_state(list_raw, standin_raw as *mut c_void);
+            list.Close().expect("close");
+            let cl: ID3D12CommandList = list.cast().expect("cast ID3D12CommandList");
+            let lists = [Some(cl)];
+            queue.ExecuteCommandLists(&lists);
+
+            // Title drops the stand-in while the command list still retains `real_raw`.
+            drop(standin_pso);
+            assert!(is_translated_compute(real_raw), "retained by open/recorded command list");
+            assert!(!super::super::late_release::is_held(real_raw), "not yet in late_release while list holds a ref");
+
+            // Resetting the command list releases its retained ref to `real_raw`, transferring the final
+            // ref into `late_release` until the queued GPU work retires past `gate`.
+            list.Reset(&alloc2, None).expect("reset");
+            assert!(!is_translated_compute(real_raw));
+            if super::super::late_release::enabled() {
+                assert!(
+                    super::super::late_release::is_held(real_raw),
+                    "final PSO ref must stay held until GPU queue retires"
+                );
+            }
+
+            gate.Signal(1).expect("signal gate");
+            let start = std::time::Instant::now();
+            while super::super::late_release::is_held(real_raw) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                super::super::late_release::drain_known(false);
+            }
+            assert!(!super::super::late_release::is_held(real_raw), "late_release must drain once queue retires");
+
+            list.Close().expect("close after reset");
+            drop(lists);
+            drop(list);
+        }
+    }
+
+    #[test]
+    fn shell_standin_resolved_pso_stays_alive_when_shell_released_after_bind() {
+        unsafe {
+            let Some((dev, rs)) = setup_test_device() else {
+                return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+            };
+            let cs = dummy_cs_bytecode();
+            let driver_pso = make_compute_pso(&dev, &rs, cs);
+            let real_pso = make_compute_pso(&dev, &rs, cs);
+            adopt(real_pso.as_raw(), Kind::PipelineState);
+
+            let key = super::super::standin::Key {
+                device: dev.as_raw() as usize,
+                root_signature: rs.as_raw() as usize,
+                kind: 1,
+                state: b"shell_standin_resolved_pso_test".to_vec(),
+            };
+            let (shell_ptr, driver_raw) =
+                super::super::standin::shell(key, || Ok(driver_pso.into_raw() as usize)).expect("standin::shell");
+            let shell_pso = ID3D12PipelineState::from_raw(shell_ptr);
+
+            let shell_raw = shell_ptr as usize;
+            let real_raw = real_pso.into_raw() as usize;
+            TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(real_raw);
+            super::super::pso_async::submit(shell_raw, true, Box::new(move || real_raw));
+            super::super::pso_async::shared(shell_raw, driver_raw);
+            assert_eq!(super::super::pso_async::resolve_wait(shell_raw), real_raw);
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).expect("list");
+            let list_raw = list.as_raw();
+            adopt(list_raw, Kind::CommandList);
+            super::super::list_x::on_create(list_raw, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            cl_set_pipeline_state(list_raw, shell_ptr);
+
+            drop(shell_pso);
+            assert!(
+                is_translated_compute(real_raw),
+                "resolved real PSO must stay alive after shell release while retained by command list"
+            );
+
+            list.Close().expect("close");
+            drop(list);
+            assert!(!is_translated_compute(real_raw));
+        }
+    }
+
+    #[test]
+    fn pending_standin_retained_on_command_list_survives_title_release_until_reset() {
+        struct QueueGateGuard {
+            gate: ID3D12Fence,
+            queue: usize,
+        }
+        impl Drop for QueueGateGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = self.gate.Signal(1);
+                    super::super::present::forget_queue_for_test(self.queue);
+                    super::super::late_release::drain_known(true);
+                }
+            }
+        }
+
+        unsafe {
+            let Some((dev, rs)) = setup_test_device() else {
+                return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+            };
+            let cs = dummy_cs_bytecode();
+            let queue: ID3D12CommandQueue =
+                dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).expect("queue");
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            queue.Wait(&gate, 1).expect("wait");
+            let _guard = QueueGateGuard { gate: gate.clone(), queue: queue.as_raw() as usize };
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let standin_pso = make_compute_pso(&dev, &rs, cs);
+            let real_pso = make_compute_pso(&dev, &rs, cs);
+            adopt(standin_pso.as_raw(), Kind::PipelineState);
+            adopt(real_pso.as_raw(), Kind::PipelineState);
+
+            let standin_raw = standin_pso.as_raw() as usize;
+            let real_raw = real_pso.into_raw() as usize;
+            TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(standin_raw);
+            TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(real_raw);
+
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            super::super::pso_async::submit_lazy(
+                standin_raw,
+                false,
+                Box::new(move || {
+                    let _ = rx.recv();
+                    real_raw
+                }),
+                0,
+            );
+
+            let alloc1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc1");
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc2");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc1, None).expect("list");
+            let list_raw = list.as_raw();
+            adopt(list_raw, Kind::CommandList);
+            super::super::list_x::on_create(list_raw, alloc1.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            list.Close().expect("close initial");
+
+            // Bind/retain the still-pending stand-in via Reset -> retained_psos (COM refcount 1 -> 2).
+            list.Reset(&alloc1, &standin_pso).expect("reset with pending standin");
+            assert!(super::super::pso_async::is_pending(standin_raw), "standin must remain pending");
+            let add_ref_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*(*(standin_raw as *const *const usize)).add(1));
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*(*(standin_raw as *const *const usize)).add(2));
+            assert_eq!(add_ref_fn(standin_raw as *mut c_void), 3, "title + retained_psos must hold 2 refs");
+            assert_eq!(rel_fn(standin_raw as *mut c_void), 2);
+
+            list.Close().expect("close");
+            let cl: ID3D12CommandList = list.cast().expect("cast ID3D12CommandList");
+            let lists = [Some(cl)];
+            queue.ExecuteCommandLists(&lists);
+
+            // Title calls Release() (2 -> 1): must not treat as final, forget async state, or defer list-owned ref.
+            drop(standin_pso);
+            assert!(super::super::pso_async::is_tracked(standin_raw), "standin must remain tracked while retained by list");
+            assert!(super::super::pso_async::is_pending(standin_raw), "standin must not be orphaned while retained by list");
+            assert!(is_translated_compute(standin_raw), "standin must not be forgotten on 2 -> 1 release");
+            assert!(!super::super::late_release::is_held(standin_raw), "2 -> 1 release must not enqueue list-owned ref into late_release");
+
+            // Let the async build finish while the list still owns the stand-in's remaining ref.
+            tx.send(()).unwrap();
+            let wait_built = std::time::Instant::now();
+            while super::super::pso_async::is_pending(standin_raw) && wait_built.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(!super::super::pso_async::is_pending(standin_raw), "async build should finish while list retains standin");
+            assert_eq!(super::super::pso_async::resolve(standin_raw), real_raw, "async state must remain valid until final release");
+
+            // Command list calls Reset() (1 -> 0): drops retained_psos and retires the actual final ref once.
+            list.Reset(&alloc2, None).expect("reset dropping retained standin");
+            assert!(!super::super::pso_async::is_tracked(standin_raw), "final release on reset must retire standin");
+            assert!(!is_translated_compute(standin_raw), "final release on reset must forget standin");
+            if super::super::late_release::enabled() {
+                assert!(
+                    super::super::late_release::is_held(standin_raw),
+                    "actual final ref must be held in late_release until GPU queue retires"
+                );
+            }
+
+            gate.Signal(1).expect("signal gate");
+            let start = std::time::Instant::now();
+            while (super::super::late_release::is_held(standin_raw) || is_translated_compute(real_raw))
+                && start.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                super::super::late_release::drain_known(false);
+            }
+            assert!(!super::super::late_release::is_held(standin_raw), "standin must drain once queue retires");
+            assert!(!is_translated_compute(real_raw), "built real PSO must retire cleanly with standin");
+
+            list.Close().expect("close after final reset");
+            drop(lists);
+            drop(list);
         }
     }
 }
@@ -9422,3 +9827,50 @@ void main() {
     }
 }
 
+
+#[cfg(test)]
+mod pso_release_tests {
+    use super::*;
+
+    /// An adopted pipeline as `orig_fn` sees it: its vtable, the original one before that.
+    #[repr(C)]
+    struct Pipeline {
+        vtable: *const usize,
+        refs: u32,
+        /// the pipeline was still known when its last reference went
+        known_when_freed: Option<bool>,
+    }
+
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        let p = &mut *(this as *mut Pipeline);
+        p.refs += 1;
+        p.refs
+    }
+
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        let p = &mut *(this as *mut Pipeline);
+        p.refs -= 1;
+        if p.refs == 0 {
+            p.known_when_freed = Some(is_translated_compute(this as usize));
+        }
+        p.refs
+    }
+
+    /// What XCL keeps of a pipeline goes before the driver frees it, not after: its address can be
+    /// another pipeline's by then. It stays while there are other references.
+    #[test]
+    fn a_pipeline_is_forgotten_before_its_address_is_free() {
+        let orig: [usize; 3] = [0, add_ref as usize, release as usize];
+        let ext: [usize; 4] = [orig.as_ptr() as usize, 0, 0, 0];
+        let mut p = Box::new(Pipeline { vtable: &ext[1], refs: 2, known_when_freed: None });
+        let this = p.as_mut() as *mut Pipeline as *mut c_void;
+        register_translated_compute_for_test(this as usize);
+        unsafe {
+            assert_eq!(pso_release(this), 1);
+            assert!(is_translated_compute(this as usize), "another reference is left");
+            assert_eq!(pso_release(this), 0);
+        }
+        assert_eq!(p.known_when_freed, Some(false));
+        assert!(!is_translated_compute(this as usize));
+    }
+}

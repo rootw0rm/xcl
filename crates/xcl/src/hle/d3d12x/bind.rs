@@ -29,6 +29,8 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    pso_resolved: super::pso_async::Resolved,
+    pso_settled: bool,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
@@ -73,41 +75,75 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
-    let (old, blocks) = with(list, |s| {
+    let (old, blocks, old_pso) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.pso = initial_pso;
+        s.pso_settled = false;
+        let old_pso = std::mem::take(&mut s.pso_resolved);
         s.layout = None;
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
-        (old, std::mem::take(&mut s.uma))
+        (old, std::mem::take(&mut s.uma), old_pso)
     });
+    drop(old_pso);
     console_list::hold_until_reset(old, blocks);
+}
+
+/// Record the resolved handle from `cl_set_pipeline_state` / `cl_reset` / `cl_clear_state`
+/// so subsequent draws/dispatches avoid re-querying `pso_async` when already settled.
+pub(super) fn note_resolved(list: *mut c_void, pso: usize, resolved: &super::pso_async::Resolved) {
+    let next = if resolved.has_com() || !resolved.is_settled() {
+        resolved.clone()
+    } else {
+        super::pso_async::Resolved::none()
+    };
+    let old = with(list, |s| {
+        if s.pso != pso {
+            return next;
+        }
+        s.pso_settled = resolved.is_settled();
+        std::mem::replace(&mut s.pso_resolved, next)
+    });
+    drop(old);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
-    with(list, |s| {
+    let old_pso = with(list, |s| {
         s.pso = pso;
+        s.pso_settled = false;
+        let old_pso = std::mem::take(&mut s.pso_resolved);
         s.layout = None;
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        old_pso
     });
+    drop(old_pso);
 }
 
 /// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, pso_resolved, pso_settled) = with(from, |s| {
+        (
+            s.layout.clone(),
+            s.args.clone(),
+            s.layout_gfx.clone(),
+            s.args_gfx.clone(),
+            s.rs_gfx,
+            s.pso,
+            s.pso_resolved.clone(),
+            s.pso_settled,
+        )
     });
-    let (old, blocks) = with(to, |s| {
+    let (old, blocks, old_pso) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.layout = layout;
@@ -116,8 +152,11 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
         s.pso = pso;
-        (old, std::mem::take(&mut s.uma))
+        s.pso_settled = pso_settled;
+        let old_pso = std::mem::replace(&mut s.pso_resolved, pso_resolved);
+        (old, std::mem::take(&mut s.uma), old_pso)
     });
+    drop(old_pso);
     console_list::hold_until_reset(old, blocks);
 }
 
@@ -276,6 +315,43 @@ pub(super) fn note_dispatch_only_signature(sig: usize, stride: Option<u32>) {
     };
 }
 
+/// Resolve the pipeline currently bound on `this` (`s.pso`), reusing `s.pso_resolved` if `s.pso`
+/// was already settled or released from `pso_async`.
+unsafe fn resolve_bound_wait(this: *mut c_void) -> (usize, super::pso_async::Resolved) {
+    let fast = with(this, |s| {
+        if s.pso_settled {
+            let res = if s.pso_resolved.ptr() != 0 {
+                s.pso_resolved.clone()
+            } else {
+                super::pso_async::Resolved::unretained_settled(s.pso)
+            };
+            Ok((s.pso, res))
+        } else {
+            Err((s.pso, s.pso_resolved.clone()))
+        }
+    });
+    let (pso, saved) = match fast {
+        Ok(hit) => return hit,
+        Err(miss) => miss,
+    };
+    let resolved = super::pso_async::resolve_cached_wait(pso, &saved);
+    let next = if resolved.has_com() || !resolved.is_settled() {
+        resolved.clone()
+    } else {
+        super::pso_async::Resolved::none()
+    };
+    let old = with(this, |s| {
+        if s.pso == pso {
+            s.pso_settled = resolved.is_settled();
+            std::mem::replace(&mut s.pso_resolved, next)
+        } else {
+            next
+        }
+    });
+    drop(old);
+    (pso, resolved)
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -287,7 +363,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    let (raw_pso, pso_guard) = resolve_bound_wait(this);
+    let pso = pso_guard.ptr();
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off_title, count_off_title) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -297,7 +374,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(raw_pso) {
+        if !pso_guard.is_settled() && super::pso_async::is_pending(raw_pso) {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -364,7 +441,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
     }
-    match bind_abi(this, list, pso, gfx) {
+    match bind_abi(this, list, &pso_guard, gfx) {
         Ok(()) => {
             if compute {
                 match super::real::dispatch_chain::whole(list, pso, with(this, |s| s.allocator)) {
@@ -549,7 +626,8 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
 /// not with the rect list GS (`real::has_rect_list_gs`), which completes each rect itself – both
 /// would draw every rect twice (each CPU half is three corners of the rect).
 fn cpu_rect_expansion(pso: usize) -> bool {
-    !super::real::has_rect_list_gs(super::pso_async::resolve(pso))
+    let pso = super::pso_async::resolve_if_pending(pso);
+    !super::real::has_rect_list_gs(pso.ptr())
 }
 
 /// #12 DrawInstanced
@@ -606,9 +684,9 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 /// translation, or no unified memory).
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
-    let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    let real = super::pso_async::resolve_wait(pso);
+    let (pso, resolved) = resolve_bound_wait(this);
+    let real = resolved.ptr();
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
@@ -632,7 +710,6 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -644,7 +721,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        if super::pso_async::is_pending(pso) {
+        if !resolved.is_settled() && super::pso_async::is_pending(pso) {
             super::list_x::note_dropped_draw(this);
         }
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
@@ -656,7 +733,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
-    match bind_abi(this, &list, pso, true) {
+    match bind_abi(this, &list, &resolved, true) {
         Ok(()) => {
             count(DRAWS);
             Some(list)
@@ -685,7 +762,8 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
     if super::present::activity().0 < 300 {
         return;
     }
-    let Some((vs, ps)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
+    let resolved_pso = super::pso_async::resolve_if_pending(pso);
+    let Some((vs, ps)) = super::real::pso_shaders(resolved_pso.ptr()) else { return };
     let rt = super::present::rt0_resource(this as usize).unwrap_or(0);
     let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.SampleDesc.Count) });
     {
@@ -765,9 +843,10 @@ unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize) {
                     super::list_x::watch_dsv(dsv);
                 }
                 let d = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.Flags.0) });
+                let resolved_pso = super::pso_async::resolve_if_pending(pso);
                 crate::xlog_info!(
                     "frame trace: a draw (shaders {:x?}, {}) reads a watched target {r:#x} {:?} at {addr:x?} (slot {k}), drawing into {rt:#x} {:?}{} – {}",
-                    super::real::pso_shaders(super::pso_async::resolve(pso)),
+                    super::real::pso_shaders(resolved_pso.ptr()),
                     super::list_x::state_summary(this),
                     d(r),
                     d(rt),
@@ -777,7 +856,7 @@ unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize) {
                 let args = DRAW_ARGS.with(|d| d.get());
                 crate::xlog_info!(
                     "frame trace: … that draw: {args:?} (indexed, count, instances, first, base vertex); input layout [{}]; {}",
-                    super::real::pso_layout(super::pso_async::resolve(pso)).unwrap_or_default(),
+                    super::real::pso_layout(resolved_pso.ptr()).unwrap_or_default(),
                     super::list_x::geometry_summary(this, args)
                 );
                 return;
@@ -825,26 +904,27 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
         return;
     }
     let Some(rt) = super::present::rt0_resource(this as usize) else { return };
+    let resolved_pso = super::pso_async::resolve_if_pending(pso);
     let wanted = traced_shaders();
     if wanted.is_empty() {
         // draws into a presented target, or – `XCL_TRACE_UI_ANY` – into any target
         if super::present::activity().0 < 300 || (!super::present::is_presented(rt) && std::env::var_os("XCL_TRACE_UI_ANY").is_none()) {
             return;
         }
-    } else if !super::real::pso_shaders(super::pso_async::resolve(pso)).is_some_and(|(v, p)| wanted.contains(&v) || wanted.contains(&p)) {
+    } else if !super::real::pso_shaders(resolved_pso.ptr()).is_some_and(|(v, p)| wanted.contains(&v) || wanted.contains(&p)) {
         return;
     } else {
         super::present::watch_rt(rt);
     }
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let sh = super::real::pso_shaders(super::pso_async::resolve(pso)).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
+    let sh = super::real::pso_shaders(resolved_pso.ptr()).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
     crate::xlog_info!("frame trace: UI draw (pipeline {pso:#x}, {}): {}", sh.unwrap_or_default(), root_args_summary(this, 16));
     if !wanted.is_empty() {
         // the picked shaders' geometry too (vertices dumped at the next present)
         let args = DRAW_ARGS.with(|d| d.get());
         crate::xlog_info!(
             "frame trace: … that draw: {args:?} (indexed, count, instances, first, base vertex); input layout [{}]; {}",
-            super::real::pso_layout(super::pso_async::resolve(pso)).unwrap_or_default(),
+            super::real::pso_layout(resolved_pso.ptr()).unwrap_or_default(),
             super::list_x::geometry_summary(this, args)
         );
     }
@@ -927,7 +1007,12 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 
 /// #25 SetPipelineState: noted, then bound as on the PC
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
-    with(this, |s| s.pso = pso as usize);
+    let old = with(this, |s| {
+        s.pso = pso as usize;
+        s.pso_settled = false;
+        std::mem::take(&mut s.pso_resolved)
+    });
+    drop(old);
     super::real::bind_pipeline(this, pso);
 }
 
@@ -937,7 +1022,8 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
     if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
         return super::pso_async::need_by_submit(pso);
     }
-    let pso = super::pso_async::resolve_wait(pso);
+    let (_, real) = resolve_bound_wait(this);
+    let pso = real.ptr();
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -949,7 +1035,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
-    match translated_dispatch(this, list, pso, x, y, z) {
+    match translated_dispatch(this, list, &real, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -1066,18 +1152,18 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
-unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
+unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, real: &super::pso_async::Resolved, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
-        trace_fullscreen(this, pso, [x, y, z]);
+        trace_fullscreen(this, real.ptr(), [x, y, z]);
     }
-    bind_abi(this, list, pso, false)?;
-    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+    bind_abi(this, list, real, false)?;
+    super::real::dispatch_chain::dispatch(list, real.ptr(), with(this, |s| s.allocator), [x, y, z])
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
-unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, resolved: &super::pso_async::Resolved, gfx: bool) -> Result<(), String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
@@ -1089,8 +1175,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
+    let real = resolved.ptr();
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
@@ -1120,9 +1205,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     }
-    let real = real as *mut c_void;
-    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
+    let raw = real as *mut c_void;
+    let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("pipeline")?;
     list.SetPipelineState(pc);
+    super::list_x::retain_pso(this, resolved.clone());
     Ok(())
 }
 
