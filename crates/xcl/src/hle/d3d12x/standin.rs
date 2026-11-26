@@ -107,6 +107,21 @@ pub unsafe fn shell(key: Key, make: impl FnOnce() -> Result<usize, HRESULT>) -> 
     Ok((p as *mut c_void, pipeline))
 }
 
+/// What the driver gets for the title's object `obj`: for a shell, the pipeline behind it now
+/// (`pso_async::current`, else its shared driver pipeline); any other object is itself.
+///
+/// # Safety
+/// `obj` is 0 or a live COM object.
+pub unsafe fn driver_object(obj: usize) -> usize {
+    if obj == 0 || !VTABLE.get().is_some_and(|&v| *(obj as *const usize) == v) {
+        return obj;
+    }
+    match super::pso_async::current(obj) {
+        d if d != obj && d != 0 => d,
+        _ => (&*(obj as *const Shell)).shared.pipeline,
+    }
+}
+
 /// ID3D12PipelineState as the title sees it.
 #[repr(C)]
 struct Shell {
@@ -241,9 +256,11 @@ unsafe extern "system" fn get_cached_blob(this: *mut c_void, ppv: *mut *mut c_vo
 
 const SLOTS: usize = 64;
 
+/// The shells' vtable, once one was made.
+static VTABLE: OnceLock<usize> = OnceLock::new();
+
 fn vtable() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
+    *VTABLE.get_or_init(|| {
         let known: [usize; 9] = [
             query_interface as usize,
             add_ref as usize,

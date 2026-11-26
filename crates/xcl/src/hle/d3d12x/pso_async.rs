@@ -1359,6 +1359,16 @@ pub fn resolve(pso: usize) -> usize {
     resolve_if_pending(pso).ptr()
 }
 
+/// The pipeline behind `pso` now, neither built nor waited for here: the real one once built,
+/// else what binds get till then (`pso` itself when it is not a stand-in).
+pub fn current(pso: usize) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    match p.real.load(Ordering::Acquire) {
+        0 => p.stand(pso),
+        r => r,
+    }
+}
+
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {

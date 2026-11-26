@@ -3017,6 +3017,55 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
     hr
 }
 
+type ResidencyFn = unsafe extern "system" fn(*mut c_void, u32, *const usize) -> HRESULT;
+
+/// `f(this, n, objects)` with the driver's objects for the title's (`standin::driver_object`):
+/// a stand-in pipeline that is no driver object goes to the driver as the pipeline behind it,
+/// in a copy of the array (the title's is left as it is).
+unsafe fn with_driver_objects(
+    f: ResidencyFn,
+    this: *mut c_void,
+    n: u32,
+    objects: *const usize,
+) -> HRESULT {
+    if objects.is_null() || n == 0 {
+        return f(this, n, objects);
+    }
+    let given = std::slice::from_raw_parts(objects, n as usize);
+    let mut copy: Option<Vec<usize>> = None;
+    for (i, &o) in given.iter().enumerate() {
+        let d = super::standin::driver_object(o);
+        if d != o {
+            copy.get_or_insert_with(|| given.to_vec())[i] = d;
+        }
+    }
+    f(this, n, copy.as_ref().map_or(objects, |c| c.as_ptr()))
+}
+
+/// MakeResident(count, objects): stand-in pipelines as their driver pipelines.
+unsafe extern "system" fn dev_make_resident(
+    this: *mut c_void,
+    n: u32,
+    objects: *const usize,
+) -> HRESULT {
+    with_driver_objects(
+        std::mem::transmute::<usize, ResidencyFn>(orig_fn(this, slot_of(this, "MakeResident"))),
+        this,
+        n,
+        objects,
+    )
+}
+
+/// Evict(count, objects): stand-in pipelines as their driver pipelines.
+unsafe extern "system" fn dev_evict(this: *mut c_void, n: u32, objects: *const usize) -> HRESULT {
+    with_driver_objects(
+        std::mem::transmute::<usize, ResidencyFn>(orig_fn(this, slot_of(this, "Evict"))),
+        this,
+        n,
+        objects,
+    )
+}
+
 fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
     let mut v: Vec<(&'static str, usize)> = vec![("QueryInterface", qi_override as usize)];
     match kind {
@@ -3027,6 +3076,8 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateGraphicsPipelineState", dev_create_graphics_pso as usize),
             ("CreateComputePipelineState", dev_create_compute_pso as usize),
             ("CreateCommandList", dev_create_command_list as usize),
+            ("MakeResident", dev_make_resident as usize),
+            ("Evict", dev_evict as usize),
             ("CreateDescriptorHeap", dev_create_descriptor_heap as usize),
             ("CreateRootSignature", dev_create_root_signature as usize),
             ("CreateRenderTargetView", dev_create_rtv as usize),
@@ -10454,3 +10505,221 @@ mod list_release_tests {
     }
 }
 
+#[cfg(test)]
+mod residency_tests {
+    use super::super::{pso_async, standin};
+    use super::*;
+    use std::cell::RefCell;
+
+    /// A COM object that counts its references (a driver pipeline, a heap).
+    #[repr(C)]
+    struct Counted {
+        vtable: *const usize,
+        refs: AtomicU64,
+    }
+
+    unsafe extern "system" fn up(this: *mut c_void) -> u32 {
+        ((*(this as *const Counted))
+            .refs
+            .fetch_add(1, Ordering::AcqRel)
+            + 1) as u32
+    }
+    unsafe extern "system" fn down(this: *mut c_void) -> u32 {
+        ((*(this as *const Counted))
+            .refs
+            .fetch_sub(1, Ordering::AcqRel)
+            - 1) as u32
+    }
+
+    fn counted() -> usize {
+        let v: &'static [usize; 3] = Box::leak(Box::new([0, up as usize, down as usize]));
+        Box::leak(Box::new(Counted {
+            vtable: v.as_ptr(),
+            refs: AtomicU64::new(1),
+        })) as *const Counted as usize
+    }
+
+    fn refs(o: usize) -> u64 {
+        unsafe { (*(o as *const Counted)).refs.load(Ordering::Acquire) }
+    }
+
+    type Got = (&'static str, u32, usize, Vec<usize>);
+
+    thread_local! {
+        /// What the driver's MakeResident / Evict got: (method, count, array, its objects).
+        static GOT: RefCell<Vec<Got>> = const { RefCell::new(Vec::new()) };
+    }
+
+    unsafe fn record(method: &'static str, n: u32, objects: *const usize) -> HRESULT {
+        let seen = if objects.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(objects, n as usize).to_vec()
+        };
+        GOT.with(|g| g.borrow_mut().push((method, n, objects as usize, seen)));
+        S_OK
+    }
+    unsafe extern "system" fn driver_make_resident(
+        _: *mut c_void,
+        n: u32,
+        objects: *const usize,
+    ) -> HRESULT {
+        record("MakeResident", n, objects)
+    }
+    unsafe extern "system" fn driver_evict(
+        _: *mut c_void,
+        n: u32,
+        objects: *const usize,
+    ) -> HRESULT {
+        record("Evict", n, objects)
+    }
+
+    fn got() -> Vec<Got> {
+        GOT.with(|g| std::mem::take(&mut *g.borrow_mut()))
+    }
+
+    /// An adopted device whose PC MakeResident / Evict are `driver_*`.
+    struct FakeDevice {
+        obj: Box<[usize; 1]>,
+    }
+
+    impl FakeDevice {
+        fn new() -> Self {
+            let iface = layout::find("ID3D12Device").unwrap();
+            let mut pc = vec![0usize; iface.methods.len()];
+            pc[layout::slot(iface, "MakeResident").unwrap()] = driver_make_resident as usize;
+            pc[layout::slot(iface, "Evict").unwrap()] = driver_evict as usize;
+            let pc: &'static [usize] = Box::leak(pc.into_boxed_slice());
+            // the extended vtable's word before slot 0 points at the PC table
+            let table: &'static [usize; 2] = Box::leak(Box::new([pc.as_ptr() as usize, 0]));
+            let ext = table.as_ptr() as usize + 8;
+            CLASSES.lock().unwrap().push(Class {
+                orig: pc.as_ptr() as usize,
+                kind: Kind::Device,
+                ext,
+                iface,
+                public: pc.len(),
+                scanned: pc.len(),
+            });
+            FakeDevice {
+                obj: Box::new([ext]),
+            }
+        }
+
+        fn this(&self) -> *mut c_void {
+            self.obj.as_ptr() as *mut c_void
+        }
+    }
+
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            let ext = self.obj[0];
+            CLASSES.lock().unwrap().retain(|c| c.ext != ext);
+        }
+    }
+
+    /// The title's object for a pipeline of `device` that `driver` stands in for.
+    fn shell(device: usize, driver: usize) -> usize {
+        let key = standin::Key {
+            device,
+            root_signature: 0,
+            kind: 0,
+            state: Vec::new(),
+        };
+        unsafe { standin::shell(key, || Ok(driver)).unwrap().0 as usize }
+    }
+
+    unsafe fn release(o: usize) -> u32 {
+        let f: unsafe extern "system" fn(usize) -> u32 =
+            std::mem::transmute(*(*(o as *const *const usize)).add(2));
+        f(o)
+    }
+
+    #[test]
+    fn device_overrides_make_resident_and_evict() {
+        let o = overrides(Kind::Device);
+        assert!(o.contains(&("MakeResident", dev_make_resident as usize)));
+        assert!(o.contains(&("Evict", dev_evict as usize)));
+    }
+
+    /// A stand-in that is no driver object (`standin::shell`) reaches the driver's MakeResident
+    /// and Evict as the pipeline behind it – its shared driver pipeline until the real one is
+    /// built, then the real one – in a copy of the title's array.
+    #[test]
+    fn residency_calls_give_the_driver_the_pipeline_behind_a_stand_in() {
+        let dev = FakeDevice::new();
+        let (heap, driver, real) = (counted(), counted(), counted());
+        let s = shell(0x7E57_2455_0001, driver);
+        unsafe {
+            // not known to pso_async (yet): its own driver pipeline
+            let given = [heap, s, 0];
+            assert_eq!(dev_make_resident(dev.this(), 3, given.as_ptr()), S_OK);
+            let g = got();
+            assert_eq!(g.len(), 1);
+            assert_eq!((g[0].0, g[0].1), ("MakeResident", 3));
+            assert_eq!(
+                g[0].3,
+                vec![heap, driver, 0],
+                "the stand-in as its driver pipeline"
+            );
+            assert_ne!(g[0].2, given.as_ptr() as usize, "a copy");
+            assert_eq!(given, [heap, s, 0], "the title's array is left as it is");
+
+            // a lazy pipeline not built yet: what binds get till then
+            pso_async::submit_lazy(s, false, Box::new(move || real), 0);
+            pso_async::shared(s, driver);
+            assert_eq!(dev_evict(dev.this(), 1, &s), S_OK);
+            assert_eq!(got()[0].3, vec![driver]);
+            assert!(
+                pso_async::is_pending(s),
+                "a residency call does not build the pipeline"
+            );
+
+            // built: the real pipeline
+            assert_eq!(pso_async::resolve_wait(s), real);
+            let given = [s, heap];
+            assert_eq!(dev_evict(dev.this(), 2, given.as_ptr()), S_OK);
+            let g = got();
+            assert_eq!((g[0].0, &g[0].3), ("Evict", &vec![real, heap]));
+
+            assert_eq!(release(s), 0);
+            assert_eq!(
+                (refs(heap), refs(driver), refs(real)),
+                (1, 0, 0),
+                "nothing taken or kept"
+            );
+        }
+    }
+
+    /// Arrays without stand-ins (empty, null, other objects) go to the driver as they are.
+    #[test]
+    fn residency_calls_without_stand_ins_hand_the_driver_the_titles_array() {
+        let dev = FakeDevice::new();
+        let (heap, driver) = (counted(), counted());
+        // (the shells' vtable exists: other objects are told apart from shells)
+        let s = shell(0x7E57_2455_0002, driver);
+        unsafe {
+            assert_eq!(dev_make_resident(dev.this(), 0, std::ptr::null()), S_OK);
+            assert_eq!(dev_evict(dev.this(), 2, std::ptr::null()), S_OK);
+            let given = [heap, 0, heap];
+            assert_eq!(dev_make_resident(dev.this(), 3, given.as_ptr()), S_OK);
+            assert_eq!(dev_evict(dev.this(), 0, given.as_ptr()), S_OK);
+            let g = got();
+            assert_eq!(g.len(), 4);
+            assert_eq!((g[0].0, g[0].1, g[0].2), ("MakeResident", 0, 0));
+            assert_eq!(
+                (g[1].0, g[1].1, g[1].2),
+                ("Evict", 2, 0),
+                "a null array is the driver's to refuse"
+            );
+            assert_eq!(
+                (g[2].2, &g[2].3),
+                (given.as_ptr() as usize, &vec![heap, 0, heap]),
+                "the title's own array"
+            );
+            assert_eq!((g[3].1, g[3].2), (0, given.as_ptr() as usize));
+            release(s);
+        }
+        assert_eq!((refs(heap), refs(driver)), (1, 0));
+    }
+}
