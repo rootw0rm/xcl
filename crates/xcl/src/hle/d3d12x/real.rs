@@ -2208,12 +2208,7 @@ unsafe extern "system" fn dev_create_uav_checked_x(
                         rd.Format.0
                     );
                 }
-                let null_dim = desc.as_ref().map_or_else(|| default_uav_dimension(&rd), |d| d.ViewDimension);
-                let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT,
-                    ViewDimension: null_dim,
-                    ..Default::default()
-                };
+                let null_desc = null_uav_desc(desc.as_ref(), Some(&rd));
                 return dev_create_uav_x(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, cpu);
             }
             if let Some(ref c) = patched {
@@ -2556,6 +2551,7 @@ fn null_uav_desc(
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
     let dim = desc
         .map(|v| v.ViewDimension.0)
+        .filter(|&d| d != 0)
         .or_else(|| rd.map(resource_dim_to_view))
         .unwrap_or(D3D12_UAV_DIMENSION_TEXTURE2D.0);
     match dim {
@@ -2571,7 +2567,7 @@ fn null_uav_desc(
                 Texture1DArray: D3D12_TEX1D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 0, ArraySize: 1 },
             },
         },
-        5 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        5 | 7 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_FLOAT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -2590,6 +2586,37 @@ fn null_uav_desc(
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         },
+    }
+}
+
+/// Map a typeless or depth DXGI format to a concrete same-family SRV format so
+/// `CreateShaderResourceView` never receives a `*_TYPELESS` or depth-only format.
+fn concrete_srv_format(fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    match fmt {
+        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_TYPELESS => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
+        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_D24_UNORM_S8_UINT => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_D16_UNORM => DXGI_FORMAT_R16_UNORM,
+        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_BC1_TYPELESS => DXGI_FORMAT_BC1_UNORM,
+        DXGI_FORMAT_BC2_TYPELESS => DXGI_FORMAT_BC2_UNORM,
+        DXGI_FORMAT_BC3_TYPELESS => DXGI_FORMAT_BC3_UNORM,
+        DXGI_FORMAT_BC4_TYPELESS => DXGI_FORMAT_BC4_UNORM,
+        DXGI_FORMAT_BC5_TYPELESS => DXGI_FORMAT_BC5_UNORM,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
+        DXGI_FORMAT_BC6H_TYPELESS => DXGI_FORMAT_BC6H_UF16,
+        DXGI_FORMAT_BC7_TYPELESS => DXGI_FORMAT_BC7_UNORM,
+        f => f,
     }
 }
 
@@ -2632,7 +2659,7 @@ fn uav_companion_srv(
         None => {
             let r = rd?;
             let dim = resource_dim_to_view(r);
-            if !matches!(dim, 2 | 3 | 4 | 5 | 8) {
+            if !matches!(dim, 2 | 3 | 4 | 5 | 6 | 7 | 8) {
                 return None;
             }
             (dim, r.Format, 0, 0, r.DepthOrArraySize as u32, 0)
@@ -2659,6 +2686,7 @@ fn uav_companion_srv(
         (mip, first_slice, array, plane)
     };
 
+    let msaa = !null_resource && rd.is_some_and(|r| r.SampleDesc.Count > 1);
     let mut srv = match dim {
         2 => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: fmt,
@@ -2682,7 +2710,7 @@ fn uav_companion_srv(
                 },
             },
         },
-        4 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+        4 if !msaa => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: fmt,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -2690,7 +2718,13 @@ fn uav_companion_srv(
                 Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: plane, ResourceMinLODClamp: 0.0 },
             },
         },
-        5 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+        4 | 6 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: fmt,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DMS: D3D12_TEX2DMS_SRV::default() },
+        },
+        5 if !msaa => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: fmt,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -2703,6 +2737,14 @@ fn uav_companion_srv(
                     PlaneSlice: plane,
                     ResourceMinLODClamp: 0.0,
                 },
+            },
+        },
+        5 | 7 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: fmt,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: first_slice, ArraySize: array_size },
             },
         },
         8 => D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -2721,6 +2763,7 @@ fn uav_companion_srv(
             srv = v;
         }
     }
+    srv.Format = concrete_srv_format(srv.Format);
     Some(srv)
 }
 
@@ -9928,6 +9971,260 @@ void main() {
                 vec![0x1111_0001, 0x2222_0002, 0x3333_0003, 0x4444_0004, 0x5555_0005, 0, 0, 0, 0x5555_0005, 0],
                 "companion SRVs (1D, 1DArray, 2D, 2DArray, 3D), null image views, and copied staging slots must all read back accurately"
             );
+        }
+    }
+
+    #[test]
+    fn uav_companion_srv_msaa_typeless_and_null_uav_dimensions() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM,
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_TYPELESS,
+            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+        };
+
+        let msaa_tex = |slices: u16, fmt: DXGI_FORMAT| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 32,
+            Height: 32,
+            DepthOrArraySize: slices,
+            MipLevels: 1,
+            Format: fmt,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+
+        // MSAA 2D texture -> TEXTURE2DMS (both default desc and explicit Texture2D UAV desc)
+        let ms2d = msaa_tex(1, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let srv_ms2d_def = uav_companion_srv(Some(&ms2d), None, false).expect("MSAA 2D default companion SRV");
+        assert_eq!((srv_ms2d_def.ViewDimension, srv_ms2d_def.Format), (D3D12_SRV_DIMENSION_TEXTURE2DMS, DXGI_FORMAT_R8G8B8A8_UNORM));
+        let u2d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let srv_ms2d = uav_companion_srv(Some(&ms2d), Some(&u2d), false).expect("MSAA 2D companion SRV");
+        assert_eq!((srv_ms2d.ViewDimension, srv_ms2d.Format), (D3D12_SRV_DIMENSION_TEXTURE2DMS, DXGI_FORMAT_R8G8B8A8_UNORM));
+
+        // MSAA 2DArray texture -> TEXTURE2DMSARRAY with resolved slice range
+        let ms2da = msaa_tex(4, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        let u2da = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 1, ArraySize: u32::MAX, PlaneSlice: 0 },
+            },
+        };
+        let srv_ms2da = uav_companion_srv(Some(&ms2da), Some(&u2da), false).expect("MSAA 2DArray companion SRV");
+        assert_eq!((srv_ms2da.ViewDimension, srv_ms2da.Format), (D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY, DXGI_FORMAT_R16G16B16A16_FLOAT));
+        assert_eq!(unsafe { (srv_ms2da.Anonymous.Texture2DMSArray.FirstArraySlice, srv_ms2da.Anonymous.Texture2DMSArray.ArraySize) }, (1, 3));
+
+        // Non-depth *_TYPELESS resources with desc == None / Format == UNKNOWN resolve to concrete same-family formats
+        for (typeless, want) in [
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM),
+            (DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM),
+        ] {
+            let rd = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1, typeless, D3D12_RESOURCE_FLAG_NONE);
+            let s_def = uav_companion_srv(Some(&rd), None, false).expect("typeless default SRV");
+            assert_eq!(s_def.Format, want, "default SRV for {typeless:?}");
+            let u_unk = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            let s_unk = uav_companion_srv(Some(&rd), Some(&u_unk), false).expect("typeless UNKNOWN-format SRV");
+            assert_eq!(s_unk.Format, want, "UNKNOWN-format SRV for {typeless:?}");
+        }
+
+        // Null-resource companion SRV never emits a typeless or depth format
+        let u_null_typeless = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        assert_eq!(uav_companion_srv(None, Some(&u_null_typeless), true).unwrap().Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let u_null_depth = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        assert_eq!(uav_companion_srv(None, Some(&u_null_depth), true).unwrap().Format, DXGI_FORMAT_R32_FLOAT);
+
+        // null_uav_desc sets valid non-zero ArraySize / WSize and falls back to rd when ViewDimension == UNKNOWN
+        let rd1da = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 16, 1, 3, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        let rd2da = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 3, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        let rd3d = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 8, 4, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        let n1da = null_uav_desc(None, Some(&rd1da));
+        let n2da = null_uav_desc(None, Some(&rd2da));
+        let n3d = null_uav_desc(None, Some(&rd3d));
+        assert_eq!((n1da.ViewDimension, unsafe { n1da.Anonymous.Texture1DArray.ArraySize }), (D3D12_UAV_DIMENSION_TEXTURE1DARRAY, 1));
+        assert_eq!((n2da.ViewDimension, unsafe { n2da.Anonymous.Texture2DArray.ArraySize }), (D3D12_UAV_DIMENSION_TEXTURE2DARRAY, 1));
+        assert_eq!((n3d.ViewDimension, unsafe { n3d.Anonymous.Texture3D.WSize }), (D3D12_UAV_DIMENSION_TEXTURE3D, 1));
+        let unk_dim = D3D12_UNORDERED_ACCESS_VIEW_DESC::default();
+        let n_unk = null_uav_desc(Some(&unk_dim), Some(&rd3d));
+        assert_eq!((n_unk.ViewDimension, unsafe { n_unk.Anonymous.Texture3D.WSize }), (D3D12_UAV_DIMENSION_TEXTURE3D, 1));
+    }
+
+    /// D3D12 debug layer: verify `dev_create_uav_checked_x` null UAV fallback on Texture1DArray /
+    /// Texture2DArray / Texture3D and `dev_create_uav_x` companion SRVs on MSAA and non-depth
+    /// `*_TYPELESS` textures produce zero D3D12 validation errors (#2461).
+    #[test]
+    fn gpu_uav_null_fallback_and_msaa_typeless_companion_srv_debug_layer() {
+        const CHILD: &str = "XCL_TEST_UAV_DEBUG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::real::uav_companion_srv_tests::gpu_uav_null_fallback_and_msaa_typeless_companion_srv_debug_layer", "--nocapture"])
+                .env(CHILD, "1")
+                .env("XCL_UMA_MB", "64")
+                .env("XCL_COHERENT_MB", "64")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stderr.lines().filter(|l| l.starts_with("SKIPPED ")) {
+                eprintln!("{line}");
+            }
+            assert!(
+                output.status.success(),
+                "child failed ({:?}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                stderr
+            );
+            return;
+        }
+
+        unsafe {
+            use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+            };
+
+            match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                Ok(d) => d.EnableDebugLayer(),
+                Err(e) => {
+                    crate::gpu::recomp::runner::skip_test(&format!("no D3D12 debug layer ({e})"));
+                    return;
+                }
+            }
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let Ok(iq) = dev.cast::<ID3D12InfoQueue>() else {
+                crate::gpu::recomp::runner::skip_test("device has no D3D12InfoQueue");
+                return;
+            };
+            let take_errors = |q: &ID3D12InfoQueue| -> Vec<String> {
+                let mut out = Vec::new();
+                for i in 0..q.GetNumStoredMessages() {
+                    let mut len = 0usize;
+                    if q.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u64; len.div_ceil(8)];
+                    let m = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                    if q.GetMessage(i, Some(m), &mut len).is_ok()
+                        && matches!((*m).Severity, D3D12_MESSAGE_SEVERITY_ERROR | D3D12_MESSAGE_SEVERITY_CORRUPTION)
+                    {
+                        let d = std::slice::from_raw_parts((*m).pDescription as *const u8, (*m).DescriptionByteLength.saturating_sub(1));
+                        out.push(String::from_utf8_lossy(d).into_owned());
+                    }
+                }
+                q.ClearStoredMessages();
+                out
+            };
+
+            assert!(crate::gpu::uma::get().is_some(), "UMA init failed in test subprocess");
+            adopt(dev.as_raw(), Kind::Device);
+
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 32,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .expect("CPU descriptor heap");
+            let heap_key = heap.as_raw() as usize;
+            assert!(super::super::console_heap::register(
+                heap_key,
+                16,
+                heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+                0,
+                inc,
+                false,
+                false,
+                false,
+            ));
+            let base_cpu = super::super::console_heap::start(heap_key).expect("console heap start");
+            let slot_cpu = |k: u64| base_cpu + k * super::super::console_heap::SLOT as u64;
+
+            let default_heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let make_tex = |desc: &D3D12_RESOURCE_DESC| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
+                    .expect("CreateCommittedResource");
+                r.unwrap()
+            };
+
+            let uav_flag = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            let t1da_typeless = make_tex(&tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 16, 1, 3, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, uav_flag));
+            let t2da_typeless = make_tex(&tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 3, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, uav_flag));
+            let t3d_typeless = make_tex(&tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 8, 4, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, uav_flag));
+            let t2d_typeless_nouav = make_tex(&tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, D3D12_RESOURCE_FLAG_NONE));
+            let msaa_desc = |slices: u16, fmt: DXGI_FORMAT| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: slices,
+                MipLevels: 1,
+                Format: fmt,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let ms2d = make_tex(&msaa_desc(1, DXGI_FORMAT_R8G8B8A8_UNORM));
+            let ms2da = make_tex(&msaa_desc(3, DXGI_FORMAT_R16G16B16A16_FLOAT));
+
+            iq.ClearStoredMessages();
+
+            // 1. `dev_create_uav_checked_x` unsupported typed UAV fallback on 1DArray, 2DArray, 3D
+            dev_create_uav_checked_x(dev.as_raw(), t1da_typeless.as_raw(), std::ptr::null_mut(), std::ptr::null(), slot_cpu(0));
+            dev_create_uav_checked_x(dev.as_raw(), t2da_typeless.as_raw(), std::ptr::null_mut(), std::ptr::null(), slot_cpu(1));
+            dev_create_uav_checked_x(dev.as_raw(), t3d_typeless.as_raw(), std::ptr::null_mut(), std::ptr::null(), slot_cpu(2));
+            let errs1 = take_errors(&iq);
+            assert!(errs1.is_empty(), "dev_create_uav_checked_x null UAV fallback debug errors: {errs1:#?}");
+
+            // 2. `dev_create_uav_x` companion SRV on MSAA 2D and MSAA 2DArray (no ALLOW_UNORDERED_ACCESS)
+            dev_create_uav_x(dev.as_raw(), ms2d.as_raw(), std::ptr::null_mut(), std::ptr::null(), slot_cpu(3));
+            let u_ms2da = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 1, ArraySize: u32::MAX, PlaneSlice: 0 },
+                },
+            };
+            dev_create_uav_x(dev.as_raw(), ms2da.as_raw(), std::ptr::null_mut(), &u_ms2da, slot_cpu(4));
+            let errs2 = take_errors(&iq);
+            assert!(errs2.is_empty(), "MSAA companion SRV debug errors: {errs2:#?}");
+
+            // 3. `dev_create_uav_x` companion SRV on non-depth *_TYPELESS texture with desc == NULL and Format == UNKNOWN
+            dev_create_uav_x(dev.as_raw(), t2d_typeless_nouav.as_raw(), std::ptr::null_mut(), std::ptr::null(), slot_cpu(5));
+            let u_unk = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            dev_create_uav_x(dev.as_raw(), t2d_typeless_nouav.as_raw(), std::ptr::null_mut(), &u_unk, slot_cpu(6));
+            let errs3 = take_errors(&iq);
+            assert!(errs3.is_empty(), "typeless companion SRV debug errors: {errs3:#?}");
+
+            super::super::console_heap::unregister(heap_key);
         }
     }
 }
