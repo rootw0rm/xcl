@@ -160,7 +160,7 @@ fn try_blobs_of(dir: &Path) -> std::io::Result<Vec<(String, PathBuf, u64)>> {
     for entry in rd {
         let e = entry?;
         if e.file_type().is_ok_and(|t| t.is_file())
-            && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
+            && !starts_with_ignore_ascii_case(&e.file_name().to_string_lossy(), TMP_PREFIX)
         {
             v.push((dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)));
         }
@@ -1387,10 +1387,13 @@ mod tests {
             assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
             XGameSaveCloseUpdate(u);
 
-            // A simulated crash-leftover temp file in `b/` must never be enumerated as a blob.
+            // Simulated crash-leftover temp files in `b/` must never be enumerated as blobs,
+            // including a mixed-case prefix on Windows' case-insensitive filesystems.
             let blobs_dir = (*c).dir.join("b");
             let leftover = blobs_dir.join(format!("{TMP_PREFIX}99999.7"));
+            let uppercase_leftover = blobs_dir.join("~XCLTMP.99999.8");
             std::fs::write(&leftover, b"partial").unwrap();
+            std::fs::write(&uppercase_leftover, b"partial").unwrap();
 
             let mut listed: Vec<(String, u32)> = Vec::new();
             assert_eq!(XGameSaveEnumerateBlobInfo(c, &mut listed as *mut _ as *mut c_void, Some(blob_names)), S_OK);
@@ -1418,6 +1421,7 @@ mod tests {
 
             // Failed atomic replace (dest is an existing directory) removes its temp file.
             let _ = std::fs::remove_file(&leftover);
+            let _ = std::fs::remove_file(&uppercase_leftover);
             let blocker = blobs_dir.join("dir_blocker");
             std::fs::create_dir_all(&blocker).unwrap();
             let ops = [("dir_blocker".to_string(), Some(b"cannot-replace-dir".to_vec()))];
