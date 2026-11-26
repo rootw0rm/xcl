@@ -797,6 +797,7 @@ mod tests {
     fn cert_verification_fails_closed_on_malformed_pins_and_zero_win32_errors() {
         assert_eq!(win32_failure_hr(0), crate::util::E_FAIL);
         assert!(win32_failure_hr(87) < 0);
+        assert_eq!(win32_failure_hr(CERT_E_UNTRUSTEDROOT as u32), CERT_E_UNTRUSTEDROOT);
         assert_eq!(policy_status_hr(CERT_E_UNTRUSTEDROOT as u32), CERT_E_UNTRUSTEDROOT);
         assert_eq!(policy_status_hr(87), hresult_from_win32(87));
 

@@ -559,7 +559,7 @@ pub unsafe extern "win64" fn XUserCloseHandle(h: *mut c_void) {
 }
 
 pub unsafe extern "win64" fn XUserCompare(a: *mut c_void, b: *mut c_void) -> i32 {
-    (a as isize - b as isize).signum() as i32
+    (a as usize).cmp(&(b as usize)) as i32
 }
 
 pub unsafe extern "win64" fn XUserGetMaxUsers(out: *mut u32) -> HRESULT {
@@ -1350,6 +1350,21 @@ mod tests {
             assert_eq!(XAsyncGetStatus(&mut b, false), 7);
             assert_eq!(xtaskqueue_linux::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
             xtaskqueue_linux::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn xuser_compare_does_not_overflow_pointer_difference() {
+        unsafe {
+            let null = std::ptr::null_mut();
+            let lo = 0x7FFF_FFFF_FFFF_FFFFusize as *mut c_void;
+            let hi = 0x8000_0000_0000_0000usize as *mut c_void;
+            let max = usize::MAX as *mut c_void;
+            assert_eq!(XUserCompare(lo, lo), 0);
+            assert_eq!(XUserCompare(lo, hi), -1);
+            assert_eq!(XUserCompare(hi, lo), 1);
+            assert_eq!(XUserCompare(null, max), -1);
+            assert_eq!(XUserCompare(max, null), 1);
         }
     }
 }

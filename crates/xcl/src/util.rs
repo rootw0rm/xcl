@@ -18,9 +18,10 @@ pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007Au32 as i32;
 pub const E_NOT_FOUND: HRESULT = 0x8007_0490u32 as i32;
 pub const E_NOT_SUPPORTED: HRESULT = 0x8007_0032u32 as i32;
 
+/// Win32's HRESULT_FROM_WIN32: preserve zero and existing failure HRESULTs.
 pub fn hresult_from_win32(code: u32) -> HRESULT {
-    if code == 0 {
-        0
+    if (code as HRESULT) <= 0 {
+        code as HRESULT
     } else {
         ((code & 0xFFFF) | 0x8007_0000) as i32
     }
@@ -411,6 +412,18 @@ mod tests {
         assert_eq!(parse_ret("-1"), Some(u64::MAX));
         assert_eq!(parse_ret("7"), Some(7));
         assert_eq!(parse_ret("bogus"), None);
+    }
+
+    #[test]
+    fn hresult_from_win32_preserves_zero_and_failure_hresults() {
+        // Zero passes through (HRESULT_FROM_WIN32(0) == S_OK).
+        assert_eq!(hresult_from_win32(0), 0);
+        // A positive Win32 error converts with FACILITY_WIN32.
+        assert_eq!(hresult_from_win32(87), 0x8007_0057u32 as i32);
+        // An existing failure HRESULT passes through unchanged, even when its
+        // facility is not FACILITY_WIN32 (CERT_E_UNTRUSTEDROOT == 0x800B0109).
+        assert_eq!(hresult_from_win32(0x800B_0109), 0x800B_0109u32 as i32);
+        assert_eq!(hresult_from_win32(E_FAIL as u32), E_FAIL);
     }
 
     #[test]
