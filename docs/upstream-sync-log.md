@@ -1082,3 +1082,61 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-135 (task-1795726534-2093): #2879/#2881 triaged SKIP, #2872 re-pin, probe past #2879
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2359 refs, in-range set exactly
+  #2830..#2881 minus the known gaps — this round it showed #2881 that
+  no prior sequential scan had reached; sequential still ground truth.
+  Per-PR sequential probe #2830..#3280 (widened past the sixth gap per
+  mem-1795712765-78dc, full-range run split 2830..2915 + 2916..3280
+  after a 120 s background timeout cut the first pass at #2915)
+  found 40 PRESENT (#2830..#2881 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880
+  gaps), matching pins on all 39 previously seen heads (no force-push,
+  #2872 pin `3893df0a` holds); all 40 `merge-base --is-ancestor`
+  exit 1 (all OPEN); #2882..#3280 ALL MISSING — scan complete,
+  top is #2881.
+- Replication-lag note (per mem-1795714025-21a1, NOT builder fault): #2879
+  committed 20:50:32 UTC mid-step-134-window yet MISSING from its scan
+  to #3230; #2881 committed 20:58:20 UTC mid-THIS-window and was caught
+  by this scan. Both triaged in-window now.
+- Triage (all SKIP with hunk evidence): #2879 `63197e31` SKIP,
+  single-commit on `8b957bec` (parent IS in main, exit 0), OPEN, 1 file
+  +15/-14 (`gpu/texture.rs` tests): `device()` helper routes through
+  `upload_device(&Selector)` (renamed from `large_upload_device`) +
+  drops redundant no-device arms — whole `gpu/texture.rs`
+  `#[cfg(windows)]` (`gpu/mod.rs`: Linux compiles neither `texture`
+  nor `uma`), zero `upload_device`/`Selector` refs in `hle_linux.rs`/
+  `d3d12x_linux.rs` (grep exit 1). #2881 `2c50cc71` SKIP,
+  single-commit on `8b957bec`, OPEN, 1 file +40/-18
+  (`tests/heap_probe.rs`): new `probe_device()` routes the 4 ignored
+  heap tests through `Selector::from_env_or("auto")` + `skip_test`
+  instead of bare `D3D12CreateDevice(None, ...)` — whole file
+  `#![cfg(windows)]` (line 1), zero `heap_probe`/`probe_device` refs
+  anywhere else in `crates/xcl/src` or `crates/xcl/tests`.
+  #2872 re-pin `b780ec78` -> `3893df0a` (force-pushed 20:47 UTC
+  mid-step-134-window, handed off by step-134 critic): tip-only diff
+  still 1 file `gpu/recomp/emit.rs` HLSL `PRELUDE_PIXEL` unroll removal
+  (now +17/-7) + `quad_ballot_pixel_helper_has_no_loop_for_dxc_to_
+  unroll` regression test — `PRELUDE_PIXEL` consumed only at
+  `emit.rs:4876` into HLSL for DXC, zero `ballot` refs in `glsl.rs`/
+  `spirv.rs`/`vulkan*.rs`; SKIP held for the SPIR-V port. Earlier pins
+  stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836
+  adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in
+  `aa59e8ac`; #2843-#2878 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`, three consecutive runs —
+  first run showed 781/2 transient parallel flakes, green on all reruns
+  per the known global-VFS flake pattern); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step135r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
