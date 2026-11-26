@@ -183,6 +183,10 @@ const COOL: std::time::Duration = std::time::Duration::from_secs(2);
 /// A pool tile: (pool heap, tile in it).
 type Tile = (u32, u32);
 
+/// A tile of a resource that gets no video memory (a top mip left out, `top_mips_to_skip`):
+/// left unmapped, so it reads as zero and takes writes nowhere (tiled resources tier 2).
+const NO_TILE: Tile = (u32::MAX, 0);
+
 struct Page {
     tile: Tile,
     /// targets using the page
@@ -235,6 +239,10 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
+    /// top mips left without video memory (`top_mip_tiles`): their levels never get pages
+    skip_mips: u32,
+    /// their tiles (empty: none), kept for `remap_if_unmapped`
+    skip: Vec<bool>,
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
@@ -842,7 +850,7 @@ impl Pages {
             return;
         }
         self.scratch_heaps.clear();
-        self.scratch_heaps.extend(tiles.iter().filter_map(|t| t.map(|x| x.0)));
+        self.scratch_heaps.extend(tiles.iter().filter_map(|t| t.map(|x| x.0).filter(|&h| h != NO_TILE.0)));
         if self.scratch_heaps.is_empty() {
             return;
         }
@@ -985,6 +993,7 @@ impl Pages {
 
     /// Acquire/share up to `total` tiles for `res` at `va` within `max_pools` and map them on the
     /// `Pages` queue; unbacked tiles stay `NULL` (Tier 2: reads zero, drops writes; #333, #646, #1337).
+    /// All but those `skip` marks, which stay unmapped.
     unsafe fn bind(
         &mut self,
         dev: &ID3D12Device,
@@ -993,6 +1002,7 @@ impl Pages {
         console_bytes: Option<u64>,
         total: u32,
         (mip_levels, array_slices): (u16, u16),
+        skip: &[bool],
     ) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
@@ -1005,6 +1015,7 @@ impl Pages {
             pool,
             (va, first, own, total as usize, mip_levels, array_slices),
             (now, POOL_PAGES),
+            skip,
             || {
                 if pools.len() >= max_pools || oom_until.is_some_and(|t| now < t) {
                     return None;
@@ -1037,11 +1048,16 @@ impl Pages {
         pool: &mut TilePool,
         (va, first, own, total, mip_levels, array_slices): (usize, usize, usize, usize, u16, u16),
         (now, pool_pages): (std::time::Instant, u32),
+        skip: &[bool],
         make_heap: impl FnMut() -> Option<u32>,
     ) -> (Vec<Option<Tile>>, Vec<usize>, Vec<(usize, usize)>, usize) {
+        let skipped = |i: usize| skip.get(i).copied().unwrap_or(false);
         let mut missing = 0usize;
         let mut preferred: Option<u32> = None;
         for i in 0..total {
+            if skipped(i) {
+                continue;
+            }
             let existing = if i < own {
                 pages.get(&(first + i * PAGE)).map(|p| p.tile.0)
             } else {
@@ -1103,6 +1119,10 @@ impl Pages {
         let mut used = Vec::with_capacity(own.min(total.saturating_sub(dropped)));
         let mut used_extra = Vec::new();
         for i in 0..total {
+            if skipped(i) {
+                tiles.push(None);
+                continue;
+            }
             let existing = if i < own {
                 pages.get_mut(&(first + i * PAGE))
             } else {
@@ -1140,10 +1160,11 @@ impl Pages {
     /// (`XCL_TEXTURE_LEVEL_PAGES=1`), respecting `max_pools` and `oom_until` so unbacked level
     /// groups stay unmapped (`None`) and retry once pools free up.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, skip: &[bool]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
+        let skipped = |i: usize| skip.get(i).copied().unwrap_or(false);
 
         let mut missing = 0usize;
         let mut preferred: Option<u32> = None;
@@ -1176,6 +1197,10 @@ impl Pages {
         let mut used = Vec::with_capacity(own.min(range.len()));
         let mut used_extra = Vec::new();
         for i in range {
+            if skipped(i) {
+                tiles.push(NO_TILE);
+                continue;
+            }
             let tile = if i < own {
                 let a = first + i * PAGE;
                 let t = match self.pages.get_mut(&a) {
@@ -1361,6 +1386,9 @@ unsafe fn place_on_pages(
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
+    // sampled textures only: what the GPU renders to keeps all of its memory
+    let (skip_mips, skip) = if require_aligned { (0, Vec::new()) } else { top_mip_tiles(dev, res, &tiled, total) };
+    let skip_tiles = skip.iter().filter(|&&s| s).count();
     let mip_levels = desc.MipLevels;
     let array_slices = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         1
@@ -1374,10 +1402,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, skip_mips, skip });
                 true
-            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, (mip_levels, array_slices)) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used, used_extra, levels: None });
+            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, (mip_levels, array_slices), &skip) {
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used, used_extra, levels: None, skip_mips, skip });
                 true
             } else {
                 false
@@ -1392,6 +1420,9 @@ unsafe fn place_on_pages(
         return None;
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    if skip_mips > 0 {
+        note_skipped_mips(raw as usize, skip_mips, skip_tiles);
+    }
     Some(hr)
 }
 
@@ -1451,10 +1482,10 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, shape, mapped)) = pages
+    let Some((va, console_bytes, total, shape, mapped, skip)) = pages
         .targets
         .get(&key)
-        .map(|t| (t.va, t.console_bytes, t.total, (t.mip_levels, t.array_slices), t.mapped))
+        .map(|t| (t.va, t.console_bytes, t.total, (t.mip_levels, t.array_slices), t.mapped, t.skip.clone()))
     else {
         return false;
     };
@@ -1477,7 +1508,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.mapped = true;
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, shape) else {
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, shape, &skip) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -1490,6 +1521,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
 
 /// A resource released: its pages are no longer its.
 fn forget_pages(resource: usize) {
+    forget_skipped_mips(resource);
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
@@ -1586,6 +1618,197 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
         (immediate, done, pruned)
     };
+}
+
+// ---------------------------------------------------------------------------------------
+// Sampled textures without their top mips while video memory fills up
+//
+// A title streams more textures than a PC card's video memory holds once the console's copy
+// of its memory is in video memory too (#1773): past the card's budget the driver pages, or
+// removes the device. So when the device's local video memory is filling up, a new sampled
+// texture gets no video memory for its largest mips: their tiles stay unmapped (they read as
+// zero), and every view of the texture is clamped to the first mip that has memory
+// (`clamp_skipped_mips`), so sampling never reaches them. The texture keeps its shape, its
+// mip numbering and the title's uploads; it is only less sharp up close.
+//
+// `XCL_TEXTURE_BUDGET=0` turns it off; `XCL_TEXTURE_MAX=<texels>` caps the largest side of
+// every new sampled texture at that whatever the fill (tests, measurements).
+// ---------------------------------------------------------------------------------------
+
+/// The largest side a new sampled texture keeps when the device's local video memory is
+/// `fill` (usage / budget) full; None: all of it.
+fn cap_for_fill(fill: f64) -> Option<u64> {
+    if fill < 0.75 {
+        None
+    } else if fill < 0.85 {
+        Some(2048)
+    } else if fill < 0.92 {
+        Some(1024)
+    } else {
+        Some(512)
+    }
+}
+
+/// How many top mips of a texture whose largest side is `largest` to leave out for none of its
+/// sides to pass `cap`, keeping at least one mip that has tiles of its own (`standard_mips`:
+/// the mips before the packed tail).
+fn mips_to_skip(largest: u64, standard_mips: u32, cap: u64) -> u32 {
+    let mut skip = 0;
+    while largest >> skip > cap && skip + 1 < standard_mips {
+        skip += 1;
+    }
+    skip
+}
+
+/// The cap that applies now (None: textures keep all their mips).
+unsafe fn texture_cap(dev: &ID3D12Device) -> Option<u64> {
+    static SET: std::sync::OnceLock<(bool, Option<u64>)> = std::sync::OnceLock::new();
+    let (on, max) = *SET.get_or_init(|| {
+        let on = std::env::var("XCL_TEXTURE_BUDGET").map_or(true, |v| v.trim() != "0");
+        let max = std::env::var("XCL_TEXTURE_MAX").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m > 0);
+        (on, max)
+    });
+    if !on {
+        return None;
+    }
+    if max.is_some() {
+        return max;
+    }
+    cap_for_fill(local_fill(dev)?)
+}
+
+/// The device's local video memory in use / its budget, asked at most every 100 ms.
+unsafe fn local_fill(dev: &ID3D12Device) -> Option<f64> {
+    use windows::Win32::Graphics::Dxgi::*;
+    struct Cached {
+        luid: (u32, i32),
+        adapter: IDXGIAdapter3,
+        at: std::time::Instant,
+        fill: f64,
+    }
+    // DXGI adapters are free-threaded
+    unsafe impl Send for Cached {}
+    static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+    let luid = dev.GetAdapterLuid();
+    let luid = (luid.LowPart, luid.HighPart);
+    let mut g = CACHE.lock().unwrap();
+    if g.as_ref().is_none_or(|c| c.luid != luid) {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(dev.GetAdapterLuid()).ok()?;
+        *g = Some(Cached { luid, adapter, at: std::time::Instant::now() - std::time::Duration::from_secs(1), fill: 0.0 });
+    }
+    let c = g.as_mut()?;
+    if c.at.elapsed() >= std::time::Duration::from_millis(100) {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        c.adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()?;
+        c.fill = info.CurrentUsage as f64 / info.Budget.max(1) as f64;
+        c.at = std::time::Instant::now();
+    }
+    Some(c.fill)
+}
+
+/// For a new sampled texture `res` (`desc`, `total` tiles): how many top mips get no video
+/// memory now, and which of its tiles those are (empty: none).
+unsafe fn top_mip_tiles(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, total: u32) -> (u32, Vec<bool>) {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels < 2 || desc.SampleDesc.Count > 1 {
+        return (0, Vec::new());
+    }
+    let Some(cap) = texture_cap(dev) else { return (0, Vec::new()) };
+    let (standard, tilings) = mip_tilings(dev, res, desc);
+    let skip = mips_to_skip(desc.Width.max(u64::from(desc.Height)), standard, cap);
+    if skip == 0 {
+        return (0, Vec::new());
+    }
+    (skip, top_mip_mask(desc, &tilings, total, skip))
+}
+
+/// The mips of `res` with tiles of their own (before the packed tail), and every
+/// subresource's tiling.
+unsafe fn mip_tilings(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> (u32, Vec<D3D12_SUBRESOURCE_TILING>) {
+    let mips = u32::from(desc.MipLevels);
+    let mut count = mips * u32::from(desc.DepthOrArraySize.max(1));
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); count as usize];
+    dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut count), 0, tilings.as_mut_ptr());
+    (u32::from(packed.NumStandardMips).min(mips), tilings)
+}
+
+/// The tiles of the `skip` top mips of every slice, of `total`.
+fn top_mip_mask(desc: &D3D12_RESOURCE_DESC, tilings: &[D3D12_SUBRESOURCE_TILING], total: u32, skip: u32) -> Vec<bool> {
+    let mips = u32::from(desc.MipLevels);
+    let slices = u32::from(desc.DepthOrArraySize.max(1));
+    let mut mask = vec![false; total as usize];
+    for slice in 0..slices {
+        for mip in 0..skip {
+            let Some(t) = tilings.get((slice * mips + mip) as usize) else { continue };
+            if t.StartTileIndexInOverallResource == u32::MAX {
+                continue;
+            }
+            let n = u32::from(t.WidthInTiles) * u32::from(t.HeightInTiles) * u32::from(t.DepthInTiles);
+            for i in t.StartTileIndexInOverallResource..t.StartTileIndexInOverallResource.saturating_add(n) {
+                if let Some(m) = mask.get_mut(i as usize) {
+                    *m = true;
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// resource → (top mips it has no video memory for, tiles of them)
+static SKIPPED_MIPS: Mutex<Option<std::collections::HashMap<usize, (u32, usize)>>> = Mutex::new(None);
+/// whether any texture has (the views' fast path)
+static ANY_SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_skipped_mips(resource: usize, mips: u32, tiles: usize) {
+    let first = {
+        let mut g = SKIPPED_MIPS.lock().unwrap();
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        m.insert(resource, (mips, tiles));
+        !ANY_SKIPPED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    };
+    if first {
+        crate::xlog_info!("D3D12.X: video memory is filling up: new sampled textures go without their largest mips (XCL_TEXTURE_BUDGET=0 keeps them)");
+    }
+}
+
+fn forget_skipped_mips(resource: usize) {
+    if ANY_SKIPPED.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(m) = SKIPPED_MIPS.lock().unwrap().as_mut() {
+            m.remove(&resource);
+        }
+    }
+}
+
+/// How many top mips `resource` has no video memory for (0: all of them).
+pub(super) fn skipped_mips(resource: usize) -> u32 {
+    if !ANY_SKIPPED.load(std::sync::atomic::Ordering::Acquire) {
+        return 0;
+    }
+    SKIPPED_MIPS.lock().unwrap().as_ref().and_then(|m| m.get(&resource).map(|e| e.0)).unwrap_or(0)
+}
+
+/// (textures alive now without their top mips, bytes of tiles they go without) – `XCL_ACTIVITY`.
+pub fn skipped_textures() -> (u64, u64) {
+    SKIPPED_MIPS.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len() as u64, m.values().map(|e| (e.1 * PAGE) as u64).sum()))
+}
+
+/// A texture view of a resource without its `mips` top mips: sampling clamped to the first mip
+/// it has (`ResourceMinLODClamp` counts from the resource's first mip, not the view's).
+pub(super) fn clamp_skipped_mips(v: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, mips: u32) {
+    let lod = mips as f32;
+    // SAFETY: the union member the view dimension names
+    unsafe {
+        let a = &mut v.Anonymous;
+        let clamp = match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => &mut a.Texture2D.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => &mut a.Texture2DArray.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURECUBE => &mut a.TextureCube.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => &mut a.TextureCubeArray.ResourceMinLODClamp,
+            _ => return,
+        };
+        *clamp = clamp.max(lod);
+    }
 }
 
 /// Before GPU work on `queue`: have it wait for every tile mapping made so far on its device,
@@ -1736,7 +1959,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         wanted.sort_unstable();
         wanted.dedup();
         let todo: Vec<(usize, u32, u32, u32, std::ops::Range<u32>)> =
-            wanted.into_iter().filter(|&k| !lv.groups[k].3).map(|k| (k, lv.groups[k].0, lv.groups[k].1, lv.groups[k].2, lv.levels_of(k))).collect();
+            groups_to_map(lv, wanted, t.skip_mips).into_iter().map(|k| (k, lv.groups[k].0, lv.groups[k].1, lv.groups[k].2, lv.levels_of(k))).collect();
         if todo.is_empty() {
             return Vec::new();
         }
@@ -1745,7 +1968,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, &[]) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
@@ -1763,6 +1986,12 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         return fresh;
     }
     Vec::new()
+}
+
+/// Of the level groups `wanted`, those to give pages now: not mapped yet, and not of the
+/// `skip_mips` top mips left without video memory (`top_mip_tiles`), which never get pages.
+fn groups_to_map(lv: &Levels, wanted: Vec<usize>, skip_mips: u32) -> Vec<usize> {
+    wanted.into_iter().filter(|&k| !lv.groups[k].3 && lv.levels_of(k).start >= skip_mips).collect()
 }
 
 /// Whether `resource` is a texture whose levels get their pages one by one (`map_levels`).
@@ -1956,13 +2185,13 @@ mod tests {
 
         // 12-tile single-mip target A allocates pools 0..=1 (4 free tiles remain in pool 1).
         let (tiles_a, used_a, extra_a, dropped_a) =
-            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x10_0000, 0x10_0000, 12, 12, 1, 1), (t0, P), make);
+            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x10_0000, 0x10_0000, 12, 12, 1, 1), (t0, P), &[], make);
         assert_eq!((dropped_a, heaps_made.get(), pages.len(), pool.free_total), (0, 2, 12, 4));
         assert!(tiles_a.iter().all(Option::is_some) && extra_a.is_empty());
 
         // 8-tile 2D mipmapped texture B (`mip_levels = 4, slices = 1`) with 4 tiles left maps coarse tail 4..8.
         let (tiles_b, used_b, extra_b, dropped_b) =
-            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x30_0000, 0x30_0000, 7, 8, 4, 1), (t0, P), make);
+            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x30_0000, 0x30_0000, 7, 8, 4, 1), (t0, P), &[], make);
         assert_eq!((dropped_b, heaps_made.get(), pages.len() + extra.len()), (4, 2, 16));
         assert_eq!(&tiles_b[..4], &[None; 4]);
         assert_eq!(&tiles_b[4..], &[Some((1, 4)), Some((1, 5)), Some((1, 6)), Some((1, 7))]);
@@ -1972,11 +2201,11 @@ mod tests {
 
         // At 0 free tiles: aliases still share backed pages, and fresh unbacked placements stay reserved (`None`).
         let (tiles_alias, used_alias, _, dropped_alias) =
-            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x10_0000, 0x10_0000, 4, 4, 1, 1), (t0, P), make);
+            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x10_0000, 0x10_0000, 4, 4, 1, 1), (t0, P), &[], make);
         assert_eq!((dropped_alias, used_alias.len(), pages[&0x10_0000].users), (0, 4, 2));
         assert!(tiles_alias.iter().all(Option::is_some));
         let (tiles_c, used_c, extra_c, dropped_c) =
-            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x50_0000, 0x50_0000, 4, 4, 1, 1), (t0, P), make);
+            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x50_0000, 0x50_0000, 4, 4, 1, 1), (t0, P), &[], make);
         assert_eq!(dropped_c, 4);
         assert!(used_c.is_empty() && extra_c.is_empty() && heap_ranges_trimmed(0, &tiles_c).is_empty());
 
@@ -1989,7 +2218,7 @@ mod tests {
         pool.push_cooling(extra.remove(&(0x30_0000, 7)).unwrap().tile, t0);
         let t1 = t0 + COOL + Duration::from_millis(1);
         let (tiles_cube, used_cube, _, dropped_cube) =
-            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x80_0000, 0x80_0000, 48, 48, 4, 6), (t1, P), make);
+            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0x80_0000, 0x80_0000, 48, 48, 4, 6), (t1, P), &[], make);
         assert_eq!((dropped_cube, used_cube.len(), heaps_made.get()), (36, 12, 2));
         for face in 0..6 {
             let slice = &tiles_cube[face * 8..(face + 1) * 8];
@@ -2003,7 +2232,7 @@ mod tests {
         }
         let t2 = t1 + COOL + Duration::from_millis(1);
         let (tiles_d, used_d, _, dropped_d) =
-            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0xE0_0000, 0xE0_0000, 10, 10, 1, 1), (t2, P), make);
+            Pages::bind_tiles(&mut pages, &mut extra, &mut pool, (0xE0_0000, 0xE0_0000, 10, 10, 1, 1), (t2, P), &[], make);
         assert_eq!((dropped_d, used_d.len(), heaps_made.get()), (2, 8, 2));
         assert!(tiles_d[..8].iter().all(Option::is_some) && tiles_d[8..] == [None, None]);
     }
@@ -2045,11 +2274,11 @@ mod tests {
             let (over, no) = reserve(256, 256, 1, 1);
             let (alias, na) = reserve(256, 256, 1, 1);
             assert!(ns > 0 && ns + nc < POOL_PAGES && nb > POOL_PAGES);
-            let (us, _) = pages.bind(&dev, &small, 0x1000_0000, Some(ns as u64 * PAGE as u64), ns, (1, 1)).unwrap();
-            let (uc, _) = pages.bind(&dev, &cube, 0x1800_0000, Some(nc as u64 * PAGE as u64), nc, (4, 6)).unwrap();
-            let (ub, _) = pages.bind(&dev, &big, 0x2000_0000, Some(nb as u64 * PAGE as u64), nb, (4, 1)).unwrap();
-            let (uo, _) = pages.bind(&dev, &over, 0x3000_0000, Some(no as u64 * PAGE as u64), no, (1, 1)).unwrap();
-            let (ua, _) = pages.bind(&dev, &alias, 0x1000_0000, Some(na as u64 * PAGE as u64), na, (1, 1)).unwrap();
+            let (us, _) = pages.bind(&dev, &small, 0x1000_0000, Some(ns as u64 * PAGE as u64), ns, (1, 1), &[]).unwrap();
+            let (uc, _) = pages.bind(&dev, &cube, 0x1800_0000, Some(nc as u64 * PAGE as u64), nc, (4, 6), &[]).unwrap();
+            let (ub, _) = pages.bind(&dev, &big, 0x2000_0000, Some(nb as u64 * PAGE as u64), nb, (4, 1), &[]).unwrap();
+            let (uo, _) = pages.bind(&dev, &over, 0x3000_0000, Some(no as u64 * PAGE as u64), no, (1, 1), &[]).unwrap();
+            let (ua, _) = pages.bind(&dev, &alias, 0x1000_0000, Some(na as u64 * PAGE as u64), na, (1, 1), &[]).unwrap();
             assert_eq!(
                 (pages.pools.len(), us.len() as u32, uc.len() as u32, ub.len() as u32, uo.len(), ua.len() as u32),
                 (1, ns, nc, POOL_PAGES - ns - nc, 0, na),
@@ -2810,6 +3039,212 @@ mod tests {
                 "AFTER  ({TEX_COUNT} x 2MiB textures, {new_calls} UpdateTileMappings + {TEX_COUNT} Signals): submit={new_submit:?} gpu_done={new_total:?}"
             );
             assert!(new_calls < old_calls);
+        }
+    }
+
+    /// A texture with lazy levels (`XCL_TEXTURE_LEVEL_PAGES=1`) whose top mips were left out:
+    /// those levels never get pages, the others do once, and the packed tail with them.
+    #[test]
+    fn lazy_levels_never_map_the_top_mips_left_out() {
+        // 4 levels with tiles of their own (16, 4, 1, 1 tiles), then a packed tail of 1 tile
+        let mut lv = Levels::new(&[(0, 16), (16, 4), (20, 1), (21, 1)], Some((22, 1)), 23, 8).unwrap();
+        let all: Vec<usize> = (0..lv.groups.len()).collect();
+        assert_eq!(groups_to_map(&lv, all.clone(), 0), vec![0, 1, 2, 3, 4]);
+        assert_eq!(groups_to_map(&lv, all.clone(), 2), vec![2, 3, 4], "levels 0 and 1 left out");
+        lv.groups[2].3 = true;
+        assert_eq!(groups_to_map(&lv, all.clone(), 2), vec![3, 4], "a group with pages is not mapped again");
+        assert_eq!(groups_to_map(&lv, vec![0, 1], 2), Vec::<usize>::new(), "an upload of the left-out levels maps nothing");
+    }
+
+    #[test]
+    fn the_cap_follows_how_full_video_memory_is() {
+        assert_eq!(cap_for_fill(0.0), None);
+        assert_eq!(cap_for_fill(0.749), None);
+        assert_eq!(cap_for_fill(0.75), Some(2048));
+        assert_eq!(cap_for_fill(0.85), Some(1024));
+        assert_eq!(cap_for_fill(0.92), Some(512));
+        assert_eq!(cap_for_fill(1.3), Some(512));
+    }
+
+    #[test]
+    fn top_mips_go_until_the_largest_side_fits_and_one_tiled_mip_stays() {
+        assert_eq!(mips_to_skip(4096, 13, 2048), 1);
+        assert_eq!(mips_to_skip(4096, 13, 1024), 2);
+        assert_eq!(mips_to_skip(4096, 13, 4096), 0);
+        assert_eq!(mips_to_skip(2048, 13, 2048), 0);
+        assert_eq!(mips_to_skip(4096, 13, 512), 3);
+        // never into the packed tail: the last mip with tiles of its own stays
+        assert_eq!(mips_to_skip(4096, 2, 256), 1);
+        assert_eq!(mips_to_skip(4096, 1, 256), 0);
+    }
+
+    /// A reserved texture bound without its top mip on the pages, the way a sampled texture is
+    /// when video memory fills up: the top mip takes no page, sampling through a clamped view
+    /// reads the first mip that has memory, and the clamp counts from the resource's first mip,
+    /// not the view's (a view from mip 1 clamped to 2 reads mip 2, not mip 3).
+    #[test]
+    fn gpu_a_texture_without_its_top_mip_samples_the_first_it_has() {
+        use std::mem::{transmute_copy, ManuallyDrop};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = crate::gpu::recomp::runner::skip_test;
+        let dev = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return skip("no DXGI") };
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((a, d)) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next() else { return skip("no GPU") };
+            let Ok(dev) = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0) else { return skip("no GPU") };
+            println!("adapter: {}", crate::gpu::adapter::name(&d));
+            dev
+        };
+        if !tier2(&dev) || crate::gpu::recomp::dxc::location().is_err() {
+            return skip("no tiled resources tier 2 or no DXC");
+        }
+        let src = r#"
+#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), UAV(u0), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_POINT)"
+RWByteAddressBuffer outb : register(u0);
+SamplerState pt : register(s0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    for (uint i = 0; i < 3; i++) {
+        Texture2D<float4> t = ResourceDescriptorHeap[i];
+        outb.Store(4 * i, uint(t.SampleLevel(pt, float2(0.5, 0.5), 0.0).r * 255.0 + 0.5));
+    }
+}
+"#;
+        const MIPS: u16 = 4;
+        let shade = |mip: u32| 0x11 * (mip + 1); // mip 0 → 0x11 … mip 3 → 0x44
+        unsafe {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 512,
+                Height: 512,
+                DepthOrArraySize: 1,
+                MipLevels: MIPS,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut tex: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut tex).unwrap();
+            let tex = tex.unwrap();
+            let mut total = 0u32;
+            dev.GetResourceTiling(&tex, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            let (standard, tilings) = mip_tilings(&dev, &tex, &desc);
+            assert!(standard >= 3, "512x512 RGBA8 has its first mips tiled ({standard})");
+            let mask = top_mip_mask(&desc, &tilings, total, 1);
+            let mip0 = u32::from(tilings[0].WidthInTiles) * u32::from(tilings[0].HeightInTiles);
+            assert_eq!(mask.iter().filter(|&&m| m).count() as u32, mip0, "exactly mip 0's tiles");
+            assert!(mask.iter().take(mip0 as usize).all(|&m| m));
+
+            let mut pages = Pages::new(&dev).unwrap();
+            let (used, extra) = pages.bind(&dev, &tex, 0x10_0000_0000, None, total, &mask).unwrap();
+            assert_eq!((used.len() + extra.len()) as u32, total - mip0, "mip 0 takes no page");
+
+            // the title's upload of every mip: mip 0's goes nowhere
+            let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); MIPS as usize];
+            let mut rows = vec![0u32; MIPS as usize];
+            let mut row_bytes = vec![0u64; MIPS as usize];
+            let mut upload_bytes = 0u64;
+            dev.GetCopyableFootprints(&desc, 0, u32::from(MIPS), 0, Some(layouts.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut upload_bytes));
+            let buffer = |size: u64, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, uav: bool| {
+                let d = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: if uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let upload = buffer(upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).unwrap();
+            for (m, l) in layouts.iter().enumerate() {
+                for r in 0..rows[m] as usize {
+                    let at = (p as *mut u8).add(l.Offset as usize + r * l.Footprint.RowPitch as usize) as *mut u32;
+                    for x in 0..l.Footprint.Width as usize {
+                        at.add(x).write_unaligned(0xFF00_0000 | shade(m as u32));
+                    }
+                }
+            }
+            upload.Unmap(0, None);
+
+            let dxil = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let dh: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 3, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 })
+                .unwrap();
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let view = |first: u32, skipped: u32| {
+                let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: desc.Format,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: first, MipLevels: u32::MAX, ..Default::default() } },
+                };
+                if skipped > 0 {
+                    clamp_skipped_mips(&mut v, skipped);
+                }
+                v
+            };
+            // 0: the whole texture, its top mip left out; 1: a view from mip 1 of a texture
+            // without two; 2: the whole texture unclamped (mip 0 has no memory: zero)
+            for (i, v) in [view(0, 1), view(1, 2), view(0, 0)].iter().enumerate() {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dh.GetCPUDescriptorHandleForHeapStart().ptr + i * inc };
+                dev.CreateShaderResourceView(&tex, Some(v), at);
+            }
+            let out = buffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+            let rb = buffer(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            queue.Wait(&pages.fence, pages.value).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).unwrap();
+            for (m, l) in layouts.iter().enumerate() {
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&tex), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: m as u32 } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&upload), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *l } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+            let barrier = |r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: before, StateAfter: after }),
+                },
+            };
+            list.ResourceBarrier(&[barrier(&tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+            list.SetDescriptorHeaps(&[Some(dh.clone())]);
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(0, out.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+            list.ResourceBarrier(&[barrier(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&rb, 0, &out, 0, 256);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 20_000).map_err(|e| format!("{e}")).unwrap();
+            let mut q = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut q)).unwrap();
+            let got = std::slice::from_raw_parts(q as *const u32, 3).to_vec();
+            rb.Unmap(0, None);
+            assert_eq!(got, vec![shade(1), shade(2), 0], "clamped to mip 1; clamped from the resource's mip 0 (mip 2, not 3); mip 0 unmapped reads zero");
         }
     }
 }

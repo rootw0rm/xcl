@@ -2239,6 +2239,16 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
         copy = Some(v);
     }
+    // a texture without video memory for its top mips (`vram::top_mip_tiles`): its views sample
+    // from the first mip it has
+    let skipped = if res.is_null() { 0 } else { super::vram::skipped_mips(res as usize) };
+    if skipped > 0 {
+        if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+            let mut v = copy.unwrap_or_else(|| default_texture2d_srv(&r.GetDesc()));
+            super::vram::clamp_skipped_mips(&mut v, skipped);
+            copy = Some(v);
+        }
+    }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
@@ -2317,6 +2327,20 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
+}
+
+/// The view D3D12 makes of a 2D texture `rd` when it is given no description: all its mips and
+/// slices, in its own format.
+fn default_texture2d_srv(rd: &D3D12_RESOURCE_DESC) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: rd.Format, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+    if rd.DepthOrArraySize > 1 {
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: u32::from(rd.DepthOrArraySize), ..Default::default() };
+    } else {
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() };
+    }
+    v
 }
 
 /// A TEXTURECUBE view as the TEXTURECUBEARRAY of its one cube (None: any other view).
