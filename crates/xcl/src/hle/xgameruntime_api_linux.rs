@@ -1726,4 +1726,101 @@ mod tests {
             assert!(has);
         }
     }
+
+    /// Linux mirror of upstream #1571 (`tests/gdk_table.rs`, Windows-only):
+    /// the twin embeds the same generated table via
+    /// `#[path = "xgameruntime/gdk_table.rs"]`, so the same regeneration
+    /// hazards (duplicate rows, bad sort, out-of-range slots, empty names)
+    /// must fail loudly here too, on Linux.
+    const GDK_EXPECTED_ROWS: usize = 396;
+    const GDK_EXPECTED_CLASSES: usize = 24;
+    const GDK_EXPECTED_INTERFACES: usize = 34;
+    const GDK_MAX_SLOT: u8 = 83;
+
+    fn gdk_hex32(v: u128) -> String {
+        format!("{v:032x}")
+    }
+
+    #[test]
+    fn gdk_table_rows_are_sorted_by_class_interface_slot() {
+        let keys: Vec<(String, String, u8)> = super::gdk_table::API
+            .iter()
+            .map(|&(_, c, i, s)| (gdk_hex32(c), gdk_hex32(i), s))
+            .collect();
+        let mut expected = keys.clone();
+        expected.sort_by(|a, b| (a.0.as_str(), a.1.as_str(), a.2).cmp(&(b.0.as_str(), b.1.as_str(), b.2)));
+        assert_eq!(keys, expected, "twin gdk_table::API is not sorted by (class, interface, slot)");
+    }
+
+    #[test]
+    fn gdk_table_function_names_are_unique_and_non_empty() {
+        let mut seen = std::collections::HashSet::new();
+        for &(name, _, _, _) in super::gdk_table::API {
+            assert!(!name.is_empty(), "empty function name");
+            assert!(seen.insert(name), "duplicate function name {name}");
+        }
+    }
+
+    #[test]
+    fn gdk_table_has_no_duplicate_class_interface_slot_triples() {
+        let mut seen = std::collections::HashSet::new();
+        for &(_, class, interface, slot) in super::gdk_table::API {
+            assert!(seen.insert((class, interface, slot)), "duplicate (class, interface, slot) {class:#x} {interface:#x} {slot}");
+        }
+    }
+
+    #[test]
+    fn gdk_table_row_and_id_counts_are_stable() {
+        assert_eq!(super::gdk_table::API.len(), GDK_EXPECTED_ROWS, "expected {GDK_EXPECTED_ROWS} rows");
+        let classes: std::collections::HashSet<u128> =
+            super::gdk_table::API.iter().map(|&(_, c, _, _)| c).collect();
+        let interfaces: std::collections::HashSet<u128> =
+            super::gdk_table::API.iter().map(|&(_, _, i, _)| i).collect();
+        assert_eq!(classes.len(), GDK_EXPECTED_CLASSES, "distinct classes");
+        assert_eq!(interfaces.len(), GDK_EXPECTED_INTERFACES, "distinct interfaces");
+    }
+
+    #[test]
+    fn gdk_table_slots_are_within_u8_and_the_known_range() {
+        for &(_, _, _, slot) in super::gdk_table::API {
+            assert!(slot <= GDK_MAX_SLOT, "slot {slot} exceeds known maximum {GDK_MAX_SLOT}");
+        }
+        // the twin's vtable builder must cover the full table (highest slot is 83)
+        let max_slot = super::gdk_table::API.iter().map(|&(_, _, _, s)| s).max().unwrap_or(0);
+        assert!((max_slot as usize) < SLOTS, "SLOTS={SLOTS} truncates slot {max_slot}");
+    }
+
+    #[test]
+    fn gdk_table_classes_and_interfaces_are_non_zero() {
+        for &(_, class, interface, _) in super::gdk_table::API {
+            assert!(class != 0, "zero class id");
+            assert!(interface != 0, "zero interface id");
+        }
+    }
+
+    #[test]
+    fn gdk_table_source_format_is_32_lowercase_hex_chars() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/hle/xgameruntime/gdk_table.rs");
+        let src = std::fs::read_to_string(&path).unwrap();
+        let mut rows_seen = 0usize;
+        for line in src.lines() {
+            let line = line.trim();
+            if !line.starts_with("(\"X") {
+                continue;
+            }
+            rows_seen += 1;
+            let inner = line.strip_prefix('(').and_then(|l| l.strip_suffix(',')).and_then(|l| l.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("unparseable row line: {line}"));
+            let mut parts = inner.split(',');
+            parts.next().unwrap();
+            let class = parts.next().unwrap().trim();
+            let interface = parts.next().unwrap().trim();
+            let slot = parts.next().unwrap().trim();
+            assert!(class.starts_with("0x") && class.len() == 34 && class[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "bad class id {class}");
+            assert!(interface.starts_with("0x") && interface.len() == 34 && interface[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "bad interface id {interface}");
+            assert!(slot.chars().all(|c| c.is_ascii_digit()), "bad slot {slot}");
+        }
+        assert_eq!(rows_seen, GDK_EXPECTED_ROWS, "source row count drifted from {GDK_EXPECTED_ROWS}");
+    }
 }
