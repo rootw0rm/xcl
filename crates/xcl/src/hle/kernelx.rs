@@ -1911,11 +1911,30 @@ pub unsafe extern "system" fn GetProcAddress(h: usize, name: *const u8) -> usize
     }
 }
 
-fn module_handle_impl(name: &str) -> usize {
-    module_handle_in(crate::hle::registry(), name)
+unsafe fn win_module_handle(name: *const u16, ex_flags: Option<u32>) -> usize {
+    match ex_flags {
+        None => ll::GetModuleHandleW(name) as usize,
+        Some(flags) => {
+            let mut r = std::ptr::null_mut();
+            if ll::GetModuleHandleExW(flags, name, &mut r) != 0 {
+                r as usize
+            } else {
+                0
+            }
+        }
+    }
 }
 
+fn module_handle_impl(name: &str) -> usize {
+    module_handle_in_ex(crate::hle::registry(), name, None)
+}
+
+#[cfg(test)]
 fn module_handle_in(reg: &crate::hle::Registry, name: &str) -> usize {
+    module_handle_in_ex(reg, name, None)
+}
+
+fn module_handle_in_ex(reg: &crate::hle::Registry, name: &str, ex_flags: Option<u32>) -> usize {
     let key = dll_key(name);
     match reg.route(&key) {
         Some(crate::hle::Route::Hle(i)) => {
@@ -1925,7 +1944,7 @@ fn module_handle_in(reg: &crate::hle::Registry, name: &str) -> usize {
                 // their genuine HMODULE; console-only aliases (advapi32legacy, kernel32legacy,
                 // minappmodelx) fall back to the HLE pseudo handle, matching LoadLibrary.
                 // SAFETY: `wide(name)` produces a valid NUL-terminated UTF-16 string.
-                let real = unsafe { ll::GetModuleHandleW(crate::util::wide(name).as_ptr()) as usize };
+                let real = unsafe { win_module_handle(crate::util::wide(name).as_ptr(), ex_flags) };
                 if real != 0 {
                     return real;
                 }
@@ -1939,7 +1958,7 @@ fn module_handle_in(reg: &crate::hle::Registry, name: &str) -> usize {
         }
         Some(crate::hle::Route::System) => {
             // SAFETY: `wide(name)` produces a valid NUL-terminated UTF-16 string.
-            return unsafe { ll::GetModuleHandleW(crate::util::wide(name).as_ptr()) as usize };
+            return unsafe { win_module_handle(crate::util::wide(name).as_ptr(), ex_flags) };
         }
         None => {}
     }
@@ -1947,7 +1966,7 @@ fn module_handle_in(reg: &crate::hle::Registry, name: &str) -> usize {
         return m.base;
     }
     // SAFETY: `wide(name)` produces a valid NUL-terminated UTF-16 string.
-    unsafe { ll::GetModuleHandleW(crate::util::wide(name).as_ptr()) as usize }
+    unsafe { win_module_handle(crate::util::wide(name).as_ptr(), ex_flags) }
 }
 
 fn main_or_real_base() -> usize {
@@ -1982,6 +2001,8 @@ pub unsafe extern "system" fn GetModuleHandleA(name: *const u8) -> usize {
     }
 }
 
+const PIN: u32 = 0x1;
+const UNCHANGED_REFCOUNT: u32 = 0x2;
 const FROM_ADDRESS: u32 = 0x4;
 
 unsafe fn module_handle_ex(flags: u32, name: Option<String>, addr: usize, out: *mut usize) -> BOOL {
@@ -1989,22 +2010,22 @@ unsafe fn module_handle_ex(flags: u32, name: Option<String>, addr: usize, out: *
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
+    if flags & !(PIN | UNCHANGED_REFCOUNT | FROM_ADDRESS) != 0 || flags & (PIN | UNCHANGED_REFCOUNT) == (PIN | UNCHANGED_REFCOUNT) {
+        *out = 0;
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let h = if flags & FROM_ADDRESS != 0 {
         match modules::image_base_for_addr(addr) {
             Some(b) => b,
-            None => {
-                let mut r = std::ptr::null_mut();
-                if ll::GetModuleHandleExW(flags, addr as *const u16, &mut r) != 0 {
-                    r as usize
-                } else {
-                    0
-                }
-            }
+            None => win_module_handle(addr as *const u16, Some(flags)),
         }
     } else {
         match name {
-            None => main_or_real_base(),
-            Some(n) => module_handle_impl(&n),
+            None => modules::main_module()
+                .map(|m| m.base)
+                .unwrap_or_else(|| win_module_handle(std::ptr::null(), Some(flags))),
+            Some(n) => module_handle_in_ex(crate::hle::registry(), &n, Some(flags)),
         }
     };
     *out = h;
@@ -3180,6 +3201,34 @@ mod tests {
             fnd::SetLastError(0);
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut huge, &mut page), 0);
             assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+
+    #[test]
+    fn get_module_handle_ex_honours_refcount_and_rejects_invalid_flags() {
+        unsafe {
+            let name = crate::util::wide("cabinet.dll");
+            let base = ll::LoadLibraryW(name.as_ptr());
+            assert!(!base.is_null(), "cabinet.dll should load on Windows");
+
+            // Invalid combination PIN | UNCHANGED_REFCOUNT must fail with ERROR_INVALID_PARAMETER.
+            let mut bad = 1usize;
+            fnd::SetLastError(0);
+            assert_eq!(GetModuleHandleExW(0x1 | 0x2, name.as_ptr(), &mut bad), 0);
+            assert_eq!(bad, 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            // Default flags (0) must increment the real Windows DLL's reference count so a
+            // matching FreeLibrary leaves the original LoadLibraryW reference alive.
+            let mut h = 0usize;
+            assert_eq!(GetModuleHandleExW(0, name.as_ptr(), &mut h), 1);
+            assert_eq!(h, base as usize);
+            assert_eq!(FreeLibrary(h), 1);
+            let still_loaded = ll::GetModuleHandleW(name.as_ptr());
+            assert!(!still_loaded.is_null(), "GetModuleHandleExW(0) failed to increment DLL refcount");
+
+            // Release our original LoadLibraryW reference.
+            fnd::FreeLibrary(base);
         }
     }
 

@@ -7287,13 +7287,32 @@ pub unsafe extern "win64" fn GetModuleHandleA(name: *const u8) -> usize {
     }
 }
 
+const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x1;
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x2;
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
 
 /// Shared `GetModuleHandleEx` body: `FROM_ADDRESS` resolves the mapped image containing
 /// `addr` (the game's own return address); otherwise it is the non-loading
 /// `GetModuleHandle` probe above. NULL name without `FROM_ADDRESS` is the main image.
+/// Mirrors the Windows guard order: unknown bits or PIN|UNCHANGED_REFCOUNT fail with
+/// ERROR_INVALID_PARAMETER and leave *out null (no refcount hook on Linux — see
+/// resolver_linux::system_module, always None — so only validation ports).
 fn module_handle_ex(flags: u32, name: Option<String>, addr: usize, out: *mut usize) -> i32 {
     if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if flags & !(GET_MODULE_HANDLE_EX_FLAG_PIN
+        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+        | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS)
+        != 0
+        || flags
+            & (GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT)
+            == (GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT)
+    {
+        unsafe {
+            *out = 0;
+        }
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -11381,6 +11400,33 @@ mod tests {
             );
             assert_eq!(GetLastError(), ERROR_MOD_NOT_FOUND);
             assert!(GetModuleHandleExW(0, std::ptr::null(), std::ptr::null_mut()) == 0);
+        }
+    }
+
+    #[test]
+    fn module_handle_ex_rejects_invalid_flags() {
+        unsafe {
+            // Port of upstream #1235 flag-validation: unknown bits or PIN|UNCHANGED_REFCOUNT
+            // fail with ERROR_INVALID_PARAMETER and leave *out null.
+            const PIN: u32 = 0x1;
+            const UNCHANGED_REFCOUNT: u32 = 0x2;
+            let name = crate::util::wide("kernelx.dll");
+            let mut out = 1usize;
+            assert_eq!(
+                GetModuleHandleExW(PIN | UNCHANGED_REFCOUNT, name.as_ptr(), &mut out),
+                0
+            );
+            assert_eq!(out, 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            let mut out2 = 1usize;
+            assert_eq!(GetModuleHandleExW(0x8, name.as_ptr(), &mut out2), 0);
+            assert_eq!(out2, 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // Controls: default flags and FROM_ADDRESS plumbing still work.
+            let mut ok = 0usize;
+            assert_eq!(GetModuleHandleExW(0, name.as_ptr(), &mut ok), 1);
+            assert_ne!(ok, 0);
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
         }
     }
 
