@@ -831,3 +831,25 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// scratch_* on RDNA2: SADDR 0x7F (EXEC_HI) is the ST form (the offset alone) and an SGPR the
+/// SS form, neither reads ADDR; NULL (0x7D) is SV, VADDR + offset. A program differing only
+/// in ADDR translates to the same container exactly when ADDR is not read.
+#[test]
+fn scratch_reads_addr_only_in_the_sv_form() {
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let kernel = |saddr: u64, addr: u64| {
+        let code = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 135)], None), // v2 = 7
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 137)], None), // v3 = 9
+            ("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", addr), ("DATA", 0), ("SADDR", saddr), ("OFFSET", 16)], None),
+            ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 4), ("ADDR", addr), ("SADDR", saddr), ("OFFSET", 20)], None),
+        ]);
+        translate(&code, ko).unwrap_or_else(|e| panic!("SADDR {saddr:#x} ADDR v{addr}: {e}"))
+    };
+    for (saddr, form) in [(0x7F, "ST"), (4, "SS")] {
+        assert!(kernel(saddr, 2) == kernel(saddr, 3), "{form} (SADDR {saddr:#x}) must not read ADDR");
+    }
+    assert!(kernel(0x7D, 2) != kernel(0x7D, 3), "SV (SADDR 0x7d) addresses VADDR + offset");
+    assert!(kernel(0x7F, 2) != kernel(0x7D, 2), "ST is not the SV form");
+}

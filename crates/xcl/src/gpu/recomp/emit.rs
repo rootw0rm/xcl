@@ -4429,12 +4429,17 @@ impl Em {
         Ok(())
     }
 
-    /// scratch_*: per-lane private memory (`xcl_scratch`); address = SADDR or VADDR + offset.
+    /// scratch_*: per-lane private memory (`xcl_scratch`); address = SADDR, VADDR or 0, + offset.
     fn scratch(&mut self, d: &Decoded, op: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         self.uses_scratch = true;
-        let saddr = f("SADDR");
-        let base = if saddr != 0x7D && saddr != 0x7F { self.sreg(saddr) } else { self.vreg(f("ADDR")) };
+        // RDNA2 has no SGPR + VGPR form (no SVE bit): SADDR 0x7F (EXEC_HI) is the ST form,
+        // the offset alone; NULL (0x7D) is SV, VADDR + offset; an SGPR is SS, SGPR + offset
+        let base = match f("SADDR") {
+            0x7F => "0u".to_string(),
+            0x7D => self.vreg(f("ADDR")),
+            s => self.sreg(s),
+        };
         let raw = f("OFFSET") as u32;
         let off = (((raw << 20) as i32) >> 20) as u32;
         let t = self.t();

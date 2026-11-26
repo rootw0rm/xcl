@@ -3297,6 +3297,69 @@ fn global_dword_addtid_address_is_saddr_plus_4_per_lane() {
     }
 }
 
+/// scratch_* (ENC_FLAT_SCRATCH) has three address forms on RDNA2 and no SGPR + VGPR one:
+/// SADDR 0x7F (EXEC_HI) is ST, the offset alone; NULL (0x7D) is SV, VADDR + offset; an SGPR
+/// is SS, SGPR + offset. ADDR is read only in the SV form.
+#[test]
+fn scratch_address_forms_follow_saddr() {
+    let scr = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_SCRATCH", f, None).unwrap();
+    let mut code = Vec::new();
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 5), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 7), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 0xFFC)]));
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 5), ("SADDR", 4), ("OFFSET", 8)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("uint t1_a = 0u + 0x00000010u;"), "ST: the offset alone\n{}", t.hlsl);
+    assert!(t.hlsl.contains("uint t2_a = v2 + 0xFFFFFFFCu;"), "SV: VADDR + the signed offset\n{}", t.hlsl);
+    assert!(t.hlsl.contains("uint t3_a = s4 + 0x00000008u;"), "SS: the SGPR + offset\n{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
+    }
+}
+
+/// On hardware: the ST scratch form addresses the offset alone whatever ADDR holds, SS the
+/// SGPR + offset, and SV the lane's VADDR + offset.
+#[test]
+fn gpu_scratch_address_forms() {
+    if !gpu_ready() {
+        return;
+    }
+    let scr = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_SCRATCH", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    // [16] = 0x55 (SV, v3 = 0), then ST writes [16] (ADDR = v2 is not read), SV reads it back
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 3), ("DATA", 9), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 5), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 20), ("ADDR", 3), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    // SS: s4 (8) + 32 = [40], read back through SV
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 6), ("SADDR", 4), ("OFFSET", 32)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 21), ("ADDR", 3), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    // [0x100] = 0x55 (ST), SV writes [0x100 + v2], ST reads [0x100]: lanes with v2 = 0 see the SV store
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 9), ("SADDR", 0x7F), ("OFFSET", 0x100)]));
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 7), ("SADDR", 0x7D), ("OFFSET", 0x100)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 22), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 0x100)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[4] = 8;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l32 = l as u32;
+        r[2] = 4 * (l32 % 4);
+        r[3] = 0;
+        r[5] = 0xA0 + l32;
+        r[6] = 0xB0 + l32;
+        r[7] = 0xC0 + l32;
+        r[9] = 0x55;
+    }
+    let r = runner::run_code(&code, &st, &[0u32; 16]).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate().take(64) {
+        let l32 = l as u32;
+        assert_eq!(v[20], 0xA0 + l32, "lane {l}: ST store at the offset alone");
+        assert_eq!(v[21], 0xB0 + l32, "lane {l}: SS store at s4 + offset");
+        assert_eq!(v[22], if l % 4 == 0 { 0xC0 + l32 } else { 0x55 }, "lane {l}: SV store at v2 + offset, ST load at the offset");
+    }
+}
+
 /// On hardware: every lane touches its own dword (EA = SADDR + 4·lane + OFFSET), the
 /// "off" SADDR sentinel gives a zero base and the signed offset can point below the base.
 #[test]
@@ -5629,10 +5692,10 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     code.extend(glbl("GLOBAL_STORE_SHORT_D16_HI", &[("ADDR", 2), ("DATA", 62), ("SADDR", 2), ("OFFSET", 0x100)]));
     code.extend(glbl("GLOBAL_LOAD_USHORT", &[("VDST", 63), ("ADDR", 2), ("SADDR", 2), ("OFFSET", 0x100)]));
     // scratch (per lane): a dword at 2 · lane + 16, a byte at 2 · lane + 40
-    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7F), ("OFFSET", 40)]));
-    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 40)]));
     // VALU
     let vv = |n: u64| V + n;
     code.extend(vop3("V_SAD_U8", &[("VDST", 66), ("SRC0", vv(22)), ("SRC1", vv(23)), ("SRC2", vv(24))]));

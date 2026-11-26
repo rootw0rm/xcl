@@ -2425,8 +2425,13 @@ impl Lw {
     }
 
     fn scratch(&mut self, d: &Decoded, op: &str) -> LResult<()> {
-        let saddr = Self::fv(d, "SADDR");
-        let base = if saddr != 0x7D && saddr != 0x7F { self.sreg(saddr) } else { self.vreg(Self::fv(d, "ADDR")) };
+        // RDNA2 has no SGPR + VGPR form (no SVE bit): SADDR 0x7F (EXEC_HI) is the ST form,
+        // the offset alone; NULL (0x7D) is SV, VADDR + offset; an SGPR is SS, SGPR + offset
+        let base = match Self::fv(d, "SADDR") {
+            0x7F => self.c(0),
+            0x7D => self.vreg(Self::fv(d, "ADDR")),
+            s => self.sreg(s),
+        };
         let raw = Self::fv(d, "OFFSET") as u32;
         let off = (((raw << 20) as i32) >> 20) as u32;
         let a = self.addc(base, off);
