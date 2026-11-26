@@ -206,7 +206,8 @@ unsafe fn release(p: usize) {
 }
 
 pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
-    if !enabled() {
+    // An RTV made by the compositor must not keep a swap-chain back buffer alive across ResizeBuffers.
+    if !enabled() || IN_PRESENT.with(Cell::get) {
         return;
     }
     let mut g = RTVS.lock().unwrap();
@@ -259,7 +260,7 @@ pub fn rt0_resource(list: usize) -> Option<usize> {
 }
 
 pub fn note_rt0(list: usize, handle: usize) {
-    if !enabled() {
+    if !enabled() || IN_PRESENT.with(Cell::get) {
         return;
     }
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
@@ -274,6 +275,19 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
         DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,
     })
+}
+
+/// Shader-resource view format for a composited `PresentX` plane: resolves typeless
+/// formats to a concrete view format while preserving concrete formats (including
+/// `*_UNORM_SRGB`, which D3D12 forbids viewing as `*_UNORM`).
+fn plane_srv_format(f: DXGI_FORMAT) -> DXGI_FORMAT {
+    match f {
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        _ => f,
+    }
 }
 
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
@@ -880,7 +894,7 @@ impl Compositor {
             let mut srv_cpu = srv_cpu_base;
             srv_cpu.ptr += (first + i) * self.srv_inc as usize;
             let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: swap_format(desc.Format).unwrap_or(desc.Format),
+                Format: plane_srv_format(desc.Format),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 ..Default::default()
@@ -1504,6 +1518,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compositor_render_targets_stay_out_of_title_tracking() {
+        unsafe {
+            // The tracking hooks only need IUnknown's AddRef and Release.
+            let object: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let res = object.as_raw();
+            let handles = [0u8; 3];
+            let title = handles.as_ptr() as usize;
+            let compositor = title + 1;
+            let list = title + 2;
+            note_rtv(title, res);
+            note_rt0(list, title);
+            IN_PRESENT.with(|flag| {
+                let previous = flag.replace(true);
+                note_rtv(compositor, res);
+                note_rt0(list, compositor);
+                flag.set(previous);
+            });
+            let tracked = (rtv_resource(title), rtv_resource(compositor));
+            let bound = LISTS.lock().unwrap().as_mut().and_then(|lists| lists.remove(&list));
+            note_rtv(compositor, std::ptr::null_mut());
+            note_rtv(title, std::ptr::null_mut());
+            assert_eq!(tracked, (Some(res as usize), None));
+            assert_eq!(bound, Some(title));
+        }
+    }
+
+    #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
         let mut ring = PresentRing::new(PRESENT_SLOTS);
         // Frame 1 (p.value == 0) -> slot 0, no wait, no rotation.
@@ -1854,6 +1895,141 @@ mod frame_dump_tests {
             let blend = px(1, 2);
             assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
             rb.Unmap(0, None);
+        }
+    }
+
+    #[test]
+    fn compositor_preserves_concrete_srgb_plane_srv_format() {
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB), DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R8G8B8A8_TYPELESS), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_B8G8R8A8_TYPELESS), DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R10G10B10A2_TYPELESS), DXGI_FORMAT_R10G10B10A2_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R16G16B16A16_TYPELESS), DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R8G8B8A8_UNORM), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R16G16B16A16_FLOAT), DXGI_FORMAT_R16G16B16A16_FLOAT);
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut comp = Compositor::new(&dev).unwrap();
+
+            let make_tex = |fmt: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 4,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: fmt,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+                r.unwrap()
+            };
+
+            let srgb = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, D3D12_RESOURCE_FLAG_NONE);
+            let out = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            let mut up: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256 * 4,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut up,
+            )
+            .unwrap();
+            let up = up.unwrap();
+            let mut p: *mut c_void = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).unwrap();
+            let bytes = std::slice::from_raw_parts_mut(p as *mut u8, 256 * 4);
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    let off = y * 256 + x * 4;
+                    bytes[off..off + 4].copy_from_slice(&[188, 128, 0, 255]);
+                }
+            }
+            up.Unmap(0, None);
+            let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&srgb),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&up),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            list.ResourceBarrier(&[transition(&srgb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            list.ResourceBarrier(&[
+                transition(&srgb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+                transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            ]);
+
+            let planes = [(srgb.clone(), srgb.GetDesc(), [0.0, 0.0, 1.0, 1.0])];
+            assert!(comp.record(&dev, &list, &out, 4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, 0));
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let out_desc = out.GetDesc();
+            let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
+            list.Close().unwrap();
+
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cl)]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            let mut rp: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rp)).unwrap();
+            let off = fp.Offset as usize + fp.Footprint.RowPitch as usize + 4;
+            let px = std::slice::from_raw_parts((rp as *const u8).add(off), 4);
+            let got = [px[0], px[1], px[2], px[3]];
+            rb.Unmap(0, None);
+            // Concrete R8G8B8A8_UNORM_SRGB sampled with an sRGB SRV decodes sRGB -> linear
+            // (~[128, 55, 0, 255]), whereas forcing UNORM fails SRV creation or skips sRGB decode.
+            assert!(
+                (125..=131).contains(&got[0]) && (52..=58).contains(&got[1]) && got[2] == 0 && got[3] == 255,
+                "expected sRGB-decoded concrete plane sample ~[128, 55, 0, 255], got {got:?}"
+            );
         }
     }
 }
