@@ -553,6 +553,7 @@ fn xpls() -> Vec<(&'static str, usize)> {
         ("XPersistentLocalStorageGetPathSize", xu::XPersistentLocalStorageGetPathSize as usize),
         ("XPersistentLocalStorageGetPath", xu::XPersistentLocalStorageGetPath as usize),
         ("XPersistentLocalStorageGetSpaceInfo", xu::XPersistentLocalStorageGetSpaceInfo as usize),
+        ("XPersistentLocalStorageMountForPackage", XPersistentLocalStorageMountForPackage as usize),
     ];
     // no prompt to show: the space asked for is granted
     v.extend([("XPersistentLocalStoragePromptUserForSpaceAsync", prompt_space_async as usize), ("XPersistentLocalStoragePromptUserForSpaceResult", empty_result as usize)]);
@@ -845,6 +846,27 @@ pub unsafe extern "win64" fn XPackageCloseMountHandle(m: *mut c_void) {
         LIVE_MOUNTS.fetch_sub(1, Ordering::SeqCst);
         drop(Box::from_raw(m as *mut Mount));
     }
+}
+
+/// `XPersistentLocalStorageMountForPackage(packageIdentifier, mountHandle)`: the running
+/// game's PLS as an XPackage mount handle (path through XPackageGetMountPath(Size), closed
+/// with XPackageCloseMountHandle). Any other package has no PLS here:
+/// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), what the GDK reference gives for a title whose
+/// PLS does not exist.
+pub unsafe extern "win64" fn XPersistentLocalStorageMountForPackage(id: *const u8, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = std::ptr::null_mut();
+    let Some(id) = crate::util::from_cstr_ptr(id).filter(|s| !s.is_empty()) else { return E_INVALIDARG };
+    if !id.eq_ignore_ascii_case(&package_identifier()) {
+        crate::xlog_warn!("XPersistentLocalStorageMountForPackage({id}) – no such package here");
+        return crate::util::hresult_from_win32(2); // ERROR_FILE_NOT_FOUND
+    }
+    #[cfg(test)]
+    LIVE_MOUNTS.fetch_add(1, Ordering::SeqCst);
+    *out = Box::into_raw(Box::new(Mount { path: xu::pls_path() })) as *mut c_void;
+    S_OK
 }
 
 /// every chunk is installed (XPackageChunkAvailability::Ready = 0)
@@ -1511,6 +1533,40 @@ mod tests {
             let mut mount_out = 0xDEADBEEFusize;
             assert_eq!(mount_with_ui_result(&mut b_bad, &mut mount_out), E_INVALIDARG);
             assert_eq!(mount_out, 0);
+        }
+    }
+
+    #[test]
+    fn pls_mounts_for_the_running_package_only() {
+        // No ASYNC_TEST_LOCK on the Linux twin (cf. step-48): direct win64 calls only.
+        unsafe {
+            let before = LIVE_MOUNTS.load(Ordering::SeqCst);
+            let mut m: *mut c_void = 1 as *mut c_void;
+            assert_eq!(XPersistentLocalStorageMountForPackage(b"x\0".as_ptr(), std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(XPersistentLocalStorageMountForPackage(std::ptr::null(), &mut m), E_INVALIDARG);
+            assert!(m.is_null());
+            assert_eq!(XPersistentLocalStorageMountForPackage(b"\0".as_ptr(), &mut m), E_INVALIDARG);
+            // another title's package: no PLS here
+            let other = b"Some.Other.Title_1.0.0.0_x64__8wekyb3d8bbwe\0";
+            assert_eq!(XPersistentLocalStorageMountForPackage(other.as_ptr(), &mut m), crate::util::hresult_from_win32(2));
+            assert!(m.is_null());
+            // the running package, in any case: the same path XPersistentLocalStorageGetPath gives
+            let id = format!("{}\0", package_identifier().to_ascii_lowercase());
+            assert_eq!(XPersistentLocalStorageMountForPackage(id.as_ptr(), &mut m), S_OK);
+            assert!(!m.is_null());
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before + 1);
+            let mut size = 0usize;
+            assert_eq!(XPackageGetMountPathSize(m, &mut size), S_OK);
+            let mut buf = vec![0u8; size];
+            assert_eq!(XPackageGetMountPath(m, size, buf.as_mut_ptr()), S_OK);
+            let got = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_str().unwrap();
+            let mut want_size = 0usize;
+            assert_eq!(xu::XPersistentLocalStorageGetPathSize(&mut want_size), S_OK);
+            let mut want = vec![0u8; want_size];
+            assert_eq!(xu::XPersistentLocalStorageGetPath(want_size, want.as_mut_ptr(), std::ptr::null_mut()), S_OK);
+            assert_eq!(got, std::ffi::CStr::from_bytes_until_nul(&want).unwrap().to_str().unwrap());
+            XPackageCloseMountHandle(m);
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before);
         }
     }
 }

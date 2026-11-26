@@ -85,6 +85,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XNetworkingGetConnectivityHint,
         XNetworkingRegisterConnectivityHintChanged,
         XNetworkingUnregisterConnectivityHintChanged,
+        XNetworkingQueryConfigurationSetting,
+        XNetworkingSetConfigurationSetting,
+        XNetworkingQueryStatistics,
         // system
         XSystemGetDeviceType,
         XSystemGetConsoleId,
@@ -103,6 +106,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XPersistentLocalStorageGetPathSize,
         XPersistentLocalStorageGetPath,
         XPersistentLocalStorageGetSpaceInfo,
+        XPersistentLocalStorageMountForPackage,
         XGameSaveFilesGetFolderWithUiAsync,
         XGameSaveFilesGetFolderWithUiResult,
         // game save containers
@@ -396,6 +400,26 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetPathSize(size: *mut usiz
 
 pub unsafe extern "system" fn XPersistentLocalStorageGetPath(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
     write_cstr_out(&pls_path(), buf, size, used)
+}
+
+/// `XPersistentLocalStorageMountForPackage(packageIdentifier, mountHandle)`: a package's PLS
+/// as an XPackage mount handle (path through XPackageGetMountPath(Size), closed with
+/// XPackageCloseMountHandle). The only package XCL has is the running game, so its own PLS
+/// is mounted (the path XPersistentLocalStorageGetPath gives); any other package has no PLS
+/// here: HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), what the GDK reference gives for a title
+/// whose PLS does not exist.
+pub unsafe extern "system" fn XPersistentLocalStorageMountForPackage(id: *const u8, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = std::ptr::null_mut();
+    let Some(id) = crate::util::from_cstr_ptr(id).filter(|s| !s.is_empty()) else { return E_INVALIDARG };
+    if !id.eq_ignore_ascii_case(&package_identifier()) {
+        crate::xlog_warn!("XPersistentLocalStorageMountForPackage({id}) – no such package here");
+        return crate::util::hresult_from_win32(2); // ERROR_FILE_NOT_FOUND
+    }
+    *out = Box::into_raw(Box::new(Mount { path: pls_path() })) as *mut c_void;
+    S_OK
 }
 
 #[repr(C)]
@@ -1349,6 +1373,31 @@ mod tests {
                 E_INVALIDARG
             );
             assert_eq!(token16_ptr, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn pls_mounts_for_the_running_package_only() {
+        unsafe {
+            let mut m: *mut c_void = 1 as *mut c_void;
+            assert_eq!(XPersistentLocalStorageMountForPackage(b"x\0".as_ptr(), std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(XPersistentLocalStorageMountForPackage(std::ptr::null(), &mut m), E_INVALIDARG);
+            assert!(m.is_null());
+            assert_eq!(XPersistentLocalStorageMountForPackage(b"\0".as_ptr(), &mut m), E_INVALIDARG);
+            // another title's package: no PLS here
+            let other = b"Some.Other.Title_1.0.0.0_x64__8wekyb3d8bbwe\0";
+            assert_eq!(XPersistentLocalStorageMountForPackage(other.as_ptr(), &mut m), crate::util::hresult_from_win32(2));
+            assert!(m.is_null());
+            // the running package, in any case: the same path XPersistentLocalStorageGetPath gives
+            let id = format!("{}\0", package_identifier().to_ascii_lowercase());
+            assert_eq!(XPersistentLocalStorageMountForPackage(id.as_ptr(), &mut m), S_OK);
+            assert!(!m.is_null());
+            let mut size = 0usize;
+            assert_eq!(XPackageGetMountPathSize(m, &mut size), S_OK);
+            let mut buf = vec![0u8; size];
+            assert_eq!(XPackageGetMountPath(m, size, buf.as_mut_ptr()), S_OK);
+            assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_str().unwrap(), pls_path());
+            XPackageCloseMountHandle(m);
         }
     }
 }

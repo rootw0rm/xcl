@@ -1061,7 +1061,7 @@ fn pls_dir() -> PathBuf {
     data_subdir("pls")
 }
 
-fn pls_path() -> String {
+pub(crate) fn pls_path() -> String {
     // Ensure the host folder exists even when the title gets the `S:\` drive root.
     let _ = pls_dir();
     crate::state::config().pls_drive().unwrap_or_else(|| pls_dir().to_string_lossy().into_owned())

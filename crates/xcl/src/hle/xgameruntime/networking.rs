@@ -709,6 +709,66 @@ pub unsafe extern "system" fn XNetworkingUnregisterConnectivityHintChanged(_toke
     true
 }
 
+// ---------------------------------------------------------------------------------------
+// Configuration settings and statistics (TCP queued receive buffers)
+// ---------------------------------------------------------------------------------------
+
+/// `XNetworkingConfigurationSetting` values: the most memory the title's, the system's and
+/// the tools' TCP sockets may queue for received payloads no buffer was posted for yet.
+pub const MAX_TITLE_TCP_QUEUED_RECEIVE_BUFFER_SIZE: u32 = 0;
+pub const MAX_SYSTEM_TCP_QUEUED_RECEIVE_BUFFER_SIZE: u32 = 1;
+pub const MAX_TOOLS_TCP_QUEUED_RECEIVE_BUFFER_SIZE: u32 = 2;
+
+/// The console's defaults (XCL reports a console, not a PC): 32 MiB for the title, 4 MiB
+/// for the system, no limit for the tools.
+const CONFIG_DEFAULTS: [u64; 3] = [32 << 20, 4 << 20, u64::MAX];
+
+static CONFIG: [AtomicU64; 3] = [AtomicU64::new(CONFIG_DEFAULTS[0]), AtomicU64::new(CONFIG_DEFAULTS[1]), AtomicU64::new(CONFIG_DEFAULTS[2])];
+
+/// `XNetworkingQueryConfigurationSetting(setting, value)`: the value last set, else the
+/// console default. A setting the runtime does not know is E_INVALIDARG.
+pub unsafe extern "system" fn XNetworkingQueryConfigurationSetting(setting: u32, value: *mut u64) -> HRESULT {
+    let Some(v) = CONFIG.get(setting as usize) else { return E_INVALIDARG };
+    if value.is_null() {
+        return E_INVALIDARG;
+    }
+    *value = v.load(Ordering::Acquire);
+    S_OK
+}
+
+/// `XNetworkingSetConfigurationSetting(setting, value)`: every value from 0 to UINT64_MAX
+/// is valid. XCL's sockets are the host's, so the limit is kept and reported, not enforced.
+pub unsafe extern "system" fn XNetworkingSetConfigurationSetting(setting: u32, value: u64) -> HRESULT {
+    let Some(v) = CONFIG.get(setting as usize) else { return E_INVALIDARG };
+    if v.swap(value, Ordering::AcqRel) != value {
+        crate::xlog_info!("XNetworkingSetConfigurationSetting({setting}) = {value:#x}");
+    }
+    S_OK
+}
+
+/// `XNetworkingTcpQueuedReceivedBufferUsageStatistics` (`XNetworking.h`, 40 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XNetworkingTcpQueuedReceivedBufferUsageStatistics {
+    pub num_bytes_currently_queued: u64,
+    pub peak_num_bytes_ever_queued: u64,
+    pub total_num_bytes_queued: u64,
+    pub num_bytes_dropped_for_exceeding_configured_max: u64,
+    pub num_bytes_dropped_due_to_any_failure: u64,
+}
+
+/// `XNetworkingQueryStatistics(type, buffer)`: the three `XNetworkingStatisticsType`s (title,
+/// system, tools TCP queued receive buffer usage) all write `tcpQueuedReceiveBufferUsage`,
+/// and only it (the rest of the caller's union stays as it was). The host keeps no such
+/// queues per partition, so nothing is queued or dropped: all zero, as a PC reports.
+pub unsafe extern "system" fn XNetworkingQueryStatistics(kind: u32, buffer: *mut XNetworkingTcpQueuedReceivedBufferUsageStatistics) -> HRESULT {
+    if kind > 2 || buffer.is_null() {
+        return E_INVALIDARG;
+    }
+    std::ptr::write_unaligned(buffer, XNetworkingTcpQueuedReceivedBufferUsageStatistics::default());
+    S_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +779,46 @@ mod tests {
         assert_eq!(std::mem::size_of::<XNetworkingThumbprint>(), 24);
         assert_eq!(std::mem::size_of::<XNetworkingSecurityInformation>(), 24);
         assert_eq!(std::mem::size_of::<XNetworkingConnectivityHint>(), 16);
+        assert_eq!(std::mem::size_of::<XNetworkingTcpQueuedReceivedBufferUsageStatistics>(), 40);
+    }
+
+    /// Configuration settings start at the console defaults, keep what the title sets (any
+    /// u64, 0 and UINT64_MAX included) and refuse a setting the runtime does not know.
+    #[test]
+    fn configuration_settings_keep_what_the_title_sets() {
+        unsafe {
+            let mut v = 0u64;
+            assert_eq!(XNetworkingQueryConfigurationSetting(MAX_SYSTEM_TCP_QUEUED_RECEIVE_BUFFER_SIZE, &mut v), S_OK);
+            assert_eq!(v, 4 << 20);
+            assert_eq!(XNetworkingQueryConfigurationSetting(MAX_TOOLS_TCP_QUEUED_RECEIVE_BUFFER_SIZE, &mut v), S_OK);
+            assert_eq!(v, u64::MAX);
+            for want in [0, 1 << 20, u64::MAX, 32 << 20] {
+                assert_eq!(XNetworkingSetConfigurationSetting(MAX_TITLE_TCP_QUEUED_RECEIVE_BUFFER_SIZE, want), S_OK);
+                assert_eq!(XNetworkingQueryConfigurationSetting(MAX_TITLE_TCP_QUEUED_RECEIVE_BUFFER_SIZE, &mut v), S_OK);
+                assert_eq!(v, want);
+            }
+            assert_eq!(XNetworkingQueryConfigurationSetting(3, &mut v), E_INVALIDARG);
+            assert_eq!(XNetworkingSetConfigurationSetting(3, 0), E_INVALIDARG);
+            assert_eq!(XNetworkingQueryConfigurationSetting(MAX_TITLE_TCP_QUEUED_RECEIVE_BUFFER_SIZE, std::ptr::null_mut()), E_INVALIDARG);
+        }
+    }
+
+    /// Statistics write the 40-byte substructure only: the bytes after it in the caller's
+    /// buffer stay as they were.
+    #[test]
+    fn statistics_write_only_the_substructure() {
+        unsafe {
+            let mut buf = [0xAAu8; 48];
+            let p = buf.as_mut_ptr() as *mut XNetworkingTcpQueuedReceivedBufferUsageStatistics;
+            for kind in 0..3 {
+                buf = [0xAA; 48];
+                assert_eq!(XNetworkingQueryStatistics(kind, p), S_OK);
+                assert!(buf[..40].iter().all(|&b| b == 0), "type {kind}");
+                assert!(buf[40..].iter().all(|&b| b == 0xAA), "type {kind}");
+            }
+            assert_eq!(XNetworkingQueryStatistics(3, p), E_INVALIDARG);
+            assert_eq!(XNetworkingQueryStatistics(0, std::ptr::null_mut()), E_INVALIDARG);
+        }
     }
 
     /// A chain laid out byte by byte as `wincrypt.h` places it on x64, independent of the
