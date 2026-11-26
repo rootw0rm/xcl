@@ -620,6 +620,83 @@ unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
     }
 }
 
+type FnSetFileInfoByHandle = unsafe extern "system" fn(HANDLE, i32, *const c_void, u32) -> i32;
+static O_SET_FILE_INFO_BY_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
+const FILE_DISPOSITION_FLAG_ON_CLOSE: u32 = 0x8;
+
+/// Game-relative path of the overlay file behind `h`. None for a directory and for a handle
+/// that is not inside the overlay.
+unsafe fn overlay_file_rel(v: &vfs::Vfs, h: HANDLE) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+    if GetFileInformationByHandle(h, &mut info) == 0 || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; 1024];
+    let mut n = GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, 0) as usize;
+    if n > buf.len() {
+        buf.resize(n + 1, 0);
+        n = GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, 0) as usize;
+    }
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    let real = String::from_utf16_lossy(&buf[..n]);
+    // the same form as the handle's name: "\\?\", links and short names resolved
+    let root = std::fs::canonicalize(v.overlay_path("")).ok()?;
+    let root = root.to_string_lossy();
+    if !real.to_lowercase().starts_with(&root.to_lowercase()) {
+        return None;
+    }
+    let rel = real.get(root.len()..)?.strip_prefix('\\')?;
+    (!rel.is_empty()).then(|| rel.to_string())
+}
+
+/// A delete through a handle (`std::filesystem::remove` does it this way). The handle of a game
+/// file is its overlay copy, so the delete removes only the copy: the whiteout is recorded here.
+/// Directories and delete-on-close (FILE_DISPOSITION_FLAG_ON_CLOSE) are passed through.
+unsafe fn set_file_info_vfs(v: &vfs::Vfs, h: HANDLE, class: i32, info: *const c_void, size: u32, orig: impl Fn() -> i32) -> i32 {
+    let delete = match class {
+        FILE_DISPOSITION_INFO_CLASS if !info.is_null() && size >= 1 => Some(*(info as *const u8) != 0),
+        FILE_DISPOSITION_INFO_EX_CLASS if !info.is_null() && size >= 4 => {
+            let flags = (info as *const u32).read_unaligned();
+            (flags & FILE_DISPOSITION_FLAG_ON_CLOSE == 0).then_some(flags & FILE_DISPOSITION_FLAG_DELETE != 0)
+        }
+        _ => None,
+    };
+    let Some(delete) = delete else { return orig() };
+    let err = GetLastError();
+    // resolved before the call, while the file's name is certainly still there
+    let rel = overlay_file_rel(v, h);
+    SetLastError(err);
+    let ok = orig();
+    if ok != 0 {
+        if let Some(rel) = rel {
+            let err = GetLastError();
+            if delete {
+                v.commit_overlay_removal(&rel);
+            } else {
+                // the delete was taken back: the file stays
+                v.commit_write(&rel);
+            }
+            SetLastError(err);
+        }
+    }
+    ok
+}
+
+unsafe extern "system" fn hk_set_file_info_by_handle(h: HANDLE, class: i32, info: *const c_void, size: u32) -> i32 {
+    let orig = orig!(O_SET_FILE_INFO_BY_HANDLE as FnSetFileInfoByHandle);
+    let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(h, class, info, size) };
+    set_file_info_vfs(v, h, class, info, size, || orig(h, class, info, size))
+}
+
 /// Source for a copy/move: (real path to read, game rel if it lives in the game folder).
 fn source_of(v: &vfs::Vfs, path: &str) -> Result<(String, Option<String>), u32> {
     match v.classify(path) {
@@ -1328,6 +1405,7 @@ pub fn install() -> Result<(), String> {
         ("CreateDirectoryW", hk_create_dir_w as usize, &O_CREATE_DIR_W),
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),
+        ("SetFileInformationByHandle", hk_set_file_info_by_handle as usize, &O_SET_FILE_INFO_BY_HANDLE),
         ("ReadFile", hk_read_file as usize, &O_READ_FILE),
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
         ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
@@ -2014,5 +2092,85 @@ mod tests {
             assert_eq!(hk_find_close(h), 1);
             assert!(matches!(merged_next(h), MergedNext::NotMerged));
         }
+    }
+
+    /// Open the way MSVC's `std::filesystem::remove` does, through the hooks' open decision.
+    fn open_for_delete(v: &vfs::Vfs, path: &str) -> HANDLE {
+        let access = 0x0001_0000 | 0x80 | 0x100; // DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+        let flags = 0x0200_0000 | 0x0020_0000; // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+        let open = |p, disposition| unsafe { CreateFileW(p, access, 7, std::ptr::null(), disposition, flags, std::ptr::null_mut()) };
+        // Adapted to this tree's reconciled (#1038) signature: the staged
+        // decision commits inside `apply_open_decision` once the host open
+        // succeeds, exactly as the `hk_create_file_*` call sites do.
+        let handle = apply_open_decision(v, v.open_decision_staged(&path, access, 3, flags), 3, || INVALID_HANDLE_VALUE, open);
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "open {path}");
+        handle
+    }
+
+    fn set_info<T>(v: &vfs::Vfs, h: HANDLE, class: i32, info: &T) -> i32 {
+        use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+        let (p, n) = (info as *const T as *const c_void, std::mem::size_of::<T>() as u32);
+        // SAFETY: `info` is a live, aligned buffer of `n` bytes for the duration of both calls.
+        unsafe { set_file_info_vfs(v, h, class, p, n, || SetFileInformationByHandle(h, class, p, n)) }
+    }
+
+    #[test]
+    fn delete_by_handle_hides_the_game_file() {
+        let f = HookFixture::new("handle_delete");
+        let v = &f.vfs;
+
+        // FileDispositionInfo { DeleteFile: TRUE }
+        let h = open_for_delete(v, r"G:\data\hello.txt");
+        unsafe { SetLastError(4242) };
+        assert_eq!(set_info(v, h, FILE_DISPOSITION_INFO_CLASS, &1u8), 1);
+        assert_eq!(unsafe { GetLastError() }, 4242, "a successful call leaves the last error alone");
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
+        assert!(v.is_whiteout(r"data\hello.txt"));
+        assert!(!v.exists(r"data\hello.txt"));
+        assert_eq!(f.read_vfs(r"G:\data\hello.txt"), None);
+        assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+
+        // FileDispositionInfoEx { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS }
+        let h = open_for_delete(v, r"G:\data\gone.txt");
+        let ok = set_info(v, h, FILE_DISPOSITION_INFO_EX_CLASS, &3u32);
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
+        // a file system without this class fails the call, and nothing is deleted
+        assert_eq!(v.exists(r"data\gone.txt"), ok == 0);
+        assert_eq!(v.is_whiteout(r"data\gone.txt"), ok != 0);
+        assert_eq!(std::fs::read(f.game().join("data").join("gone.txt")).unwrap(), b"bye");
+    }
+
+    #[test]
+    fn set_file_info_by_handle_passes_everything_else_through() {
+        let f = HookFixture::new("handle_pass");
+        let v = &f.vfs;
+
+        // a directory (its overlay copy is still empty here) is not hidden: its game files stay
+        let h = open_for_delete(v, r"G:\data");
+        assert_eq!(set_info(v, h, FILE_DISPOSITION_INFO_CLASS, &1u8), 1);
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
+        assert!(v.whiteouts().is_empty(), "{:?}", v.whiteouts());
+        assert_eq!(f.read_vfs(r"G:\data\gone.txt"), Some(b"bye".to_vec()));
+
+        // a delete that is taken back, and another class (FileBasicInfo, all zero = no change)
+        let h = open_for_delete(v, r"G:\data\hello.txt");
+        assert_eq!(set_info(v, h, FILE_DISPOSITION_INFO_CLASS, &1u8), 1);
+        assert_eq!(set_info(v, h, FILE_DISPOSITION_INFO_CLASS, &0u8), 1);
+        assert_eq!(set_info(v, h, 0, &[0u64; 5]), 1);
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
+        assert!(!v.is_whiteout(r"data\hello.txt"));
+        assert_eq!(f.read_vfs(r"G:\data\hello.txt"), Some(b"original".to_vec()));
+
+        // a file outside the overlay is deleted and leaves no whiteout
+        std::fs::write(f.temp().join("ext.txt"), b"ext").unwrap();
+        let h = open_for_delete(v, r"T:\ext.txt");
+        assert_eq!(set_info(v, h, FILE_DISPOSITION_INFO_CLASS, &1u8), 1);
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
+        assert!(!f.temp().join("ext.txt").exists());
+        assert!(v.whiteouts().is_empty(), "{:?}", v.whiteouts());
+
+        // a failed call returns the native result and error
+        assert_eq!(set_info(v, INVALID_HANDLE_VALUE, FILE_DISPOSITION_INFO_CLASS, &1u8), 0);
+        assert_eq!(unsafe { GetLastError() }, 6); // ERROR_INVALID_HANDLE
     }
 }

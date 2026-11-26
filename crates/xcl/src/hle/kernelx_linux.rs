@@ -3575,6 +3575,23 @@ fn close_file_handle(h: usize) -> bool {
             }
         }
     }
+    // Upstream #1054: a disposition-delete mark finalises when the marking
+    // handle closes (Windows deletes the file at close). Best effort: drop the
+    // overlay copy so the whiteout recorded at set time hides the original.
+    // NOTE: bind before use (same non-reentrant-mutex rule as above).
+    let mark = handle_delete_marks().lock().unwrap().remove(&h);
+    if let Some(mark) = mark {
+        match (crate::vfs::get(), mark.rel) {
+            (Some(v), Some(rel)) => {
+                let _ = v.delete_file(&rel);
+            }
+            _ => {
+                if !mark.host.is_empty() {
+                    let _ = std::fs::remove_file(&mark.host);
+                }
+            }
+        }
+    }
     true
 }
 
@@ -4619,6 +4636,157 @@ fn delete_file_impl(path: &str) -> i32 {
             0
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Handle-based deletes (Linux twin of upstream #1054).
+// ---------------------------------------------------------------------------------------
+//
+// `SetFileInformationByHandle(FileDisposition*)` is how `std::filesystem::remove`
+// deletes: the handle names the overlay copy, so removing only the copy would
+// expose the original. The overlay rel is resolved BEFORE the mark (through
+// `/proc/self/fd`, while the file's name is certainly still there) — the
+// `GetFinalPathNameByHandleW` + overlay-root prefix check of upstream
+// `overlay_file_rel`. Directory handles and handles outside the overlay are
+// passed through with no VFS bookkeeping. A successful disposition-delete
+// records the whiteout at set time and removes the overlay copy when the
+// marking handle closes (Windows deletes at close, which is also what keeps a
+// taken-back delete reversible); a taken-back delete records a write instead.
+// The last error is preserved across the bookkeeping, and a successful call
+// leaves the caller's last error alone, as on Windows.
+
+const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
+const FILE_DISPOSITION_INFO_EX_CLASS: u32 = 21;
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
+const FILE_DISPOSITION_FLAG_ON_CLOSE: u32 = 0x8;
+
+/// A disposition-delete mark: the whiteout is recorded at set time, the file
+/// itself is removed when the marking handle closes.
+struct HandleDeleteMark {
+    /// Game-relative path when the handle names a game file (the overlay copy
+    /// or, for a read-only handle, the original itself); `None` for host files.
+    rel: Option<String>,
+    /// Absolute host path behind the handle, for the non-game case.
+    host: String,
+}
+
+static HANDLE_DELETE_MARKS: OnceLock<Mutex<HashMap<usize, HandleDeleteMark>>> =
+    OnceLock::new();
+
+fn handle_delete_marks() -> &'static Mutex<HashMap<usize, HandleDeleteMark>> {
+    HANDLE_DELETE_MARKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Absolute host path behind a file handle via `/proc/self/fd`, without the
+/// ` (deleted)` suffix the kernel appends after an unlink. `None` when the
+/// handle is not a known file handle.
+fn handle_fs_path(handle: usize) -> Option<std::path::PathBuf> {
+    let fd = with_file(handle, |f| {
+        use std::os::fd::{AsFd, AsRawFd};
+        f.as_fd().as_raw_fd()
+    })?;
+    let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    let s = link.to_string_lossy();
+    let s = s.strip_suffix(" (deleted)").unwrap_or(&s);
+    Some(std::path::PathBuf::from(s.to_string()))
+}
+
+/// Game-relative path of the file behind `handle`. `None` for directory
+/// handles and for handles outside the game folder (overlay copies and
+/// read-only originals both resolve; host files do not).
+fn game_rel_for_handle(v: &crate::vfs::Vfs, handle: usize) -> Option<String> {
+    if with_file(handle, |f| f.metadata().map(|m| m.is_dir()).unwrap_or(true)).unwrap_or(true) {
+        return None;
+    }
+    let path = handle_fs_path(handle)?;
+    // The handle names the overlay copy: hide the game file it covers.
+    let root = std::path::PathBuf::from(v.overlay_path(""));
+    if let Ok(rel) = path.strip_prefix(&root) {
+        if !rel.as_os_str().is_empty() {
+            return Some(rel.to_string_lossy().replace('/', "\\"));
+        }
+        return None;
+    }
+    // A read-only handle can name the original itself (no overlay copy was
+    // staged): whiteout the game file without touching the game folder.
+    let groot = std::path::PathBuf::from(v.game_root());
+    if let Ok(rel) = path.strip_prefix(&groot) {
+        if !rel.as_os_str().is_empty() {
+            return Some(rel.to_string_lossy().replace('/', "\\"));
+        }
+    }
+    None
+}
+
+/// `BOOL SetFileInformationByHandle(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD)` —
+/// only the two disposition classes carry VFS meaning; everything else
+/// (other info classes, delete-on-close marks) passes through untouched.
+pub unsafe extern "win64" fn SetFileInformationByHandle(
+    handle: usize,
+    class: u32,
+    info: *const c_void,
+    size: u32,
+) -> i32 {
+    // Matches upstream `set_file_info_vfs` class handling verbatim.
+    let delete = match class {
+        FILE_DISPOSITION_INFO_CLASS if !info.is_null() && size >= 1 => {
+            Some((info as *const u8).read_unaligned() != 0)
+        }
+        FILE_DISPOSITION_INFO_EX_CLASS if !info.is_null() && size >= 4 => {
+            let flags = (info as *const u32).read_unaligned();
+            if flags & FILE_DISPOSITION_FLAG_ON_CLOSE != 0 {
+                None
+            } else {
+                Some(flags & FILE_DISPOSITION_FLAG_DELETE != 0)
+            }
+        }
+        _ => None,
+    };
+    // NOTE: bind before use: a map-guard temporary must never live across a
+    // second lock of the same non-reentrant mutex (see `close_file_handle`).
+    let known = files().lock().unwrap().contains_key(&handle);
+    if !known {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let saved = get_error();
+    let Some(delete) = delete else {
+        // Passed through: a known file handle succeeds with no VFS change.
+        set_error(saved);
+        return 1;
+    };
+    if with_file(handle, |f| f.metadata().map(|m| m.is_dir()).unwrap_or(true)).unwrap_or(true) {
+        // Directories are passed through: never hidden, never marked.
+        set_error(saved);
+        return 1;
+    }
+    // Resolved BEFORE the mark, while the file's name is certainly still there.
+    let v = crate::vfs::get();
+    let rel = v.and_then(|v| game_rel_for_handle(v, handle));
+    if delete {
+        let host = handle_fs_path(handle)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        handle_delete_marks()
+            .lock()
+            .unwrap()
+            .insert(handle, HandleDeleteMark { rel: rel.clone(), host });
+        if let (Some(v), Some(r)) = (v, rel.as_deref()) {
+            let err = get_error();
+            v.commit_overlay_removal(r);
+            set_error(err);
+        }
+    } else {
+        // The delete was taken back: the file stays.
+        handle_delete_marks().lock().unwrap().remove(&handle);
+        if let (Some(v), Some(r)) = (v, rel.as_deref()) {
+            let err = get_error();
+            v.commit_write(r);
+            set_error(err);
+        }
+    }
+    set_error(saved);
+    1
 }
 
 pub unsafe extern "win64" fn CreateDirectoryW(name: *const u16, _sa: *const c_void) -> i32 {
@@ -8747,6 +8915,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetFullPathNameA", GetFullPathNameA as usize),
         ("DeleteFileW", DeleteFileW as usize),
         ("DeleteFileA", DeleteFileA as usize),
+        ("SetFileInformationByHandle", SetFileInformationByHandle as usize),
         ("CreateDirectoryW", CreateDirectoryW as usize),
         ("CreateDirectoryA", CreateDirectoryA as usize),
         ("RemoveDirectoryW", RemoveDirectoryW as usize),
@@ -9530,6 +9699,182 @@ mod tests {
         }
         // Transient seed: remove it so later tests see a clean game root.
         let _ = std::fs::remove_file(global_game.join("data").join(&probe));
+    }
+
+    #[test]
+    fn handle_delete_hides_the_game_file_after_close() {
+        // Linux twin of upstream `delete_by_handle_hides_the_game_file` (#1054):
+        // MSVC's `std::filesystem::remove` deletes through the handle
+        // (`SetFileInformationByHandle(FileDisposition)`). The handle names the
+        // overlay copy, so the whiteout is recorded at set time and the copy is
+        // removed when the marking handle closes; a taken-back delete is
+        // reversible. The game folder stays byte-identical throughout.
+        let _ = ensure_test_vfs();
+        let gv = crate::vfs::get().expect("global VFS initialised");
+        let global_game = std::path::Path::new(gv.game_root());
+        let pid = std::process::id();
+        let probe = format!("hd_del_{pid}.txt");
+        let probe2 = format!("hd_del_gone_{pid}.txt");
+        std::fs::create_dir_all(global_game.join("data")).ok();
+        std::fs::write(global_game.join("data").join(&probe), b"original").ok();
+        std::fs::write(global_game.join("data").join(&probe2), b"bye").ok();
+        unsafe {
+            const DELETE: u32 = 0x0001_0000;
+            const OPEN_EXISTING: u32 = 3;
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const INFO: u32 = 4; // FILE_DISPOSITION_INFO
+            const INFO_EX: u32 = 21; // FILE_DISPOSITION_INFO_EX
+            let open_del = |name: &str| {
+                let w = crate::util::wide(&format!("G:\\data\\{name}"));
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    DELETE | 0x80 | 0x100, // DELETE | READ_ATTRIBUTES | WRITE_ATTRIBUTES
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE, "open {name} err {}", GetLastError());
+                h
+            };
+            let set = |h: usize, class: u32, p: *const c_void, n: u32| {
+                SetFileInformationByHandle(h, class, p, n)
+            };
+
+            // FileDispositionInfo { DeleteFile: TRUE }
+            let rel = format!("data\\{probe}");
+            let h = open_del(&probe);
+            SetLastError(4242);
+            assert_eq!(set(h, INFO, &1u8 as *const u8 as *const c_void, 1), 1);
+            assert_eq!(GetLastError(), 4242, "a successful call leaves the last error alone");
+            assert_eq!(CloseHandle(h), 1);
+            assert!(gv.is_whiteout(&rel));
+            assert!(gv.read_path_rel(&rel).is_none());
+            let w = crate::util::wide(&format!("G:\\data\\{probe}"));
+            assert_eq!(
+                CreateFileW(w.as_ptr(), GENERIC_READ, 0, std::ptr::null(), OPEN_EXISTING, 0, 0),
+                INVALID_HANDLE_VALUE
+            );
+            assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+            assert_eq!(std::fs::read(global_game.join("data").join(&probe)).unwrap(), b"original");
+
+            // FileDispositionInfoEx { DELETE | POSIX_SEMANTICS }: supported here,
+            // so the game file is hidden the same way.
+            let rel2 = format!("data\\{probe2}");
+            let h = open_del(&probe2);
+            assert_eq!(set(h, INFO_EX, &3u32 as *const u32 as *const c_void, 4), 1);
+            assert_eq!(CloseHandle(h), 1);
+            assert!(gv.is_whiteout(&rel2));
+            assert!(gv.read_path_rel(&rel2).is_none());
+            assert_eq!(std::fs::read(global_game.join("data").join(&probe2)).unwrap(), b"bye");
+        }
+        let _ = std::fs::remove_file(global_game.join("data").join(&probe));
+        let _ = std::fs::remove_file(global_game.join("data").join(&probe2));
+    }
+
+    #[test]
+    fn set_file_info_by_handle_passes_everything_else_through() {
+        // Linux twin of upstream
+        // `set_file_info_by_handle_passes_everything_else_through` (#1054):
+        // directories are never hidden, a taken-back delete keeps the file, a
+        // host file is deleted with no whiteout, and a bad handle fails with
+        // ERROR_INVALID_HANDLE.
+        let _ = ensure_test_vfs();
+        let gv = crate::vfs::get().expect("global VFS initialised");
+        let global_game = std::path::Path::new(gv.game_root());
+        let pid = std::process::id();
+        let dir_probe = format!("hd_pass_dir_{pid}");
+        let inner = format!("{dir_probe}\\inner.txt");
+        let file_probe = format!("hd_pass_{pid}.txt");
+        let ext_probe = format!("hd_pass_ext_{pid}.txt");
+        std::fs::create_dir_all(global_game.join(&dir_probe)).ok();
+        std::fs::write(global_game.join(&dir_probe).join("inner.txt"), b"inner").ok();
+        std::fs::write(global_game.join("data").join(&file_probe), b"original").ok();
+        unsafe {
+            const DELETE: u32 = 0x0001_0000;
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const OPEN_EXISTING: u32 = 3;
+            const CREATE_ALWAYS: u32 = 2;
+            const INFO: u32 = 4; // FILE_DISPOSITION_INFO
+            let open_del = |path: &str| {
+                let w = crate::util::wide(path);
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    DELETE | 0x80 | 0x100,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE, "open {path} err {}", GetLastError());
+                h
+            };
+            let set = |h: usize, class: u32, p: *const c_void, n: u32| {
+                SetFileInformationByHandle(h, class, p, n)
+            };
+            let no_pass_whiteout = || {
+                assert!(
+                    gv.whiteouts().iter().all(|w| !w.contains("hd_pass")),
+                    "{:?}",
+                    gv.whiteouts()
+                );
+            };
+
+            // A directory is not hidden: its game files stay visible.
+            let h = open_del(&format!("G:\\{dir_probe}"));
+            assert_eq!(set(h, INFO, &1u8 as *const u8 as *const c_void, 1), 1);
+            assert_eq!(CloseHandle(h), 1);
+            no_pass_whiteout();
+            let w = crate::util::wide(&format!("G:\\{inner}"));
+            let rh = CreateFileW(w.as_ptr(), GENERIC_READ, 0, std::ptr::null(), OPEN_EXISTING, 0, 0);
+            assert_ne!(rh, INVALID_HANDLE_VALUE);
+            assert_eq!(read_all(rh), b"inner");
+            assert_eq!(CloseHandle(rh), 1);
+
+            // A delete that is taken back, and another class (FileBasicInfo,
+            // all zero = no change): the file stays, no whiteout.
+            let rel = format!("data\\{file_probe}");
+            let h = open_del(&format!("G:\\data\\{file_probe}"));
+            assert_eq!(set(h, INFO, &1u8 as *const u8 as *const c_void, 1), 1);
+            assert_eq!(set(h, INFO, &0u8 as *const u8 as *const c_void, 1), 1);
+            assert_eq!(set(h, 0, &[0u64; 5] as *const u64 as *const c_void, 40), 1);
+            assert_eq!(CloseHandle(h), 1);
+            assert!(!gv.is_whiteout(&rel));
+            let w = crate::util::wide(&format!("G:\\data\\{file_probe}"));
+            let rh = CreateFileW(w.as_ptr(), GENERIC_READ, 0, std::ptr::null(), OPEN_EXISTING, 0, 0);
+            assert_ne!(rh, INVALID_HANDLE_VALUE);
+            assert_eq!(read_all(rh), b"original");
+            assert_eq!(CloseHandle(rh), 1);
+            no_pass_whiteout();
+
+            // A file outside the overlay is deleted and leaves no whiteout.
+            let w = crate::util::wide(&format!("T:\\{ext_probe}"));
+            let eh = CreateFileW(w.as_ptr(), GENERIC_WRITE, 0, std::ptr::null(), CREATE_ALWAYS, 0, 0);
+            assert_ne!(eh, INVALID_HANDLE_VALUE);
+            assert_eq!(CloseHandle(eh), 1);
+            let h = open_del(&format!("T:\\{ext_probe}"));
+            assert_eq!(set(h, INFO, &1u8 as *const u8 as *const c_void, 1), 1);
+            assert_eq!(CloseHandle(h), 1);
+            if let crate::vfs::Target::Translated(p) = gv.classify(&format!("T:\\{ext_probe}")) {
+                assert!(!std::path::Path::new(&p).exists());
+            } else {
+                panic!("T: must classify Translated");
+            }
+            no_pass_whiteout();
+
+            // A failed call returns the invalid-handle error.
+            assert_eq!(
+                set(INVALID_HANDLE_VALUE, INFO, &1u8 as *const u8 as *const c_void, 1),
+                0
+            );
+            assert_eq!(GetLastError(), 6); // ERROR_INVALID_HANDLE
+        }
+        let _ = std::fs::remove_file(global_game.join("data").join(&file_probe));
+        let _ = std::fs::remove_file(global_game.join(&dir_probe).join("inner.txt"));
+        let _ = std::fs::remove_dir(global_game.join(&dir_probe));
     }
 
     #[test]
