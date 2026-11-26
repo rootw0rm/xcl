@@ -1045,7 +1045,11 @@ fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64
             continue;
         }
         // the every-lane section it is in, with no other EXEC write before the end
-        let Some(open) = insts[..i].iter().rev().take(6).position(|d| d.inst.name == "S_OR_SAVEEXEC_B32" && f(d, "SSRC0") == Some(193)) else { continue };
+        let Some(open) = insts[..i].iter().rev().take(6).position(|d| {
+            d.inst.name == "S_OR_SAVEEXEC_B32" && f(d, "SSRC0") == Some(193) && f(d, "SDST").is_some_and(|x| !(126..=127).contains(&x))
+        }) else {
+            continue;
+        };
         let open = i - 1 - open;
         let steps: Vec<&Decoded> = insts[i + 1..].iter().filter(|d| !idle(d)).take(7).collect();
         let [a, b, c, mirror, cross, last, read] = steps[..] else { continue };
@@ -1055,28 +1059,38 @@ fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64
         if f(seed, "SRC0") != Some(identity) {
             continue;
         }
-        let same = |d: &Decoded, variant: rdna2::Variant| {
+        let same_v = |d: &Decoded, variant: rdna2::Variant| {
             let (r, w) = rdna2::vgpr_uses(d);
-            op_of(d).map(|o| o.0) == Some(op) && d.variant == variant && w == vec![v] && r.contains(&v)
+            op_of(d).map(|o| o.0) == Some(op) && d.variant == variant && w == [v] && r == [v, v]
         };
-        let dpp8 = [a, b, c].iter().enumerate().all(|(k, d)| same(d, rdna2::Variant::Dpp8) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
-        let crossed = {
-            let (r, w) = rdna2::vgpr_uses(cross);
-            cross.inst.name == "V_PERMLANEX16_B32" && r.contains(&v) && w.len() == 1
-        };
-        if !dpp8 || !same(mirror, rdna2::Variant::Dpp16) || ext(mirror, "DPP_CTRL") != Some(0x140) || !crossed || !same(last, rdna2::Variant::Plain) {
+        let dpp8 = [a, b, c].iter().enumerate().all(|(k, d)| same_v(d, rdna2::Variant::Dpp8) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
+        let mirrored = same_v(mirror, rdna2::Variant::Dpp16)
+            && ext(mirror, "DPP_CTRL") == Some(0x140)
+            && ext(mirror, "ROW_MASK").is_some_and(|m| m & 0x3 == 0x3)
+            && ext(mirror, "BANK_MASK") == Some(0xF);
+        let [cw] = rdna2::vgpr_uses(cross).1[..] else { continue };
+        let crossed = cross.inst.name == "V_PERMLANEX16_B32" && cross.variant == rdna2::Variant::Plain && f(cross, "SRC0") == Some(256 + v) && cw != v;
+        let (lr, lw) = rdna2::vgpr_uses(last);
+        let combined = op_of(last).map(|o| o.0) == Some(op) && last.variant == rdna2::Variant::Plain && lw == [v] && (lr == [v, cw] || lr == [cw, v]);
+        if !dpp8 || !mirrored || !crossed || !combined {
             continue;
         }
-        let (r, _) = rdna2::vgpr_uses(read);
-        if read.inst.name != "V_READLANE_B32" || !r.contains(&v) || f(read, "SRC1") != Some(128) {
+        if read.inst.name != "V_READLANE_B32" || read.variant != rdna2::Variant::Plain || f(read, "SRC0") != Some(256 + v) || f(read, "SRC1") != Some(128) {
             continue;
         }
         // one basic block, and EXEC kept all ones from the section's start
         let end = insts.iter().position(|d| d.pc == read.pc).unwrap_or(i);
         let inside = &insts[open + 1..=end];
-        let straight = inside.iter().all(|d| !leaders.contains(&d.pc) && d.inst.flags & rdna2::F_TERMINATOR == 0 && rdna2::branch_target(d).is_none());
-        let exec = inside.iter().any(|d| d.inst.name.contains("SAVEEXEC") || (d.enc.name.starts_with("ENC_SOP") && f(d, "SDST").is_some_and(|x| (126..=127).contains(&x))));
-        if !straight || exec {
+        let straight = inside.iter().all(|d| !leaders.contains(&d.pc) && d.inst.flags & (rdna2::F_TERMINATOR | rdna2::F_BRANCH | rdna2::F_INDIRECT) == 0);
+        let writes_exec = |d: &Decoded| {
+            d.ienc.operands.iter().any(|o| o.output && matches!(o.ty, "OPR_EXEC" | "OPR_SDST_EXEC"))
+                || rdna2::sgpr_uses(d).1.iter().any(|x| (126..=127).contains(x))
+                || (d.enc.name == "ENC_SMEM" && f(d, "SDATA").is_some_and(|x| (126..=127).contains(&x)))
+                || (d.variant == rdna2::Variant::Sdwa
+                    && d.enc.name == "ENC_VOPC"
+                    && d.words.get(1).is_some_and(|ext| ext >> 15 & 1 == 1 && (126..=127).contains(&((ext >> 8 & 0x7f) as u64))))
+        };
+        if !straight || inside.iter().any(writes_exec) {
             continue;
         }
         out.seeds.insert(seed.pc, v);
@@ -1758,5 +1772,105 @@ mod attribute_tests {
         assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
+    }
+}
+
+#[cfg(test)]
+mod wave32_reduction_tests {
+    use super::*;
+
+    fn enc(n: &str, e: &str, f: &[(&str, u64)]) -> Vec<u8> {
+        rdna2::encode(n, e, f, None).unwrap_or_else(|err| panic!("{n} ({e}): {err}"))
+    }
+
+    fn decode_all(code: &[u8]) -> (Vec<Decoded>, BTreeSet<u64>) {
+        let (mut insts, mut off) = (Vec::new(), 0);
+        while off + 4 <= code.len() {
+            let d = rdna2::decode(&code[off..], off as u64).expect("valid RDNA2");
+            off += d.len;
+            insts.push(d);
+        }
+        let leaders = insts.iter().filter_map(rdna2::branch_target).collect();
+        (insts, leaders)
+    }
+
+    struct Seq {
+        inst: &'static str, id: u64, open_sdst: u64, between: Vec<u8>,
+        dpp8_src: [(u64, u64); 3], mir_src: (u64, u64), row_mask: u64, bank_mask: u64,
+        cross_src: u64, cross_dst: u64, last_src: (u64, u64), read_src: u64, read_dst: u64,
+    }
+
+    impl Seq {
+        fn valid(inst: &'static str, id: u64) -> Self {
+            Self { inst, id, open_sdst: 1, between: vec![], dpp8_src: [(0, 0); 3], mir_src: (0, 0), row_mask: 0xF, bank_mask: 0xF, cross_src: 0, cross_dst: 1, last_src: (256 + 1, 0), read_src: 0, read_dst: 3 }
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let mut b = enc("S_OR_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", self.open_sdst), ("SSRC0", 193)]);
+            b.extend_from_slice(&self.between);
+            b.extend(enc("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", self.id), ("SRC1", 256 + 4), ("SRC2", 3)]));
+            const SELS: [&str; 8] = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
+            for (k, &(s0, s1)) in self.dpp8_src.iter().enumerate() {
+                let mut f = vec![("VDST", 0), ("SRC0", 233), ("VSRC0", s0), ("VSRC1", s1)];
+                f.extend(SELS.iter().enumerate().map(|(n, &name)| (name, (n ^ (1 << k)) as u64)));
+                b.extend(enc(self.inst, "VOP2_VOP_DPP8", &f));
+            }
+            b.extend(enc(self.inst, "VOP2_VOP_DPP16", &[("VDST", 0), ("SRC0", 250), ("VSRC0", self.mir_src.0), ("VSRC1", self.mir_src.1), ("DPP_CTRL", 0x140), ("BOUND_CTRL", 1), ("ROW_MASK", self.row_mask), ("BANK_MASK", self.bank_mask)]));
+            b.extend(enc("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", self.cross_dst), ("SRC0", 256 + self.cross_src), ("SRC1", 128), ("SRC2", 128)]));
+            b.extend(enc(self.inst, "ENC_VOP2", &[("VDST", 0), ("SRC0", self.last_src.0), ("VSRC1", self.last_src.1)]));
+            b.extend(enc("V_READLANE_B32", "ENC_VOP3", &[("VDST", self.read_dst), ("SRC0", 256 + self.read_src), ("SRC1", 128)]));
+            b.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+            b
+        }
+    }
+
+    #[test]
+    fn valid_wave32_reductions_match_and_translate() {
+        for (inst, id, op) in [("V_OR_B32", 128, "or"), ("V_MAX_U32", 128, "max"), ("V_AND_B32", 193, "and"), ("V_MIN_U32", 193, "min")] {
+            for (row_mask, last_src) in [(0xF, (256 + 1, 0)), (0x3, (256, 1))] {
+                let mut s = Seq::valid(inst, id);
+                (s.row_mask, s.last_src) = (row_mask, last_src);
+                let code = s.build();
+                let (insts, leaders) = decode_all(&code);
+                assert_eq!(wave32_reductions(&insts, &leaders).reads.values().map(|x| x.1).collect::<Vec<_>>(), vec![op], "{inst}");
+                for mode in [Mode::Pixel(PsInterface::default()), Mode::Vertex(VsInterface::default())] {
+                    let t = translate(&code, &Options { mode, wave64: false, ..Default::default() }).expect("translate");
+                    assert!(t.hlsl.contains(&format!("xcl_red_{op}(")), "{inst}: missing xcl_red_{op}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_wave32_reduction_shapes_and_exec_writes_are_rejected() {
+        let case = |f: fn(&mut Seq)| { let mut s = Seq::valid("V_OR_B32", 128); f(&mut s); s };
+        let cases = [
+            ("dpp8_wrong_vsrc0", case(|s| s.dpp8_src[1] = (2, 0))),
+            ("dpp8_wrong_vsrc1", case(|s| s.dpp8_src[0] = (0, 2))),
+            ("mirror_wrong_vsrc0", case(|s| s.mir_src = (2, 0))),
+            ("mirror_row_mask_1", case(|s| s.row_mask = 0x1)),
+            ("mirror_row_mask_2", case(|s| s.row_mask = 0x2)),
+            ("mirror_bank_mask", case(|s| s.bank_mask = 0x7)),
+            ("cross_inplace", case(|s| { s.cross_dst = 0; s.last_src = (256, 0); })),
+            ("cross_wrong_src0", case(|s| s.cross_src = 2)),
+            ("last_ignores_cw", case(|s| s.last_src = (256, 0))),
+            ("last_wrong_vgpr", case(|s| s.last_src = (256 + 2, 0))),
+            ("last_scalar_src0", case(|s| s.last_src = (128, 0))),
+            ("read_wrong_src0", case(|s| s.read_src = 1)),
+            ("read_dst_exec_lo", case(|s| s.read_dst = 126)),
+            ("open_sdst_exec_lo", case(|s| s.open_sdst = 126)),
+            ("open_sdst_exec_hi", case(|s| s.open_sdst = 127)),
+            ("cmpx_between", case(|s| s.between = enc("V_CMPX_NE_U32", "ENC_VOPC", &[("SRC0", 256), ("VSRC1", 1)]))),
+            ("wrexec_between", case(|s| s.between = enc("S_ANDN2_WREXEC_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 128)]))),
+            ("subvec_between", case(|s| s.between = enc("S_SUBVECTOR_LOOP_BEGIN", "ENC_SOPK", &[("SDST", 2), ("SIMM16", 0)]))),
+            ("smem_exec_between", case(|s| s.between = enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 126), ("SBASE", 0), ("SOFFSET", 128)]))),
+        ];
+        for (name, seq) in cases {
+            let code = seq.build();
+            let (insts, leaders) = decode_all(&code);
+            assert!(wave32_reductions(&insts, &leaders).reads.is_empty(), "{name} should be rejected");
+            let t = translate(&code, &Options { mode: Mode::Pixel(PsInterface::default()), wave64: false, ..Default::default() }).expect("translate");
+            assert!(!t.hlsl.contains("xcl_red_"), "{name} should not emit xcl_red_");
+        }
     }
 }
