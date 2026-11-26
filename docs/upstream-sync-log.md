@@ -937,3 +937,55 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-132 (task-1795724164-1571): #2872/#2873 triaged SKIP, #2864 re-pinned after force-push, probe past #2873
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2354 refs. Per-PR sequential probe #2830..#3150
+  (widened past the sixth gap per mem-1795712765-78dc) found 35 PRESENT
+  (#2830..#2873 minus #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869
+  gaps), matching pins on all previously seen heads except #2864 (see
+  below); all 35 `merge-base --is-ancestor` exit 1 (all OPEN);
+  #2874..#3150 ALL MISSING — scan complete, top is #2873.
+- Replication-lag note (per mem-1795714025-21a1, NOT builder fault): #2873
+  committed 19:50:00 UTC, before task creation (20:16:04 UTC), yet MISSING
+  from the step-131 critic scan to #3130 — same handoff treatment as
+  #2862/#2864 in step-130. Triaged in-window now.
+- Force-push on #2864 mid-window: live head moved `aea330e1` -> `723f5a19`
+  (old NOT ancestor of new, exit 1; new committed 20:24:26 UTC, parent
+  still `8b957bec`). Tip-only delta is a closed-file guard
+  (`f.handle()?` -> E_FILE_HANDLE in `unpack_cache_entry`) + the
+  `a_closed_file_is_not_answered_from_the_unpack_cache` regression test +
+  `flush` visibility (`fn` -> `pub(super) fn`); same 3 files
+  (README + `hle/dstorage.rs` + `hle/dstorage/unpack_cache.rs`, whole
+  `hle` `cfg(windows)`), Linux twin `dstorage_linux.rs` untouched —
+  SKIP stands, pin updated.
+- Triage (all SKIP with hunk evidence): #2872 `b780ec78` SKIP,
+  single-commit on `8b957bec` (parent IS in main, exit 0), 1 file +13/-7
+  (`gpu/recomp/emit.rs`): `ballot_px_quad`'s `[unroll]` loop factored into
+  `ballot_px_member` x4 + `the_pixel_prelude_has_no_loop_for_dxc_to_unroll`
+  test — HLSL PRELUDE_PIXEL only (DXC compile-time perf), zero
+  `PRELUDE_PIXEL`/`ballot_px` refs outside `recomp/emit.rs`, so no
+  GLSL/SPIR-V consumer; held for the SPIR-V port like the other
+  emit-side-only keepers. #2873 `1f3d506d` SKIP, single-commit (parent
+  `e120925e` IS in main, exit 0; 2-behind tip), tip-only 1 file +308
+  (`hle/d3d12x/list_x.rs`): `footprint_plan` routing unaligned
+  CopyTextureRegion footprints through scratch — whole `hle`
+  `cfg(windows)`, zero `footprint_plan`/`copy_texture_region_x`/
+  `UnrestrictedBufferTextureCopyPitch` refs in `hle_linux.rs`,
+  `d3d12x_linux.rs`, `vulkan_linux.rs` (grep exit 1). Earlier pins stand:
+  #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted
+  in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in
+  `aa59e8ac`; #2843-#2871 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step132r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
