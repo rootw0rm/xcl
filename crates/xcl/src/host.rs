@@ -44,6 +44,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     });
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
+        crate::hle::d3d12x::list_x::enable_sync_activity();
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
             let snap = || {
                 let (p, e) = crate::hle::d3d12x::present::activity();
@@ -53,6 +54,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut last_sync = crate::hle::d3d12x::list_x::sync_activity();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -61,6 +63,18 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // the per-draw sync of buffer mirrors (only once a mirror exists)
+                let sync = crate::hle::d3d12x::list_x::sync_activity();
+                let s: Vec<u64> = sync.iter().zip(last_sync).map(|(a, b)| a - b).collect();
+                let slowest = crate::hle::d3d12x::list_x::take_sync_slowest();
+                if s[0] > 0 {
+                    let ms = |ns: u64| ns as f64 / 1e6;
+                    crate::xlog_info!(
+                        "buffer mirrors (2 s): {} draws synced, {} with a mirror; {} copies ({} whole buffers), {} KB; {} indices scanned; {} readable() calls ({} over 16 pages), {:.2} ms, slowest {:.2} ms; {:.2} ms in all",
+                        s[0], s[1], s[2], s[3], s[4] >> 10, s[5], s[6], s[7], ms(s[8]), ms(slowest), ms(s[9])
+                    );
+                }
+                last_sync = sync;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = crate::platform::process_private_bytes();
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));

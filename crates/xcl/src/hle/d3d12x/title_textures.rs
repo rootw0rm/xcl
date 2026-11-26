@@ -1439,7 +1439,7 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 /// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
 /// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
 /// calls and only unreadable pages stay zeroed.
-unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
+pub(super) unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const PAGE: usize = 0x1000;
