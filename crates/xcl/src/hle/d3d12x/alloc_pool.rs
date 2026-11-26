@@ -139,7 +139,7 @@ pub fn created_on(list: usize, raw: usize, ty: i32) {
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    s.types.entry(raw).or_insert(ty);
+    s.types.insert(raw, ty);
     move_list(s, list, raw);
     *s.recordings.entry(list).or_default() += 1;
 }

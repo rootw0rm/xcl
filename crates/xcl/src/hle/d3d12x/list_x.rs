@@ -2825,14 +2825,21 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
-            None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
-                return None;
+        None => {
+            let pc_alloc = super::alloc_pool::current(alloc);
+            match real::create_raw_pc_command_list(dev.as_raw(), ty, pc_alloc, init_pso) {
+                Some(p) => {
+                    super::alloc_pool::created_on(p as usize, pc_alloc, ty.0);
+                    real::dispatch_chain::list_reset(p as usize);
+                    p
+                }
+                None => {
+                    static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+                    warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
+                    return None;
+                }
             }
-        },
+        }
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
@@ -7357,6 +7364,94 @@ mod tests {
                 gr.cells.remove(&va_a);
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
+            }
+        }
+    }
+
+    /// A fresh Wait-split segment created after `alloc_pool` swapped the title's allocator must
+    /// register on its active PC backing allocator (`pc_alloc`) so `dispatch_chain` keys scratch
+    /// and retained PSOs to `pc_alloc` rather than the title allocator (which a later Reset can
+    /// reuse and reset while the split segment on `pc_alloc` is still alive).
+    #[test]
+    fn wait_split_fresh_segment_tracks_swapped_backing_allocator() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        if !super::super::alloc_pool::enabled() {
+            return;
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let a_title: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let a_raw = a_title.as_raw() as usize;
+            if !real::is_adopted(a_title.as_raw()) {
+                real::adopt(a_title.as_raw(), real::Kind::CommandAllocator);
+            }
+
+            let l_hold: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_title, None).unwrap();
+            real::adopt(l_hold.as_raw(), real::Kind::CommandList);
+            on_create(l_hold.as_raw(), a_raw, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            l_hold.Close().unwrap();
+
+            let raw_c: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_title, None).unwrap();
+            let pc_c0 = raw_c.into_raw();
+            real::adopt(pc_c0, real::Kind::CommandList);
+            on_create(pc_c0, a_raw, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            super::super::bind::reset(pc_c0, a_raw, 0);
+            let wrap_c = super::super::title_list::wrap(pc_c0);
+
+            // Title Reset while both lists still record on `a_title` swaps `a_title` -> backing B.
+            a_title.Reset().unwrap();
+            let pc_alloc_b = super::super::alloc_pool::current(a_raw);
+            assert_ne!(pc_alloc_b, a_raw, "title Reset with live recordings must swap to a backing PC allocator");
+
+            // Close and reset `wrap_c` on `a_title` so `pc_c0` records on backing B.
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap_c as *const *const usize)).add(9));
+            let reset_fn: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(*(*(wrap_c as *const *const usize)).add(10));
+            assert_eq!(close_fn(wrap_c), 0);
+            assert_eq!(reset_fn(wrap_c, a_raw, 0), 0);
+            assert_eq!(super::super::alloc_pool::recording_backing_for_test(pc_c0 as usize), Some(pc_alloc_b));
+
+            // Trigger a mid-list Wait split with no idle spare -> creates a fresh segment on B.
+            let cell_a = Box::new(AtomicU64::new(0));
+            let cell_b = Box::new(AtomicU64::new(0));
+            let va_a = &*cell_a as *const AtomicU64 as u64;
+            let va_b = &*cell_b as *const AtomicU64 as u64;
+            note_write64_recorded(pc_c0, va_a, 1);
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let entry = g.get_or_insert_with(SyncGraph::default).cells.entry(va_b).or_default();
+                entry.recorded_max = entry.recorded_max.max(1);
+                entry.recorded_list_type = Some(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            }
+            wait64_x(pc_c0, va_b, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 1, 0, 0);
+
+            let mut segs = Vec::new();
+            assert!(super::super::title_list::push_segments(wrap_c, &mut segs));
+            assert_eq!(segs.len(), 2, "mid-list Wait64 after Write64 must split into 2 segments");
+            let seg1 = segs[1];
+            assert_ne!(seg1, pc_c0);
+
+            // Fresh split segment must be tracked on B (not untracked / falling back to title A).
+            assert_eq!(super::super::alloc_pool::recording_backing_for_test(seg1 as usize), Some(pc_alloc_b));
+            assert_eq!(real::dispatch_chain::resolve_allocator_for_test(seg1 as usize, a_raw), pc_alloc_b);
+
+            // Releasing `l_hold` frees A in `aside[A]`; a title Reset now reuses and resets A
+            // while B stays alive for `seg1`, so `seg1` must still resolve to B.
+            drop(l_hold);
+            a_title.Reset().unwrap();
+            assert_eq!(super::super::alloc_pool::current(a_raw), a_raw, "title Reset must reuse freed A");
+            assert_eq!(super::super::alloc_pool::recording_backing_for_test(seg1 as usize), Some(pc_alloc_b));
+            assert_eq!(real::dispatch_chain::resolve_allocator_for_test(seg1 as usize, a_raw), pc_alloc_b);
+
+            assert_eq!(close_fn(wrap_c), 0);
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap_c as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap_c), 0);
+            drop(a_title);
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&va_a);
+                gr.cells.remove(&va_b);
             }
         }
     }

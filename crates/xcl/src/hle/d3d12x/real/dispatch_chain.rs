@@ -104,9 +104,24 @@ pub(super) fn forget(pso: usize) {
     drop(gone); // releasing a tail PSO also goes through forget_pso
 }
 
-pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
-    let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+fn resolve_allocator_with(pool_enabled: bool, list: usize, allocator: usize, backing: impl FnOnce(usize) -> Option<usize>) -> usize {
+    if pool_enabled { backing(list).unwrap_or(allocator) } else { allocator }
+}
+
+fn resolve_allocator(list: usize, allocator: usize) -> usize {
+    resolve_allocator_with(super::super::alloc_pool::enabled(), list, allocator, super::super::alloc_pool::recording_backing)
+}
+
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn resolve_allocator_for_test(list: usize, allocator: usize) -> usize {
+    resolve_allocator(list, allocator)
+}
+
+pub(in crate::hle::d3d12x) unsafe fn whole(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize) -> Result<Option<ID3D12PipelineState>, String> {
+    let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(None) };
+    let whole = chain.whole()?;
+    retain_whole(resolve_allocator(list.as_raw() as usize, allocator), chain);
+    Ok(Some(whole))
 }
 
 struct Scratch {
@@ -121,8 +136,8 @@ impl Drop for Scratch {
 }
 
 struct Recording {
-    scratch: Arc<Scratch>,
-    first: ID3D12PipelineState,
+    scratch: Option<Arc<Scratch>>,
+    first: Option<ID3D12PipelineState>,
     chain: Arc<Chain>,
 }
 
@@ -182,6 +197,19 @@ unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed:
     Some((s, false))
 }
 
+fn retain_whole(allocator: usize, chain: Arc<Chain>) {
+    if allocator == 0 { return; }
+    {
+        let mut map = RECORDINGS.lock().unwrap();
+        let entries = map.entry(allocator).or_default();
+        if !entries.iter().any(|r| Arc::ptr_eq(&r.chain, &chain)) {
+            entries.push(Arc::new(Recording { scratch: None, first: None, chain }));
+            return;
+        }
+    }
+    drop(chain); // outside RECORDINGS.lock()
+}
+
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
     let recordings = RECORDINGS.lock().unwrap().remove(&allocator);
     drop(recordings);
@@ -208,10 +236,8 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
     if grid.contains(&0) { return Ok(()); }
     // A title Reset can switch to a different PC allocator while this
-    // recording is still submitted on the old one. Retain by backing.
-    let allocator = if super::super::alloc_pool::enabled() {
-        super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
-    } else { allocator };
+    // recording is still submitted on the old one; untracked lists keep theirs.
+    let allocator = resolve_allocator(list.as_raw() as usize, allocator);
     let group = u64::from(chain.words) * 4;
     let needed = grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64));
     WANTED.fetch_max(needed, Ordering::Relaxed);
@@ -220,22 +246,24 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        let whole = chain.whole()?;
+        retain_whole(allocator, chain);
+        list.SetPipelineState(&whole);
         list.Dispatch(x, y, z);
         return Ok(());
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    let held = Arc::new(Recording { scratch, first, chain });
+    let held = Arc::new(Recording { scratch: Some(scratch), first: Some(first), chain });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
+    pso::record_dispatch_chain(list, grid, most, &held.scratch.as_ref().unwrap().buffer, used, std::iter::once(held.first.as_ref().unwrap()).chain(&held.chain.tail));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::*;
 
     const MB: u64 = 1 << 20;
 
@@ -283,5 +311,56 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    unsafe extern "system" fn unused_pso_fn(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT { crate::util::E_FAIL }
+
+    #[test]
+    fn untracked_list_keeps_caller_allocator_when_alloc_pool_is_enabled() {
+        assert_eq!(resolve_allocator_with(true, 0x1000, 0x2000, |_| None), 0x2000);
+        assert_eq!(resolve_allocator_with(true, 0x1000, 0x2000, |_| Some(0x3000)), 0x3000);
+        assert_eq!(resolve_allocator_with(false, 0x1000, 0x2000, |_| Some(0x3000)), 0x2000);
+        assert_eq!(resolve_allocator(0x7D00_DEAD, 0x2000), 0x2000);
+    }
+
+    #[test]
+    fn whole_fallback_and_indirect_retain_chain_until_allocator_reset() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap();
+            let cs = dummy_cs_bytecode();
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() }, ..Default::default() };
+            let whole_pso: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).unwrap();
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+            let bundle_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE).unwrap();
+            let bundle: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, &bundle_alloc, None).unwrap();
+            bundle.SetComputeRootSignature(&rs);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let mk = |words| Arc::new(Chain { builder: Arc::new(PipelineBuilder { device: dev.clone(), create: unused_pso_fn, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 }), tail: Vec::new(), words, whole_code: Vec::new(), whole: OnceLock::from(whole_pso.clone()), build_whole: Mutex::new(()) });
+            let (c1, c2) = (mk(4), mk(4));
+            let (w1, w2) = (Arc::downgrade(&c1), Arc::downgrade(&c2));
+            let (p1, a1, p2, a2) = (0x7D00_0001usize, 0x7D00_A001usize, 0x7D00_0002usize, 0x7D00_A002usize);
+            CHAINS.lock().unwrap().extend([(p1, c1), (p2, c2)]);
+            dispatch(&bundle, p1, a1, [1, 1, 1]).unwrap();
+            forget(p1);
+            assert!(w1.upgrade().is_some(), "dispatch whole fallback must retain Chain until allocator_reset");
+            allocator_reset(a1);
+            assert!(w1.upgrade().is_none());
+            assert!(whole(&list, p2, a2).unwrap().is_some() && whole(&list, p2, a2).unwrap().is_some());
+            assert_eq!(RECORDINGS.lock().unwrap().get(&a2).map(Vec::len), Some(1));
+            forget(p2);
+            assert!(w2.upgrade().is_some(), "whole() must retain Chain until allocator_reset");
+            allocator_reset(a2);
+            assert!(w2.upgrade().is_none());
+            bundle.Close().unwrap();
+            list.Close().unwrap();
+        }
     }
 }

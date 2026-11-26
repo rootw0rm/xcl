@@ -338,7 +338,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
-                match super::real::dispatch_chain::whole(pso) {
+                match super::real::dispatch_chain::whole(list, pso, with(this, |s| s.allocator)) {
                     Ok(Some(whole)) => list.SetPipelineState(&whole),
                     Ok(None) => {}
                     Err(e) => {
