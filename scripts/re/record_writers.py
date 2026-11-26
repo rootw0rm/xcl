@@ -13,6 +13,7 @@ for l in lines:
     if m:
         ins.append((int(m.group(1), 16), m.group(2).strip()))
 idx = {a: i for i, (a, _) in enumerate(ins)}
+control_prefixes = re.compile(r'^(?:(?:rep|repe|repz|repne|repnz|bnd|notrack|data16|addr32|cs|ds)\s+)+')
 sites = []
 for i, (a, t) in enumerate(ins):
     m = re.match(r'mov\s+0x18\(%(\w+)\),%(\w+)$', t)
@@ -53,15 +54,32 @@ for i, (a, t) in enumerate(ins):
         if mf:
             header = f'list+{mf.group(1)}'
             break
-    # fallback: first indirect call at/after the jae target
+    # fallback: first reachable indirect call from the jae target
     slot = '?'
     k = idx.get(fallback)
     if k is not None:
-        for j in range(k, min(k + 12, len(ins))):
-            mc = re.match(r'call\s+\*0x([0-9a-f]+)\(%\w+\)$', ins[j][1])
+        pending = collections.deque([k])
+        visited = set()
+        while pending and len(visited) < 12:
+            j = pending.popleft()
+            if j in visited or j >= len(ins):
+                continue
+            visited.add(j)
+            tj = control_prefixes.sub('', ins[j][1])
+            mc = re.match(r'call\s+\*0x([0-9a-f]+)\(%\w+\)$', tj)
             if mc:
                 slot = int(mc.group(1), 16) // 8
                 break
+            mnemonic = tj.split(maxsplit=1)[0] if tj else ''
+            if mnemonic in ('ret', 'retq', 'ud2'):
+                continue
+            if mnemonic not in ('jmp', 'jmpq'):
+                pending.append(j + 1)
+            if mnemonic.startswith(('j', 'loop')):
+                branch = re.match(r'\w+\s+(?:0x)?([0-9a-f]+)(?:\s|$)', tj)
+                target = idx.get(int(branch.group(1), 16)) if branch else None
+                if target is not None:
+                    pending.append(target)
     sites.append((a, L, bound, length, header, slot))
 
 print(f'{len(sites)} record write sites')
