@@ -229,25 +229,17 @@ pub unsafe extern "win64" fn VirtualFree(addr: *mut c_void, size: usize, ftype: 
             }
             // Only whole-allocation releases are supported (the title always does
             // `VirtualFree(base, 0, MEM_RELEASE)`); anything else is a caller bug.
+            let Some(len) = gfx_allocation_size(base) else {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            };
+            // Dropping a reservation also drops every page mapping inside it (each
+            // page's data belongs home again); forgetting only the exact base left
+            // stale entries behind for the rest of the range.
+            unmap_away_range(base, len);
             if !gfx_free(base) {
                 set_error(ERROR_INVALID_PARAMETER);
                 return 0;
-            }
-            // Dropping a reservation also drops any page mappings inside it.
-            if let Some(st) = away().lock().unwrap().as_mut() {
-                let dead: Vec<usize> = st.at.keys().copied().filter(|&a| gfx_contains(a) && {
-                    // The freed base is gone from `allocs`; any mapping at an address
-                    // no longer inside a live allocation is stale. Recompute via free
-                    // list absence is expensive, so drop mappings at the exact base
-                    // range conservatively: the caller freed whole allocations, and
-                    // physical-page tests free pages before releasing the VA.
-                    a == base
-                }).collect();
-                for a in dead {
-                    if let Some(p) = st.at.remove(&a) {
-                        st.page.remove(&p);
-                    }
-                }
             }
             set_error(ERROR_SUCCESS);
             return 1;
@@ -258,6 +250,9 @@ pub unsafe extern "win64" fn VirtualFree(addr: *mut c_void, size: usize, ftype: 
                 set_error(ERROR_INVALID_PARAMETER);
                 return 0;
             }
+            // Decommitted pages are unmapped first (their data belongs home again);
+            // otherwise stale address→page entries survive the decommit.
+            unmap_away_range(base, len);
             gfx_decommit_at(base, len);
             set_error(ERROR_SUCCESS);
             return 1;
@@ -2844,6 +2839,12 @@ fn gfx_free(addr: usize) -> bool {
     true
 }
 
+/// Size of the graphics allocation based at `addr`, if `addr` is an allocation base.
+fn gfx_allocation_size(base: usize) -> Option<usize> {
+    let m = gfx_state()?;
+    m.lock().unwrap().allocs.get(&base).map(|&(n, _)| n)
+}
+
 /// Commit `len` bytes at `at` inside an existing graphics allocation (no zeroing;
 // the caller copies data or zeroes explicitly).
 fn gfx_commit_at(at: usize, len: usize) -> bool {
@@ -3214,6 +3215,35 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
         page_off = 0;
     }
     true
+}
+
+/// Drop every away-mapped physical page overlapping `[start, start + len)`: each
+/// page's data belongs home again, then the address is free for the decommit or
+/// release that follows. (There is no `note_mapping_at` counterpart: the queue's
+/// page-mapping record has no Linux twin.)
+unsafe fn unmap_away_in(away: &mut Away, start: usize, len: usize) {
+    if len == 0 || away.at.is_empty() {
+        return;
+    }
+    let end = start.saturating_add(len);
+    let addrs: Vec<usize> = away.at.range((start & !(PHYS_PAGE - 1))..end).map(|(&at, _)| at).collect();
+    for at in addrs {
+        if let Some(p) = away.at.remove(&at) {
+            away.page.remove(&p);
+            if let Some(home) = page_home(p) {
+                std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
+            }
+        }
+    }
+}
+
+/// Unmap every away-mapped physical page overlapping `[start, start + len)`.
+unsafe fn unmap_away_range(start: usize, len: usize) {
+    if len > 0 {
+        if let Some(away) = away().lock().unwrap().as_mut() {
+            unmap_away_in(away, start, len);
+        }
+    }
 }
 
 /// Map `n` pages at `base` (`arr` null unmaps). Returns `base` on success, null on failure.
@@ -12968,6 +12998,47 @@ mod tests {
             assert_eq!(XMemFreePhysicalPages(1, pa.as_mut_ptr()), 1);
             assert_eq!(XMemFreePhysicalPages(1, pb.as_mut_ptr()), 1);
             assert_eq!(VirtualFree(m as *mut c_void, 0, 0x8000), 1);
+        }
+    }
+
+    /// Whether an away-mapped physical page is recorded at `at` (test-only view
+    /// of the AWAY table; only own addresses are asserted).
+    fn away_mapped(at: usize) -> bool {
+        away().lock().unwrap().as_ref().is_some_and(|st| st.at.contains_key(&at))
+    }
+
+    #[test]
+    fn virtual_free_unmaps_away_pages_across_gfx_reservations() {
+        // Upstream #2544, Linux twin: VirtualFree on a graphics reservation used
+        // to leave stale address→page entries (release forgot every mapping past
+        // the exact base; decommit forgot them all). Partial MEM_DECOMMIT unmaps
+        // the covered pages, saving their bytes home; MEM_RELEASE clears the
+        // rest. Plain (non-graphics) frees need no twin: every away mapping
+        // lives in the graphics pool, so those paths cannot overlap one.
+        unsafe {
+            let (mut n, mut pages) = (2usize, [0u64; 2]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            let [p0, p1] = [pages[0] as usize, pages[1] as usize];
+            let r = XMemMapPhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()) as usize;
+            assert_ne!(r, 0);
+            assert!(away_mapped(r) && away_mapped(r + PHYS_PAGE));
+            *(r as *mut u32) = 0x5555_0001;
+            // Partial MEM_DECOMMIT unmaps the first page (its bytes went home);
+            // the second page stays mapped.
+            assert_eq!(VirtualFree(r as *mut c_void, PHYS_PAGE, MEM_DECOMMIT), 1);
+            assert!(!away_mapped(r) && away_mapped(r + PHYS_PAGE));
+            // Full MEM_RELEASE clears the remaining mapping: no stale entries.
+            assert_eq!(VirtualFree(r as *mut c_void, 0, MEM_RELEASE), 1);
+            assert!(!away_mapped(r) && !away_mapped(r + PHYS_PAGE));
+            // Remap into a fresh reservation: p0 kept its bytes, untouched p1 reads 0.
+            let r2 = XMemMapPhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()) as usize;
+            assert_ne!(r2, 0);
+            assert_eq!((*(r2 as *const u32), *((r2 + PHYS_PAGE) as *const u32)), (0x5555_0001, 0));
+            assert_eq!(VirtualFree(r2 as *mut c_void, 0, MEM_RELEASE), 1);
+            assert!(!away_mapped(r2) && !away_mapped(r2 + PHYS_PAGE));
+            assert_eq!(XMemFreePhysicalPages(2, pages.as_mut_ptr()), 1);
+            // The page numbers resolve nowhere once freed.
+            assert!(page_home(p0).is_none() && page_home(p1).is_none());
         }
     }
 
