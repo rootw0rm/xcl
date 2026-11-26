@@ -8452,6 +8452,37 @@ fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
     }
 }
 
+/// `ds_permute_b32` as RDNA2 hardware runs it (measured in native wave64 and wave32 on an RDNA2
+/// gfx1036, and in #925): each active lane sends DATA0 to lane `((ADDR + offset) >> 2) & 31` of
+/// its own 32-lane half; of several senders the highest lane wins, an active lane no one sends
+/// to gets 0, inactive lanes neither send nor receive.
+fn ds_permute_reference(lanes: usize, exec: u64, addr: &[u32], offset: u32, data: &[u32], old: u32) -> Vec<u32> {
+    let mut tmp = vec![0u32; lanes];
+    for i in 0..lanes {
+        if exec >> i & 1 == 1 {
+            tmp[(i & 32) | (addr[i].wrapping_add(offset) >> 2) as usize & 31] = data[i];
+        }
+    }
+    (0..lanes).map(|i| if exec >> i & 1 == 1 { tmp[i] } else { old }).collect()
+}
+
+/// The reference model itself, on values read from RDNA2 hardware (gfx1036, native wave64):
+/// a reversal and a cross-half address stay in each 32-lane half, and `ADDR = 4 * lane + 2`
+/// with offset 2 moves each lane on by one (an address and offset shifted apart would give
+/// the identity).
+#[test]
+fn ds_permute_reference_matches_rdna2_values() {
+    let data: Vec<u32> = (0..64).map(|l| 0x1000 + l).collect();
+    let rev: Vec<u32> = (0..64).map(|l| 4 * (63 - l)).collect();
+    let r = ds_permute_reference(64, u64::MAX, &rev, 0, &data, 0);
+    assert_eq!((r[0], r[31], r[32], r[63]), (0x101F, 0x1000, 0x103F, 0x1020));
+    let cross: Vec<u32> = (0..64).map(|l| 4 * ((l + 32) % 64)).collect();
+    assert_eq!(ds_permute_reference(64, u64::MAX, &cross, 0, &data, 0), data);
+    let a: Vec<u32> = (0..64).map(|l| 4 * l + 2).collect();
+    let r = ds_permute_reference(64, u64::MAX, &a, 2, &data, 0);
+    assert_eq!((r[0], r[31], r[32], r[63]), (0x101F, 0x101E, 0x103F, 0x103E));
+}
+
 #[test]
 fn gpu_ldexp_f32() {
     for wave64 in gpu_waves() {
