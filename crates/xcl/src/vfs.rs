@@ -875,8 +875,10 @@ impl Vfs {
         Ok(())
     }
 
+    /// Containment-checked overlay path, shared with the Linux delete twin
+    /// (`vfs_hooks_linux::delete_file`, upstream #2809 shape).
     #[cfg(not(windows))]
-    fn checked_overlay_path(&self, rel: &str) -> Result<String, u32> {
+    pub(crate) fn checked_overlay_path(&self, rel: &str) -> Result<String, u32> {
         Self::checked_rel(rel)?;
         // The overlay root is owned by XCL. Unlike a configured mount root it must not be a
         // symlink, otherwise every "contained" child would share the outside boundary.
@@ -1572,20 +1574,57 @@ impl Vfs {
             self.commit_overlay_removal_unlocked(&rel_clean);
             return Ok(());
         }
-        if !self.visible_in_original(&rel_clean) {
+        // Upstream #2809: hiding the original goes through the shared
+        // whiteout helper. An explicit delete keeps the existing
+        // delete policy (no readonly check here — the DeleteFile entry
+        // point applies it); retiring a source after a VFS move already
+        // published the new name and uses this same path.
+        self.whiteout_original_file_unlocked(&rel_clean, false)
+    }
+
+    /// Upstream #2809: hide a game-original file behind a whiteout, refusing
+    /// read-only files when the caller is a delete entry point
+    /// (`check_readonly = true`) and keeping the existing move policy
+    /// otherwise (`false`). Locking wrapper; `delete_file` (which already
+    /// holds `write_lock`) uses the `_unlocked` form below.
+    pub(crate) fn whiteout_original_file(
+        &self,
+        rel: &str,
+        check_readonly: bool,
+    ) -> Result<(), u32> {
+        let _guard = self.write_lock.lock().unwrap();
+        self.whiteout_original_file_unlocked(rel, check_readonly)
+    }
+
+    pub(crate) fn whiteout_original_file_unlocked(
+        &self,
+        rel: &str,
+        check_readonly: bool,
+    ) -> Result<(), u32> {
+        if self.is_whiteout(rel) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
         #[cfg(windows)]
-        let original_is_dir = Path::new(&self.original_path(&rel_clean)).is_dir();
+        let original = self.original_path(rel);
         #[cfg(not(windows))]
-        let original_is_dir = self
-            .checked_original_path(&rel_clean)
-            .is_ok_and(|path| Path::new(&path).is_dir());
-        if original_is_dir {
+        let original = self
+            .checked_original_path(rel)
+            .map_err(|_| ERROR_ACCESS_DENIED)?;
+        let meta = std::fs::metadata(&original).map_err(|_| ERROR_FILE_NOT_FOUND)?;
+        if meta.is_dir() {
             return Err(ERROR_ACCESS_DENIED);
         }
-        self.add_whiteout(&rel_clean);
-        self.record_write(&rel_clean);
+        // DeleteFileW checks a file link's own attribute. Retiring a source after a
+        // VFS move has already published the new name and uses the existing move policy.
+        if check_readonly {
+            let entry = std::fs::symlink_metadata(&original)
+                .map_err(|e| e.raw_os_error().map_or(ERROR_ACCESS_DENIED, |code| code as u32))?;
+            if entry.permissions().readonly() {
+                return Err(ERROR_ACCESS_DENIED);
+            }
+        }
+        self.add_whiteout(rel);
+        self.record_write(rel);
         Ok(())
     }
 
@@ -2210,6 +2249,26 @@ mod tests {
         );
         assert_eq!(std::fs::read(&overlay).unwrap(), b"original");
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+    }
+
+    /// MAXIMUM_ALLOWED asks for every right the ACL grants; on a writable game folder that
+    /// includes write, so the open must go through the overlay like an explicit write (#2682).
+    #[test]
+    fn a_maximum_allowed_open_takes_the_write_path() {
+        let f = Fixture::new("maxal");
+        let v = &f.vfs;
+        let orig = f.game().join("data").join("hello.txt");
+        let Decision::Use(ov) = v.open_decision("G:\\data\\hello.txt", 0x0200_0000, OPEN_EXISTING, 0) else {
+            panic!("MAXIMUM_ALLOWED + OPEN_EXISTING must be a write open")
+        };
+        assert!(ov.contains("overlay"), "writes through MAXIMUM_ALLOWED must land in the overlay: {ov}");
+        assert_eq!(std::fs::read(&ov).unwrap(), b"original");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original", "the original must be untouched");
+        // and a read-only bit stays on the read path
+        assert_eq!(
+            v.open_decision("G:\\data\\gone.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Use(f.game().join("data").join("gone.txt").to_string_lossy().to_string())
+        );
     }
 
     #[test]

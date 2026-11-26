@@ -191,6 +191,37 @@ fn libc_flags(access: u32, disposition: u32, flags: u32) -> i32 {
     open_flags
 }
 
+/// Linux twin of upstream `delete_file_w_vfs` (#2809): a title delete honors
+/// the read-only attribute on the visible file. An overlay entry is removed
+/// by Rust itself — libc has no readonly gate (unlink needs only directory
+/// permission) — so the attribute is checked explicitly first, and with no
+/// overlay entry the shared `whiteout_original_file(rel, true)` refuses
+/// read-only originals. (Upstream's `delete_overlay_path` MAX_PATH juggling
+/// is Windows-native and stays out.) Retiring a source after a VFS move keeps
+/// the existing move policy and goes through `Vfs::delete_file` directly, as
+/// upstream.
+pub fn delete_file(v: &vfs::Vfs, rel: &str) -> Result<(), u32> {
+    let Some(rel_clean) = vfs::clean_rel(rel) else {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    };
+    let overlay = v.checked_overlay_path(&rel_clean)?;
+    // A dangling symlink entry still takes precedence over the original game file.
+    match std::fs::symlink_metadata(&overlay) {
+        Ok(meta) if meta.is_dir() => return Err(ERROR_ACCESS_DENIED),
+        Ok(meta) => {
+            if meta.permissions().readonly() {
+                return Err(ERROR_ACCESS_DENIED);
+            }
+            std::fs::remove_file(&overlay).map_err(|_| ERROR_ACCESS_DENIED)?;
+            v.commit_overlay_removal(&rel_clean);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(ERROR_ACCESS_DENIED),
+    }
+    v.whiteout_original_file(&rel_clean, true)
+}
+
 fn errno_to_win(errno: i32) -> u32 {
     match errno {
         libc::ENOENT => vfs::ERROR_FILE_NOT_FOUND,
@@ -795,5 +826,112 @@ mod tests {
             v.is_whiteout("data\\delete_on_close.txt"),
             "reopening an existing overlay entry must keep the delete-on-close whiteout"
         );
+    }
+
+    /// Linux twin of upstream `vfs_readonly_delete` (#2809, `#![cfg(windows)]`
+    /// as filed): a title delete honors the read-only attribute on the visible
+    /// file, while retiring a source after a VFS move keeps the existing move
+    /// policy (no readonly check).
+    #[cfg(unix)]
+    #[test]
+    fn delete_honors_readonly_attributes() {
+        fn set_readonly(path: &Path, readonly: bool) {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_readonly(readonly);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        let f = Fixture::new("readonly_delete");
+        let v = &f.vfs;
+        // A read-only game-original file.
+        std::fs::write(
+            f.game.join("data").join("readonly-original.txt"),
+            b"original",
+        )
+        .unwrap();
+        set_readonly(&f.game.join("data").join("readonly-original.txt"), true);
+        // A read-only overlay file shadowing a writable original.
+        std::fs::write(
+            f.game.join("data").join("shadowed.txt"),
+            b"shadowed original",
+        )
+        .unwrap();
+        let overlay_shadowed = f.data.join("overlay").join("data").join("shadowed.txt");
+        std::fs::create_dir_all(overlay_shadowed.parent().unwrap()).unwrap();
+        std::fs::write(&overlay_shadowed, b"overlay").unwrap();
+        set_readonly(&overlay_shadowed, true);
+        // A read-only original whose retirement must still succeed.
+        std::fs::write(
+            f.game.join("data").join("readonly-move.txt"),
+            b"readonly move source",
+        )
+        .unwrap();
+        set_readonly(&f.game.join("data").join("readonly-move.txt"), true);
+        // Plain writable files.
+        std::fs::write(
+            f.game.join("data").join("writable.txt"),
+            b"writable original",
+        )
+        .unwrap();
+        let overlay_only = f
+            .data
+            .join("overlay")
+            .join("data")
+            .join("writable-overlay.txt");
+        std::fs::write(&overlay_only, b"writable overlay").unwrap();
+
+        // Deleting a read-only original fails and leaves it visible.
+        assert_eq!(
+            delete_file(v, "data\\readonly-original.txt"),
+            Err(ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(
+            std::fs::read(
+                v.real_path_for_read("G:\\data\\readonly-original.txt")
+                    .unwrap()
+            )
+            .unwrap(),
+            b"original"
+        );
+        assert!(!v.is_whiteout("data\\readonly-original.txt"));
+
+        // Deleting a read-only overlay file fails and keeps both copies.
+        assert_eq!(
+            delete_file(v, "data\\shadowed.txt"),
+            Err(ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(std::fs::read(&overlay_shadowed).unwrap(), b"overlay");
+        assert_eq!(
+            std::fs::read(f.game.join("data").join("shadowed.txt")).unwrap(),
+            b"shadowed original"
+        );
+
+        // A writable overlay-only file deletes with no whiteout ...
+        assert_eq!(delete_file(v, "data\\writable-overlay.txt"), Ok(()));
+        assert!(!v.exists("data\\writable-overlay.txt"));
+        assert!(!v.is_whiteout("data\\writable-overlay.txt"));
+        assert_eq!(
+            delete_file(v, "data\\writable-overlay.txt"),
+            Err(ERROR_FILE_NOT_FOUND)
+        );
+
+        // ... and a writable original whiteouts, staying hidden on a fresh Vfs.
+        assert_eq!(delete_file(v, "data\\writable.txt"), Ok(()));
+        assert!(v.real_path_for_read("G:\\data\\writable.txt").is_none());
+        assert!(v.is_whiteout("data\\writable.txt"));
+        assert_eq!(
+            delete_file(v, "data\\writable.txt"),
+            Err(ERROR_FILE_NOT_FOUND)
+        );
+
+        // Retiring a source after a VFS move keeps the existing move policy:
+        // a read-only original still retires through `Vfs::delete_file`.
+        assert_eq!(v.delete_file("data\\readonly-move.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\readonly-move.txt"));
+
+        // Restore attributes so fixture cleanup never trips on readonly files.
+        set_readonly(&f.game.join("data").join("readonly-original.txt"), false);
+        set_readonly(&overlay_shadowed, false);
+        set_readonly(&f.game.join("data").join("readonly-move.txt"), false);
     }
 }

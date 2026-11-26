@@ -4960,7 +4960,7 @@ fn delete_file_impl(path: &str) -> i32 {
                 0
             }
         },
-        Target::Game { rel } => match v.delete_file(&rel) {
+        Target::Game { rel } => match crate::vfs_hooks::delete_file(v, &rel) {
             Ok(()) => {
                 set_error(ERROR_SUCCESS);
                 1
