@@ -103,7 +103,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let hdr = (pe.size_of_headers as usize).min(file.len()).min(size);
         std::ptr::copy_nonoverlapping(file.as_ptr(), base as *mut u8, hdr);
         for s in &pe.sections {
-            let raw = (s.raw_size as usize).min(s.mapped_size() as usize);
+            let mapped = s.mapped_size() as usize;
+            if (s.va as usize).checked_add(mapped).is_none_or(|e| e > size) {
+                return fail(format!("{name}: section {} outside the image", s.name));
+            }
+            let raw = (s.raw_size as usize).min(mapped);
             if raw == 0 {
                 continue;
             }
@@ -199,12 +203,22 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     }
     for dll in &all {
         for e in &dll.entries {
+            let iat = e.iat_rva as usize;
+            if iat + 8 > size {
+                modules::unregister_mapped(base);
+                return fail(format!("{name}: import IAT slot @ {:#x} outside image", e.iat_rva));
+            }
             let addr = resolver::resolve_import(&dll.dll, &e.what, &name, dll.delay);
-            unsafe { ((base + e.iat_rva as usize) as *mut u64).write_unaligned(addr as u64) };
+            unsafe { ((base + iat) as *mut u64).write_unaligned(addr as u64) };
         }
         if dll.delay && dll.module_handle_rva != 0 {
+            let hmod = dll.module_handle_rva as usize;
+            if hmod + 8 > size {
+                modules::unregister_mapped(base);
+                return fail(format!("{name}: delay-load module handle @ {:#x} outside image", dll.module_handle_rva));
+            }
             let h = resolver::load_library(&dll.dll).unwrap_or(1);
-            unsafe { ((base + dll.module_handle_rva as usize) as *mut u64).write_unaligned(h as u64) };
+            unsafe { ((base + hmod) as *mut u64).write_unaligned(h as u64) };
         }
     }
 

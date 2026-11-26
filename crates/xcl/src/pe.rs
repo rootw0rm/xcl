@@ -325,7 +325,7 @@ impl<'a> Pe<'a> {
     pub fn rva_to_offset(&self, rva: u32) -> Option<usize> {
         match self.layout {
             Layout::Mapped => {
-                if (rva as usize) < self.data.len() {
+                if (self.size_of_image == 0 || rva < self.size_of_image) && (rva as usize) < self.data.len() {
                     Some(rva as usize)
                 } else {
                     None
@@ -352,7 +352,17 @@ impl<'a> Pe<'a> {
 
     fn rva_tail(&self, rva: u32) -> Option<&'a [u8]> {
         match self.layout {
-            Layout::Mapped => self.data.get(rva as usize..),
+            Layout::Mapped => {
+                if self.size_of_image != 0 && rva >= self.size_of_image {
+                    return None;
+                }
+                let len = if self.size_of_image != 0 {
+                    (self.size_of_image - rva) as usize
+                } else {
+                    self.data.len().saturating_sub(rva as usize)
+                };
+                self.data.get(rva as usize..).and_then(|s| s.get(..len.min(s.len())))
+            }
             Layout::File => {
                 if rva < self.size_of_headers {
                     let off = rva as usize;
@@ -408,8 +418,15 @@ impl<'a> Pe<'a> {
     fn thunks(&self, int_rva: u32, iat_rva: u32) -> Result<Vec<ImportEntry>, PeError> {
         let mut out = Vec::new();
         let names_rva = if int_rva != 0 { int_rva } else { iat_rva };
+        if names_rva == 0 {
+            return Ok(out);
+        }
         for i in 0..65536u32 {
-            let slot = names_rva.checked_add(i * 8).ok_or(PeError::BadRva(names_rva))?;
+            let offset = i.checked_mul(8).ok_or(PeError::BadRva(names_rva))?;
+            let slot = names_rva.checked_add(offset).ok_or(PeError::BadRva(names_rva))?;
+            if self.size_of_image != 0 && slot.saturating_add(8) > self.size_of_image {
+                return Err(PeError::BadRva(slot));
+            }
             let v = self.u64_at(slot).ok_or(PeError::BadRva(slot))?;
             if v == 0 {
                 break;
@@ -425,7 +442,12 @@ impl<'a> Pe<'a> {
                 let name = self.cstr_at(name_rva).ok_or(PeError::BadRva(hn))?;
                 ImportName::Name { hint, name }
             };
-            out.push(ImportEntry { iat_rva: iat_rva.checked_add(i * 8).ok_or(PeError::BadRva(iat_rva))?, what });
+            let iat_offset = i.checked_mul(8).ok_or(PeError::BadRva(iat_rva))?;
+            let entry_iat_rva = iat_rva.checked_add(iat_offset).ok_or(PeError::BadRva(iat_rva))?;
+            if self.size_of_image != 0 && entry_iat_rva.saturating_add(8) > self.size_of_image {
+                return Err(PeError::BadRva(entry_iat_rva));
+            }
+            out.push(ImportEntry { iat_rva: entry_iat_rva, what });
         }
         Ok(out)
     }
@@ -436,8 +458,15 @@ impl<'a> Pe<'a> {
         if d.rva == 0 || d.size == 0 {
             return Ok(out);
         }
+        if d.size < 20 || d.rva.checked_add(d.size).is_none() {
+            return Err(PeError::BadRva(d.rva));
+        }
         for i in 0..4096u32 {
-            let o = d.rva.checked_add(i * 20).ok_or(PeError::BadRva(d.rva))?;
+            let pos = i.checked_mul(20).ok_or(PeError::BadRva(d.rva))?;
+            if 20 > d.size - pos {
+                return Err(PeError::BadRva(d.rva.checked_add(pos).unwrap_or(d.rva)));
+            }
+            let o = d.rva.checked_add(pos).ok_or(PeError::BadRva(d.rva))?;
             let g = |offset: u32| {
                 let rva = o.checked_add(offset).ok_or(PeError::BadRva(o))?;
                 self.u32_at(rva).ok_or(PeError::BadRva(rva))
@@ -461,8 +490,15 @@ impl<'a> Pe<'a> {
         if d.rva == 0 || d.size == 0 {
             return Ok(out);
         }
+        if d.size < 32 || d.rva.checked_add(d.size).is_none() {
+            return Err(PeError::BadRva(d.rva));
+        }
         for i in 0..4096u32 {
-            let o = d.rva.checked_add(i * 32).ok_or(PeError::BadRva(d.rva))?;
+            let pos = i.checked_mul(32).ok_or(PeError::BadRva(d.rva))?;
+            if 32 > d.size - pos {
+                return Err(PeError::BadRva(d.rva.checked_add(pos).unwrap_or(d.rva)));
+            }
+            let o = d.rva.checked_add(pos).ok_or(PeError::BadRva(d.rva))?;
             let g = |offset: u32| {
                 let rva = o.checked_add(offset).ok_or(PeError::BadRva(o))?;
                 self.u32_at(rva).ok_or(PeError::BadRva(rva))
@@ -496,6 +532,9 @@ impl<'a> Pe<'a> {
         if d.rva == 0 || d.size == 0 {
             return Ok(out);
         }
+        if d.size < 8 || d.rva.checked_add(d.size).is_none() {
+            return Err(PeError::BadRva(d.rva));
+        }
         // the block sizes come from the file: a block past the directory's end (or one whose
         // offsets overflow) is a malformed image, not a panic or a 2^31-entry loop
         let mut pos = 0u32;
@@ -519,7 +558,11 @@ impl<'a> Pe<'a> {
                 if kind == IMAGE_REL_BASED_ABSOLUTE {
                     continue;
                 }
-                out.push(Reloc { rva: page.checked_add((e & 0x0FFF) as u32).ok_or(PeError::BadRva(at))?, kind });
+                let reloc_rva = page.checked_add((e & 0x0FFF) as u32).ok_or(PeError::BadRva(at))?;
+                if self.size_of_image != 0 && reloc_rva >= self.size_of_image {
+                    return Err(PeError::BadRva(reloc_rva));
+                }
+                out.push(Reloc { rva: reloc_rva, kind });
             }
             pos += block;
         }
@@ -565,6 +608,25 @@ impl<'a> Pe<'a> {
         let afunc = g(28)?;
         let anames = g(32)?;
         let aords = g(36)?;
+        let check_table = |rva: u32, size: u32| -> Result<(), PeError> {
+            if rva >= d.rva && rva < d.rva.saturating_add(d.size) {
+                let pos = rva - d.rva;
+                if size > d.size - pos {
+                    return Err(PeError::BadRva(rva));
+                }
+            }
+            if self.size_of_image != 0 && rva.saturating_add(size) > self.size_of_image {
+                return Err(PeError::BadRva(rva));
+            }
+            Ok(())
+        };
+        let func_table_size = nfunc.checked_mul(4).ok_or(PeError::BadRva(afunc))?;
+        check_table(afunc, func_table_size)?;
+        let name_table_size = nnames.checked_mul(4).ok_or(PeError::BadRva(anames))?;
+        check_table(anames, name_table_size)?;
+        let ord_table_size = nnames.checked_mul(2).ok_or(PeError::BadRva(aords))?;
+        check_table(aords, ord_table_size)?;
+
         let mut functions = Vec::with_capacity(nfunc as usize);
         for i in 0..nfunc {
             let rva = i.checked_mul(4).and_then(|o| afunc.checked_add(o)).ok_or(PeError::BadRva(afunc))?;
@@ -880,5 +942,77 @@ mod tests {
         let tls = pe.tls().unwrap().expect("rust binaries have a TLS directory");
         assert!(tls.end_raw >= tls.start_raw);
         assert!(pe.va_to_rva(tls.address_of_index).is_some());
+    }
+
+    #[test]
+    fn truncated_directories_are_rejected() {
+        // Import directory with size smaller than one descriptor (20 bytes)
+        let data = directory_at_rva(DIR_IMPORT, 0x1000, &[0; 10]);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.imports(), Err(PeError::BadRva(_))));
+
+        // Delay-import directory with size smaller than one descriptor (32 bytes)
+        let data = directory_at_rva(DIR_DELAY_IMPORT, 0x1000, &[0; 16]);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.delay_imports(), Err(PeError::BadRva(_))));
+
+        // Relocation directory with size smaller than one block header (8 bytes)
+        let data = directory_at_rva(DIR_BASERELOC, 0x1000, &[0; 4]);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.relocations(), Err(PeError::BadRva(_))));
+
+        // Export directory with size smaller than export directory structure (40 bytes)
+        let data = directory_at_rva(DIR_EXPORT, 0x1000, &[0; 30]);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.exports(), Err(PeError::BadRva(_))));
+    }
+
+    #[test]
+    fn import_directory_without_null_terminator_exceeding_size_is_error() {
+        // Non-null import descriptor of 20 bytes, followed by only 10 bytes (not enough for 20-byte null descriptor)
+        let mut payload = vec![0u8; 30];
+        payload[0..4].copy_from_slice(&0x1000u32.to_le_bytes()); // int_rva
+        payload[12..16].copy_from_slice(&0x1000u32.to_le_bytes()); // name_rva
+        payload[16..20].copy_from_slice(&0x1000u32.to_le_bytes()); // iat_rva
+        let data = directory_at_rva(DIR_IMPORT, 0x1000, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.imports(), Err(PeError::BadRva(_))));
+    }
+
+    #[test]
+    fn delay_import_without_null_terminator_exceeding_size_is_error() {
+        let mut payload = vec![0u8; 40];
+        payload[4..8].copy_from_slice(&0x1000u32.to_le_bytes()); // name_rva
+        payload[12..16].copy_from_slice(&0x1000u32.to_le_bytes()); // iat_rva
+        let data = directory_at_rva(DIR_DELAY_IMPORT, 0x1000, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.delay_imports(), Err(PeError::BadRva(_))));
+    }
+
+    #[test]
+    fn export_tables_exceeding_directory_bounds_is_error() {
+        // Export directory claiming 100 functions (400 bytes), but directory size is only 48 bytes
+        let mut payload = vec![0u8; 48];
+        payload[20..24].copy_from_slice(&100u32.to_le_bytes()); // nfunc = 100
+        payload[28..32].copy_from_slice(&0x1028u32.to_le_bytes()); // afunc at offset 40 in directory
+        let data = directory_at_rva(DIR_EXPORT, 0x1000, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.exports(), Err(PeError::BadRva(_))));
+    }
+
+    #[test]
+    fn thunks_with_out_of_bounds_iat_slot_is_error() {
+        // Import descriptor with IAT pointing past size_of_image (0x2000)
+        let mut payload = vec![0u8; 48];
+        payload[0..4].copy_from_slice(&0x1028u32.to_le_bytes()); // int_rva -> points to non-zero thunk
+        payload[12..16].copy_from_slice(&0x1020u32.to_le_bytes()); // name_rva
+        payload[16..20].copy_from_slice(&0x7FFF_0000u32.to_le_bytes()); // iat_rva outside image
+        // thunk entry at 0x1028: ordinal 1
+        payload[40..48].copy_from_slice(&(1u64 | (1u64 << 63)).to_le_bytes());
+        let mut data = directory_at_rva(DIR_IMPORT, 0x1000, &payload);
+        // set size_of_image in optional header (opt = 0x58, size_of_image at opt + 56)
+        data[0x58 + 56..0x58 + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.imports(), Err(PeError::BadRva(_))));
     }
 }
