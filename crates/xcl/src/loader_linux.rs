@@ -395,7 +395,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                 continue;
             }
             let src = s.raw_ptr as usize;
-            if src + raw > file.len() || s.va as usize + raw > size {
+            if src.checked_add(raw).is_none_or(|e| e > file.len())
+                || (s.va as usize).checked_add(raw).is_none_or(|e| e > size)
+            {
                 return Err(format!("{name}: section {} outside the file/image", s.name));
             }
             std::ptr::copy_nonoverlapping(
@@ -408,7 +410,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
 
     // 3. relocations. The image is at its link address, so this is a no-op today; the same
     // fixups run should a future backend map elsewhere (never silently: that is an error).
-    let delta = base as i64 - pe.image_base as i64;
+    let delta = (base as u64).wrapping_sub(pe.image_base);
     apply_relocations(&pe, base, delta).map_err(|e| format!("{name}: {e}"))?;
 
     let exports = OwnedExports::from_pe(&pe).unwrap_or_default();
@@ -602,19 +604,18 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
 }
 
 /// Apply base relocations for a non-zero delta, mirroring `loader.rs`.
-fn apply_relocations(pe: &Pe<'_>, base: usize, delta: i64) -> Result<(), String> {
+fn apply_relocations(pe: &Pe<'_>, base: usize, delta: u64) -> Result<(), String> {
     if delta == 0 {
         return Ok(());
     }
     let relocs = pe.relocations().map_err(|e| format!("relocations: {e}"))?;
     for r in relocs {
+        // the target comes from the file: one outside the mapping would patch memory that is
+        // not the image's (mirrors the Windows `loader::map_image_ex` guard).
         let width = match r.kind {
             pe::IMAGE_REL_BASED_DIR64 => 8,
             pe::IMAGE_REL_BASED_HIGHLOW => 4,
-            k => {
-                crate::xlog_warn!("unsupported relocation type {k} @ {:#x}", r.rva);
-                continue;
-            }
+            _ => 0,
         };
         if r.rva as usize + width > pe.size_of_image as usize {
             return Err(format!("relocation RVA {:#x} outside the image", r.rva));
@@ -624,13 +625,15 @@ fn apply_relocations(pe: &Pe<'_>, base: usize, delta: i64) -> Result<(), String>
             match r.kind {
                 pe::IMAGE_REL_BASED_DIR64 => {
                     let v = std::ptr::read_unaligned(p as *const u64);
-                    std::ptr::write_unaligned(p as *mut u64, (v as i64 + delta) as u64);
+                    std::ptr::write_unaligned(p as *mut u64, v.wrapping_add(delta));
                 }
                 pe::IMAGE_REL_BASED_HIGHLOW => {
                     let v = std::ptr::read_unaligned(p as *const u32);
-                    std::ptr::write_unaligned(p as *mut u32, (v as i64 + delta) as u32);
+                    std::ptr::write_unaligned(p as *mut u32, v.wrapping_add(delta as u32));
                 }
-                _ => unreachable!(),
+                k => {
+                    crate::xlog_warn!("unsupported relocation type {k} @ {:#x}", r.rva);
+                }
             }
         }
     }
@@ -902,6 +905,73 @@ mod tests {
             assert_eq!(
                 std::ptr::read_unaligned((at + 0x1018) as *const u32),
                 (image_base + 0x2000) as u32
+            );
+        }
+    }
+
+    /// Wrapping relocation delta for a high link address (mirrors the Windows
+    /// `relocates_high_image_base_without_signed_overflow` port): the preferred
+    /// base near `0x8000_...` makes the signed `base - image_base` overflow in
+    /// debug; the wrapping `u64` delta relocates exactly.
+    #[test]
+    fn relocates_high_image_base_with_wrapping_delta() {
+        let high_base = 0x8000_0000_0000_0000u64;
+        let mut file = tiny_dll(high_base, &[0xC3], None);
+        set_relocs(&mut file, &[(10, 0x020)]);
+        let pe = Pe::parse(&file, Layout::File).unwrap();
+        let mut image = vec![0u8; 0x2000];
+        let at = image.as_mut_ptr() as usize;
+        unsafe {
+            std::ptr::write_unaligned((at + 0x1020) as *mut u64, high_base + 0x1000);
+        }
+        let delta = (at as u64).wrapping_sub(high_base);
+        apply_relocations(&pe, at, delta).unwrap();
+        unsafe {
+            assert_eq!(
+                std::ptr::read_unaligned((at + 0x1020) as *const u64),
+                (at + 0x1000) as u64
+            );
+        }
+    }
+
+    /// Relocation targets outside the image fail before they are patched (mirrors
+    /// the Windows `relocations_outside_the_image_are_errors` port): one past the
+    /// end, or one whose 8 bytes straddle it, is an error; an inside target still
+    /// relocates.
+    #[test]
+    fn relocations_outside_the_image_are_errors() {
+        const BASE: u64 = 0x4000_0000;
+        // tiny_dll images are 0x3000 bytes: 0x4000 past the end, 0x2FFC straddles it.
+        for target in [0x4000u32, 0x2FFC] {
+            let mut file = tiny_dll(BASE, &[0xC3], None);
+            set_relocs(
+                &mut file,
+                &[(
+                    pe::IMAGE_REL_BASED_DIR64,
+                    (target & 0xFFF) as u16,
+                )],
+            );
+            // retarget the single block at its page: set_relocs always uses page 0x1000.
+            let mut pe_bytes = file.clone();
+            p32(&mut pe_bytes, 0x300, target & !0xFFF);
+            let pe = Pe::parse(&pe_bytes, Layout::File).unwrap();
+            let e = apply_relocations(&pe, 0x1_0000, 0x1000).err().expect("outside target fails");
+            assert!(e.contains("outside the image"), "{target:#x}: {e}");
+        }
+        let mut file = tiny_dll(BASE, &[0xC3], None);
+        set_relocs(&mut file, &[(pe::IMAGE_REL_BASED_DIR64, 0x010)]);
+        let pe = Pe::parse(&file, Layout::File).unwrap();
+        let mut image = vec![0u8; 0x2000];
+        let at = image.as_mut_ptr() as usize;
+        unsafe {
+            std::ptr::write_unaligned((at + 0x1010) as *mut u64, BASE + 0x1000);
+        }
+        let delta = (at as u64).wrapping_sub(BASE);
+        apply_relocations(&pe, at, delta).unwrap();
+        unsafe {
+            assert_eq!(
+                std::ptr::read_unaligned((at + 0x1010) as *const u64),
+                (at + 0x1000) as u64
             );
         }
     }
