@@ -1129,13 +1129,20 @@ unsafe extern "system" fn install_chunks_result(b: *mut XAsyncBlock, out: *mut u
 }
 
 unsafe extern "system" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock) -> HRESULT {
-    let mut m: *mut c_void = std::ptr::null_mut();
-    let hr = XPackageMount(id, &mut m);
-    if hr < 0 {
-        return hr;
-    }
-    let m = m as usize;
-    begin_with(b, &MOUNT_ID as *const u8 as usize, move || Ok(m.to_le_bytes().to_vec()))
+    let owned_id = crate::util::from_cstr_ptr(id).map(|s| {
+        let mut bytes = s.into_bytes();
+        bytes.push(0);
+        bytes
+    });
+    begin_with(b, &MOUNT_ID as *const u8 as usize, move || {
+        let mut m: *mut c_void = std::ptr::null_mut();
+        let ptr = owned_id.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        let hr = unsafe { XPackageMount(ptr, &mut m) };
+        if hr < 0 {
+            return Err(hr);
+        }
+        Ok((m as usize).to_le_bytes().to_vec())
+    })
 }
 
 unsafe extern "system" fn mount_with_ui_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
@@ -2083,5 +2090,38 @@ mod tests {
         assert!(parse_mute_tts(Some("1")));
         assert!(parse_mute_tts(Some("true")));
         assert!(parse_mute_tts(Some("yes")));
+    }
+
+    #[test]
+    fn mount_with_ui_async_does_not_leak_mount_on_invalid_or_aborted_call() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let before = LIVE_MOUNTS.load(Ordering::SeqCst);
+
+            // Null XAsyncBlock -> E_INVALIDARG without leaking a Mount handle.
+            assert_eq!(mount_with_ui_async(std::ptr::null(), std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before, "Mount leaked on null XAsyncBlock");
+
+            // Terminated task queue -> E_ABORT without leaking a Mount handle.
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_THREAD_POOL, taskqueue::MODE_THREAD_POOL, &mut q), S_OK);
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            let mut b_aborted: XAsyncBlock = std::mem::zeroed();
+            b_aborted.queue = q;
+            assert_eq!(mount_with_ui_async(std::ptr::null(), &mut b_aborted), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b_aborted, true), crate::util::E_ABORT);
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before, "Mount leaked on terminated queue");
+            taskqueue::XTaskQueueCloseHandle(q);
+
+            // Control: normal async mount succeeds and closes cleanly.
+            let mut b_ok: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(mount_with_ui_async(std::ptr::null(), &mut b_ok), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b_ok, true), S_OK);
+            let mut handle = 0usize;
+            assert_eq!(mount_with_ui_result(&mut b_ok, &mut handle), S_OK);
+            assert_ne!(handle, 0);
+            XPackageCloseMountHandle(handle as *mut c_void);
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before);
+        }
     }
 }

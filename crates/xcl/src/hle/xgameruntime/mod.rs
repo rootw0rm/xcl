@@ -311,6 +311,9 @@ pub unsafe extern "system" fn XPackageGetIdentifier(_path_or_name: *const u8, si
     write_cstr_out(&package_identifier(), buf, size, std::ptr::null_mut())
 }
 
+#[cfg(test)]
+pub(super) static LIVE_MOUNTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct Mount {
     path: String,
 }
@@ -324,6 +327,8 @@ pub unsafe extern "system" fn XPackageMount(id: *const u8, out: *mut *mut c_void
         crate::xlog_warn!("XPackageMount({id}) – unknown package (DLC?)");
         return E_NOT_FOUND;
     }
+    #[cfg(test)]
+    LIVE_MOUNTS.fetch_add(1, Ordering::SeqCst);
     *out = Box::into_raw(Box::new(Mount { path: game_root() })) as *mut c_void;
     S_OK
 }
@@ -346,6 +351,8 @@ pub unsafe extern "system" fn XPackageGetMountPath(m: *mut c_void, size: usize, 
 
 pub unsafe extern "system" fn XPackageCloseMountHandle(m: *mut c_void) {
     if !m.is_null() {
+        #[cfg(test)]
+        LIVE_MOUNTS.fetch_sub(1, Ordering::SeqCst);
         drop(Box::from_raw(m as *mut Mount));
     }
 }

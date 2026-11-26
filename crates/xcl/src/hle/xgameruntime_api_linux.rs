@@ -800,6 +800,9 @@ fn game_root() -> String {
     crate::state::boot().map(|b| b.game_root.to_string_lossy().into_owned()).unwrap_or_else(|| ".".into())
 }
 
+#[cfg(test)]
+pub(super) static LIVE_MOUNTS: AtomicUsize = AtomicUsize::new(0);
+
 struct Mount {
     path: String,
 }
@@ -813,6 +816,8 @@ pub unsafe extern "win64" fn XPackageMount(id: *const u8, out: *mut *mut c_void)
         crate::xlog_warn!("XPackageMount({id}) – unknown package (DLC?)");
         return crate::util::E_NOT_FOUND;
     }
+    #[cfg(test)]
+    LIVE_MOUNTS.fetch_add(1, Ordering::SeqCst);
     *out = Box::into_raw(Box::new(Mount { path: game_root() })) as *mut c_void;
     S_OK
 }
@@ -835,6 +840,8 @@ pub unsafe extern "win64" fn XPackageGetMountPath(m: *mut c_void, size: usize, b
 
 pub unsafe extern "win64" fn XPackageCloseMountHandle(m: *mut c_void) {
     if !m.is_null() {
+        #[cfg(test)]
+        LIVE_MOUNTS.fetch_sub(1, Ordering::SeqCst);
         drop(Box::from_raw(m as *mut Mount));
     }
 }
@@ -981,13 +988,20 @@ unsafe extern "win64" fn install_chunks_result(b: *mut XAsyncBlock, out: *mut us
 }
 
 unsafe extern "win64" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock) -> HRESULT {
-    let mut m: *mut c_void = std::ptr::null_mut();
-    let hr = XPackageMount(id, &mut m);
-    if hr < 0 {
-        return hr;
-    }
-    let m = m as usize;
-    xu::begin_with(b, &MOUNT_ID as *const u8 as usize, move || Ok(m.to_le_bytes().to_vec()))
+    let owned_id = crate::util::from_cstr_ptr(id).map(|s| {
+        let mut bytes = s.into_bytes();
+        bytes.push(0);
+        bytes
+    });
+    xu::begin_with(b, &MOUNT_ID as *const u8 as usize, move || {
+        let mut m: *mut c_void = std::ptr::null_mut();
+        let ptr = owned_id.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        let hr = unsafe { XPackageMount(ptr, &mut m) };
+        if hr < 0 {
+            return Err(hr);
+        }
+        Ok((m as usize).to_le_bytes().to_vec())
+    })
 }
 
 unsafe extern "win64" fn mount_with_ui_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
@@ -1435,6 +1449,40 @@ mod tests {
             let addr = addr.unwrap();
             assert_ne!(addr, 0, "{name} must be real code");
             assert!(crate::stubs::info_of_stub(addr).is_none(), "{name} must not be an auto-stub");
+        }
+    }
+
+    #[test]
+    fn mount_with_ui_async_does_not_leak_mount_on_invalid_or_aborted_call() {
+        // No ASYNC_TEST_LOCK on the Linux twin (cf. step-48): each async test drives
+        // its own XAsyncBlock / task queue, so no cross-test serialisation is needed.
+        unsafe {
+            let before = LIVE_MOUNTS.load(Ordering::SeqCst);
+
+            // Null XAsyncBlock -> E_INVALIDARG without leaking a Mount handle.
+            assert_eq!(mount_with_ui_async(std::ptr::null(), std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before, "Mount leaked on null XAsyncBlock");
+
+            // Terminated task queue -> E_ABORT without leaking a Mount handle.
+            let mut q = std::ptr::null_mut();
+            assert_eq!(xq::XTaskQueueCreate(xq::MODE_THREAD_POOL, xq::MODE_THREAD_POOL, &mut q), S_OK);
+            assert_eq!(xq::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            let mut b_aborted: XAsyncBlock = std::mem::zeroed();
+            b_aborted.queue = q;
+            assert_eq!(mount_with_ui_async(std::ptr::null(), &mut b_aborted), S_OK);
+            assert_eq!(xu::XAsyncGetStatus(&mut b_aborted, true), crate::util::E_ABORT);
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before, "Mount leaked on terminated queue");
+            xq::XTaskQueueCloseHandle(q);
+
+            // Control: normal async mount succeeds and closes cleanly.
+            let mut b_ok: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(mount_with_ui_async(std::ptr::null(), &mut b_ok), S_OK);
+            assert_eq!(xu::XAsyncGetStatus(&mut b_ok, true), S_OK);
+            let mut handle = 0usize;
+            assert_eq!(mount_with_ui_result(&mut b_ok, &mut handle), S_OK);
+            assert_ne!(handle, 0);
+            XPackageCloseMountHandle(handle as *mut c_void);
+            assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before);
         }
     }
 }
