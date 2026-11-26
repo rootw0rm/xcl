@@ -135,6 +135,9 @@ pub unsafe fn hold(res: usize) {
 }
 
 unsafe fn release_obj(obj: usize) {
+    if super::vram::recycle_ready(obj) {
+        return;
+    }
     let raw = obj as *mut c_void;
     let release_fn = if super::real::is_adopted(raw) {
         super::real::orig_fn(raw, 2)

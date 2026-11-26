@@ -130,14 +130,190 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
     PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
 }
 
-pub(super) fn forget(resource: usize) {
-    let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
-    if placed {
-        forget_pages(resource);
-        if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
-            ARENAS.lock().unwrap().release(id, std::time::Instant::now());
+/// Maximum idle reserved sampled textures kept per device for reuse (#1268).
+/// Reserved resources hold no backing memory of their own (tiles are unmapped when parked).
+const RESERVED_POOL_MAX: usize = 512;
+
+fn reserved_pool_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_RESERVED_POOL").ok().as_deref() != Some("0"))
+}
+
+/// Exact description and uniform D3D12 resource state of a recyclable reserved sampled texture.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ReservedKey {
+    dimension: i32,
+    alignment: u64,
+    width: u64,
+    height: u32,
+    depth_or_array: u16,
+    mip_levels: u16,
+    format: i32,
+    sample_count: u32,
+    sample_quality: u32,
+    flags: i32,
+    state: u32,
+}
+
+impl ReservedKey {
+    fn from_desc(desc: &D3D12_RESOURCE_DESC, state: u32) -> Self {
+        Self {
+            dimension: desc.Dimension.0,
+            alignment: desc.Alignment,
+            width: desc.Width,
+            height: desc.Height,
+            depth_or_array: desc.DepthOrArraySize,
+            mip_levels: desc.MipLevels,
+            format: desc.Format.0,
+            sample_count: desc.SampleDesc.Count,
+            sample_quality: desc.SampleDesc.Quality,
+            flags: desc.Flags.0,
+            state,
         }
     }
+}
+
+/// Bounded per-device pool of idle reserved sampled textures keyed by `(desc, state)`.
+/// FIFO eviction caps the number of idle `ID3D12Resource` wrappers; evicted raw pointers are
+/// returned to the caller so COM `Release` runs outside `PAGES.lock()`.
+struct ReservedPool {
+    by_key: std::collections::HashMap<ReservedKey, Vec<(usize, u32, u64)>>,
+    order: std::collections::VecDeque<(ReservedKey, usize, u64)>,
+    live_gen: std::collections::HashMap<usize, u64>,
+    next_gen: u64,
+    cap: usize,
+}
+
+impl ReservedPool {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_key: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            live_gen: std::collections::HashMap::new(),
+            next_gen: 0,
+            cap,
+        }
+    }
+
+    fn compact_order(&mut self) {
+        if self.live_gen.is_empty() {
+            self.order.clear();
+            return;
+        }
+        while let Some(&(_, raw, gen)) = self.order.front() {
+            if self.live_gen.get(&raw) == Some(&gen) {
+                break;
+            }
+            self.order.pop_front();
+        }
+        if self.order.len() > self.live_gen.len().saturating_mul(2).max(16) {
+            self.order.retain(|&(_, raw, gen)| self.live_gen.get(&raw) == Some(&gen));
+        }
+    }
+
+    fn take(&mut self, key: &ReservedKey) -> Option<(usize, u32)> {
+        let bucket = self.by_key.get_mut(key)?;
+        let (raw, total, _gen) = bucket.pop()?;
+        if bucket.is_empty() {
+            self.by_key.remove(key);
+        }
+        self.live_gen.remove(&raw);
+        self.compact_order();
+        Some((raw, total))
+    }
+
+    fn push(&mut self, key: ReservedKey, raw: usize, total: u32) -> Option<usize> {
+        if self.cap == 0 {
+            return Some(raw);
+        }
+        let mut evicted = None;
+        while self.live_gen.len() >= self.cap {
+            let Some((old_key, old_raw, old_gen)) = self.order.pop_front() else { break };
+            if self.live_gen.get(&old_raw) != Some(&old_gen) {
+                continue;
+            }
+            self.live_gen.remove(&old_raw);
+            if let Some(bucket) = self.by_key.get_mut(&old_key) {
+                if let Some(pos) = bucket.iter().position(|&(r, _, g)| r == old_raw && g == old_gen) {
+                    bucket.swap_remove(pos);
+                    if bucket.is_empty() {
+                        self.by_key.remove(&old_key);
+                    }
+                }
+            }
+            evicted = Some(old_raw);
+            break;
+        }
+        let gen = self.next_gen;
+        self.next_gen = self.next_gen.wrapping_add(1);
+        self.live_gen.insert(raw, gen);
+        self.by_key.entry(key).or_default().push((raw, total, gen));
+        self.order.push_back((key, raw, gen));
+        self.compact_order();
+        evicted
+    }
+}
+
+/// Metadata for a released reserved sampled texture awaiting GPU completion in `late_release`.
+#[derive(Clone, Copy)]
+pub(super) struct RecycleInfo {
+    dev_key: usize,
+    key: ReservedKey,
+    total: u32,
+    was_mapped: bool,
+}
+
+static PARKING: Mutex<Option<std::collections::HashMap<usize, RecycleInfo>>> = Mutex::new(None);
+
+pub(super) fn forget_for_recycle(resource: usize, held: bool) -> Option<RecycleInfo> {
+    let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
+    if !placed {
+        return None;
+    }
+    let info = forget_pages(resource, held);
+    if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
+        ARENAS.lock().unwrap().release(id, std::time::Instant::now());
+    }
+    info
+}
+
+pub(super) fn park_recyclable(resource: usize, mut info: RecycleInfo, final_state: u32) {
+    info.key.state = final_state;
+    PARKING.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(resource, info);
+}
+
+/// Called by `late_release` once every live GPU queue is past the batch containing `resource`.
+/// Returns `true` when `resource` was unmapped and parked in the per-device reuse pool (so
+/// `late_release` must not call `Release` on it).
+pub(super) unsafe fn recycle_ready(resource: usize) -> bool {
+    let Some(info) = PARKING.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) else {
+        return false;
+    };
+    if !reserved_pool_enabled() {
+        return false;
+    }
+    let evicted = {
+        let mut g = PAGES.lock().unwrap();
+        let Some(Some(pages)) = g.get_mut(&info.dev_key) else {
+            return false;
+        };
+        if info.was_mapped {
+            if let Some(res) = ID3D12Resource::from_raw_borrowed(&(resource as *mut c_void)) {
+                pages.unmap(res, info.total);
+            }
+        }
+        pages.reserved_pool.push(info.key, resource, info.total)
+    };
+    if let Some(old) = evicted {
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(old as *mut c_void, 2));
+        f(old as *mut c_void);
+    }
+    true
+}
+
+#[allow(dead_code)]
+pub(super) fn forget(resource: usize) {
+    let _ = forget_for_recycle(resource, false);
 }
 
 /// Whether a console texture with these D3D12_RESOURCE_FLAGS is the GPU's (render target,
@@ -239,6 +415,7 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
+    recycle: Option<ReservedKey>,
     /// top mips left without video memory (`top_mip_tiles`): their levels never get pages
     skip_mips: u32,
     /// their tiles (empty: none), kept for `remap_if_unmapped`
@@ -754,6 +931,8 @@ struct Pages {
     held: Vec<HeldUnmap>,
     /// cached `reservable()` answers for `(DXGI_FORMAT, SampleCount)` on this device
     reservable_cache: std::collections::HashMap<(i32, u32), bool>,
+    /// idle reserved sampled textures kept for reuse by `(desc, state)` (#1268)
+    reserved_pool: ReservedPool,
     /// reusable scratch buffers for `map()`
     scratch_heaps: Vec<u32>,
     scratch_flags: Vec<D3D12_TILE_RANGE_FLAGS>,
@@ -806,6 +985,7 @@ impl Pages {
             marks: std::collections::HashMap::new(),
             held: Vec::new(),
             reservable_cache: std::collections::HashMap::new(),
+            reserved_pool: ReservedPool::new(RESERVED_POOL_MAX),
             scratch_heaps: Vec::new(),
             scratch_flags: Vec::new(),
             scratch_offsets: Vec::new(),
@@ -1359,22 +1539,57 @@ unsafe fn place_on_pages(
         }
     };
     let dev_key = dev.as_raw() as usize;
+    let recycle_key = (!require_aligned && clear.is_null() && tiled.Flags.0 == 0 && reserved_pool_enabled())
+        .then(|| ReservedKey::from_desc(&tiled, state));
+    let mut pooled = None;
     let is_reservable = {
         let mut g = PAGES.lock().unwrap();
         let pages = g.entry(dev_key).or_insert_with(|| Pages::new(dev)).as_mut()?;
-        *pages.reservable_cache.entry((tiled.Format.0, tiled.SampleDesc.Count)).or_insert_with(|| reservable(dev, &tiled))
+        let ok = *pages.reservable_cache.entry((tiled.Format.0, tiled.SampleDesc.Count)).or_insert_with(|| reservable(dev, &tiled));
+        if ok {
+            if let Some(key) = recycle_key {
+                pooled = pages.reserved_pool.take(&key);
+            }
+        }
+        ok
     };
     if !is_reservable {
         log("no tiled support for its format or sample count");
         return None;
     }
-    // CreateReservedResource and GetResourceTiling do not touch `PAGES`; keep them outside the
-    // lock so concurrent streaming threads, `before_execute`, and `page_bytes` do not serialize.
-    let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
-    if hr < 0 || (*ppv).is_null() {
-        log(&format!("{hr:#x}"));
-        return None;
-    }
+    let (hr, cached_total) = if let Some((pooled_raw, cached_total)) = pooled {
+        type QiFn = unsafe extern "system" fn(*mut c_void, *const windows_sys::core::GUID, *mut *mut c_void) -> HRESULT;
+        type RelFn = unsafe extern "system" fn(*mut c_void) -> u32;
+        let qi: QiFn = std::mem::transmute(super::real::orig_fn(pooled_raw as *mut c_void, 0));
+        let rel: RelFn = std::mem::transmute(super::real::orig_fn(pooled_raw as *mut c_void, 2));
+        let hr = qi(pooled_raw as *mut c_void, riid, ppv);
+        rel(pooled_raw as *mut c_void);
+        if hr >= 0 && !(*ppv).is_null() {
+            super::real::note_reserved(hr, ppv);
+            static REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let h = REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if h.is_power_of_two() && h >= 16 {
+                crate::xlog_info!("D3D12.X: reserved texture pool: {h} reused (skipped CreateReservedResource)");
+            }
+            (hr, Some(cached_total))
+        } else {
+            let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
+            if hr < 0 || (*ppv).is_null() {
+                log(&format!("{hr:#x}"));
+                return None;
+            }
+            (hr, None)
+        }
+    } else {
+        // CreateReservedResource and GetResourceTiling do not touch `PAGES`; keep them outside the
+        // lock so concurrent streaming threads, `before_execute`, and `page_bytes` do not serialize.
+        let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
+        if hr < 0 || (*ppv).is_null() {
+            log(&format!("{hr:#x}"));
+            return None;
+        }
+        (hr, None)
+    };
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
@@ -1382,6 +1597,9 @@ unsafe fn place_on_pages(
         let (levels, n) = level_tiling(dev, res, desc.MipLevels as u32);
         total = n;
         levels.filter(|_| total > 0 && owned_pages(va, console_bytes, total as usize).is_some())
+    } else if let Some(n) = cached_total {
+        total = n;
+        None
     } else {
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
@@ -1402,10 +1620,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, skip_mips, skip });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, skip_mips, skip, recycle: recycle_key });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, (mip_levels, array_slices), &skip) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used, used_extra, levels: None, skip_mips, skip });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mip_levels, array_slices, mapped: true, used, used_extra, levels: None, skip_mips, skip, recycle: recycle_key });
                 true
             } else {
                 false
@@ -1520,11 +1738,12 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
 }
 
 /// A resource released: its pages are no longer its.
-fn forget_pages(resource: usize) {
+fn forget_pages(resource: usize, held: bool) -> Option<RecycleInfo> {
     forget_skipped_mips(resource);
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
-    for pages in g.values_mut().flatten() {
+    for (&dev_key, slot) in g.iter_mut() {
+        let Some(pages) = slot.as_mut() else { continue };
         let Some(t) = pages.targets.remove(&resource) else { continue };
         if let Some(l) = &t.levels {
             LEVEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1534,8 +1753,11 @@ fn forget_pages(resource: usize) {
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
         }
-        return;
+        return (held && reserved_pool_enabled())
+            .then(|| t.recycle.map(|key| RecycleInfo { dev_key, key, total: t.total, was_mapped: t.mapped }))
+            .flatten();
     }
+    None
 }
 
 /// Reclaimed heaps waiting for `unmap_mark` (if any) and every live queue's fence mark on one device.
@@ -3245,6 +3467,161 @@ void main() {
             let got = std::slice::from_raw_parts(q as *const u32, 3).to_vec();
             rb.Unmap(0, None);
             assert_eq!(got, vec![shade(1), shade(2), 0], "clamped to mip 1; clamped from the resource's mip 0 (mip 2, not 3); mip 0 unmapped reads zero");
+        }
+    }
+
+    #[test]
+    fn reserved_pool_reuses_matching_key_isolates_state_and_evicts_fifo() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 9,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let k_common = ReservedKey::from_desc(&desc, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+        let k_srv = ReservedKey::from_desc(&desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+        let mut desc2 = desc;
+        desc2.Width = 512;
+        let k_512 = ReservedKey::from_desc(&desc2, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+
+        let mut pool = ReservedPool::new(2);
+        assert_eq!(pool.push(k_common, 0x1000, 1), None);
+        assert_eq!(pool.push(k_srv, 0x2000, 1), None);
+        // State mismatch does not cross-hit.
+        assert_eq!(pool.take(&k_512), None);
+        // Third push evicts oldest (0x1000) FIFO.
+        assert_eq!(pool.push(k_512, 0x3000, 4), Some(0x1000));
+        assert_eq!(pool.take(&k_common), None);
+        assert_eq!(pool.take(&k_srv), Some((0x2000, 1)));
+        assert_eq!(pool.take(&k_512), Some((0x3000, 4)));
+        assert_eq!(pool.live_gen.len(), 0);
+        assert_eq!(pool.order.len(), 0);
+
+        // Zero-cap pool immediately returns pushed objects for release.
+        let mut disabled = ReservedPool::new(0);
+        assert_eq!(disabled.push(k_common, 0x4000, 1), Some(0x4000));
+    }
+
+    #[test]
+    fn reserved_pool_repark_tombstones_stale_order_and_preserves_fifo() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_UNORM, DXGI_SAMPLE_DESC};
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 9,
+            Format: DXGI_FORMAT_BC1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let k_a = ReservedKey::from_desc(&desc, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+        let k_b = ReservedKey::from_desc(&desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+        let mut desc_c = desc;
+        desc_c.Width = 512;
+        let k_c = ReservedKey::from_desc(&desc_c, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+
+        // Repeated take -> repark below cap must not accumulate unbounded stale order entries,
+        // even when an older entry stays parked at the front of the queue.
+        let mut pool = ReservedPool::new(4);
+        assert_eq!(pool.push(k_a, 0x1000, 1), None);
+        assert_eq!(pool.push(k_b, 0x2000, 1), None);
+        for _ in 0..100 {
+            assert_eq!(pool.take(&k_b), Some((0x2000, 1)));
+            assert_eq!(pool.push(k_b, 0x2000, 1), None);
+        }
+        assert_eq!(pool.live_gen.len(), 2);
+        assert!(pool.order.len() <= 16, "stale order entries accumulated: {}", pool.order.len());
+
+        // At cap, a reparked pointer must be ordered by its current parking time, not its original one.
+        let mut cap2 = ReservedPool::new(2);
+        assert_eq!(cap2.push(k_a, 0x1000, 1), None); // gen 0
+        assert_eq!(cap2.push(k_b, 0x2000, 1), None); // gen 1
+        assert_eq!(cap2.take(&k_a), Some((0x1000, 1))); // tombstones gen 0
+        assert_eq!(cap2.push(k_a, 0x1000, 1), None); // gen 2 (newer than 0x2000)
+        // Third entry at cap=2 must evict 0x2000 (gen 1), NOT reparked 0x1000 (gen 2).
+        assert_eq!(cap2.push(k_c, 0x3000, 4), Some(0x2000));
+        assert_eq!(cap2.take(&k_b), None);
+        assert_eq!(cap2.take(&k_a), Some((0x1000, 1)));
+        assert_eq!(cap2.take(&k_c), Some((0x3000, 4)));
+        assert_eq!(cap2.live_gen.len(), 0);
+        assert_eq!(cap2.order.len(), 0);
+
+        // Non-front stale entry at cap: push A, B, C; take+repark B so stale B(1) remains
+        // behind A(0); pushing D evicts A(0), then pushing E must skip stale B(1) and evict C(2).
+        let mut cap3 = ReservedPool::new(3);
+        assert_eq!(cap3.push(k_a, 0x1000, 1), None);
+        assert_eq!(cap3.push(k_b, 0x2000, 1), None);
+        assert_eq!(cap3.push(k_c, 0x3000, 4), None);
+        assert_eq!(cap3.take(&k_b), Some((0x2000, 1)));
+        assert_eq!(cap3.push(k_b, 0x2000, 1), None);
+        assert_eq!(cap3.push(k_a, 0x4000, 1), Some(0x1000));
+        assert_eq!(cap3.push(k_a, 0x5000, 1), Some(0x3000));
+        assert_eq!(cap3.take(&k_b), Some((0x2000, 1)));
+    }
+
+    #[test]
+    fn reserved_resource_recycle_unmaps_reuses_and_remaps_on_gpu() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_UNORM, DXGI_SAMPLE_DESC};
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(mut pages) = Pages::new(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 9,
+                Format: DXGI_FORMAT_BC1_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+            let res = r.unwrap();
+            let raw = res.into_raw() as usize;
+            let raw_ptr = raw as *mut c_void;
+            let borrowed = ID3D12Resource::from_raw_borrowed(&raw_ptr).unwrap();
+            let mut total = 0u32;
+            dev.GetResourceTiling(borrowed, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            assert!(total >= 1);
+
+            let key = ReservedKey::from_desc(&desc, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+            let (used1, extra1) = pages.bind(&dev, borrowed, 0x2000_0000, Some(total as u64 * PAGE as u64), total).expect("initial bind");
+            pages.unmap(borrowed, total);
+            pages.release_tiles(used1, extra1, std::time::Instant::now(), false);
+            assert_eq!(pages.reserved_pool.push(key, raw, total), None);
+
+            // Mismatched state does not reuse it.
+            let wrong_state = ReservedKey::from_desc(&desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+            assert_eq!(pages.reserved_pool.take(&wrong_state), None);
+
+            // Matching desc + state pops the exact same resource and rebinds cleanly to a new VA.
+            let (reused_raw, reused_total) = pages.reserved_pool.take(&key).expect("recycle hit");
+            assert_eq!(reused_raw, raw);
+            assert_eq!(reused_total, total);
+            let reused_ptr = reused_raw as *mut c_void;
+            let reused = ID3D12Resource::from_raw_borrowed(&reused_ptr).unwrap();
+            let (used2, extra2) = pages.bind(&dev, reused, 0x2010_0000, Some(total as u64 * PAGE as u64), reused_total).expect("rebind after recycle");
+            pages.unmap(reused, reused_total);
+            pages.release_tiles(used2, extra2, std::time::Instant::now(), false);
+            // Wait for unmap on the tile-mapping queue before dropping the resource and heaps.
+            let _ = pages.fence.SetEventOnCompletion(pages.value, windows::Win32::Foundation::HANDLE::default());
+            drop(ID3D12Resource::from_raw(reused_raw as *mut c_void));
         }
     }
 }
