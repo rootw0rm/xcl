@@ -8628,6 +8628,10 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     let marker = "    v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n";
     assert!(hlsl.contains(marker), "unexpected kernel body:\n{hlsl}");
     hlsl = hlsl.replace(marker, probe);
+    // the translation has only the prelude functions its own code reaches
+    let helpers = super::emit::missing_prelude_functions(&hlsl, probe);
+    assert!(helpers.contains("float mad_nf_f16("), "{helpers}");
+    hlsl = hlsl.replacen("[WaveSize(", &format!("{helpers}[WaveSize("), 1);
 
     let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap();
     let mut st = KernelState::default();

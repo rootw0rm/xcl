@@ -4871,7 +4871,7 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        h.push_str(PRELUDE);
+        h.push_str(PRELUDE_HERE);
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
         }
@@ -4890,7 +4890,7 @@ impl Em {
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
-        h.push_str(PRELUDE_MEM);
+        h.push_str(PRELUDE_MEM_HERE);
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -5331,6 +5331,7 @@ impl Em {
                 h.push_str("    return xo;\n}\n");
             }
         }
+        h = with_preludes(&h);
         if windows > 1 {
             let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
             h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
@@ -5783,6 +5784,126 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
     out.push_str(rest);
     out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
 }
+
+/// Placeholders where `PRELUDE` and `PRELUDE_MEM` go (`with_preludes`).
+const PRELUDE_HERE: &str = "//XCL_PRELUDE\n";
+const PRELUDE_MEM_HERE: &str = "//XCL_PRELUDE_MEM\n";
+
+/// `PRELUDE` and `PRELUDE_MEM` in place of their placeholders, with only the functions the
+/// program reaches: those named outside the two preludes (the program, the other preludes,
+/// the preludes' globals) and the ones those functions name in turn. A program keeps a few
+/// of the ~90, so a change to one helper no longer changes the HLSL – and the DXIL cache key –
+/// of every program, only of those that use it. Unreached functions are only text to DXC,
+/// which drops them, so the DXIL does not change. A name is matched as a whole word anywhere,
+/// comments included: a stray match keeps a function it need not.
+fn with_preludes(h: &str) -> String {
+    let items: Vec<(Option<&str>, &str)> = prelude_items(PRELUDE).into_iter().chain(prelude_items(PRELUDE_MEM)).collect();
+    let mut roots = vec![h];
+    roots.extend(items.iter().filter(|i| i.0.is_none()).map(|i| i.1));
+    let kept = reached(&items, &roots);
+    let first = prelude_items(PRELUDE).len();
+    let join = |range: std::ops::Range<usize>| -> String { range.filter(|&i| items[i].0.is_none() || kept[i]).map(|i| items[i].1).collect() };
+    h.replacen(PRELUDE_HERE, &join(0..first), 1).replacen(PRELUDE_MEM_HERE, &join(first..items.len()), 1)
+}
+
+/// Which of the prelude functions `items` the texts `roots` reach: named in them, or named by
+/// a function reached.
+fn reached(items: &[(Option<&str>, &str)], roots: &[&str]) -> Vec<bool> {
+    let mut by_name: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (i, (name, _)) in items.iter().enumerate() {
+        if let Some(n) = name {
+            by_name.entry(n).or_default().push(i);
+        }
+    }
+    let mut kept = vec![false; items.len()];
+    let mut todo: Vec<usize> = Vec::new();
+    let reach = |text: &str, kept: &mut Vec<bool>, todo: &mut Vec<usize>| {
+        for word in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            for &i in by_name.get(word).map(Vec::as_slice).unwrap_or(&[]) {
+                if !kept[i] {
+                    kept[i] = true;
+                    todo.push(i);
+                }
+            }
+        }
+    };
+    for text in roots {
+        reach(text, &mut kept, &mut todo);
+    }
+    while let Some(i) = todo.pop() {
+        reach(items[i].1, &mut kept, &mut todo);
+    }
+    kept
+}
+
+/// Tests that call prelude functions in code they add to a translation (`code`): the
+/// definitions of the ones it reaches that `hlsl` does not have yet, in the preludes' order.
+// Linux twin: the only callers live in the Windows-only `recomp::tests` module, so this is
+// Windows-gated here to keep Linux test builds warning-free (upstream: plain `#[cfg(test)]`).
+#[cfg(all(test, windows))]
+pub(super) fn missing_prelude_functions(hlsl: &str, code: &str) -> String {
+    let items: Vec<(Option<&str>, &str)> = prelude_items(PRELUDE).into_iter().chain(prelude_items(PRELUDE_MEM)).collect();
+    let kept = reached(&items, &[code]);
+    items.iter().zip(kept).filter(|(i, k)| *k && !hlsl.contains(i.1)).map(|(i, _)| i.1).collect()
+}
+
+/// A prelude's top-level pieces in order, which put together are the prelude again: a function
+/// definition with the comment lines right above it (Some(its name)), or anything else (None:
+/// globals, comments, blank lines). Braces in `//` comments are not counted.
+fn prelude_items(p: &str) -> Vec<(Option<&str>, &str)> {
+    let mut items = Vec::new();
+    let (mut start, mut comments) = (0usize, None::<usize>);
+    let mut at = 0usize;
+    let mut open: Option<(&str, usize, i32)> = None;
+    for line in p.split_inclusive('\n') {
+        let code = line.split("//").next().unwrap_or("");
+        let depth = code.matches('{').count() as i32 - code.matches('}').count() as i32;
+        let end = at + line.len();
+        if let Some((name, from, d)) = open {
+            let d = d + depth;
+            if d > 0 {
+                open = Some((name, from, d));
+            } else {
+                items.push((Some(name), &p[from..end]));
+                (start, open) = (end, None);
+            }
+        } else if let Some(name) = function_name(code) {
+            let from = comments.unwrap_or(at);
+            if start < from {
+                items.push((None, &p[start..from]));
+            }
+            if depth > 0 {
+                open = Some((name, from, depth));
+            } else {
+                items.push((Some(name), &p[from..end]));
+                start = end;
+            }
+            comments = None;
+        } else if line.trim_start().starts_with("//") {
+            comments.get_or_insert(at);
+        } else {
+            comments = None;
+        }
+        at = end;
+    }
+    if start < p.len() {
+        items.push((None, &p[start..]));
+    }
+    items
+}
+
+/// The name of the function a top-level prelude line defines (`type name(… {`), if it is one.
+fn function_name(code: &str) -> Option<&str> {
+    let (head, _) = code.split_once('(')?;
+    if !code.contains('{') || head.contains('=') || head.trim_start().starts_with("static ") {
+        return None;
+    }
+    let mut words = head.split_whitespace();
+    let (_ty, name) = (words.next()?, words.next()?);
+    let is_ident = |s: &str| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (words.next().is_none() && is_ident(name)).then_some(name)
+}
+
 
 /// The `mem` methods (and overloads) the translator emits: result, name, parameters, arguments,
 /// and what an access outside the windows does (the switch's `default`; its `break` leaves
@@ -6748,7 +6869,48 @@ uint fclass64(double f) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PRELUDE, PRELUDE_MEM};
+    use super::{prelude_items, with_preludes, PRELUDE, PRELUDE_HERE, PRELUDE_MEM, PRELUDE_MEM_HERE};
+
+    #[test]
+    fn the_preludes_split_into_their_functions_and_back() {
+        for p in [PRELUDE, PRELUDE_MEM] {
+            let items = prelude_items(p);
+            assert_eq!(items.iter().map(|i| i.1).collect::<String>(), p);
+            // every braced block at the top level is a function: the rest has no braces
+            for (name, text) in &items {
+                let code: String = text.lines().map(|l| l.split("//").next().unwrap_or("")).collect();
+                match name {
+                    Some(n) => assert!(code.contains(&format!("{n}(")) && code.contains('{'), "{n}: {text}"),
+                    None => assert!(!code.contains('{') && !code.contains('}'), "a block that is not a function:\n{text}"),
+                }
+            }
+        }
+        let names: Vec<_> = prelude_items(PRELUDE).into_iter().filter_map(|i| i.0).collect();
+        for n in ["mul_hi_u32", "ballot", "rla", "cube_dir", "first_lane"] {
+            assert!(names.contains(&n), "{n} not found: {names:?}");
+        }
+    }
+
+    #[test]
+    fn a_program_gets_the_helpers_it_reaches_and_no_others() {
+        let h = format!("RWByteAddressBuffer io : register(u0);\n{PRELUDE_HERE}{PRELUDE_MEM_HERE}void main() {{ uint4 r = fmt_pack(uint4(0u, 0u, 0u, 0u), 0u); uint c = ballot(true).x; }}\n");
+        let out = with_preludes(&h);
+        assert!(!out.contains(PRELUDE_HERE) && !out.contains(PRELUDE_MEM_HERE));
+        // named by the program, and what they name in turn (fmt_pack: put_bits, fmt_encode)
+        for f in ["uint4 fmt_pack(", "uint2 ballot(", "put_bits(inout", "fmt_encode("] {
+            assert!(out.contains(f), "{f} missing:\n{out}");
+        }
+        for f in ["uint rla(", "float3 cube_dir(", "uint mul_hi_u32("] {
+            assert!(!out.contains(f), "{f} kept although nothing reaches it");
+        }
+        // the globals stay, and the comments above a function go with it
+        assert!(out.contains("static uint lane_id;") && out.contains("static bool xcl_w32 = false;"));
+        assert!(!out.contains("AMD cube coordinates"));
+        // a program that names everything gets the preludes whole
+        let all: String = prelude_items(PRELUDE).iter().chain(prelude_items(PRELUDE_MEM).iter()).filter_map(|i| i.0).map(|n| format!("{n}(); ")).collect();
+        let whole = with_preludes(&format!("{PRELUDE_HERE}{PRELUDE_MEM_HERE}{all}"));
+        assert_eq!(whole, format!("{PRELUDE}{PRELUDE_MEM}{all}"));
+    }
 
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {
