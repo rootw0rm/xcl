@@ -126,7 +126,8 @@ fn kernelx_exports() -> Vec<(&'static str, usize)> {
         RegisterAppStateChangeNotification, UnregisterAppStateChangeNotification,
         RegisterAppConstrainedChangeNotification, UnregisterAppConstrainedChangeNotification,
         SetUnhandledExceptionFilter, SetThreadName, GetThreadName, SetThreadpoolAffinityMask,
-        SetThreadAffinityMask, SetThreadGroupAffinity, SetThreadPriority, GetThreadPriority,
+        SetThreadAffinityMask, SetThreadGroupAffinity, SetThreadIdealProcessor,
+        SetThreadIdealProcessorEx, SetThreadPriority, GetThreadPriority,
         SetThreadPriorityBoost, GetThreadPriorityBoost, QueryProcessorSchedulingStatistics,
         GetConsoleType, OutputDebugStringA, OutputDebugStringW, GetSystemOSVersion, LoadLibraryW,
         LoadLibraryA, LoadLibraryExW, LoadLibraryExA, LoadPackagedLibrary, GetProcAddress,
@@ -548,7 +549,7 @@ mod tests {
         // Spot-check counts against the Windows tables (kernelx grows with the Linux
         // kernel-family fallbacks routed to it; ucrtbase is a Linux-only CRT module).
         let kx = r.module_by_name(KERNELX).unwrap();
-        assert_eq!(kx.exports.len(), 73 + kernelx_linux::exports().iter().filter(|(n, _)| !kx_stub_name(n)).count(), "kernelx export count");
+        assert_eq!(kx.exports.len(), 75 + kernelx_linux::exports().iter().filter(|(n, _)| !kx_stub_name(n)).count(), "kernelx export count");
         assert_eq!(r.module_by_name(XGAMERUNTIME).unwrap().exports.len(), 127);
         assert_eq!(r.module_by_name(D3D12X).unwrap().exports.len(), 13);
         assert_eq!(r.module_by_name(UCRT).unwrap().exports.len(), crt_linux::exports().len());
@@ -898,7 +899,7 @@ mod tests {
         }
     }
 
-    /// Windows `hle_exports![...]` names in `hle/kernelx.rs` (73). Kernel-family fallback
+    /// Windows `hle_exports![...]` names in `hle/kernelx.rs` (75). Kernel-family fallback
     /// names below are Linux additions and do not change the Windows count.
     fn kx_stub_name(name: &str) -> bool {
         matches!(
@@ -942,6 +943,8 @@ mod tests {
                 | "SetThreadpoolAffinityMask"
                 | "SetThreadAffinityMask"
                 | "SetThreadGroupAffinity"
+                | "SetThreadIdealProcessor"
+                | "SetThreadIdealProcessorEx"
                 | "SetThreadPriority"
                 | "GetThreadPriority"
                 | "SetThreadPriorityBoost"

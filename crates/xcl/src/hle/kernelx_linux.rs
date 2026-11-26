@@ -407,6 +407,7 @@ struct ThreadRecord {
     tid: AtomicU32,
     priority: AtomicU32,
     boost: AtomicU32,
+    ideal: AtomicU32,
     name: Mutex<String>,
     suspended_gate: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>,
 }
@@ -554,6 +555,7 @@ pub unsafe extern "win64" fn CreateThread(
         tid: AtomicU32::new(0),
         priority: AtomicU32::new(0),
         boost: AtomicU32::new(0),
+        ideal: AtomicU32::new(0),
         name: Mutex::new(format!("xcl-game-{handle:x}")),
         suspended_gate: gate,
     });
@@ -765,20 +767,35 @@ pub unsafe extern "win64" fn GetThreadPriorityBoost(handle: usize, disable: *mut
     1
 }
 
-/// A mask from the PC's processors passes through; a console mask naming processors outside
-/// the process is cut to those present, spreading onto them by index when none overlap.
-/// Pure function (mirrors the Windows helper) so unit tests pin the mapping.
+/// The console's dedicated title cores (7 cores, cores 0..6).
+pub const CONSOLE_TITLE_CORES: u32 = 7;
+/// The console's title core affinity mask (cores 0..6).
+pub const CONSOLE_TITLE_AFFINITY_MASK: usize = (1 << CONSOLE_TITLE_CORES) - 1; // 0x7F
+/// With SMT enabled: 7 cores x 2 threads = 14 threads (threads 0..13).
+pub const CONSOLE_TITLE_SMT_AFFINITY_MASK: usize = (1 << (CONSOLE_TITLE_CORES * 2)) - 1; // 0x3FFF
+
+/// An affinity mask the PC takes. The title sees the PC's processors, so a mask made from them
+/// passes unchanged. A console mask (its 7 cores / 14 threads) that names processors outside the
+/// process's affinity is fitted: every processor in the mask that belongs to the process's
+/// affinity is kept, and any processor outside it is mapped modulo the count of available
+/// processors. Pure function (mirrors the Windows helper) so unit tests pin the mapping.
 pub fn fit_affinity_mask(mask: usize, allowed: usize) -> usize {
     if mask == 0 || allowed == 0 || mask & !allowed == 0 {
         return mask;
     }
-    if mask & allowed != 0 {
-        return mask & allowed;
-    }
     let pcs: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
+    if pcs.is_empty() {
+        return mask;
+    }
     (0..usize::BITS)
         .filter(|b| mask >> b & 1 != 0)
-        .fold(0, |m, b| m | 1 << pcs[b as usize % pcs.len()])
+        .fold(0, |m, b| {
+            if (allowed >> b) & 1 != 0 {
+                m | (1 << b)
+            } else {
+                m | (1 << pcs[b as usize % pcs.len()])
+            }
+        })
 }
 
 fn process_affinity() -> usize {
@@ -830,6 +847,14 @@ fn apply_affinity_to_tid(tid: u32, mask: usize) -> bool {
 }
 
 pub unsafe extern "win64" fn SetThreadAffinityMask(handle: usize, mask: usize) -> usize {
+    if handle == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if mask == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let fit = fitted_affinity(mask, "SetThreadAffinityMask");
     let tid = resolve_tid(handle).unwrap_or(0);
     if !apply_affinity_to_tid(if handle == current_thread_handle() || handle == 0 { 0 } else { tid }, fit) {
@@ -852,11 +877,21 @@ pub unsafe extern "win64" fn SetThreadGroupAffinity(
     affinity: *const GroupAffinity,
     prev: *mut GroupAffinity,
 ) -> i32 {
+    if handle == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
     if affinity.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    if (*affinity).mask == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     if (*affinity).group != 0 {
+        // Multi-group processes have no Linux equivalent (one cpu_set_t group);
+        // fail cleanly instead of mis-applying the mask.
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -880,9 +915,118 @@ pub unsafe extern "win64" fn SetThreadGroupAffinity(
 }
 
 pub unsafe extern "win64" fn SetThreadpoolAffinityMask(
-    _pool: *mut c_void,
-    _mask: usize,
+    pool: *mut c_void,
+    mask: usize,
 ) -> i32 {
+    if pool.is_null() || mask == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let _fit = fitted_affinity(mask, "SetThreadpoolAffinityMask");
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// A console ideal-processor number: group 0 only (Linux has a single cpu_set_t group).
+/// Mirrors Windows `PROCESSOR_NUMBER`; field names follow the twin's `GroupAffinity` style.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProcessorNumber {
+    pub group: u16,
+    pub number: u8,
+    pub reserved: u8,
+}
+
+static CURRENT_IDEAL: AtomicU32 = AtomicU32::new(0);
+
+/// An ideal processor number fitted to the process's affinity mask.
+/// Pure function (mirrors the Windows helper) so unit tests pin the mapping.
+pub fn fit_ideal_processor(ideal: u32, allowed: usize) -> u32 {
+    if ideal == u32::MAX || allowed == 0 || (ideal < usize::BITS && (allowed >> ideal) & 1 != 0) {
+        return ideal;
+    }
+    let pcs: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
+    if pcs.is_empty() {
+        return ideal;
+    }
+    pcs[ideal as usize % pcs.len()]
+}
+
+/// Remember the ideal processor per handle and report the previous one. The host
+/// scheduler hint is best-effort and never changes the thread's affinity mask (an
+/// ideal processor is a hint, not a pin), so the call succeeds once validated.
+pub unsafe extern "win64" fn SetThreadIdealProcessor(handle: usize, ideal: u32) -> u32 {
+    if handle == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return u32::MAX;
+    }
+    let allowed = process_affinity();
+    let fit = fit_ideal_processor(ideal, allowed);
+    if fit != ideal {
+        crate::xlog_debug!(
+            "SetThreadIdealProcessor: ideal processor {ideal} outside process mask {allowed:#x} -> {fit}"
+        );
+    }
+    if handle == current_thread_handle() {
+        let prev = CURRENT_IDEAL.swap(fit, Ordering::Relaxed);
+        set_error(ERROR_SUCCESS);
+        return prev;
+    }
+    let g = threads().lock().unwrap();
+    match g.get(&handle) {
+        Some(rec) => {
+            let prev = rec.ideal.swap(fit, Ordering::Relaxed);
+            set_error(ERROR_SUCCESS);
+            prev
+        }
+        None => {
+            set_error(ERROR_INVALID_HANDLE);
+            u32::MAX
+        }
+    }
+}
+
+pub unsafe extern "win64" fn SetThreadIdealProcessorEx(
+    handle: usize,
+    ideal: *const ProcessorNumber,
+    prev: *mut ProcessorNumber,
+) -> i32 {
+    if handle == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if ideal.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (*ideal).group != 0 {
+        // Multi-group processes have no Linux equivalent; fail cleanly.
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let allowed = process_affinity();
+    let fit_num = fit_ideal_processor((*ideal).number as u32, allowed) as u8;
+    let store = |slot: &AtomicU32| slot.swap(fit_num as u32, Ordering::Relaxed) as u8;
+    let prev_num = if handle == current_thread_handle() {
+        store(&CURRENT_IDEAL)
+    } else {
+        let g = threads().lock().unwrap();
+        match g.get(&handle) {
+            Some(rec) => store(&rec.ideal),
+            None => {
+                set_error(ERROR_INVALID_HANDLE);
+                return 0;
+            }
+        }
+    };
+    if !prev.is_null() {
+        *prev = ProcessorNumber {
+            group: 0,
+            number: prev_num,
+            reserved: 0,
+        };
+    }
+    set_error(ERROR_SUCCESS);
     1
 }
 
@@ -9207,6 +9351,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("SetThreadpoolAffinityMask", SetThreadpoolAffinityMask as usize),
         ("SetThreadAffinityMask", SetThreadAffinityMask as usize),
         ("SetThreadGroupAffinity", SetThreadGroupAffinity as usize),
+        ("SetThreadIdealProcessor", SetThreadIdealProcessor as usize),
+        ("SetThreadIdealProcessorEx", SetThreadIdealProcessorEx as usize),
         ("QueryProcessorSchedulingStatistics", QueryProcessorSchedulingStatistics as usize),
         ("GetConsoleType", GetConsoleType as usize),
         ("OutputDebugStringA", OutputDebugStringA as usize),
@@ -9445,10 +9591,125 @@ mod tests {
     fn affinity_masks_outside_the_process_are_fitted() {
         assert_eq!(fit_affinity_mask(0x3F, 0xFF), 0x3F);
         assert_eq!(fit_affinity_mask(0, 0xF), 0);
+        assert_eq!(fit_affinity_mask(0x7F, 0), 0x7F);
         assert_eq!(fit_affinity_mask(0x7F, 0xF), 0xF);
+        assert_eq!(fit_affinity_mask(CONSOLE_TITLE_AFFINITY_MASK, 0xF), 0xF);
+        assert_eq!(fit_affinity_mask(CONSOLE_TITLE_SMT_AFFINITY_MASK, 0xF), 0xF);
         assert_eq!(fit_affinity_mask(1 << 6, 0xF), 1 << 2);
         assert_eq!(fit_affinity_mask(0x3000, 0xF), 0x3);
         assert_eq!(fit_affinity_mask(1 << 20, 0b1010_1010), 0b10);
+        // Partial overlap preserves in-process bits and maps remaining console cores.
+        assert_eq!(fit_affinity_mask(0b0111_1000, 0xF), 0xF);
+        assert_eq!(fit_affinity_mask(0b0110_0010, 0xF), 0b0110);
+    }
+
+    #[test]
+    fn affinity_null_and_zero_args_fail_cleanly() {
+        unsafe {
+            // Null handle fails even with a valid mask.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetThreadAffinityMask(0, 0xF), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            // Zero mask fails even on the current thread.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetThreadAffinityMask(current_thread_handle(), 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            let mut a: GroupAffinity = std::mem::zeroed();
+            a.mask = 0xF;
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetThreadGroupAffinity(0, &a, std::ptr::null_mut()), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            set_error(ERROR_SUCCESS);
+            assert_eq!(
+                SetThreadGroupAffinity(current_thread_handle(), std::ptr::null(), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            let zero_mask: GroupAffinity = std::mem::zeroed();
+            set_error(ERROR_SUCCESS);
+            assert_eq!(
+                SetThreadGroupAffinity(current_thread_handle(), &zero_mask, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            // Threadpool mask: null pool or zero mask fails; a console mask succeeds.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetThreadpoolAffinityMask(std::ptr::null_mut(), 0x7F), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            let dummy_pool = 0x1000usize as *mut c_void;
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetThreadpoolAffinityMask(dummy_pool, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            assert_eq!(SetThreadpoolAffinityMask(dummy_pool, 0x7F), 1);
+        }
+    }
+
+    #[test]
+    fn ideal_processor_bounds_and_fitting() {
+        // Pure mapping: u32::MAX passes through, in-mask numbers stay, the rest wrap.
+        assert_eq!(fit_ideal_processor(u32::MAX, 0xF), u32::MAX);
+        assert_eq!(fit_ideal_processor(0, 0xF), 0);
+        assert_eq!(fit_ideal_processor(3, 0xF), 3);
+        assert_eq!(fit_ideal_processor(4, 0xF), 0);
+        assert_eq!(fit_ideal_processor(5, 0xF), 1);
+        assert_eq!(fit_ideal_processor(6, 0xF), 2);
+        assert_eq!(fit_ideal_processor(14, 0xF), 2);
+        assert_eq!(fit_ideal_processor(6, 0), 6);
+        unsafe {
+            // Null handle fails with the Windows sentinel; null ideal fails cleanly.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetThreadIdealProcessor(0, 0), u32::MAX);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            let ideal = ProcessorNumber { group: 0, number: 6, reserved: 0 };
+            set_error(ERROR_SUCCESS);
+            assert_eq!(
+                SetThreadIdealProcessorEx(0, &ideal, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            set_error(ERROR_SUCCESS);
+            assert_eq!(
+                SetThreadIdealProcessorEx(
+                    current_thread_handle(),
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // Nonzero groups have no Linux equivalent and fail cleanly.
+            let grouped = ProcessorNumber { group: 1, number: 0, reserved: 0 };
+            set_error(ERROR_SUCCESS);
+            assert_eq!(
+                SetThreadIdealProcessorEx(
+                    current_thread_handle(),
+                    &grouped,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // A console ideal processor is fitted, remembered, and reported back.
+            let mut prev: ProcessorNumber = std::mem::zeroed();
+            assert_eq!(
+                SetThreadIdealProcessorEx(current_thread_handle(), &ideal, &mut prev),
+                1
+            );
+            assert_eq!(prev.group, 0);
+            assert_ne!(SetThreadIdealProcessor(current_thread_handle(), 5), u32::MAX);
+            // Unknown handles fail cleanly.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetThreadIdealProcessor(0xDEAD_BEEF, 3), u32::MAX);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            set_error(ERROR_SUCCESS);
+            assert_eq!(
+                SetThreadIdealProcessorEx(0xDEAD_BEEF, &ideal, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+        }
     }
 
     #[test]
