@@ -884,6 +884,50 @@ pub fn format_crash(signal: libc::c_int, pc: usize, address: usize) -> String {
     crash
 }
 
+/// Rewrites the code bytes at `at` with `new` when they lie inside one aligned 8-byte word: one
+/// atomic store, so another thread at the same instruction runs either the old one (and comes
+/// back here) or the new one, never a mix. Otherwise the code is left as it is and the
+/// instruction stays emulated. Whether it was rewritten.
+///
+/// Linux twin of upstream #2618's `eh.rs::rewrite_code`: `mprotect` stands in for
+/// `VirtualProtect(PAGE_EXECUTE_READWRITE)` (page-granular, so the page range covering
+/// the word is widened and its previous protection, read from `/proc/self/maps`, is
+/// restored); x86(-64) needs no `FlushInstructionCache`: its instruction cache is
+/// coherent with data writes. There is no emulation call site yet — `monitorx`/`mwaitx`
+/// still arrive here as SIGILL (handled above) — so this is used by its tests only.
+fn rewrite_code(at: usize, new: &[u8]) -> bool {
+    use std::sync::atomic::AtomicU64;
+    let word = at & !7;
+    let off = at - word;
+    if new.is_empty() || off + new.len() > 8 {
+        return false;
+    }
+    // SAFETY: `word` is the aligned word around code the processor just fetched; it is made
+    // writable for the one store and given its protection back
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE).max(0x1000) as usize;
+        let base = word & !(page - 1);
+        let len = (word.saturating_add(8) - base).next_multiple_of(page);
+        let old = maps_region_for(word as u64).map(|(_, _, p, _)| {
+            (if p[0] == b'r' { libc::PROT_READ } else { 0 })
+                | (if p[1] == b'w' { libc::PROT_WRITE } else { 0 })
+                | (if p[2] == b'x' { libc::PROT_EXEC } else { 0 })
+        });
+        let Some(old) = old else { return false };
+        if libc::mprotect(base as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) != 0 {
+            return false;
+        }
+        let cell = &*(word as *const AtomicU64);
+        let was = cell.load(Ordering::Acquire);
+        let mut bytes = was.to_le_bytes();
+        bytes[off..off + new.len()].copy_from_slice(new);
+        // another thread may have rewritten it first: then it holds the same bytes already
+        let _ = cell.compare_exchange(was, u64::from_le_bytes(bytes), Ordering::AcqRel, Ordering::Acquire);
+        libc::mprotect(base as *mut libc::c_void, len, old);
+    }
+    true
+}
+
 /// The tag of `mov dword ptr [0], imm32` (C7 04 25 00 00 00 00 imm32), the instruction titles
 /// use to end themselves on purpose.
 fn deliberate_null_write(code: &[u8]) -> Option<u32> {
@@ -1343,6 +1387,54 @@ mod tests {
         assert!(crash.contains("(code bytes: 48 8b 05"), "{crash}");
         let unmapped = format_crash(libc::SIGTRAP, 0x1000, 0x1000);
         assert!(!unmapped.contains("code bytes"), "{unmapped}");
+    }
+
+    /// Bytes across an aligned 8-byte word are left as they are (the instruction stays emulated).
+    #[test]
+    fn code_across_an_aligned_word_is_not_rewritten() {
+        let mut buf = [0xCCu8; 24];
+        let base = (buf.as_mut_ptr() as usize + 7) & !7;
+        let at = base + 6;
+        unsafe { std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA].as_ptr(), at as *mut u8, 3) };
+        assert!(!rewrite_code(at, &[0x90; 3]));
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 3) }, &[0x0F, 0x01, 0xFA]);
+        let inside = base + 8;
+        unsafe { std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA].as_ptr(), inside as *mut u8, 3) };
+        assert!(rewrite_code(inside, &[0x90; 3]));
+        assert_eq!(unsafe { std::slice::from_raw_parts(inside as *const u8, 3) }, &[0x90; 3]);
+    }
+
+    /// The first-fault rewrite of monitorx / mwaitx (upstream #2618): monitorx becomes
+    /// nops, mwaitx `pause` + nops. There is no `emulate_console_only` call site on
+    /// Linux yet, so the rewrite itself is driven directly on an executable mapping
+    /// (`mmap` for `VirtualAlloc`); the byte sequences are the ones the Windows arms
+    /// pass to `rewrite_code`.
+    #[test]
+    fn monitorx_and_mwaitx_are_rewritten_in_place() {
+        let code = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                0x1_0000,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        } as usize;
+        assert_ne!(code, libc::MAP_FAILED as usize);
+        // monitorx at +0x10, mwaitx at +0x20: inside an aligned word each
+        let cases: [(usize, [u8; 3], [u8; 3]); 2] = [(0x10, [0x0F, 0x01, 0xFA], [0x90, 0x90, 0x90]), (0x20, [0x0F, 0x01, 0xFB], [0xF3, 0x90, 0x90])];
+        for (at, before, after) in cases {
+            unsafe {
+                std::ptr::copy_nonoverlapping(before.as_ptr(), (code + at) as *mut u8, 3);
+                assert!(rewrite_code(code + at, &after));
+                assert_eq!(std::slice::from_raw_parts((code + at) as *const u8, 3), &after);
+            }
+        }
+        // the page's protection is as it was (still executable, still writable here)
+        let (_, _, perms, _) = maps_region_for(code as u64).expect("test mapping is mapped");
+        assert_eq!(perms[..3], [b'r', b'w', b'x']);
+        assert_eq!(unsafe { libc::munmap(code as *mut libc::c_void, 0x1_0000) }, 0);
     }
 
     #[test]

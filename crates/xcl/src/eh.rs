@@ -245,6 +245,39 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Rewrites the code bytes at `at` with `new` when they lie inside one aligned 8-byte word: one
+/// atomic store, so another thread at the same instruction runs either the old one (and comes
+/// back here) or the new one, never a mix. Otherwise the code is left as it is and the
+/// instruction stays emulated. Whether it was rewritten.
+fn rewrite_code(at: usize, new: &[u8]) -> bool {
+    use std::sync::atomic::AtomicU64;
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let word = at & !7;
+    let off = at - word;
+    if new.is_empty() || off + new.len() > 8 {
+        return false;
+    }
+    let mut old = 0u32;
+    // SAFETY: `word` is the aligned word around code the processor just fetched; it is made
+    // writable for the one store and given its protection back
+    unsafe {
+        if VirtualProtect(word as *const c_void, 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        let cell = &*(word as *const AtomicU64);
+        let was = cell.load(Ordering::Acquire);
+        let mut bytes = was.to_le_bytes();
+        bytes[off..off + new.len()].copy_from_slice(new);
+        // another thread may have rewritten it first: then it holds the same bytes already
+        let _ = cell.compare_exchange(was, u64::from_le_bytes(bytes), Ordering::AcqRel, Ordering::Acquire);
+        VirtualProtect(word as *const c_void, 8, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), word as *const c_void, 8);
+    }
+    true
+}
+
 fn is_writable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     // a committed window of unified memory is read-write as a whole and is not asked about, as in
@@ -347,9 +380,19 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
         }
-        ConsoleOnly::Monitorx => {}
+        // A title that paces itself with monitorx / mwaitx spins on them: tens of thousands of
+        // faults a second on a CPU without them. Each is rewritten in place at its first fault
+        // (`rewrite_code`), so the title's loop runs natively from then on: monitorx becomes
+        // nops, mwaitx `pause` and nops – a wait that ended at once, after which the title
+        // checks its own condition again, as it must after any mwaitx.
+        ConsoleOnly::Monitorx => {
+            rewrite_code(rip, &[0x90; 16][..len]);
+        }
         ConsoleOnly::Mwaitx => {
             std::hint::spin_loop();
+            let mut b = [0x90u8; 16];
+            b[0] = 0xF3;
+            rewrite_code(rip, &b[..len]);
         }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
@@ -999,6 +1042,48 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    /// monitorx / mwaitx are emulated once and rewritten in place: nops, and `pause` + nops.
+    #[test]
+    fn monitorx_and_mwaitx_are_rewritten_at_their_first_fault() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize };
+        assert_ne!(code, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "waits.exe".into(), path: "waits.exe".into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // monitorx at +0x10, mwaitx at +0x20: inside an aligned word each
+        let cases: [(usize, [u8; 3], [u8; 3]); 2] = [(0x10, [0x0F, 0x01, 0xFA], [0x90, 0x90, 0x90]), (0x20, [0x0F, 0x01, 0xFB], [0xF3, 0x90, 0x90])];
+        for (at, before, after) in cases {
+            unsafe {
+                std::ptr::copy_nonoverlapping(before.as_ptr(), (code + at) as *mut u8, 3);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                ctx.Rip = (code + at) as u64;
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, (code + at + 3) as u64);
+                assert_eq!(std::slice::from_raw_parts((code + at) as *const u8, 3), &after);
+            }
+        }
+        modules::unregister_mapped(code);
+    }
+
+    /// Bytes across an aligned 8-byte word are left as they are (the instruction stays emulated).
+    #[test]
+    fn code_across_an_aligned_word_is_not_rewritten() {
+        let mut buf = [0xCCu8; 24];
+        let base = (buf.as_mut_ptr() as usize + 7) & !7;
+        let at = base + 6;
+        unsafe { std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA].as_ptr(), at as *mut u8, 3) };
+        assert!(!rewrite_code(at, &[0x90; 3]));
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 3) }, &[0x0F, 0x01, 0xFA]);
+        let inside = base + 8;
+        unsafe { std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA].as_ptr(), inside as *mut u8, 3) };
+        assert!(rewrite_code(inside, &[0x90; 3]));
+        assert_eq!(unsafe { std::slice::from_raw_parts(inside as *const u8, 3) }, &[0x90; 3]);
     }
 
     /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and
