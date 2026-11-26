@@ -741,7 +741,8 @@ struct ListState {
 
 /// A `Dispatch` or an `ExecuteIndirect` (dispatching or drawing) put off to the submit, with its arguments.
 pub(super) enum Deferred {
-    Dispatch(u32, u32, u32),
+    /// x, y, z and `DispatchX`'s flags (0 for `Dispatch`)
+    Dispatch(u32, u32, u32, u32),
     Indirect(usize, u32, usize, u64, usize, u64),
 }
 
@@ -3105,7 +3106,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         }
         super::bind::wait_for_bound(seg);
         match what {
-            Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
+            Deferred::Dispatch(x, y, z, flags) => super::bind::dispatch_flags(seg, x, y, z, flags),
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
         }
         let ext = *(seg as *const usize);
@@ -3495,8 +3496,8 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 }
 
 /// command list #78 DispatchX(x, y, z, flags)
-pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
-    super::bind::dispatch(this, x, y, z);
+pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    super::bind::dispatch_flags(this, x, y, z, flags);
 }
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH

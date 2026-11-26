@@ -36,6 +36,9 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
+    /// dimensions), taken by its `bind_abi`
+    limits: [u32; 3],
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -1081,8 +1084,30 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    dispatch_flags(this, x, y, z, 0);
+}
+
+/// `DispatchX` flag: x, y, z are thread counts, not group counts; the console launches whole
+/// groups and leaves the lanes past the count out of EXEC (0x8000, wave32, needs nothing here)
+const DISPATCH_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// What a dispatch of `dims` with `flags` launches on pipeline `pso`: its groups and the thread
+/// limits for `IO_THREAD_LIMIT` (0: that axis ends on a whole group). None: it cannot be run
+/// as the console would (thread dimensions with a group shape not known).
+fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], [u32; 3])> {
+    if flags & DISPATCH_THREAD_DIMENSIONS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    let threads = super::real::pso_threads(pso)?.map(|t| t.max(1));
+    let groups = std::array::from_fn(|k| dims[k].div_ceil(threads[k]));
+    let limits = std::array::from_fn(|k| if dims[k] % threads[k] != 0 { dims[k] } else { 0 });
+    Some((groups, limits))
+}
+
+/// `Dispatch` / `DispatchX(x, y, z, flags)`.
+pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
     let pso = with(this, |s| s.pso);
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
         return super::pso_async::need_by_submit(pso);
     }
     let (_, real) = resolve_bound_wait(this);
@@ -1098,7 +1123,26 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
-    match translated_dispatch(this, list, &real, x, y, z) {
+    let Some((groups, limits)) = dispatch_groups(pso, [x, y, z], flags) else {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: DispatchX of {x}x{y}x{z} threads (flags {flags:#x}) with a pipeline whose group shape is not known ({pso:#x}) skipped");
+        }
+        count(DISPATCHES_SKIPPED);
+        return;
+    };
+    if flags != 0 {
+        // each kind of flags once: what titles pass, and what it launches
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let first = { let mut g = SEEN.lock().unwrap(); !g.contains(&flags) && { g.push(flags); true } };
+        if first {
+            crate::xlog_info!("D3D12.X: DispatchX with flags {flags:#x}: {x}x{y}x{z} launched as {}x{}x{} groups (thread limits {limits:?})", groups[0], groups[1], groups[2]);
+        }
+    }
+    with(this, |s| s.limits = limits);
+    let done = translated_dispatch(this, list, &real, groups[0], groups[1], groups[2]);
+    with(this, |s| s.limits = [0; 3]);
+    match done {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -1251,6 +1295,11 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, resolved
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    if !gfx {
+        for (k, l) in with(this, |s| std::mem::take(&mut s.limits)).into_iter().enumerate() {
+            io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = l;
+        }
+    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
@@ -1736,6 +1785,34 @@ void main(uint t : SV_GroupIndex) {
         _count_off: u64,
     ) {
         (*(this as *const FakeAdoptedList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `DispatchX` with thread dimensions (flag 0x20, as the BVH builder's rehydration passes
+    /// use it): the console launches whole groups of the pipeline's `numthreads` and leaves
+    /// the lanes past the count out; without the flag the counts are groups. With the flag
+    /// and a group shape not known, nothing is launched (the counts as groups was the bug).
+    #[test]
+    fn dispatch_x_with_thread_dimensions_launches_whole_groups() {
+        let pso = 0x7300_0001usize;
+        real::register_threads_for_test(pso, [64, 1, 1]);
+        // 640 threads in groups of 64: 10 groups, the last one whole
+        assert_eq!(dispatch_groups(pso, [640, 1, 1], 0x20), Some(([10, 1, 1], [0, 0, 0])));
+        // 100 threads: 2 groups, and the lanes past 100 to leave out
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x20), Some(([2, 1, 1], [100, 0, 0])));
+        // the wave32 bit (0x8000) changes nothing here
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x8020), Some(([2, 1, 1], [100, 0, 0])));
+        // a 2-D group shape
+        let pso2 = 0x7300_0002usize;
+        real::register_threads_for_test(pso2, [8, 8, 1]);
+        assert_eq!(dispatch_groups(pso2, [20, 16, 3], 0x20), Some(([3, 2, 3], [20, 0, 0])));
+        // group counts (Dispatch, DispatchX without the flag) are launched as they are
+        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0), Some(([7, 2, 1], [0, 0, 0])));
+        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0x8000), Some(([7, 2, 1], [0, 0, 0])));
+        // no threads: no groups
+        assert_eq!(dispatch_groups(pso, [0, 1, 1], 0x20), Some(([0, 1, 1], [0, 0, 0])));
+        // thread dimensions on a pipeline whose group shape is not known: not launched
+        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0x20), None);
+        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0), Some(([100, 1, 1], [0, 0, 0])));
     }
 
     #[test]

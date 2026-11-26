@@ -941,13 +941,19 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.
 pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    compute_interface(blob).map(|cs| cs.user_sgprs)
+}
+
+/// The dispatch ABI of a console compute program: its user SGPRs and the console's group shape
+/// (`numthreads`). None: not a console compute program.
+pub fn compute_interface(blob: &[u8]) -> Option<super::CsInterface> {
     if let Some(f) = fspx(blob) {
-        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2));
     }
     let sh = xbox::parse(blob)?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
     match interface(blob, &sh, f)? {
-        Mode::Compute(cs) => Some(cs.user_sgprs),
+        Mode::Compute(cs) => Some(cs),
         _ => None,
     }
 }

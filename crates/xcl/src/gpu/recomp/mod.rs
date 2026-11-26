@@ -253,6 +253,11 @@ pub const IO_UMA_BASE_HI: usize = 112;
 /// told from a load of the title's memory at the same low dword (descriptor tables in window 0,
 /// any memory with one window, which ignores the high dword).
 pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
+/// io slots of a `DispatchX` with thread dimensions (flag 0x20): the thread count of each axis
+/// when it is not a whole number of groups (0: the last group is whole), so the program can leave
+/// the lanes past it out of EXEC. Written by D3D12.X now; read by the compute prologue later.
+/// (113 is left for the group-limit slot of #1428.)
+pub const IO_THREAD_LIMIT: [usize; 3] = [114, 115, 116];
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
