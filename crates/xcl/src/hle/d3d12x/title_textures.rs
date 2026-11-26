@@ -1095,71 +1095,157 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             crate::xlog_warn!("title texture: upload failed: {e}");
         }
     };
-    let mut todo = todo.into_iter().peekable();
-    while todo.peek().is_some() {
-        let mut picked = Vec::new();
-        let mut bytes = 0usize;
-        let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
-                break;
-            }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
+    let (uploaded, retry, clear_last) = run_upload_batches(
+        todo,
+        |(_, (dev, _, tex, _))| (*dev, tex.size() as usize),
+        |(r, _)| r,
+        |r: &ID3D12Resource| r.as_raw() as usize,
+        |(r, (_, va, tex, _))| {
             // The same bytes as at this texture's last upload: nothing to do. The write watch is
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
+                let h = content_hash(&title_bytes(*va, tex.size() as usize));
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
                         crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
                     }
-                    continue;
+                    return true;
                 }
             }
+            false
+        },
+        |device, bytes, picked| {
+            let d = device as *mut c_void;
+            let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Ok((0, Vec::new())) };
+            let queue = match upload_queue(dev, device) {
+                Ok(q) => q,
+                Err(e) => {
+                    warn(&e);
+                    return Err(picked.into_iter().map(|(r, _)| r).collect());
+                }
+            };
+            let subs = subresources_of_all(&picked, bytes);
+            let mut batch = Vec::with_capacity(picked.len());
+            for ((r, (_, va, _, states)), subs) in picked.into_iter().zip(subs) {
+                if super::present::trace_frame() {
+                    note_content(va, &r, &subs);
+                }
+                if super::vram::level_pages() {
+                    // (the queue waits for these mappings before the copies: `vram::before_execute` below)
+                    map_levels_with_texels(&r, &subs);
+                }
+                batch.push((r, subs, states));
+            }
+            match own_work(|| {
+                super::vram::before_execute(&queue);
+                texture::upload_batch(dev, &queue, &batch)
+            }) {
+                Ok(failed) => {
+                    let mut failed_keys = Vec::with_capacity(failed.len());
+                    for (idx, e) in failed {
+                        warn(&e);
+                        if let Some((r, _, _)) = batch.get(idx) {
+                            failed_keys.push(r.as_raw() as usize);
+                        }
+                    }
+                    failed_keys.sort_unstable();
+                    failed_keys.dedup();
+                    Ok((batch.len(), failed_keys))
+                }
+                Err(e) => {
+                    warn(&e);
+                    Err(batch.into_iter().map(|(r, _, _)| r).collect())
+                }
+            }
+        },
+    );
+    if uploaded > 0 {
+        UPLOADS.fetch_add(uploaded, Ordering::Relaxed);
+    }
+    if !clear_last.is_empty() {
+        let mut last = LAST_CONTENT.lock().unwrap();
+        for key in clear_last {
+            last.remove(&key);
+        }
+    }
+    if !retry.is_empty() {
+        // Hold `ID3D12Resource` handles across `TEXTURES` lookup so raw pointers stay pinned,
+        // and drop them after unlocking so COM Release -> `forget()` cannot re-enter `TEXTURES`.
+        let keys: Vec<usize> = retry.iter().map(|r| r.as_raw() as usize).collect();
+        let restored = { restore_pending(&mut TEXTURES.lock().unwrap(), &keys) };
+        if restored > 0 {
+            PENDING.fetch_add(restored, Ordering::Relaxed);
+        }
+        drop(retry);
+    }
+}
+
+/// Restores `pending` on active entries in `table.by_res` that are neither `pending` nor `gpu_written`.
+fn restore_pending(table: &mut Table, keys: &[usize]) -> usize {
+    let mut restored = 0usize;
+    for &key in keys {
+        if let Some(e) = table.by_res.get_mut(&key) {
+            if !e.pending && !e.gpu_written {
+                e.pending = true;
+                restored += 1;
+            }
+        }
+    }
+    restored
+}
+
+/// Batches `todo` by device/size/count, aborts later batches on a failed device while keeping
+/// their handles for `pending` restoration, and returns `(uploaded, retry, clear_last)`.
+fn run_upload_batches<T, R>(
+    todo: Vec<T>,
+    mut meta: impl FnMut(&T) -> (usize, usize),
+    mut keep: impl FnMut(T) -> R,
+    mut key: impl FnMut(&R) -> usize,
+    mut unchanged: impl FnMut(&T) -> bool,
+    mut submit: impl FnMut(usize, usize, Vec<T>) -> Result<(usize, Vec<usize>), Vec<R>>,
+) -> (u64, Vec<R>, Vec<usize>) {
+    let (mut failed_devices, mut retry, mut clear_last, mut uploaded) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
+    let mut todo = todo.into_iter().peekable();
+    while todo.peek().is_some() {
+        let (mut picked, mut bytes, mut device) = (Vec::new(), 0usize, 0usize);
+        while let Some(next) = todo.peek() {
+            let (dev, size) = meta(next);
+            if !batch_fits(picked.len(), bytes, device, dev, size) {
+                break;
+            }
+            let item = todo.next().unwrap();
+            if failed_devices.contains(&dev) {
+                retry.push(keep(item));
+                continue;
+            }
+            if unchanged(&item) {
+                continue;
+            }
             device = dev;
-            bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
+            bytes += size;
+            picked.push(item);
         }
         if picked.is_empty() {
             continue;
         }
-        let subs = subresources_of_all(&picked, bytes);
-        let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
-            if super::present::trace_frame() {
-                note_content(va, &r, &subs);
+        match submit(device, bytes, picked) {
+            Ok((count, failed_keys)) => {
+                uploaded += count.saturating_sub(failed_keys.len()) as u64;
+                clear_last.extend(failed_keys);
             }
-            if super::vram::level_pages() {
-                // (the queue waits for these mappings before the copies: `vram::before_execute` below)
-                map_levels_with_texels(&r, &subs);
-            }
-            batch.push((r, subs, states));
-        }
-        let d = device as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
-        let queue = match upload_queue(dev, device) {
-            Ok(q) => q,
-            Err(e) => {
-                warn(&e);
-                continue;
-            }
-        };
-        match own_work(|| {
-            super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
-        }) {
-            Ok(failed) => {
-                for (_, e) in failed {
-                    warn(&e);
+            Err(failed_items) => {
+                if !failed_devices.contains(&device) {
+                    failed_devices.push(device);
                 }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                clear_last.extend(failed_items.iter().map(&mut key));
+                retry.extend(failed_items);
             }
-            Err(e) => warn(&e),
         }
     }
+    (uploaded, retry, clear_last)
 }
 
 /// (`vram::level_pages`) Before an upload of title texture `r`: its levels with texels in `subs`
@@ -1416,8 +1502,8 @@ const PARALLEL_BYTES: usize = 1 << 20;
 /// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
 /// when the batch is big. They were read and detiled one after another in the title's own
 /// submit – most of a retail game's render thread while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
-    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
+unsafe fn subresources_of_all(picked: &[(ID3D12Resource, Upload)], bytes: usize) -> Vec<Vec<Subresource>> {
+    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, (_, va, tex, _))| (*va, &**tex)).collect();
     let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
     subresources_on(&picked, threads)
 }
@@ -2629,5 +2715,93 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    #[test]
+    fn upload_all_aborts_failed_device_batches_while_other_devices_continue() {
+        let todo = vec![
+            (101usize, 1usize, BATCH_BYTES), (102, 1, BATCH_BYTES), (103, 1, 4096),
+            (201, 2, BATCH_BYTES), (202, 2, 4096), (104, 1, 4096),
+        ];
+        let (mut hashed, mut submitted) = (Vec::new(), Vec::new());
+        let (uploaded, retry, clear_last) = run_upload_batches(
+            todo,
+            |&(_, dev, bytes)| (dev, bytes),
+            |(res, _, _)| res,
+            |&res| res,
+            |&(res, _, _)| { hashed.push(res); false },
+            |dev, _, batch| {
+                let keys: Vec<usize> = batch.iter().map(|&(res, _, _)| res).collect();
+                submitted.push((dev, keys.clone()));
+                if dev == 1 { Err(keys) } else { Ok((keys.len(), Vec::new())) }
+            },
+        );
+        // Device 1 stopped after its first failed batch; device 2 still ran both batches.
+        assert_eq!(submitted, vec![(1, vec![101]), (2, vec![201]), (2, vec![202])]);
+        assert_eq!(hashed, vec![101, 201, 202]);
+        assert_eq!(uploaded, 2);
+        assert_eq!(retry, vec![101, 102, 103, 104]);
+        assert_eq!(clear_last, vec![101]);
+    }
+
+    #[test]
+    fn upload_all_clears_last_content_on_batch_err_and_partial_ok_without_poisoning_skipped() {
+        // Case A: whole-batch Err clears only the failed batch's keys; unchanged & skipped keep prior hashes.
+        let mut last_a = BTreeMap::from([(1usize, 0xAAu64), (3, 0xCC)]);
+        let todo_a = vec![(1usize, 1usize, 4096usize, 0xAAu64), (2, 1, BATCH_BYTES, 0xBB), (3, 1, 4096, 0xDD)];
+        let (uploaded_a, retry_a, clear_a) = run_upload_batches(
+            todo_a,
+            |&(_, dev, bytes, _)| (dev, bytes),
+            |(res, _, _, _)| res,
+            |&res| res,
+            |&(res, _, _, h)| last_a.insert(res, h) == Some(h),
+            |_, _, batch| Err(batch.into_iter().map(|(res, _, _, _)| res).collect()),
+        );
+        clear_a.iter().for_each(|k| { last_a.remove(k); });
+        assert_eq!((uploaded_a, retry_a, clear_a), (0, vec![2, 3], vec![2]));
+        assert_eq!((last_a.get(&1), last_a.get(&2), last_a.get(&3)), (Some(&0xAA), None, Some(&0xCC)));
+
+        // Case B: partial Ok(failed) clears only the failed key, does not requeue it, counts successes, and continues.
+        let mut last_b = BTreeMap::new();
+        let todo_b = vec![
+            (10usize, 1usize, 4096usize, 0x10u64), (11, 1, 4096, 0x11),
+            (12, 1, BATCH_BYTES - 8192, 0x12), (13, 1, 4096, 0x13),
+        ];
+        let mut batches_b = 0usize;
+        let (uploaded_b, retry_b, clear_b) = run_upload_batches(
+            todo_b,
+            |&(_, dev, bytes, _)| (dev, bytes),
+            |(res, _, _, _)| res,
+            |&res| res,
+            |&(res, _, _, h)| last_b.insert(res, h) == Some(h),
+            |_, _, batch| {
+                batches_b += 1;
+                Ok((batch.len(), if batches_b == 1 { vec![11] } else { Vec::new() }))
+            },
+        );
+        clear_b.iter().for_each(|k| { last_b.remove(k); });
+        assert_eq!((batches_b, uploaded_b, retry_b, clear_b), (2, 3, vec![], vec![11]));
+        assert_eq!((last_b.get(&10), last_b.get(&11), last_b.get(&12), last_b.get(&13)), (Some(&0x10), None, Some(&0x12), Some(&0x13)));
+    }
+
+    #[test]
+    fn restore_pending_requeues_only_active_non_pending_non_gpu_written_entries() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 1)).unwrap());
+        let entry = |va: usize, pending: bool, gpu_written: bool| Entry {
+            device: 1, va, src: va, in_gpu_view: false, tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON], pending, gpu_written,
+            placed: true, unmapped: false, seq: 0,
+        };
+        let mut table = Table::new();
+        table.insert(1, entry(0x10_0000, false, false)); // active, !pending, !gpu_written -> restore once
+        table.insert(2, entry(0x20_0000, false, true));  // gpu_written -> keep !pending
+        table.insert(3, entry(0x30_0000, true, false));  // already pending -> do not double-count
+        table.insert(5, entry(0x50_0000, false, false)); // shadowed by 6 -> not in by_res
+        table.insert(6, entry(0x50_0000, false, false));
+        assert!(table.shadowed.contains_key(&5) && !table.by_res.contains_key(&5));
+        // res 4 is absent (removed concurrently); res 1 duplicated to verify idempotence.
+        assert_eq!(restore_pending(&mut table, &[1, 1, 2, 3, 4, 5]), 1);
+        assert!(table.by_res[&1].pending && !table.by_res[&2].pending && table.by_res[&3].pending);
+        assert!(!table.shadowed[&5].pending && !table.by_res[&6].pending);
     }
 }
