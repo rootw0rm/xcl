@@ -39,7 +39,7 @@ def value(tok):
 
 
 def table(name):
-    m = re.search(r'const\s+\w+\s+' + re.escape(name) + r'\[\](?:\[\d+\])?\s*=\s*\{(.*?)\n\};', src, re.S)
+    m = re.search(r'const\s+\w+\s+' + re.escape(name) + r'\[\](?:\[\d+\])?\s*=\s*\{(.*?)\n[ \t]*\}[ \t]*;', src, re.S)
     assert m, name
     rows = re.findall(r'\{([^{}]*)\}', m.group(1))
     out = []
