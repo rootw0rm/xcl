@@ -22,6 +22,35 @@ impl Src {
     }
 }
 
+/// Returns the per-quad lane map `[p0, p1, p2, p3]` when a DPP16 `ctrl` stays strictly
+/// inside each 4-lane quad (`quad_perm` `0x000..=0x0FF`, or `row_xmask` `0x160..=0x163`).
+fn dpp16_quad_map(ctrl: u64) -> Option<[u8; 4]> {
+    match ctrl {
+        0x000..=0x0FF => Some([
+            (ctrl & 3) as u8,
+            ((ctrl >> 2) & 3) as u8,
+            ((ctrl >> 4) & 3) as u8,
+            ((ctrl >> 6) & 3) as u8,
+        ]),
+        0x160..=0x163 => {
+            let n = (ctrl & 3) as u8;
+            Some([n, 1 ^ n, 2 ^ n, 3 ^ n])
+        }
+        _ => None,
+    }
+}
+
+/// Returns the per-quad lane map when a DPP8 selector maps lanes `0..4` into `0..4` and
+/// applies the same relative map to lanes `4..8` into `4..8`.
+fn dpp8_quad_map(sel: u64) -> Option<[u8; 4]> {
+    let s: [u8; 8] = std::array::from_fn(|i| ((sel >> (3 * i)) & 7) as u8);
+    if (0..4).all(|i| s[i] < 4 && s[i + 4] == s[i] + 4) {
+        Some([s[0], s[1], s[2], s[3]])
+    } else {
+        None
+    }
+}
+
 impl Lw {
     pub fn mods(d: &Decoded) -> Mods {
         let fv = |e: &Encoding, n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);

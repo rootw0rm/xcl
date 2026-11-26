@@ -151,6 +151,28 @@ pub struct FmtComp1 {
     pub dflt: Value,
 }
 
+/// Returns the per-quad lane map `[p0, p1, p2, p3]` when `ds_swizzle_b32`'s `offset`
+/// stays strictly inside each 4-lane quad (quad permute mode `0x8000..=0xBFFF`, or bit
+/// mode `0x0000..=0x7FFF` with upper bits `4:2` preserved).
+fn swizzle_quad_map(offset: u64) -> Option<[u8; 4]> {
+    if offset >= 0xC000 {
+        return None;
+    }
+    if offset & 0x8000 != 0 {
+        return Some([
+            (offset & 3) as u8,
+            ((offset >> 2) & 3) as u8,
+            ((offset >> 4) & 3) as u8,
+            ((offset >> 6) & 3) as u8,
+        ]);
+    }
+    let (and, or, xor) = ((offset & 0x1F) as u32, ((offset >> 5) & 0x1F) as u32, ((offset >> 10) & 0x1F) as u32);
+    if (and & 0x1C) == 0x1C && (or & 0x1C) == 0 && (xor & 0x1C) == 0 {
+        return Some(std::array::from_fn(|q| ((((q as u32) & and) | or) ^ xor) as u8 & 3));
+    }
+    None
+}
+
 impl Lw {
     /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
