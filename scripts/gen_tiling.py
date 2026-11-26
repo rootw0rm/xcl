@@ -29,8 +29,10 @@ def value(tok):
         part = part.strip()
         if part in sym:
             v ^= sym[part]
-        elif part.startswith('0x') or part.isdigit():
-            v ^= int(part, 0)
+        elif part.startswith(('0x', '0X')):
+            v ^= int(part, 16)
+        elif part.isascii() and part.isdigit():
+            v ^= int(part, 8 if part.startswith('0') else 10)
         else:
             raise ValueError(tok)
     return v
