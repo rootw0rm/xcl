@@ -54,15 +54,25 @@ pub fn init(path: Option<&Path>, level: Level, echo_stderr: bool) {
     LEVEL.store(level as u8, Ordering::Relaxed);
     ECHO.store(echo_stderr, Ordering::Relaxed);
     if let Some(p) = path {
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(f) = File::create(p) {
-            if let Ok(mut g) = FILE.lock() {
-                *g = Some(f);
+        // a log that cannot be opened is said once on stderr: `xlog_*` would go nowhere, and the
+        // console has already been given its path (#2277); the run goes on without it
+        match open(p) {
+            Ok(f) => {
+                if let Ok(mut g) = FILE.lock() {
+                    *g = Some(f);
+                }
             }
+            Err(e) => eprintln!("xcl: {e}"),
         }
     }
+}
+
+/// The log file at `p`, its folder made first; the error names the path and the OS error.
+fn open(p: &Path) -> Result<File, String> {
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create the log folder {}: {e}", dir.display()))?;
+    }
+    File::create(p).map_err(|e| format!("cannot open the log {}: {e}", p.display()))
 }
 
 pub fn enabled(level: Level) -> bool {
@@ -153,5 +163,21 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(died.is_err());
         assert!(log.contains("thread 'xcl-dies' panicked at ") && log.contains("gone for the run"), "the log: {log:?}");
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_opened_names_its_path() {
+        let dir = std::env::temp_dir().join(format!("xcl-log-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // a file where the log folder should be: neither the folder nor the log can be made
+        let blocker = dir.join("not-a-folder");
+        std::fs::write(&blocker, "x").unwrap();
+        let bad = blocker.join("logs").join("xcl.log");
+        let e = open(&bad).unwrap_err();
+        assert!(e.starts_with("cannot create the log folder ") && e.contains("not-a-folder"), "{e}");
+        let good = dir.join("logs").join("xcl.log");
+        assert!(open(&good).is_ok());
+        assert!(good.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
