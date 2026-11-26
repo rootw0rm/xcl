@@ -720,3 +720,81 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-128 (task-1795720425-15cc): #2858/#2859/#2860 triaged SKIP, probe past #2860
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) first topped at #2858 (`971f766c`) — the critic
+  step-127 handoff. Per-PR sequential probe #2830..#2980 (widened past
+  the sixth gap per mem-1795712765-78dc) found 25 PRESENT
+  (#2830..#2860 minus #2835/#2839-#2841/#2857 gaps) — INCLUDING #2859
+  (`83b95c4f`) the batched listing missed (replication lag, NOT
+  rate-limit: the ref committed 18:36 UTC, ~40 min before the batch).
+  A second batched listing then showed #2860 (`6efa82fa`); targeted
+  sequential #2857/#2861..#2870 (only #2858/#2859/#2860 PRESENT) plus
+  #2981..#3020 (ALL MISSING) closed the window — scan complete, top is
+  #2860. #2858 `971f766c` matches the handoff pin (no force-push).
+  All 25 pins `merge-base --is-ancestor` exit 1 (all OPEN); #2857 and
+  #2861..#3020 MISSING. All three new heads predate this task window
+  (task created 19:13:45 UTC; #2858 19:06:41 UTC in-window-commit but
+  handed off pre-push, #2859 18:36 UTC, #2860 17:46 UTC) — late-replication
+  arrivals, not missed fallout (per mem-1795714025-21a1).
+- Triage (three new PRs, all SKIP with hunk evidence):
+  - #2858 `971f766c` (D3D12.X: the depth bias of a 16-bit depth buffer
+    is in 24-bit units; SINGLE commit on `e120925e`, parent already in
+    main): `device_x.rs` +78 (`pc_depth_bias` x256 for console DSV 118
+    -> PC 45, `DepthBias::for_dsv`, `base_dsv_format`,
+    `depth_bias_pso` re-emit with PC DSV format), `list_x.rs` +44
+    (`try_native_depth_bias` + `on_set_pipeline_state` re-scale on DSV
+    change), `real.rs` +101 (`stream_dsv_format` /
+    `pc_stream_depth_bias` for RASTERIZER 10/27/28 subobjects, GS-PSO
+    rasterizer + fallback-stream paths). SKIP — Windows-only: all three
+    files under `hle/d3d12x/` (`lib.rs:30-34` `#[cfg(windows)]` gate,
+    `hle_linux` swap on Linux), zero `pc_depth_bias` / `for_dsv` /
+    `base_dsv_format` refs in `hle_linux.rs` / `d3d12x_linux.rs` /
+    `vulkan_linux.rs` (grep exit 1). The scale lives entirely in the
+    D3D12.X PSO-translation layer; the Linux device path (Vulkan/SPIR-V
+    via null `d3d12x_linux`) has no consumer. Nothing to port.
+  - #2859 `83b95c4f` (D3D12.X: pipeline library blob has a readable
+    dword after its end; 276-commit stack, tip is 1 file +36/-1):
+    `hle/d3d12x/pso_library.rs` gains the `copy: Vec<u8>` fallback
+    (files ending <4 bytes before a page boundary are read into memory
+    + 4 zero bytes, since AMD's driver over-reads the mapped end) plus
+    a `VirtualQuery`-gated readability test. SKIP — blocked on
+    unlanded stack AND Windows-only: `pso_library.rs` does not exist in
+    the tree (the whole module is part of the unlanded stack), and the
+    diff is `windows_sys`/CreateFileMappingW/UnmapViewOfFile-only with
+    zero Linux-shim refs. Revisit when the module lands.
+  - #2860 `6efa82fa` (Shaders: separate Series S and Series X used
+    manifests; 410-commit stack on `b49be183`, tip is 4 files +96/-16):
+    `README.md` doc line, `gfx_records.rs` +3/-2 (`path()` joins
+    `used_file_name`), `pso_async.rs` +52/-35
+    (`profile_is_series_s` boot->`XCL_DEVICE_TYPE` fallback,
+    `used_file_name`/`used_pipelines_name`/`used_shaders_name`,
+    `-lockhart` manifest variants), `shaders.rs` +34/-12 (new
+    `pipeline_worker_command` forwarding `XCL_DEVICE_TYPE`, workers and
+    `--used-only` println use the per-profile names). SKIP — blocked on
+    the unlanded stack: the tip's callees (`worker_command`) do not
+    exist in the tree's `shaders.rs`, and every production hunk sits in
+    Windows-gated code (`precompile` real impl `#[cfg(windows)]`
+    `shaders.rs:1794`, Linux stub `:2046`; `earlier_used_keys` call
+    site under `#[cfg(windows)]` `:1043`; `hle/d3d12x/` files) with zero
+    `pso_async` / `profile_is_series_s` / `used_pipelines_name` refs in
+    the Linux shims (grep exit 1). Revisit when `f9bcafd`/preparation
+    stack lands.
+  Earlier pins stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed;
+  #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim
+  in `aa59e8ac`; #2843/#2844-new-head/#2845/#2846/#2847/#2848/#2849/#2850/
+  #2851/#2852/#2853/#2854/#2855/#2856 SKIP.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step128r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
