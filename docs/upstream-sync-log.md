@@ -1528,3 +1528,51 @@ newest at the bottom.
   XAsync/XNetworking/XUser — HOLDS (fresh-root `report.json` verified
   before removal). Lock audit: 0 new `lock()` (test + pure-std helper);
   `diff --check` clean.
+
+## 2026-11-27 — manual sync (driver session): 7 new PRs #2911–#2919 triaged, #2913 ported
+
+- `upstream/main` = `8b957bec` (unchanged; `main` in sync, `linux`
+  contains it). Local ref shadows `upstream/main` + `upstream/pr-2836`
+  deleted (identical SHAs; `pr-2836` kept as `pr2836head`).
+- New refs past the #2910 probe: 2911, 2912, 2913, 2915, 2916, 2918,
+  2919 (7 heads fetched to `prNNNN-head`; #2912/#2913/#2916/#2919 ride
+  aggregate stacks — no merge base with `upstream/main`, diffed vs
+  parent).
+- Triage (all OPEN at fetch):
+  - #2911 PORT-ARCHIVED (K-D3D-61): CopyTiles slot map (`PC_COPY_TILES`
+    = 18; DmaList 14 + CommandList 18) + linear-buffer-only
+    `saturating_add(buffer_delta)`. No linux twin (no slot tables in
+    `d3d12x_linux.rs`; no d3d12 calls on the abort path) — rule + code
+    in `keep-d3d12-behavior.md`, no production port today.
+  - #2912 PORT-ARCHIVED (K-D3D-62): `drain_completed` + cross-queue
+    reclaim + `on_queue_release` (q_release calls both twins). No linux
+    twin (no in-flight upload tracking on the linux path) — rule + code
+    in `keep-d3d12-behavior.md`, no production port today.
+  - #2913 PORTED verbatim in `81bfb2c8` (shared `gpu/dxil`: node-type
+    end-of-node span 112 B Box32 / 64 B rest, uma-relative window index,
+    null/out-of-window guard, RDNA2 tri miss sentinel; `uma_base`
+    `pub(super)`; test
+    `bvh_multi_window_guard_and_triangle_miss_sentinel` as-is in
+    `cfg(windows)` `core_tests`). Fidelity: 38/38 added lines present,
+    old guard shape gone.
+  - #2915 SKIP (DXIL-path RAM caches in `recomp::{dxc,pso}`,
+    `cfg(windows)` — linux SPIR-V owns its cache; no consumer).
+  - #2916 SKIP (Wine-only: `XCL_GPU_AWAKE` opt-in under Wine,
+    `gpu_awake.rs` — native linux binary never runs under Wine).
+  - #2918 SKIP (same bucket as #2915: legacy ES+GS DXIL RAM cache in
+    `cfg(windows)` `recomp::pso`).
+  - #2919 PORT-ARCHIVED (K-D3D-63): `title_reset_with` detach-under-lock
+    + `take_recordings` + race test (1,887 recordings/48 allocators).
+    No linux twin (no aside/sweep pool on the linux path) — rule + code
+    in `keep-d3d12-behavior.md`, no production port today.
+- Archive: 3 K-D3D entries (61–63) appended to
+  `keep-d3d12-behavior.md` with verbatim production code (notes dir is
+  not a repo — this file is the durable record).
+- Gates for the #2913 port: both `cargo check`s 0 errors;
+  `cargo test -p xcl --lib -- --test-threads=4` 784/0/1 (matches
+  baseline; new test is `cfg(windows)`, unrunnable on this box —
+  fidelity verified by line-compare instead); title e2e 12 unique
+  FAILs, all `D3D12.X`, 0 non-GPU, `ExitProcess(0xc)` (by design);
+  retail fresh-root exit 139 SIGSEGV `exe+0x2237320` fault `0x0`,
+  stubs 20, xgr exactly XAsync/XNetworking/XUser, `unmapped_paths` []
+  — HOLDS. Lock audit: 0 new `lock()`; `diff --check` clean.
