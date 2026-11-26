@@ -6,17 +6,6 @@ use super::*;
 use crate::gpu::dxil::module::{BinOp, CastOp, Pred};
 use crate::gpu::dxil::validate;
 
-pub(super) fn part<'a>(c: &'a [u8], cc: &[u8; 4]) -> Option<&'a [u8]> {
-    let n = u32::from_le_bytes(c[28..32].try_into().unwrap()) as usize;
-    (0..n).find_map(|i| {
-        let off = u32::from_le_bytes(c[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
-        (&c[off..off + 4] == cc).then(|| {
-            let len = u32::from_le_bytes(c[off + 4..off + 8].try_into().unwrap()) as usize;
-            &c[off + 8..off + 8 + len]
-        })
-    })
-}
-
 fn hex(b: &[u8]) -> String {
     b.chunks(16).enumerate().map(|(i, c)| format!("{:04x}: {}\n", i * 16, c.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" "))).collect()
 }

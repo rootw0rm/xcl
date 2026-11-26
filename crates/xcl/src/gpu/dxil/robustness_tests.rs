@@ -231,3 +231,121 @@ fn use_of_a_void_value_and_wrong_finish_are_errors() {
     m.ret();
     assert!(m.try_to_bitcode("dxil-ms-dx", "").is_err());
 }
+
+#[test]
+fn split_wave64_whole_live_elides_exchange_barriers_for_lane_local_masks() {
+    use super::bitreader_tests::parse;
+    use super::cfg::{Cfg, Term};
+    use super::graphics::part;
+    use super::kernel::{compute_init, Entry};
+    use super::lower::Lw;
+    use super::module::{Block, InstInfo};
+
+    if std::env::var_os("XCL_X64_ALL_MASKS").is_some() {
+        eprintln!("SKIPPED: XCL_X64_ALL_MASKS set");
+        return;
+    }
+    let lower_cs = |code: &[u8], wave64: bool, split: bool| -> (Vec<u8>, u64, usize) {
+        let cfg = Cfg::build(code).unwrap();
+        let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+        let threads = [if wave64 { 64 } else { 32 }, 1, 1];
+        let cs = CsInterface { threads, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let mut lw = Lw::new(&cfg.insts, &leaders, KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 }, &Entry::Compute(cs.clone()));
+        let (tid, gtid) = lw.setup_lanes_compute(cs.threads, false);
+        compute_init(&mut lw, &cs, tid, gtid);
+        let (h0, exit) = (lw.block(Some(1)), lw.block(Some(1)));
+        lw.edge(Block(0), h0);
+        lw.s.m.set_block(h0);
+        for &i in &cfg.blocks[0].insts {
+            lw.inst(&cfg.insts[i]).unwrap();
+        }
+        assert!(matches!(cfg.blocks[0].term, Term::End));
+        lw.br(exit);
+        lw.s.m.set_block(exit);
+        lw.seal(exit);
+        lw.s.m.ret();
+        lw.s.m.set_block(Block(0));
+        lw.s.m.br(h0);
+        let tgsm_bytes = lw.s.m.global_bytes(3);
+        let barriers = (0..lw.s.m.block_count())
+            .flat_map(|b| lw.s.m.block_insts(Block(b as u32)).iter().copied())
+            .filter(|&i| matches!(lw.s.m.inst_info(i), InstInfo::Call("dx.op.barrier", _)))
+            .count();
+        (lw.s.try_finish(threads, Some(32)).unwrap(), tgsm_bytes, barriers)
+    };
+    let tgsm_globals = |c: &[u8]| -> usize {
+        // Skip the 24-byte `DxilProgramHeader` (`container::program_part`) before `BC\xC0\xDE`.
+        let dxil = part(c, b"DXIL").unwrap();
+        parse(&dxil[24..]).find(8).unwrap().records_with(7).into_iter().filter(|r| (r[1] >> 2) == 3).count()
+    };
+    let local = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 128), ("VSRC1", 0)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0)], None),
+    ]);
+    let whole = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 4)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0)], None),
+    ]);
+    // `setup_lanes_compute` uses 1 TGSM dword (`xcl_wt`, 4 B) and 1 barrier; lane-local `VCC`
+    // (`v_cndmask_b32`) skips `xcl_x64_s`, while scalar `VCC` (`s_mov_b32`) adds `xcl_x64_s` (+8 B, +2 barriers).
+    let (c_local, bytes_local, bar_local) = lower_cs(&local, true, true);
+    assert_eq!((tgsm_globals(&c_local), bytes_local, bar_local), (1, 4, 1));
+    let (c_whole, bytes_whole, bar_whole) = lower_cs(&whole, true, true);
+    assert_eq!((tgsm_globals(&c_whole), bytes_whole, bar_whole), (2, 12, 3));
+
+    // 64-bit integer compares lower to 32-bit dword `icmp`s, leaving `D3D_SHADER_REQUIRES_INT64_OPS` (`0x8000`) unset.
+    let cmp64 = prog(&[
+        ("V_CMP_LT_I64", "ENC_VOPC", &[("SRC0", 256), ("VSRC1", 2)], None),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 128), ("VSRC1", 1)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 4), ("SADDR", 0)], None),
+    ]);
+    let (c_cmp64, _, _) = lower_cs(&cmp64, false, false);
+    let sfi0 = u64::from_le_bytes(part(&c_cmp64, b"SFI0").unwrap().try_into().unwrap());
+    assert_eq!(sfi0 & 0x8000, 0, "64-bit integer compare must not set Int64Ops in SFI0: {sfi0:#x}");
+}
+
+#[test]
+fn pops_pixel_shader_gates_rov_sfi0_flag_on_surviving_uav_handles() {
+    use super::cfg::Cfg;
+    use super::graphics::part;
+    use super::graphics::StageInfo;
+    use super::kernel::Entry;
+    use super::lower::Lw;
+    use super::module::Block;
+
+    let ps_sfi0 = |pops: bool, write_uav: bool| -> u64 {
+        let mov_f: &[(&str, u64)] = if pops { &[("VDST", 3), ("SRC0", 239)] } else { &[("VDST", 3), ("SRC0", 242)] };
+        let mut ops = vec![("V_MOV_B32", "ENC_VOP1", mov_f, None)];
+        if write_uav {
+            ops.push(("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 3), ("SADDR", 0)][..], None));
+        }
+        ops.push(("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 3), ("VSRC1", 3), ("VSRC2", 3), ("VSRC3", 3), ("DONE", 1), ("VM", 1)][..], None));
+        let code = prog(&ops);
+        let cfg = Cfg::build(&code).unwrap();
+        let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+        let psi = PsInterface { inputs: vec![], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 2, attrs: None };
+        let mw = 2 | crate::gpu::recomp::HEAP_WINDOWS;
+        let mut lw = Lw::new(&cfg.insts, &leaders, KernelOptions { wave64: true, split: false, mem_windows: mw, sampler_base: 0 }, &Entry::Pixel(psi.clone()));
+        lw.setup_lanes_gfx();
+        lw.setup_pixel(&psi, &Default::default());
+        let h0 = lw.block(Some(1));
+        lw.edge(Block(0), h0);
+        lw.s.m.set_block(h0);
+        for &i in &cfg.blocks[0].insts {
+            lw.inst(&cfg.insts[i]).unwrap();
+        }
+        lw.finish_gfx();
+        lw.s.m.ret();
+        lw.s.m.set_block(Block(0));
+        lw.s.m.br(h0);
+        let g = lw.gfx.take().unwrap();
+        let c = lw.s.try_finish_graphics(g.io, StageInfo::Pixel { early_depth_stencil: false }).unwrap();
+        u64::from_le_bytes(part(&c, b"SFI0").unwrap().try_into().unwrap())
+    };
+    assert_eq!(ps_sfi0(false, true) & 0x1000, 0, "non-POPS PS must not set ROVs");
+    assert_eq!(ps_sfi0(true, false) & 0x1000, 0, "POPS PS whose UAV handles are DCE'd must not set ROVs");
+    assert_eq!(ps_sfi0(true, true) & 0x1000, 0x1000, "POPS PS with live UAV store must set ROVs");
+}

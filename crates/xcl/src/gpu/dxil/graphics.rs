@@ -1189,3 +1189,18 @@ impl Shader {
 #[cfg(all(test, windows))]
 #[path = "graphics_tests.rs"]
 pub(in crate::gpu::dxil) mod tests;
+
+/// Slice out a fourcc container part (`part` in upstream `graphics_tests.rs` lives there
+/// under plain `cfg(test)`; on Linux that module is Windows-only, so the pure helper
+/// lives here under `cfg(test)` for the Linux-run lowering pins).
+#[cfg(test)]
+pub(in crate::gpu::dxil) fn part<'a>(c: &'a [u8], cc: &[u8; 4]) -> Option<&'a [u8]> {
+    let n = u32::from_le_bytes(c[28..32].try_into().unwrap()) as usize;
+    (0..n).find_map(|i| {
+        let off = u32::from_le_bytes(c[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
+        (&c[off..off + 4] == cc).then(|| {
+            let len = u32::from_le_bytes(c[off + 4..off + 8].try_into().unwrap()) as usize;
+            &c[off + 8..off + 8 + len]
+        })
+    })
+}

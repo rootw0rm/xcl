@@ -3,7 +3,7 @@
 //! that the validator and disassembler do not distinguish (e.g. atomic
 //! ordering codes the LLVM reader maps leniently).
 
-use super::module::{BinOp, Module, RmwOp};
+use super::module::{BinOp, FnAttrs, Module, Pred, RmwOp};
 
 #[derive(Debug, Default)]
 pub(super) struct Block {
@@ -167,4 +167,90 @@ fn float_constants_ignore_bits_above_their_width() {
     assert_eq!(m.const_float(f32, 0xFFFF_0000_0000_0000 | 1.0f32.to_bits() as u64), one);
     let h = m.const_float(f16, 0x3C00);
     assert_eq!(m.const_float(f16, 0x1_3C00), h);
+}
+
+#[test]
+fn phis_encode_signed_relative_ids_and_prune_unreachable_predecessors() {
+    const FUNC_CODE_DECLAREBLOCKS: u32 = 1;
+    const FUNC_CODE_INST_PHI: u32 = 16;
+
+    let mut m = Module::new();
+    m.define_entry("main");
+    let (one, four) = (m.i32c(1), m.i32c(4));
+    let entry = m.current_block();
+    let (lp, dead, exit) = (m.new_block(), m.new_block(), m.new_block());
+
+    let init = m.bin(BinOp::Add, one, one);
+    m.br(lp);
+
+    m.set_block(dead);
+    let dead_val = m.bin(BinOp::Sub, four, one);
+    m.br(lp);
+
+    m.set_block(lp);
+    let i32 = m.i32();
+    let acc = m.phi(i32);
+    let next = m.bin(BinOp::Add, acc, one);
+    let done = m.cmp(Pred::Eq, next, four);
+    m.cond_br(done, exit, lp);
+    m.add_incoming(acc, init, entry);
+    m.add_incoming(acc, dead_val, dead);
+    m.add_incoming(acc, next, lp);
+
+    m.set_block(exit);
+    let _ = m.bin(BinOp::Xor, next, one);
+    m.ret();
+
+    let root = parse(&m.to_bitcode("dxil-ms-dx", ""));
+    let f = root.find(BLOCK_FUNCTION).unwrap();
+    assert_eq!(f.records_with(FUNC_CODE_DECLAREBLOCKS), [&[3][..]], "unreachable block must be omitted");
+    let phis = f.records_with(FUNC_CODE_INST_PHI);
+    assert_eq!(phis.len(), 1);
+    // `[ty, +1 signed_vbr (2), bb 0, -1 signed_vbr (3), bb 1]`; `dead` incoming edge dropped.
+    assert_eq!(&phis[0][1..], &[2, 0, 3, 1], "phi record: {:?}", phis[0]);
+}
+
+#[test]
+fn alloca_explicit_type_bit_and_unused_symbol_elision() {
+    const BLOCK_MODULE: u32 = 8;
+    const BLOCK_VALUE_SYMTAB: u32 = 14;
+    const MODULE_CODE_GLOBALVAR: u32 = 7;
+    const MODULE_CODE_FUNCTION: u32 = 8;
+    const VST_CODE_ENTRY: u32 = 1;
+    const FUNC_CODE_INST_ALLOCA: u32 = 19;
+
+    let mut m = Module::new();
+    m.define_entry("main");
+    let (i32, i64) = (m.i32(), m.i64());
+    let _g_dead = m.global("g_dead", i32, 3, None, false, 4);
+    let g_live = m.global("g_live", i32, 3, None, false, 8);
+    let fty = m.func_ty(i32, &[i32]);
+    let _f_dead = m.declare("dx.op.dead", fty, FnAttrs::ReadNone);
+    let f_live = m.declare("dx.op.live", fty, FnAttrs::ReadOnly);
+
+    let a4 = m.alloca(i32, 4);
+    let _a8 = m.alloca(i64, 8);
+    let v = m.load(g_live, 8);
+    let r = m.call(f_live, &[v]);
+    m.store(a4, r, 4);
+    m.ret();
+
+    let root = parse(&m.to_bitcode("dxil-ms-dx", ""));
+    let md = root.find(BLOCK_MODULE).unwrap();
+    let gvars = md.records_with(MODULE_CODE_GLOBALVAR);
+    assert_eq!(gvars.len(), 1, "unused global must be elided");
+    // `[valty, (addrspace<<2)|2|isconst = 14, init=0, linkage=0, log2(8)+1 = 4, ...]`
+    assert_eq!((gvars[0][1], gvars[0][3], gvars[0][4]), (14, 0, 4));
+    let funcs = md.records_with(MODULE_CODE_FUNCTION);
+    assert_eq!(funcs.len(), 2, "only defined entry and called declaration remain");
+    assert_eq!((funcs[0][2], funcs[1][2], funcs[1][4]), (0, 1, 2));
+    assert_eq!(root.find(BLOCK_VALUE_SYMTAB).unwrap().records_with(VST_CODE_ENTRY).len(), 3);
+
+    let allocas = root.find(BLOCK_FUNCTION).unwrap().records_with(FUNC_CODE_INST_ALLOCA);
+    assert_eq!(allocas.len(), 2);
+    // Explicit-type bit (1 << 6) | (log2(align) + 1): align 4 -> 67, align 8 -> 68;
+    // `ops[0]` is the explicit pointee type (`i32` then `i64`), `ops[1]` is the size type (`i32`).
+    assert_eq!((allocas[0][3], allocas[1][3]), (67, 68));
+    assert_eq!(allocas[0][0], allocas[0][1], "i32 alloca pointee type matches i32 size type");
+    assert_ne!(allocas[1][0], allocas[1][1], "i64 alloca pointee type differs from i32 size type");
 }
