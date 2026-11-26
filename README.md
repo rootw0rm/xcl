@@ -357,6 +357,14 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   those on which the GPU completed at least one operation. For each, it names the translated
   pipeline bound at the last operation DRED saw complete and those bound after it, by their
   console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
+- `XCL_HOST_DXR=1` enables an experimental shadow-build capture of XboxBvhBuilder
+  build, rehydrate and copy calls on DXR 1.1 devices. It snapshots triangle inputs from
+  mapped UMA windows and rewrites readable CPU instance arrays to native BLAS addresses.
+  Compressed rehydration, command-buffer replay, procedural geometry and GPU-generated
+  instance arrays are not supported. Rehydration invalidates earlier shadow mappings.
+  Native buffers are retained until exit with a 256 MiB allocation budget
+  per device. Translated shaders still use the console BVH, so this diagnostic mode
+  adds GPU work and does not accelerate rendering yet. It is disabled by default.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.

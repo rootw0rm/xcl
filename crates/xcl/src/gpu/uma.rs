@@ -465,6 +465,8 @@ impl Uma {
             len += l;
         }
         g.0.insert(start, len);
+        drop(g);
+        crate::hle::d3d12x::host_bvh::forget_range(p, size);
         Some(size)
     }
 
@@ -712,6 +714,8 @@ impl Uma {
             let mut g = self.pool.lock().unwrap();
             if p >= g.0 && p < g.1 {
                 g.2.push(p);
+                drop(g);
+                crate::hle::d3d12x::host_bvh::forget_range(p, ARENA_BLOCK);
                 return true;
             }
         }
@@ -731,6 +735,8 @@ impl Uma {
             len += l;
         }
         g.free.insert(start, len);
+        drop(g);
+        crate::hle::d3d12x::host_bvh::forget_range(p, orig);
         true
     }
 

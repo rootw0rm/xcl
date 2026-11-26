@@ -181,7 +181,10 @@ fn resolve_export_of_mapped_inner(
         ImportName::Ordinal(o) => m.exports.by_ordinal.get(&(*o as u32))?,
     };
     match t {
-        ExportTarget::Rva(r) => Some(m.base + *r as usize),
+        ExportTarget::Rva(r) => {
+            let original = m.base + *r as usize;
+            Some(crate::hle::d3d12x::host_bvh::intercept(m, what, *r, original))
+        }
         ExportTarget::Forwarder(f) => {
             if depth > 8 {
                 return None;

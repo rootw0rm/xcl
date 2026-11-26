@@ -168,6 +168,7 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
         f(primary, alloc, pso)
     };
     if hr >= 0 {
+        super::host_bvh::forget_list(primary as usize);
         let active = stand_in.unwrap_or(primary as usize);
         *((this as usize + F_BACKING) as *mut usize) = active;
         let moved = {
@@ -242,6 +243,12 @@ pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
         return None;
     }
     unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_PRIMARY) as *const *mut c_void)) }
+}
+
+/// The PC list currently recording this wrapper, including a mid-list split.
+pub(super) fn recording(list: *mut c_void) -> Option<*mut c_void> {
+    backing(list)?;
+    Some(unsafe { *((list as usize + F_BACKING) as *const *mut c_void) })
 }
 
 /// Expand a console list object into all of its recorded PC command list segments (in exact
@@ -399,6 +406,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
+        super::host_bvh::forget_list(pc as usize);
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
             let mut wg = WRAPPER_OF.lock().unwrap();
@@ -465,6 +473,11 @@ mod tests {
         unsafe {
             let o = wrap(fake as *mut c_void);
             assert_eq!(backing(o), Some(fake as *mut c_void));
+            assert_eq!(recording(o), Some(fake as *mut c_void));
+            *((o as usize + F_BACKING) as *mut usize) = 17;
+            assert_eq!(recording(o), Some(17usize as *mut c_void));
+            assert_eq!(backing(o), Some(fake as *mut c_void));
+            *((o as usize + F_BACKING) as *mut usize) = fake as usize;
             assert_eq!(backing(fake as *mut c_void), None);
             let (w, e) = (*((o as usize + F_WRITE) as *const usize), *((o as usize + F_END) as *const usize));
             assert!(w >= e && *((o as usize + F_DISPATCH_END) as *const usize) == w);

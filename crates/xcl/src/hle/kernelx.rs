@@ -481,6 +481,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         };
         if n > 0 {
             unmap_away_range(a, n);
+            crate::hle::d3d12x::host_bvh::forget_range(a, n);
             // sparse first: under its lock, so no copy of CPU writes to video memory reads the
             // pages while they go (the submit thread's copy faulted on them)
             crate::hle::d3d12x::sparse::decommitted(a, n);
@@ -499,6 +500,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             return u.free(addr as usize) as BOOL;
         }
         if t & 0x4000 != 0 && size > 0 {
+            crate::hle::d3d12x::host_bvh::forget_range(addr as usize, size);
             std::ptr::write_bytes(addr as *mut u8, 0, size);
         }
         return 1;
@@ -955,6 +957,7 @@ pub fn gpu_view_map_gen() -> u64 {
 
 /// Pages are mapped or unmapped at `va`: a GPU view's mappings changed if it lies in one.
 fn note_mapping_at(va: usize) {
+    crate::hle::d3d12x::host_bvh::forget_range(va, PHYS_PAGE);
     if mirrors::source(va).is_some() {
         GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
     }
@@ -1084,6 +1087,7 @@ unsafe fn give_back_homes(away: &mut Away) {
             end += PHYS_PAGE;
             i += 1;
         }
+        crate::hle::d3d12x::host_bvh::forget_range(start, end - start);
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(start)) {
             crate::hle::d3d12x::sparse::decommitted(start, end - start);
         }
@@ -1406,10 +1410,12 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         if page >= first + count {
             continue;
         }
+        crate::hle::d3d12x::host_bvh::forget_range(home + (page - first) * PHYS_PAGE, PHYS_PAGE);
         let e = g.get_mut(&first).unwrap();
         e.1 = e.1.saturating_sub(1);
         if e.1 == 0 {
             g.remove(&first);
+            crate::hle::d3d12x::host_bvh::forget_range(home, count * PHYS_PAGE);
             if u.is_sparse(home) {
                 crate::hle::d3d12x::sparse::free(home);
             } else if u.contains(home) {
