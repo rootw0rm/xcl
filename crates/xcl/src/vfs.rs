@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +97,11 @@ pub struct Vfs {
     /// Other folders XCL itself reads and writes (`own_folder`), absolute and lower-case.
     own_roots_lc: Vec<String>,
     overlay: String,
+    /// The overlay holds (or may hold) something besides the whiteout list: from an earlier run,
+    /// or written by this one. While it holds nothing, no game file has an overlay copy and
+    /// `visible_in_overlay` needs no file system call (a title that never writes its game folder
+    /// opens every file without one).
+    overlay_used: AtomicBool,
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
     whiteout_file: PathBuf,
@@ -471,6 +477,9 @@ impl Vfs {
                     .collect()
             })
             .unwrap_or_default();
+        let overlay_used = std::fs::read_dir(&overlay_dir)
+            .map(|d| d.flatten().any(|e| e.file_name() != ".xcl_whiteouts"))
+            .unwrap_or(false);
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
             .map(|(p, t)| {
@@ -511,6 +520,7 @@ impl Vfs {
             own_roots_lc: Vec::new(),
             game_root,
             overlay: trim_sep(&norm(&overlay_dir.to_string_lossy())),
+            overlay_used: AtomicBool::new(overlay_used),
             mounts,
             whiteouts: Mutex::new(whiteouts),
             whiteout_file,
@@ -1005,6 +1015,9 @@ impl Vfs {
         let Some(clean) = clean_rel(rel) else {
             return false;
         };
+        if !self.overlay_used.load(Ordering::Acquire) {
+            return false;
+        }
         #[cfg(windows)]
         let path = self.overlay_path(&clean);
         #[cfg(not(windows))]
@@ -1012,6 +1025,14 @@ impl Vfs {
             return false;
         };
         Path::new(&path).exists()
+    }
+
+    /// Something is about to be created in the overlay (set before it exists, so a reader that
+    /// sees the entry also sees the flag). `pub(crate)` for the Linux twin tests that plant
+    /// an overlay folder behind the VFS's back to model a run that found one at start
+    /// (same touch upstream #1106 makes in its own `remove_merged_dir` fixture).
+    pub(crate) fn mark_overlay_used(&self) {
+        self.overlay_used.store(true, Ordering::Release);
     }
 
     pub fn visible_in_original(&self, rel: &str) -> bool {
@@ -1038,17 +1059,22 @@ impl Vfs {
         let Some(clean) = clean_rel(rel) else {
             return false;
         };
-        #[cfg(windows)]
-        let overlay = self.overlay_path(&clean);
-        #[cfg(not(windows))]
-        let Ok(overlay) = self.checked_overlay_path(&clean) else {
-            return self.visible_in_original(&clean)
-                && self
-                    .checked_original_path(&clean)
-                    .is_ok_and(|path| Path::new(&path).is_dir());
-        };
-        if let Ok(m) = std::fs::metadata(overlay) {
-            return m.is_dir();
+        if self.overlay_used.load(Ordering::Acquire) {
+            #[cfg(windows)]
+            let overlay = self.overlay_path(&clean);
+            #[cfg(not(windows))]
+            let overlay = match self.checked_overlay_path(&clean) {
+                Ok(overlay) => overlay,
+                Err(_) => {
+                    return self.visible_in_original(&clean)
+                        && self
+                            .checked_original_path(&clean)
+                            .is_ok_and(|path| Path::new(&path).is_dir());
+                }
+            };
+            if let Ok(m) = std::fs::metadata(overlay) {
+                return m.is_dir();
+            }
         }
         #[cfg(windows)]
         let original_is_dir = Path::new(&self.original_path(&clean)).is_dir();
@@ -1113,6 +1139,7 @@ impl Vfs {
         let ov = self.overlay_path(&rel_clean);
         #[cfg(not(windows))]
         let ov = self.checked_overlay_path(&rel_clean)?;
+        self.mark_overlay_used();
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
@@ -1224,6 +1251,7 @@ impl Vfs {
         let ov = self.overlay_path(&rel_clean);
         #[cfg(not(windows))]
         let ov = self.checked_overlay_path(&rel_clean)?;
+        self.mark_overlay_used();
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
@@ -1326,6 +1354,15 @@ impl Vfs {
                 let Some(clean) = clean_rel(&rel) else {
                     return (Decision::Fail(ERROR_PATH_NOT_FOUND), None);
                 };
+                // a plain read: only `read_path_rel` asks the file system (titles open their files
+                // for reading thousands of times; each probe below costs about as much as the open)
+                if !Self::is_write(access, disposition, flags) && disposition != OPEN_ALWAYS {
+                    let decision = match self.read_path_rel(&clean) {
+                        Some(p) => Decision::Use(p),
+                        None => Decision::Fail(ERROR_FILE_NOT_FOUND),
+                    };
+                    return (decision, None);
+                }
                 let in_ov = self.visible_in_overlay(&clean);
                 let in_orig = self.visible_in_original(&clean);
                 let visible = in_ov || in_orig;
@@ -1517,6 +1554,7 @@ impl Vfs {
         let ov = self.overlay_path(&rel_clean);
         #[cfg(not(windows))]
         let ov = self.checked_overlay_path(&rel_clean)?;
+        self.mark_overlay_used();
         std::fs::create_dir_all(&ov).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         #[cfg(not(windows))]
         self.checked_overlay_path(&rel_clean)?;
@@ -1609,11 +1647,12 @@ impl Vfs {
             return false;
         };
         #[cfg(windows)]
-        let overlay_is_dir = Path::new(&self.overlay_path(&clean)).is_dir();
+        let overlay_is_dir = self.overlay_used.load(Ordering::Acquire) && Path::new(&self.overlay_path(&clean)).is_dir();
         #[cfg(not(windows))]
-        let overlay_is_dir = self
-            .checked_overlay_path(&clean)
-            .is_ok_and(|path| Path::new(&path).is_dir());
+        let overlay_is_dir = self.overlay_used.load(Ordering::Acquire)
+            && self
+                .checked_overlay_path(&clean)
+                .is_ok_and(|path| Path::new(&path).is_dir());
         overlay_is_dir || self.has_whiteouts_under(&clean)
     }
 
@@ -2048,6 +2087,68 @@ mod tests {
     }
 
     #[test]
+    fn reads_take_the_original_and_read_only_open_always_still_creates() {
+        let f = Fixture::new("rdonly");
+        let v = &f.vfs;
+        let data = f.game().join("data");
+        // a plain read of a missing file names the original: the open itself reports the error
+        assert_eq!(
+            v.open_decision("G:\\data\\missing.bin", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Use(data.join("missing.bin").to_string_lossy().to_string())
+        );
+        // OPEN_ALWAYS reads an existing file where it is …
+        assert_eq!(
+            v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_ALWAYS, 0),
+            Decision::Use(data.join("hello.txt").to_string_lossy().to_string())
+        );
+        // … and creates a missing one in the overlay even without write access
+        let d = v.open_decision("G:\\data\\created.bin", 0x8000_0000, OPEN_ALWAYS, 0);
+        let Decision::Use(p) = d else { panic!("{d:?}") };
+        assert!(p.contains("overlay"), "{p}");
+        assert!(!data.join("created.bin").exists());
+        assert_eq!(v.redirected_writes(), vec!["data\\created.bin".to_string()]);
+    }
+
+    #[test]
+    fn an_overlay_from_an_earlier_run_is_seen_but_a_whiteout_list_alone_is_none() {
+        let f = Fixture::new("ovrun");
+        let data_dir = f.dir.join("xcldata");
+        let mounts = || vec![("G:".to_string(), f.game().to_string_lossy().to_string())];
+        // an earlier run deleted a game file: the overlay folder holds only the whiteout list
+        assert_eq!(f.vfs.delete_file("data\\gone.txt"), Ok(()));
+        let v = Vfs::new(&f.game(), &data_dir, mounts());
+        assert!(!v.overlay_used.load(Ordering::Acquire));
+        assert_eq!(v.open_decision("G:\\data\\gone.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Fail(ERROR_FILE_NOT_FOUND));
+        // an earlier run wrote a game file: this run reads its copy
+        let ov = f.vfs.prepare_write("data\\hello.txt", true).unwrap();
+        std::fs::write(&ov, b"modified").unwrap();
+        let v = Vfs::new(&f.game(), &data_dir, mounts());
+        assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Use(ov));
+    }
+
+    #[test]
+    fn an_empty_overlay_is_not_asked_until_this_run_writes_to_it() {
+        let f = Fixture::new("ovfresh");
+        let v = &f.vfs;
+        let orig = f.game().join("data").join("hello.txt").to_string_lossy().to_string();
+        // a file put into the overlay folder behind the VFS's back is not looked for …
+        let ov = v.overlay_path("data\\hello.txt");
+        std::fs::create_dir_all(Path::new(&ov).parent().unwrap()).unwrap();
+        std::fs::write(&ov, b"elsewhere").unwrap();
+        assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Use(orig));
+        // … nor is a folder there, for directory checks and listings …
+        std::fs::create_dir_all(v.overlay_path("data\\extra")).unwrap();
+        assert!(!v.is_dir("data\\extra"));
+        assert!(!v.needs_merge("data"));
+        // … until the VFS writes to the overlay itself
+        let d = v.open_decision("G:\\data\\new.bin", GENERIC_WRITE, CREATE_ALWAYS, 0);
+        assert!(matches!(d, Decision::Use(_)), "{d:?}");
+        assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Use(ov));
+        assert!(v.is_dir("data\\extra"));
+        assert!(v.needs_merge("data"));
+    }
+
+    #[test]
     fn delete_is_a_persistent_whiteout() {
         let f = Fixture::new("wo");
         let v = &f.vfs;
@@ -2091,6 +2192,8 @@ mod tests {
         let f = Fixture::new("remove_merged_dir");
         let v = &f.vfs;
         std::fs::create_dir_all(v.overlay_path("data")).unwrap();
+        // put there behind the VFS's back: in use, as for a run that finds it at start
+        v.mark_overlay_used();
         assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
         assert!(v.visible_in_overlay("data"));
         assert!(!v.is_whiteout("data"));

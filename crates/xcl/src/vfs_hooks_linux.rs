@@ -487,6 +487,9 @@ mod tests {
         v.remove_dir("data").unwrap();
         let overlay_data = f.data.join("overlay").join("data");
         std::fs::create_dir_all(&overlay_data).unwrap();
+        // put there behind the VFS's back: in use, as for a run that finds it at start
+        // (upstream #1106 models this with `mark_overlay_used` in its own fixture).
+        v.mark_overlay_used();
         std::fs::set_permissions(&overlay_data, std::fs::Permissions::from_mode(0o500)).unwrap();
 
         let result = open_with(v, "G:\\data\\gone.txt", GENERIC_WRITE, CREATE_ALWAYS, 0);
