@@ -18,6 +18,7 @@
   <b><a href="#quick-start">Quick start</a></b> ·
   <b><a href="#what-works">What works</a></b> ·
   <b><a href="#controls">Controls</a></b> ·
+  <b><a href="#configuration">Configuration</a></b> ·
   <b><a href="#building-and-usage">Building and usage</a></b> ·
   <b><a href="#tests">Tests</a></b> ·
   <b><a href="#contributing">Contributing</a></b>
@@ -187,6 +188,47 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
+
+## Configuration
+
+Each title has its own `xcl.toml` in `%LOCALAPPDATA%\XCL\<title>\`
+(`%XCL_DATA_ROOT%`). XCL creates it with the defaults below on the first
+run; edit it to change them. A partial file is fine — any key you leave
+out takes its default. Values marked "auto" are resolved at startup,
+from the game's `MicrosoftGame.Config` where noted. Some keys also have
+an environment-variable override, which wins over the file.
+Keyboard and mouse (`keyboard_mouse`, `mouse_sensitivity`) are
+documented under [Controls](#controls).
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `device_type` | string | `"anaconda"` | `"anaconda"` (Series X) or `"lockhart"` (Series S). `XCL_DEVICE_TYPE` overrides it (`"series x"` / `"xsx"` / `"x"`, `"series s"` / `"xss"` / `"s"` work too). |
+| `console_type_raw` | u32 | `6` | Raw value returned by `GetConsoleType`. The Series values are not public; this is a guess and can be overridden. |
+| `gamertag` | string | `"Player1"` | The local offline user's gamertag the title sees (`XUserGetGamertag`). No modern suffix: the gamertag itself is the unique name. A long gamertag is cut at a character boundary to fit each buffer. |
+| `user_id` | u64 | `2533274790395905` | The local offline user's id (`0x0009_0000_0000_0001`), returned by the XUser id calls and embedded in the local placeholder token. |
+| `console_id` | string | `"00000000.00000000.00000000.00000000.00"` | What `XSystemGetConsoleId` returns: the console-id format, 38 characters, which titles size their buffer for. |
+| `sandbox_id` | string | `"RETAIL"` | The Xbox Live sandbox the title runs in. |
+| `title_id` | string | `""` | Xbox title id (hex) for `XGameGetXboxTitleId`. Empty means the `<TitleId>` of `MicrosoftGame.Config`. |
+| `package_identifier` | string | `""` | The package identifier the title sees (`XPackageGetCurrentProcessPackageIdentifier`). Empty means XCL synthesises one from the title name (`<Title>_1.0.0.0_x64__xcl`). |
+| `exe` | string | `""` | Executable inside the game folder. Empty means auto-detected. |
+| `title_memory` | string | `"auto"` | `"auto"` (from `MicrosoftGame.Config`: the `anaconda` / `lockhart` memory mode, else `"standard"`), `"standard"` or `"advanced"`. Case-insensitive. |
+| `title_memory_mb` | u64 | `0` | Title memory budget in MiB, as `TitleMemoryStatus` reports it. `0` is the console's standard budget: 13,824 on Series X, 8,192 on Series S. Set it to raise or lower the budget — lowering it helps GPUs with less video memory than the budget. |
+| `pls_mb` | u64 | `0` | Persistent local storage quota in MiB. `0` takes the value from `MicrosoftGame.Config`, else 4096. |
+| `uma_mb` | u64 | `0` | Unified (GPU-visible) memory in MiB. `0` is 4095 for `"advanced"` title memory, else 2048. Above 4095 it is split into 4 GiB windows. `XCL_UMA_MB` overrides it. |
+| `log_level` | string | `"info"` | `"error"`, `"warn"` (or `"warning"`), `"info"`, `"debug"`, `"trace"` (case-insensitive). Any other value falls back to `"info"`; there is no off. |
+| `log_to_stderr` | bool | `true` | Also write log lines to stderr (error, warning and info; debug and trace go to the log file only). |
+| `graphics` | string | `"d3d12"` | `"d3d12"` (real GPU) or `"null"` (no rendering). |
+| `d3d12_adapter` | string | `"auto"` | `"auto"` (high-performance GPU, then WARP), `"warp"`, a number (that hardware adapter in high-performance order) or a part of the adapter's name (`"radeon"`). `XCL_ADAPTER` overrides it. |
+| `d3d12_debug` | bool | `false` | Enable the D3D12 debug layer (needs Graphics Tools). `XCL_D3D12_DEBUG=1` also turns it on. |
+| `present` | string | `"auto"` | `"auto"` (show the title's frames in an XCL window) or `"off"`. |
+| `raytracing` | string | `"auto"` | Ray-tracing tier reported by `CheckFeatureSupport(D3D12_OPTIONS5)`: `"auto"` (host GPU tier), `"tier1_1"` (11), `"tier1_0"` (10) or `"off"` (0). `XCL_RAYTRACING` overrides it. |
+| `window_width` | u32 | `1280` | The XCL window's initial width, in pixels. |
+| `window_height` | u32 | `720` | The XCL window's initial height, in pixels. |
+| `window_pos` | string | `"auto"` | The XCL window's position: `"auto"` (let Windows place it), `"center"` (the primary monitor's work area) or `"x,y"` (top-left of the window, screen coordinates; clamped into the nearest monitor's work area). `XCL_WINDOW_POS` overrides it. |
+| `xbox_live_tokens` | bool | `false` | Answer `XUserGetTokenAndSignature*` with XCL's local placeholder token — only useful with a backend of your own that accepts it. Off, the request fails as on a console that cannot reach Xbox Live (`0x80072EFD`), and titles go their offline way. |
+| `mounts` | table | (see below) | Console path prefix → target. `{game}` is the game folder (read-only), `{data}` the XCL data folder. Defaults: `GAME:` and `G:` → `{game}`, `D:` → `{game}`, `T:` → `{data}\temp`, `S:` → `{data}\pls` (persistent local storage). |
+| `aliases` | table | (empty) | Import DLL pattern → route: an HLE module (`"kernelx.dll"`, `"xgameruntime.dll"`, `"d3d12_xs.dll"`), `"@system"` or `"@stub"`. |
+| `stub_returns` | table | (empty) | `"dll!function"` (or `"*!function"`) → value the auto-stub returns (e.g. `"E_NOTIMPL"`, `"0"`, `"0x1"`). |
 
 ## Building and usage
 
