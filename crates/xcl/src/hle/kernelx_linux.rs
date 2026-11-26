@@ -9840,6 +9840,7 @@ mod tests {
                 template: TEMPLATE.as_ptr() as usize,
                 template_len: TEMPLATE.len(),
                 total_len: TEMPLATE.len() as u64,
+                characteristics: 0,
                 index_ptr,
                 hinst: 0,
                 callbacks: Vec::new(),

@@ -230,7 +230,10 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let index_ptr = if t.address_of_index == 0 { std::ptr::null_mut() } else { adj(t.address_of_index) as *mut u32 };
         unsafe {
             // game DLLs loaded while its imports were resolved may point into it: its memory stays
-            tls_install(&module, template, template_len, t.total_len(), index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
+            tls_install(&module, template, template_len, t.total_len(), t.characteristics, index_ptr).inspect_err(|_| {
+                crate::tls::uninstall(&module.name);
+                modules::unregister_mapped(base);
+            })?;
             if t.address_of_callbacks != 0 {
                 // Cap and stay inside the image: an unterminated or out-of-image list
                 // used to walk forever / read past the mapping.
@@ -300,8 +303,8 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     Ok(module)
 }
 
-unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64, index_ptr: *mut u32) -> Result<(), String> {
-    let k = crate::tls::install(&m.name, template, len, total, index_ptr, &cache_dir())?;
+unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64, characteristics: u32, index_ptr: *mut u32) -> Result<(), String> {
+    let k = crate::tls::install_with_characteristics(&m.name, template, len, total, characteristics, index_ptr, &cache_dir())?;
     // the title's executable: slot 0, as a process's executable has it
     if !m.is_dll {
         if let Err(e) = crate::tls::take_slot_zero(&m.name, index_ptr, k) {

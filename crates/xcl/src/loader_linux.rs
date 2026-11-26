@@ -74,6 +74,7 @@ struct PendingTls {
     template: usize,
     template_len: usize,
     total_len: u64,
+    characteristics: u32,
     index_ptr: usize,
     hinst: usize,
     callbacks: Vec<usize>,
@@ -201,6 +202,7 @@ pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
                 template: pending.template,
                 template_len: pending.template_len,
                 total_len: pending.total_len,
+                characteristics: pending.characteristics,
                 index_ptr: pending.index_ptr,
                 hinst: pending.hinst,
                 callbacks: pending.callbacks,
@@ -220,6 +222,7 @@ pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
                 std::ptr::null_mut(),
             ) == 0
             {
+                crate::tls::uninstall(&m.name);
                 modules::unregister_mapped(m.base);
                 return Err(format!("DllMain({}) returned FALSE", m.name));
             }
@@ -270,6 +273,7 @@ pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
         crate::xlog_warn!("{key} is not a DLL but is being loaded as a library");
     }
     if let Err(e) = init_dll(&m) {
+        crate::tls::uninstall(&m.name);
         modules::unregister_mapped(m.base);
         PENDING_TLS.lock().unwrap().remove(&m.base);
         return Err(e);
@@ -553,6 +557,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                     template,
                     template_len,
                     total_len: t.total_len(),
+                    characteristics: t.characteristics,
                     index_ptr,
                     hinst: base,
                     callbacks: tls_callbacks.clone(),
@@ -573,6 +578,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                     template,
                     template_len,
                     total_len: t.total_len(),
+                    characteristics: t.characteristics,
                     index_ptr,
                     hinst: base,
                     callbacks: tls_callbacks.clone(),

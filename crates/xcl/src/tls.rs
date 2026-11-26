@@ -29,6 +29,26 @@ use std::sync::{Arc, RwLock};
 use crate::util::wide;
 
 pub const NO_INDEX: u32 = u32::MAX;
+pub const IMAGE_SCN_ALIGN_MASK: u32 = 0x00F0_0000;
+pub const MAX_CARRIER_TEMPLATE_SIZE: u32 = 0xFFFE_0000;
+
+/// Extract the alignment requirement in bytes from TLS directory characteristics (bits 20..24).
+/// Returns 16 if unaligned (0) or invalid.
+pub fn alignment_from_characteristics(characteristics: u32) -> u32 {
+    let val = (characteristics & IMAGE_SCN_ALIGN_MASK) >> 20;
+    if (1..=14).contains(&val) {
+        1 << (val - 1)
+    } else {
+        16
+    }
+}
+
+/// Convert an alignment in bytes (1..=8192) to IMAGE_SCN_ALIGN_* bits.
+pub fn characteristics_from_alignment(align: u32) -> u32 {
+    let align = align.clamp(1, 8192).next_power_of_two();
+    let val = align.trailing_zeros() + 1;
+    (val << 20) & IMAGE_SCN_ALIGN_MASK
+}
 
 // ---------------------------------------------------------------------------------------
 // Carrier DLL synthesis (pure, unit-tested)
@@ -54,11 +74,16 @@ const OFF_TEMPLATE: u32 = 0x100;
 pub struct CarrierOpts {
     pub entry_point: bool,
     pub with_import: bool,
+    pub characteristics: u32,
 }
 
 impl Default for CarrierOpts {
     fn default() -> Self {
-        CarrierOpts { entry_point: true, with_import: true }
+        CarrierOpts {
+            entry_point: true,
+            with_import: true,
+            characteristics: 0,
+        }
     }
 }
 
@@ -72,12 +97,19 @@ fn put64(b: &mut [u8], o: usize, v: u64) {
     b[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-const MAX_CARRIER_TEMPLATE: u32 = (u32::MAX - 0x10000) & !15;
-
 /// TLS block size the carrier must provide for a game template of `total_len` bytes.
 pub fn carrier_template_size_for(total_len: u64) -> u32 {
-    let n = total_len.clamp(16, MAX_CARRIER_TEMPLATE as u64);
-    ((n + 15) & !15) as u32
+    carrier_template_size_aligned(total_len, 16)
+}
+
+/// TLS block size the carrier must provide with explicit alignment preservation.
+pub fn carrier_template_size_aligned(total_len: u64, align: u32) -> u32 {
+    let align = align.max(16).clamp(16, 8192).next_power_of_two() as u64;
+    let mask = align - 1;
+    let max = (MAX_CARRIER_TEMPLATE_SIZE as u64) & !mask;
+    let n = total_len.max(align).min(max);
+    let rounded = n.saturating_add(mask) & !mask;
+    rounded.min(max) as u32
 }
 
 pub fn build_carrier_dll(template_size: u32) -> Vec<u8> {
@@ -86,9 +118,15 @@ pub fn build_carrier_dll(template_size: u32) -> Vec<u8> {
 
 /// Build a minimal x64 DLL whose TLS block is exactly `template_size` bytes.
 pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> {
-    let template_size = template_size.clamp(16, MAX_CARRIER_TEMPLATE);
-    let data_vsize = OFF_TEMPLATE + template_size;
-    let size_of_image = (DATA_RVA + data_vsize + 0xFFF) & !0xFFF;
+    let align = alignment_from_characteristics(opts.characteristics);
+    let template_size = carrier_template_size_aligned(template_size as u64, align);
+    let off_template = if align > 256 {
+        (OFF_TEMPLATE + align - 1) & !(align - 1)
+    } else {
+        OFF_TEMPLATE
+    };
+    let data_vsize = off_template.saturating_add(template_size);
+    let size_of_image = (DATA_RVA.saturating_add(data_vsize).saturating_add(0xFFF)) & !0xFFF;
     let mut f = vec![0u8; FILE_ALIGN * 4];
     // DOS header
     f[0] = b'M';
@@ -162,11 +200,12 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     // .data: IMAGE_TLS_DIRECTORY64
     let d = FILE_ALIGN * 3;
     let va = |off: u32| CARRIER_BASE + (DATA_RVA + off) as u64;
-    put64(&mut f, d + OFF_TLS_DIR as usize, va(OFF_TEMPLATE));
-    put64(&mut f, d + OFF_TLS_DIR as usize + 8, va(OFF_TEMPLATE + template_size));
+    put64(&mut f, d + OFF_TLS_DIR as usize, va(off_template));
+    put64(&mut f, d + OFF_TLS_DIR as usize + 8, va(off_template + template_size));
     put64(&mut f, d + OFF_TLS_DIR as usize + 16, va(OFF_INDEX));
     put64(&mut f, d + OFF_TLS_DIR as usize + 24, va(OFF_CALLBACKS));
-    // SizeOfZeroFill = 0, Characteristics = 0
+    put32(&mut f, d + OFF_TLS_DIR as usize + 32, 0); // SizeOfZeroFill
+    put32(&mut f, d + OFF_TLS_DIR as usize + 36, opts.characteristics);
     put32(&mut f, d + OFF_INDEX as usize, NO_INDEX); // sentinel: was a slot assigned?
     if opts.with_import {
         let desc = d + OFF_IMPORT_DESC as usize;
@@ -226,7 +265,7 @@ pub unsafe fn current_teb() -> *mut u8 {
 
 /// TEB.ThreadLocalStoragePointer (offset 0x58 on x64) [index].
 unsafe fn tls_block_of(teb: *mut u8, index: u32) -> *mut u8 {
-    if teb.is_null() {
+    if teb.is_null() || index == NO_INDEX {
         return std::ptr::null_mut();
     }
     let arr = *(teb.add(0x58) as *const *mut *mut u8);
@@ -237,7 +276,7 @@ unsafe fn tls_block_of(teb: *mut u8, index: u32) -> *mut u8 {
 }
 
 unsafe fn fill_block(block: *mut u8, img: &TlsImage) {
-    if block.is_null() || img.template_len == 0 {
+    if block.is_null() || img.template_len == 0 || img.template == 0 {
         return;
     }
     std::ptr::copy_nonoverlapping(img.template as *const u8, block, img.template_len);
@@ -311,6 +350,9 @@ unsafe fn thread_tebs() -> Vec<*mut u8> {
 /// access in flight with either index stays right.
 pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> Result<(), String> {
     use std::sync::atomic::fence;
+    if k == 0 || k == NO_INDEX {
+        return Err(format!("invalid carrier TLS index {k}"));
+    }
     let own = own_tls_index().ok_or("xcl.exe has no TLS directory")?;
     if *own != 0 {
         return Err(format!("xcl.exe's TLS index is {}, not 0", *own));
@@ -320,11 +362,15 @@ pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> R
     // 1. slot k = slot 0 (xcl.exe's block) in every thread; the carrier blocks kept
     let mut carriers: Vec<(*mut *mut u8, *mut u8)> = Vec::new();
     for &teb in &tebs {
+        if teb.is_null() {
+            continue;
+        }
         let arr = *(teb.add(0x58) as *const *mut *mut u8);
         if arr.is_null() {
             continue;
         }
-        carriers.push((arr, *arr.add(k as usize)));
+        let carrier_block = *arr.add(k as usize);
+        carriers.push((arr, carrier_block));
         *arr.add(k as usize) = *arr;
         moved.push(teb as usize);
     }
@@ -338,7 +384,7 @@ pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> R
         *arr = block;
     }
     if !title_index.is_null() {
-        *title_index = 0;
+        std::ptr::write_unaligned(title_index, 0);
     }
     if let Ok(images) = IMAGES.read() {
         for img in images.iter().filter(|i| i.name == img_name) {
@@ -354,7 +400,7 @@ pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> R
 /// anything here reads TLS.
 unsafe fn exchange_for_new_thread(teb: *mut u8) {
     let k = XCL_SLOT.load(Ordering::Acquire);
-    if k == NO_INDEX {
+    if k == NO_INDEX || k == 0 || teb.is_null() {
         return;
     }
     let Ok(mut moved) = MOVED.lock() else { return };
@@ -378,6 +424,9 @@ pub fn on_thread_detach() {
         return;
     }
     let teb = unsafe { current_teb() } as usize;
+    if teb == 0 {
+        return;
+    }
     if let Ok(mut moved) = MOVED.lock() {
         moved.retain(|&t| t != teb);
     }
@@ -458,17 +507,35 @@ pub unsafe fn install(
     index_ptr: *mut u32,
     cache_dir: &Path,
 ) -> Result<u32, String> {
-    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
-    let img = Arc::new(TlsImage {
-        name: img_name.to_string(),
-        template,
-        template_len,
-        index: AtomicU32::new(NO_INDEX),
-    });
-    IMAGES.write().map_err(|_| "TLS lock poisoned")?.push(img.clone());
+    install_with_characteristics(img_name, template, template_len, total_len, 0, index_ptr, cache_dir)
+}
 
-    let size = carrier_template_size_for(total_len);
-    let bytes = build_carrier_dll(size);
+/// Create + load a carrier for `img_name` preserving TLS directory characteristics/alignment.
+pub unsafe fn install_with_characteristics(
+    img_name: &str,
+    template: usize,
+    template_len: usize,
+    total_len: u64,
+    characteristics: u32,
+    index_ptr: *mut u32,
+    cache_dir: &Path,
+) -> Result<u32, String> {
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+
+    if template_len > 0 && template == 0 {
+        return Err("null TLS template pointer with non-zero template_len".into());
+    }
+
+    let align = alignment_from_characteristics(characteristics);
+    let required_len = total_len.max(template_len as u64);
+    let size = carrier_template_size_aligned(required_len, align);
+    let opts = CarrierOpts {
+        entry_point: true,
+        with_import: true,
+        characteristics,
+    };
+    let bytes = build_carrier_dll_with(size, opts);
+
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("cache dir: {e}"))?;
     let safe: String = img_name
         .chars()
@@ -492,15 +559,30 @@ pub unsafe fn install(
     if index == NO_INDEX {
         return Err("Windows did not allocate a TLS slot for the carrier (TLS directory ignored)".into());
     }
+
+    let img = Arc::new(TlsImage {
+        name: img_name.to_string(),
+        template,
+        template_len,
+        index: AtomicU32::new(index),
+    });
+    IMAGES.write().map_err(|_| "TLS lock poisoned")?.push(img.clone());
+
     if !index_ptr.is_null() {
-        *index_ptr = index;
+        std::ptr::write_unaligned(index_ptr, index);
     }
-    img.index.store(index, Ordering::Release);
     let n = fill_existing_threads(&img, index);
     crate::xlog_info!(
-        "TLS: {img_name}: template {template_len} B, block {size} B, index {index}, threads initialized: {n}"
+        "TLS: {img_name}: template {template_len} B, block {size} B, align {align} B, index {index}, threads initialized: {n}"
     );
     Ok(index)
+}
+
+/// Unregister a TLS image by name (e.g. if module unload or cleanup is needed).
+pub fn uninstall(img_name: &str) {
+    if let Ok(mut images) = IMAGES.write() {
+        images.retain(|i| i.name != img_name);
+    }
 }
 
 /// Best-effort removal of carrier files left behind by previous runs.
@@ -544,10 +626,15 @@ mod tests {
         assert_eq!(carrier_template_size_for(0), 16);
         assert_eq!(carrier_template_size_for(17), 32);
         assert_eq!(carrier_template_size_for(0x1000), 0x1000);
+        // Overflow safety with huge lengths
+        assert_eq!(carrier_template_size_for(u64::MAX), MAX_CARRIER_TEMPLATE_SIZE);
+        assert_eq!(carrier_template_size_for(u64::MAX - 10), MAX_CARRIER_TEMPLATE_SIZE);
     }
 
     #[test]
     fn carrier_size_and_build_clamp_without_overflow() {
+        // Ported from #1403: the build path clamps like the size query, so a
+        // hostile `u32::MAX` template never overflows or over-allocates.
         let clamped = carrier_template_size_for(u64::MAX);
         assert!(clamped >= 16 && clamped % 16 == 0);
         let bytes = build_carrier_dll(u32::MAX);
@@ -555,6 +642,88 @@ mod tests {
         let tls = pe.tls().unwrap().unwrap();
         assert_eq!(tls.template_len(), clamped as u64);
         assert!(pe.size_of_image >= DATA_RVA + OFF_TEMPLATE + clamped);
+    }
+
+    #[test]
+    fn alignment_preservation_and_characteristics() {
+        // Default characteristics (0) yields 16-byte alignment
+        assert_eq!(alignment_from_characteristics(0), 16);
+
+        // Power of two alignments 1..8192
+        for p in 0..=13 {
+            let align = 1u32 << p;
+            let ch = characteristics_from_alignment(align);
+            assert_eq!(alignment_from_characteristics(ch), align);
+        }
+
+        // Test explicit alignments via carrier_template_size_aligned
+        assert_eq!(carrier_template_size_aligned(1, 64), 64);
+        assert_eq!(carrier_template_size_aligned(64, 64), 64);
+        assert_eq!(carrier_template_size_aligned(65, 64), 128);
+        assert_eq!(carrier_template_size_aligned(0x1000, 256), 0x1000);
+        assert_eq!(carrier_template_size_aligned(0x1001, 256), 0x1100);
+        assert_eq!(carrier_template_size_aligned(u64::MAX, 128) % 128, 0);
+    }
+
+    #[test]
+    fn carrier_alignments_in_pe_headers() {
+        // Test with 64-byte alignment
+        let ch64 = characteristics_from_alignment(64);
+        let opts64 = CarrierOpts {
+            entry_point: true,
+            with_import: true,
+            characteristics: ch64,
+        };
+        let bytes64 = build_carrier_dll_with(100, opts64);
+        let pe64 = Pe::parse(&bytes64, Layout::File).unwrap();
+        let tls64 = pe64.tls().unwrap().unwrap();
+        assert_eq!(tls64.characteristics, ch64);
+        assert_eq!(tls64.template_len() % 64, 0);
+        let start_rva64 = pe64.va_to_rva(tls64.start_raw).unwrap();
+        assert_eq!(start_rva64 % 64, 0);
+        let end_rva64 = pe64.va_to_rva(tls64.end_raw).unwrap();
+        assert_eq!(end_rva64 % 64, 0);
+
+        // Test with 512-byte alignment (triggers template offset adjustment > 256)
+        let ch512 = characteristics_from_alignment(512);
+        let opts512 = CarrierOpts {
+            entry_point: true,
+            with_import: true,
+            characteristics: ch512,
+        };
+        let bytes512 = build_carrier_dll_with(0x200, opts512);
+        let pe512 = Pe::parse(&bytes512, Layout::File).unwrap();
+        let tls512 = pe512.tls().unwrap().unwrap();
+        assert_eq!(tls512.characteristics, ch512);
+        assert_eq!(tls512.template_len() % 512, 0);
+        let start_rva512 = pe512.va_to_rva(tls512.start_raw).unwrap();
+        assert_eq!(start_rva512 % 512, 0);
+    }
+
+    #[test]
+    fn index_allocation_safety() {
+        unsafe {
+            // Null TEB should not crash and return null
+            assert!(tls_block_of(std::ptr::null_mut(), 0).is_null());
+            assert!(tls_block_of(std::ptr::null_mut(), NO_INDEX).is_null());
+            // NO_INDEX query on current thread should safely return null
+            assert!(tls_block_of(current_teb(), NO_INDEX).is_null());
+
+            // Invalid slot 0 requests must be rejected
+            assert!(take_slot_zero("test_invalid", std::ptr::null_mut(), 0).is_err());
+            assert!(take_slot_zero("test_invalid", std::ptr::null_mut(), NO_INDEX).is_err());
+
+            // fill_block safety on null block or null template
+            let dummy = TlsImage {
+                name: "dummy".into(),
+                template: 0,
+                template_len: 64,
+                index: AtomicU32::new(1),
+            };
+            let mut buf = [0u8; 64];
+            fill_block(buf.as_mut_ptr(), &dummy); // template == 0, safe early return
+            fill_block(std::ptr::null_mut(), &dummy); // null block, safe early return
+        }
     }
 
     /// Diagnostic: which carrier variants does this Windows build honour?
@@ -566,7 +735,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xcl_tls_probe_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (i, (entry, imp)) in [(false, false), (true, false), (false, true), (true, true)].into_iter().enumerate() {
-            let bytes = build_carrier_dll_with(0x1000, CarrierOpts { entry_point: entry, with_import: imp });
+            let bytes = build_carrier_dll_with(0x1000, CarrierOpts { entry_point: entry, with_import: imp, characteristics: 0 });
             let p = dir.join(format!("probe{i}.dll"));
             std::fs::write(&p, bytes).unwrap();
             let h = unsafe { LoadLibraryW(wide(&p.to_string_lossy()).as_ptr()) };
@@ -622,6 +791,37 @@ mod tests {
             let b = tls_block_of(current_teb(), idx);
             assert!(!b.is_null());
             assert_eq!(std::slice::from_raw_parts(b, 16), &template[..]);
+        }
+    }
+
+    #[test]
+    fn install_with_characteristics_aligned() {
+        let dir = std::env::temp_dir().join(format!("xcl_tls_test_align_{}", std::process::id()));
+        let mut template = [0u8; 128];
+        template[0] = 0x42;
+        template[127] = 0x99;
+        let template: &'static [u8; 128] = Box::leak(Box::new(template));
+        let mut index_var: u32 = 0xDEAD;
+        let ch = characteristics_from_alignment(64);
+        let idx = unsafe {
+            install_with_characteristics(
+                "unit-align64",
+                template.as_ptr() as usize,
+                128,
+                0x1000,
+                ch,
+                &mut index_var,
+                &dir,
+            )
+            .unwrap()
+        };
+        assert_ne!(idx, NO_INDEX);
+        assert_eq!(index_var, idx);
+        unsafe {
+            let b = tls_block_of(current_teb(), idx);
+            assert!(!b.is_null());
+            assert_eq!(b as usize % 16, 0);
+            assert_eq!(std::slice::from_raw_parts(b, 128), &template[..]);
         }
     }
 }

@@ -37,6 +37,27 @@ use std::thread::JoinHandle;
 /// No slot assigned (Windows' `TLS_OUT_OF_INDEXES`).
 pub const NO_INDEX: u32 = u32::MAX;
 
+pub const IMAGE_SCN_ALIGN_MASK: u32 = 0x00F0_0000;
+
+/// Extract the alignment requirement in bytes from TLS directory characteristics
+/// (bits 20..24). Returns 16 if unaligned (0) or invalid.
+/// Mirrors `tls.rs` (Windows carrier) so both loaders honour the same nibble.
+pub fn alignment_from_characteristics(characteristics: u32) -> u32 {
+    let val = (characteristics & IMAGE_SCN_ALIGN_MASK) >> 20;
+    if (1..=14).contains(&val) {
+        1 << (val - 1)
+    } else {
+        16
+    }
+}
+
+/// Convert an alignment in bytes (1..=8192) to IMAGE_SCN_ALIGN_* bits.
+pub fn characteristics_from_alignment(align: u32) -> u32 {
+    let align = align.clamp(1, 8192).next_power_of_two();
+    let val = align.trailing_zeros() + 1;
+    (val << 20) & IMAGE_SCN_ALIGN_MASK
+}
+
 /// `PIMAGE_TLS_CALLBACK` on x64: `void (*)(PVOID hinst, DWORD reason, PVOID reserved)`.
 /// PE code uses the Windows x64 ABI even when the host is Linux.
 pub type TlsCallback = unsafe extern "win64" fn(*mut c_void, u32, *mut c_void);
@@ -65,6 +86,8 @@ pub struct ImageSpec {
     pub template_len: usize,
     /// Template plus zero fill.
     pub total_len: u64,
+    /// Raw TLS directory characteristics (alignment nibble, bits 20..24).
+    pub characteristics: u32,
     /// Address of the image's `_tls_index`; 0 leaves it alone.
     pub index_ptr: usize,
     /// The module handle Windows passes to the callbacks (the image base).
@@ -80,6 +103,7 @@ struct Image {
     template: usize,
     template_len: usize,
     total_len: usize,
+    characteristics: u32,
     hinst: usize,
     callbacks: Vec<usize>,
 }
@@ -195,7 +219,12 @@ impl ThreadState {
 
 fn alloc_block(img: &Image) -> Result<Block, String> {
     let size = img.total_len.max(1);
-    let layout = Layout::from_size_align(size, BLOCK_ALIGN)
+    // Honour the image's TLS alignment nibble (mirrors the Windows carrier's
+    // `carrier_template_size_aligned`): blocks for align > 16 come from an
+    // aligned layout so over-aligned statics stay aligned. Floor stays 16.
+    let align = alignment_from_characteristics(img.characteristics)
+        .max(BLOCK_ALIGN as u32) as usize;
+    let layout = Layout::from_size_align(size, align)
         .map_err(|e| format!("TLS block for {} ({size} B): {e}", img.name))?;
     let ptr = unsafe { alloc_zeroed(layout) };
     if ptr.is_null() {
@@ -205,6 +234,10 @@ fn alloc_block(img: &Image) -> Result<Block, String> {
         ));
     }
     if img.template_len != 0 {
+        if img.template == 0 {
+            unsafe { dealloc(ptr, layout) };
+            return Err(format!("{}: TLS template is null", img.name));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(img.template as *const u8, ptr, img.template_len);
         }
@@ -270,6 +303,11 @@ pub unsafe fn install(spec: ImageSpec) -> Result<u32, String> {
         return Err(format!("{}: TLS template is null", spec.name));
     }
     if spec.template_len as u64 > spec.total_len {
+        // Strictly stronger than upstream's `total_len.max(template_len)`: a
+        // caller passing an inconsistent spec is a bug — fail closed instead
+        // of silently widening the block. Real images always satisfy this
+        // (`total_len` derives from the same `TlsDir`), so boot behavior is
+        // identical; only synthetic misuse errors.
         return Err(format!(
             "{}: TLS template {} B exceeds the block {} B",
             spec.name, spec.template_len, spec.total_len
@@ -281,7 +319,8 @@ pub unsafe fn install(spec: ImageSpec) -> Result<u32, String> {
             spec.name, spec.total_len
         )
     })?;
-    if Layout::from_size_align(total_len.max(1), BLOCK_ALIGN).is_err() {
+    let align = alignment_from_characteristics(spec.characteristics).max(BLOCK_ALIGN as u32);
+    if Layout::from_size_align(total_len.max(1), align as usize).is_err() {
         return Err(format!(
             "{}: TLS block {} B is too large",
             spec.name, spec.total_len
@@ -317,6 +356,7 @@ pub unsafe fn install(spec: ImageSpec) -> Result<u32, String> {
         template: spec.template,
         template_len: spec.template_len,
         total_len,
+        characteristics: spec.characteristics,
         hinst: spec.hinst,
         callbacks: spec.callbacks,
     });
@@ -343,19 +383,44 @@ pub unsafe fn install(spec: ImageSpec) -> Result<u32, String> {
 
     if spec.index_ptr != 0 {
         // The image's compiled TLS accesses reload `_tls_index`; publish it before any
-        // thread can run image code that reads it.
+        // thread can run image code that reads it. Unaligned write: the index RVA
+        // comes from the file and is only bounds-checked, never alignment-checked.
         fence(Ordering::SeqCst);
-        std::ptr::write_volatile(spec.index_ptr as *mut u32, index);
+        std::ptr::write_unaligned(spec.index_ptr as *mut u32, index);
         fence(Ordering::SeqCst);
     }
     crate::xlog_info!(
-        "TLS: {}: slot {index}, template {} B, block {} B, {} callbacks",
+        "TLS: {}: slot {index}, template {} B, block {} B, align {} B, {} callbacks",
         img.name,
         spec.template_len,
         total_len,
+        align,
         img.callbacks.len()
     );
     Ok(index)
+}
+
+/// Unregister a TLS image by name (e.g. when the loader fails after the
+/// install). Mirrors upstream `tls::uninstall`: drops the registry entry so a
+/// later load starts clean, and detaches the image's blocks from every
+/// attached thread so the failed install frees its memory instead of leaking
+/// it. Threads that attached keep their slot array (preallocated, stable).
+pub fn uninstall(img_name: &str) {
+    let Ok(_guard) = lock_install() else { return };
+    let index = IMAGES
+        .read()
+        .map(|v| v.iter().find(|i| i.name == img_name).map(|i| i.index))
+        .unwrap_or(None);
+    let Some(index) = index else { return };
+    if let Ok(threads) = THREADS.lock() {
+        for &p in threads.iter() {
+            let state = unsafe { &mut *(p as *mut ThreadState) };
+            state.detach_image(index);
+        }
+    }
+    if let Ok(mut images) = IMAGES.write() {
+        images.retain(|i| i.name != img_name);
+    }
 }
 
 /// Give the current thread a TEB, its own copy of every image's TLS template, and run the
@@ -545,6 +610,7 @@ mod tests {
                 template: TEMPLATE_7.as_ptr() as usize,
                 template_len: TEMPLATE_7.len(),
                 total_len: TEMPLATE_7.len() as u64,
+                characteristics: 0,
                 index_ptr,
                 hinst: 0,
                 callbacks: Vec::new(),
@@ -601,6 +667,7 @@ mod tests {
                 template: TEMPLATE_7.as_ptr() as usize,
                 template_len: TEMPLATE_7.len(),
                 total_len: TEMPLATE_7.len() as u64,
+                characteristics: 0,
                 index_ptr,
                 hinst: token,
                 callbacks: vec![record_callback as usize],
@@ -646,6 +713,7 @@ mod tests {
                     template: 0,
                     template_len: 0,
                     total_len,
+                    characteristics: 0,
                     index_ptr: leaked_index(),
                     hinst: 0,
                     callbacks: Vec::new(),
@@ -658,6 +726,81 @@ mod tests {
                 "unexpected error for {total_len:#x}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn alignment_nibbles_roundtrip_and_sanitize() {
+        // Mirrors upstream `tls.rs` encode/decode: 1..=8192 round-trip, 0 and
+        // reserved nibbles sanitize to 16.
+        assert_eq!(alignment_from_characteristics(0), 16);
+        for p in 0..=13 {
+            let align = 1u32 << p;
+            let ch = characteristics_from_alignment(align);
+            assert_eq!(alignment_from_characteristics(ch), align);
+        }
+        assert_eq!(alignment_from_characteristics(0x00F0_0000), 16);
+    }
+
+    #[test]
+    fn overaligned_block_start_satisfies_characteristics() {
+        // A 512-byte-aligned TLS image must get a 512-aligned block (the
+        // pre-#1431 Linux path always used 16 and would fail this).
+        attach_current_thread().expect("attach");
+        let template = Box::leak(Box::new([0xABu8; 64]));
+        let ch = characteristics_from_alignment(512);
+        let index = unsafe {
+            install(ImageSpec {
+                name: "tls-test-align512".into(),
+                template: template.as_ptr() as usize,
+                template_len: template.len(),
+                total_len: template.len() as u64,
+                characteristics: ch,
+                index_ptr: leaked_index(),
+                hinst: 0,
+                callbacks: Vec::new(),
+                main: false,
+            })
+        }
+        .expect("aligned TLS image installs");
+        let slots: *mut *mut u8 = unsafe {
+            let mut s: *mut *mut u8;
+            core::arch::asm!("mov {}, gs:[0x58]", out(reg) s, options(nostack, readonly, preserves_flags));
+            s
+        };
+        let block = unsafe { *slots.add(index as usize) };
+        assert!(!block.is_null());
+        assert_eq!(block as usize % 512, 0, "block honors 512 B characteristics");
+        uninstall("tls-test-align512");
+    }
+
+    #[test]
+    fn uninstall_removes_the_image_and_frees_its_blocks() {
+        // Global `image_count` races with sibling tests installing in parallel
+        // (same reason the oversize test asserts no slot counter), so this test
+        // asserts per-thread, per-index effects instead of exact global counts.
+        attach_current_thread().expect("attach");
+        let index = unsafe {
+            install(ImageSpec {
+                name: "tls-test-uninstall".into(),
+                template: TEMPLATE_7.as_ptr() as usize,
+                template_len: TEMPLATE_7.len(),
+                total_len: TEMPLATE_7.len() as u64,
+                characteristics: 0,
+                index_ptr: leaked_index(),
+                hinst: 0,
+                callbacks: Vec::new(),
+                main: false,
+            })
+        }
+        .expect("image installs");
+        let slots = slots_ptr_for_current_thread().expect("slots") as *mut *mut u8;
+        assert!(!unsafe { *slots.add(index as usize) }.is_null());
+        let during = image_count();
+        assert!(during >= 1);
+        uninstall("tls-test-uninstall");
+        assert!(unsafe { *slots.add(index as usize) }.is_null());
+        // Idempotent: second call is a no-op, never panics.
+        uninstall("tls-test-uninstall");
     }
 
     #[test]
@@ -727,6 +870,7 @@ mod tests {
                 template: TEMPLATE_7.as_ptr() as usize,
                 template_len: TEMPLATE_7.len(),
                 total_len: TEMPLATE_7.len() as u64,
+                characteristics: 0,
                 index_ptr,
                 hinst: token,
                 callbacks: vec![late_record_callback as usize],
@@ -792,6 +936,7 @@ mod tests {
                 template: TEMPLATE_7.as_ptr() as usize,
                 template_len: TEMPLATE_7.len(),
                 total_len: TEMPLATE_7.len() as u64,
+                characteristics: 0,
                 index_ptr,
                 hinst: 0,
                 callbacks: Vec::new(),
