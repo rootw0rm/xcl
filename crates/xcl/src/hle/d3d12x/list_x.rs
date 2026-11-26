@@ -809,6 +809,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     let key = list as usize;
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
+    real::dispatch_chain::list_reset(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -848,6 +849,7 @@ pub(super) fn on_release(list: usize) {
     super::host_bvh::forget_list(list);
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
+    real::dispatch_chain::list_reset(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -3184,6 +3186,12 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
     }
 }
 
+/// The title's predication (`SetPredicationBufferX`) is set on `list`: what it records now may not run.
+pub(super) fn predicated(list: *mut c_void) -> bool {
+    PREDICATION_USED.load(Ordering::Acquire)
+        && LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.predication.is_some())
+}
+
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
 /// bind `SetPredication(pb, 0, op)` on `this`.
 unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
@@ -4729,6 +4737,21 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// A list made at the address of a released one does not share the split programs' scratch
+    /// of the old one's recordings, which the GPU may still run (#2588: addresses are reused)
+    #[test]
+    fn a_list_at_a_released_lists_address_starts_without_its_chain_scratch() {
+        let list = 0x7a51_0000usize;
+        real::dispatch_chain::note_shared_for_test(list, 0x333);
+        on_release(list);
+        assert!(!real::dispatch_chain::shares_scratch_for_test(list), "kept after the release");
+        // a release not seen: the create clears it
+        real::dispatch_chain::note_shared_for_test(list, 0x333);
+        unsafe { on_create(list as *mut c_void, 0x333, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        assert!(!real::dispatch_chain::shares_scratch_for_test(list), "kept by a list created at the address");
+        on_release(list);
+    }
+
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
     /// and is gone from it once the fence gets there.
     #[test]
@@ -5930,6 +5953,7 @@ mod tests {
                     PredEvent::SetPred(pb_raw, 0, D3D12_PREDICATION_OP_EQUAL_ZERO),
                 ]
             );
+            assert!(predicated(list_ptr));
 
             // Rejections while a predicate is active must neither emit events nor disturb tracked state.
             for ty in [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE] {
@@ -6002,11 +6026,14 @@ mod tests {
             );
             set_predication_buffer_x(list_ptr, std::ptr::null());
             assert_eq!(take_events(), vec![PredEvent::SetPred(0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)]);
+            assert!(!predicated(list_ptr));
 
             // (g) on_pc_reset clears predication & pred_in_state so subsequent before_close emits 0 barriers.
             apply_predication_copy(list_ptr, uma_buf, 0x100, pb_raw, D3D12_PREDICATION_OP_EQUAL_ZERO);
             take_events();
+            assert!(predicated(list_ptr));
             on_pc_reset(list_ptr);
+            assert!(!predicated(list_ptr));
             before_close(list_ptr);
             assert!(take_events().is_empty(), "on_pc_reset must clear pred_in_state before before_close");
         }

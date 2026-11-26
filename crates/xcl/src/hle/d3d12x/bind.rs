@@ -263,6 +263,19 @@ fn signature_dispatches(sig: usize) -> bool {
     DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
 }
 
+/// command signatures of one Dispatch argument → their stride (a split program runs them as its
+/// chain, `chained_indirect`)
+static DISPATCH_ONLY: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+pub(super) fn note_dispatch_only_signature(sig: usize, stride: Option<u32>) {
+    let mut s = DISPATCH_ONLY.lock().unwrap();
+    let s = s.get_or_insert_with(Default::default);
+    match stride {
+        Some(n) => s.insert(sig, n),
+        None => s.remove(&sig),
+    };
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -276,6 +289,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let (args_off_title, count_off_title) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
@@ -335,6 +349,21 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if compute {
+        // a split program: its chain (it binds the ABI itself)
+        match chained_indirect(this, list, pso, sig, max, (args, args_off_title, args_off), (count_buf, count_off_title, count_off)) {
+            Ok(true) => return count(DISPATCHES),
+            Ok(false) => {}
+            Err(e) => {
+                count(DISPATCHES_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("D3D12.X: ExecuteIndirect of a split program skipped: {e}");
+                }
+                return;
+            }
+        }
+    }
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
@@ -358,6 +387,40 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
             }
         }
+    }
+}
+
+/// An ExecuteIndirect of split program `pso` with a command signature of one Dispatch, run as its
+/// chain (`dispatch_chain::execute_indirect`); the buffers as (resource, title's offset, PC's).
+/// Ok(false): nothing recorded – run it as the whole form.
+#[allow(clippy::too_many_arguments)]
+unsafe fn chained_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, sig: usize, max: u32,
+    (args, args_title, args_pc): (usize, u64, u64), (count_buf, count_title, count_pc): (usize, u64, u64)) -> Result<bool, String> {
+    let Some(stride) = DISPATCH_ONLY.lock().unwrap().as_ref().and_then(|m| m.get(&sig).copied()) else { return Ok(false) };
+    let Some(args_va) = indirect_address(args, args_title, args_pc) else { return Ok(false) };
+    let count_va = match count_buf {
+        0 => None,
+        c => match indirect_address(c, count_title, count_pc) { Some(v) => Some(v), None => return Ok(false) },
+    };
+    // the arguments there now (the GPU's last ones) size the rounds
+    let read = |res: usize, off: u64, n: usize| -> Option<Vec<u32>> {
+        let (p, size) = super::real::console_buffer(res)?;
+        let at = p + off as usize;
+        (off as usize + 4 * n <= size && crate::gpu::shader::readable(at, 4 * n))
+            .then(|| (0..n).map(|i| std::ptr::read_volatile((at as *const u32).add(i))).collect())
+    };
+    let n = if count_buf == 0 { max } else { read(count_buf, count_title, 1).map_or(max, |c| c[0].min(max)) };
+    let seen: Vec<[u32; 3]> = (0..n.min(64)).filter_map(|k| read(args, args_title + u64::from(k * stride), 3)).map(|v| [v[0], v[1], v[2]]).collect();
+    super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), args_va, stride, max, count_va, &seen,
+        super::list_x::predicated(this), || bind_abi(this, list, pso, false))
+}
+
+/// The GPU address of a title's buffer `res` at its offset `title` (a buffer in unified memory) or
+/// `pc` (another)
+unsafe fn indirect_address(res: usize, title: u64, pc: u64) -> Option<u64> {
+    match super::real::console_buffer(res) {
+        Some((p, _)) => super::real::uma_va_of(p + title as usize),
+        None => Some(ID3D12Resource::from_raw_borrowed(&(res as *mut c_void))?.GetGPUVirtualAddress()).filter(|&va| va != 0).map(|va| va + pc),
     }
 }
 
