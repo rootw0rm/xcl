@@ -5262,6 +5262,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
+    normalize_integer_blend_targets(&mut copy.BlendState, &copy.RTVFormats[..copy.NumRenderTargets.min(8) as usize]);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
@@ -5837,10 +5838,198 @@ const SHADER_SUBOBJECTS: [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE; 8] = [
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
 ];
 
+/// PC D3D12 rejects blending on typed integer color targets. Expand the shared state before
+/// disabling those targets so normalized/float attachments keep their effective blend state.
+fn normalize_integer_blend_targets(blend: &mut D3D12_BLEND_DESC, formats: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT]) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    let integer = |f: DXGI_FORMAT| matches!(f,
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT |
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT |
+        DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT |
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R10G10B10A2_UINT |
+        DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT |
+        DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT |
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT |
+        DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT);
+    let mut changed = false;
+    for (i, &format) in formats.iter().take(8).enumerate() {
+        let state = if blend.IndependentBlendEnable.as_bool() { i } else { 0 };
+        if !integer(format) || !blend.RenderTarget[state].BlendEnable.as_bool() { continue }
+        if !blend.IndependentBlendEnable.as_bool() {
+            let shared = blend.RenderTarget[0];
+            blend.RenderTarget.fill(shared);
+            blend.IndependentBlendEnable = true.into();
+        }
+        blend.RenderTarget[i].BlendEnable = false.into();
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod integer_blend_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn shared() -> D3D12_BLEND_DESC {
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(), SrcBlend: D3D12_BLEND_SRC_ALPHA,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA, BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE, DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD, LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        blend
+    }
+
+    #[test]
+    fn integer_blend_expands_shared_state_without_changing_float_targets() {
+        let mut b = shared();
+        let original = b.RenderTarget[0];
+        assert!(normalize_integer_blend_targets(&mut b, &[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8_UINT]));
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[0], original);
+        assert_eq!(b.RenderTarget[1], original);
+        let mut integer = original;
+        integer.BlendEnable = false.into();
+        assert_eq!(b.RenderTarget[2], integer);
+    }
+
+    #[test]
+    fn integer_blend_preserves_independent_states_and_inactive_slots() {
+        let mut b = shared();
+        b.IndependentBlendEnable = true.into();
+        b.RenderTarget[1] = b.RenderTarget[0];
+        b.RenderTarget[1].RenderTargetWriteMask = 1;
+        b.RenderTarget[2] = b.RenderTarget[0];
+        let original = b;
+        assert!(normalize_integer_blend_targets(&mut b, &[DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8G8B8A8_UNORM]));
+        assert!(!b.RenderTarget[0].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[1], original.RenderTarget[1]);
+        assert_eq!(b.RenderTarget[2], original.RenderTarget[2]);
+        assert!(!normalize_integer_blend_targets(&mut b, &[DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8G8B8A8_UNORM]));
+    }
+
+    #[test]
+    fn integer_blend_leaves_noninteger_and_disabled_states_unchanged() {
+        for formats in [vec![], vec![DXGI_FORMAT_R8G8B8A8_UNORM], vec![DXGI_FORMAT_UNKNOWN], vec![DXGI_FORMAT_R24_UNORM_X8_TYPELESS]] {
+            let mut b = shared();
+            let before = b;
+            assert!(!normalize_integer_blend_targets(&mut b, &formats));
+            assert_eq!(b, before);
+        }
+        let mut b = shared();
+        b.RenderTarget[0].BlendEnable = false.into();
+        let before = b;
+        assert!(!normalize_integer_blend_targets(&mut b, &[DXGI_FORMAT_R8_UINT]));
+        assert_eq!(b, before);
+    }
+
+    #[test]
+    fn integer_blend_stream_preserves_shader_bytes_and_other_subobjects() {
+        let mut stream = StreamOut::default();
+        let code = [0u8; 20];
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &code);
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &shared());
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &D3D12_RT_FORMAT_ARRAY {
+            RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN],
+            NumRenderTargets: 2,
+        });
+        let normalized = normalized_integer_blend_stream(&stream).expect("integer target requires independent state");
+        assert_eq!(normalized.shader_bytes(), code.len());
+        let before = stream_subobjects(&stream.0).unwrap();
+        let after = stream_subobjects(&normalized.0).unwrap();
+        for ((ty, a), (other, b)) in before.iter().zip(&after) {
+            assert_eq!(ty, other);
+            if *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND.0 as u32 {
+                let blend = unsafe { std::ptr::read_unaligned(b.as_ptr().cast::<D3D12_BLEND_DESC>()) };
+                assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+                assert!(!blend.RenderTarget[1].BlendEnable.as_bool());
+            } else {
+                assert_eq!(a, b);
+            }
+        }
+        assert!(normalized_integer_blend_stream(&normalized).is_none());
+    }
+
+    #[test]
+    fn gpu_integer_blend_mixed_targets_create_a_pipeline() {
+        use crate::gpu::recomp::{dxc, runner};
+        if dxc::location().is_err() { return runner::skip_test("no DXC") }
+        if super::super::backend() != super::super::Backend::Real { return runner::skip_test("no GPU") }
+        let vs = dxc::compile("float4 main(uint id : SV_VertexID) : SV_Position { return float4(id == 1 ? 1 : -1, id == 2 ? 1 : -1, 0, 1); }", "main", "vs_6_0", &[]).unwrap();
+        let ps = dxc::compile("struct O { float4 color : SV_Target0; uint tag : SV_Target2; }; O main() { O o; o.color = float4(1,0,0,0.5); o.tag = 3; return o; }", "main", "ps_6_0", &[]).unwrap();
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let mut sig = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+            let sig = sig.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(sig.GetBufferPointer().cast::<u8>(), sig.GetBufferSize())).unwrap();
+            let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            d.pRootSignature = std::mem::ManuallyDrop::new(Some(rs));
+            d.VS = bytecode(&vs);
+            d.PS = bytecode(&ps);
+            d.BlendState = shared();
+            d.SampleMask = u32::MAX;
+            d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            d.NumRenderTargets = 3;
+            d.RTVFormats[..3].copy_from_slice(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8_UINT]);
+            d.SampleDesc.Count = 1;
+            normalize_integer_blend_targets(&mut d.BlendState, &d.RTVFormats[..3]);
+            let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateGraphicsPipelineState")));
+            let mut pso = std::ptr::null_mut();
+            let hr = create(raw, (&d as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC).cast(), &pc_iid(Kind::PipelineState), &mut pso);
+            assert!(hr >= 0 && !pso.is_null(), "mixed float/integer pipeline rejected ({hr:#x})");
+            drop(ID3D12PipelineState::from_raw(pso));
+            let mut stream = StreamOut::default();
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &d.pRootSignature.as_ref().unwrap().as_raw());
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs);
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &shared());
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &d.PrimitiveTopologyType);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &D3D12_RT_FORMAT_ARRAY { RTFormats: d.RTVFormats, NumRenderTargets: d.NumRenderTargets });
+            let normalized = normalized_integer_blend_stream(&stream).unwrap();
+            let desc = [normalized.0.len(), normalized.0.as_ptr() as usize];
+            let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreatePipelineState")));
+            pso = std::ptr::null_mut();
+            let hr = create(raw, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut pso);
+            std::mem::ManuallyDrop::drop(&mut d.pRootSignature);
+            assert!(hr >= 0 && !pso.is_null(), "mixed float/integer stream rejected ({hr:#x})");
+            drop(ID3D12PipelineState::from_raw(pso));
+        }
+    }
+}
+
 /// A pipeline state stream being written: subobjects aligned as D3D12 expects
 /// (type, payload at 4 or 8, size rounded to 8).
 #[derive(Default)]
 struct StreamOut(Vec<u8>, usize);
+
+fn normalized_integer_blend_stream(stream: &StreamOut) -> Option<StreamOut> {
+    let subs = stream_subobjects(&stream.0)?;
+    let b = subs.iter().find(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND.0 as u32)?.1;
+    let rt = subs.iter().find(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS.0 as u32)?.1;
+    // These payloads are validated by stream_subobjects, but are only four-byte aligned.
+    let (mut blend, formats) = unsafe {
+        (std::ptr::read_unaligned(b.as_ptr().cast::<D3D12_BLEND_DESC>()),
+         std::ptr::read_unaligned(rt.as_ptr().cast::<D3D12_RT_FORMAT_ARRAY>()))
+    };
+    if !normalize_integer_blend_targets(&mut blend, &formats.RTFormats[..formats.NumRenderTargets.min(8) as usize]) { return None }
+    let offset = b.as_ptr() as usize - stream.0.as_ptr() as usize;
+    let mut out = StreamOut(stream.0.clone(), stream.1);
+    unsafe { std::ptr::write_unaligned(out.0.as_mut_ptr().add(offset).cast::<D3D12_BLEND_DESC>(), blend) };
+    Some(out)
+}
 
 impl StreamOut {
     fn raw(&mut self, ty: u32, payload: &[u8], align8: bool) {
@@ -5993,6 +6182,8 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
 unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let normalized = normalized_integer_blend_stream(stream);
+    let stream = normalized.as_ref().unwrap_or(stream);
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];

@@ -259,6 +259,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
   made up of complete native waves can use the per-lane form for branches on whole-wave masks.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **Mixed render targets:** translated graphics and two-pass mesh/geometry pipelines disable
+  blending on typed integer color targets, preserving blending on normalized and float targets.
+  Mixed float/integer pipelines are checked by a synthetic GPU test; this does not establish retail
+  gameplay support.
 - **CPU:** the console's Zen 2 instruction sets (SSE4.2, POPCNT, AVX, AVX2, FMA, F16C, BMI1,
   BMI2, LZCNT, MOVBE). `xcl run` refuses a CPU that lacks any of them, since the game would
   stop with an illegal instruction; set `XCL_SKIP_CPU_CHECK=1` to run anyway.
