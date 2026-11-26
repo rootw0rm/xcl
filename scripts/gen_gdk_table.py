@@ -10,6 +10,9 @@ src = io.open(sys.argv[1], encoding='utf-8').read()
 origin = re.search(r'Source\s*:\s*(\S+)', src)
 rows = re.findall(r'\w+\((\w+), "([0-9A-Fa-f-]{36})", "([0-9A-Fa-f-]{36})", (\d+)\)', src)
 assert rows, 'no rows'
+for name, _, _, slot in rows:
+    if int(slot) > 255:
+        sys.exit(f'{name}: slot {slot} does not fit in u8')
 hexg = lambda g: '0x' + g.replace('-', '').lower()
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'crates', 'xcl', 'src', 'hle', 'xgameruntime', 'gdk_table.rs')
 with io.open(OUT, 'w', encoding='utf-8', newline='\n') as f:
