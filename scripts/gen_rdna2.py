@@ -3,6 +3,8 @@
 Input:  amdgpu_isa_rdna2.xml from https://gpuopen.com/machine-readable-isa/ (MIT licence)
 Usage:  python -I scripts/gen_rdna2.py <path/to/amdgpu_isa_rdna2.xml> crates/xcl/src/gpu/rdna2_spec.rs
 
+Other or missing architectures are rejected before the output is opened.
+
 Only the "primary" encodings (condition "default") are emitted with operands; the
 literal / SDWA / DPP / NSA variants are derived at decode time from operand values,
 exactly as the hardware does. Instructions that *always* carry a literal (e.g.
@@ -26,7 +28,9 @@ def main(src, dst):
     root = ET.parse(src).getroot()
     doc = root.find("Document")
     isa = root.find("ISA")
-    arch = isa.find("Architecture").findtext("ArchitectureName")
+    arch = root.findtext("ISA/Architecture/ArchitectureName")
+    if arch != "AMD RDNA 2":
+        raise SystemExit(f"expected AMD RDNA 2 specification, got {arch!r}")
 
     encodings = []  # (name, bits, order, fixed_mask, fixed_value, fields, op_ranges)
     enc_index = {}
