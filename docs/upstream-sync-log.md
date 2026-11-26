@@ -1185,3 +1185,54 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-137 (task-1795728244-cdb4): #2886 triaged SKIP (dev-stack), probe past #2882
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2361 refs (+1 vs step-136), in-range set exactly
+  #2830..#2886 minus the known gaps — no refs >=2887 in batched;
+  sequential still ground truth. Per-PR sequential probe #2830..#3350
+  (widened past #2882 per mem-1795712765-78dc; three foreground chunks
+  2830..2930 + 2931..3050 + 3051..3350, no background tail left open)
+  found 42 PRESENT (#2830..#2886 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880
+  gaps), all 41 prior pins match (no force-push, #2872 pin `3893df0a` +
+  #2879 pin `63197e31` + #2881 pin `2c50cc71` + #2882 pin `3e8e2c43`
+  hold); #2887..#3350 ALL MISSING — scan complete, top is #2886.
+- Replication-lag note (per mem-1795714025-21a1, NOT builder fault):
+  #2886 tip `237b7181` committed 20:57:10 UTC, before the step-136
+  scans to #3300/#3320 that reported it MISSING — same handoff
+  treatment as #2873/#2875/#2877/#2878/#2879/#2881. Triaged in-window
+  now.
+- Triage (SKIP with hunk evidence): #2886 `237b7181` SKIP — NOT a
+  single-commit PR on `8b957bec`: parent `eae01502` is NOT in main
+  (exit 1) and `merge-base upstream/main 237b7181` = `5bec5877`
+  (ancestor of upstream/main, exit 0), i.e. a 1730-commit dev-branch
+  stack (`wm17/prs` merge train, 99 files +44225/-4056 vs merge-base)
+  with an old base — a whole-stack port is out of scope for the hourly
+  sync. Tip commit alone is 1 file +57/-6 (`gpu/uma.rs`):
+  `sparse_reserve` keeps reservations of at most one window inside a
+  single window (single-window `take_sparse_in(..., true)` probe before
+  the cross-window/all-space fallbacks) + `checked_next_multiple_of`
+  rounding + `sparse_reserve_keeps_single_window_reservations_inside_
+  one_window` regression test — whole `gpu/uma.rs` compiled only under
+  `#[cfg(windows)]` (`gpu/mod.rs`; Linux gets the constants-only stub),
+  and the only out-of-file `sparse_reserve` callers
+  (`hle/kernelx.rs`, `hle/kernelx/placeholders.rs`) are likewise
+  Windows-only (`lib.rs` gates real `hle` on `#[cfg(windows)]`,
+  Linux uses `hle_linux.rs`). Zero Linux consumers.
+  Earlier pins stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834
+  landed; #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed
+  verbatim in `aa59e8ac`; #2843-#2882 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step137r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
