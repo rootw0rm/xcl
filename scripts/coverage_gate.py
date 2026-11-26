@@ -61,7 +61,7 @@ def main(argv=None):
     ap.add_argument("--update", action="store_true", help="write the baseline from the sweep and exit 0")
     args = ap.parse_args(argv)
     if args.run_json:
-        run = json.loads(args.run_json.read_text(encoding="utf-8"))
+        run = json.loads(args.run_json.read_bytes())
     else:
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
