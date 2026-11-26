@@ -1641,13 +1641,11 @@ fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
 fn wake_sync_watchdog() {
     let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
-            let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
-            let guard = lock.lock().unwrap();
-            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
-                let _g = cv.wait(guard).unwrap();
+            let pair = SYNC_WATCHDOG_WAKE.get().unwrap();
+            let Some(guard) = sync_watchdog_sleep_if_idle(pair, &ARMED_GPU_WAITS, || {}) else {
                 continue;
-            }
-            let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            };
+            let _ = pair.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
@@ -1736,6 +1734,31 @@ fn wake_sync_watchdog() {
             }
         });
     });
+    notify_sync_watchdog(pair);
+}
+
+/// The watchdog's check for armed waits: none (`armed` is 0) – it sleeps until a
+/// `notify_sync_watchdog` and returns `None`; some – the pair's lock, still held. The lock is held
+/// from the check until `cv.wait` releases it; `after_check` runs in between (a test's pause).
+fn sync_watchdog_sleep_if_idle<'a>(
+    pair: &'a (Mutex<()>, Condvar),
+    armed: &AtomicUsize,
+    after_check: impl FnOnce(),
+) -> Option<std::sync::MutexGuard<'a, ()>> {
+    let guard = pair.0.lock().unwrap();
+    if armed.load(Ordering::Acquire) != 0 {
+        return Some(guard);
+    }
+    after_check();
+    let _g = pair.1.wait(guard).unwrap();
+    None
+}
+
+/// Wake the watchdog after a wait was armed. The notify takes the pair's lock: without it, it can
+/// fall between the watchdog's check (still 0) and its `cv.wait`, and the watchdog sleeps with the
+/// wait armed and never releases it (the lock is a leaf: the watchdog takes no other lock with it).
+fn notify_sync_watchdog(pair: &(Mutex<()>, Condvar)) {
+    let _g = pair.0.lock().unwrap();
     pair.1.notify_one();
 }
 
@@ -6931,6 +6954,43 @@ mod tests {
             sync_watchdog_pair(&WAKE, || seen.push(std::thread::spawn(|| WAKE.get().is_some()).join().unwrap()));
         }
         assert_eq!(seen, [true]);
+    }
+
+    /// A wait armed between the watchdog's check (no wait armed) and its `cv.wait` wakes it: the
+    /// watchdog pauses there (`after_check`) until the arm's notify is done, or 200 ms when the
+    /// notify waits for the lock. A notify that does not take the lock is lost there, and the
+    /// watchdog sleeps with the wait armed (no "did not complete" release).
+    #[test]
+    fn a_wait_armed_during_the_watchdogs_check_wakes_it() {
+        use std::sync::{mpsc, Arc};
+        let pair = Arc::new((Mutex::new(()), Condvar::new()));
+        let armed = Arc::new(AtomicUsize::new(0));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (notified_tx, notified_rx) = mpsc::channel::<()>();
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let (p, a) = (pair.clone(), armed.clone());
+        let watchdog = std::thread::spawn(move || {
+            let slept = sync_watchdog_sleep_if_idle(&p, &a, || {
+                checked_tx.send(()).unwrap();
+                let _ = notified_rx.recv_timeout(Duration::from_millis(200));
+            })
+            .is_none();
+            woke_tx.send(slept).unwrap();
+        });
+        checked_rx.recv().unwrap();
+        armed.fetch_add(1, Ordering::AcqRel);
+        notify_sync_watchdog(&pair);
+        // (the pause may be over already: then nobody receives this)
+        let _ = notified_tx.send(());
+        let woke = woke_rx.recv_timeout(Duration::from_secs(2));
+        if woke.is_err() {
+            // let the thread end before the test fails
+            pair.1.notify_one();
+        }
+        watchdog.join().unwrap();
+        assert_eq!(woke, Ok(true), "the watchdog slept through the arm's notify");
+        // a wait already armed: no sleep, the lock comes back
+        assert!(sync_watchdog_sleep_if_idle(&pair, &armed, || unreachable!()).is_some());
     }
 
     /// Submitting a DIRECT list with `Wait64BitValueX(va, >=, 0x677)` BEFORE submitting the
