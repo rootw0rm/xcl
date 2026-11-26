@@ -285,6 +285,20 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- To investigate a world-load pause, save a run's `xcl.log` with `XCL_ACTIVITY=1` (set by
+  `scripts/smoke.ps1`) and `XCL_PSO_TRACE=1` for full driver compile tracing. Run
+  `python scripts/world_load_stall.py path/to/xcl.log` on the saved file. It finds the final
+  run of zero-present samples after a sample with presents, up to the last sample before any
+  timed shutdown. It reports sampled submit, draw, dispatch and DirectStorage activity alongside
+  overlapping driver compiles and logged GPU wait events. Compile overlap counts concurrent
+  work once and shows possible additional overlap when a finish is missing. Without the trace
+  switch, XCL logs only huge driver compiles. The wait-before-signal bridge messages are capped.
+  The samples give a time window for investigation. Confirm the visible scene separately, and
+  use thread or queue diagnostics to determine what the title was waiting on.
+  If the log includes dumps from `XCL_THREAD_DUMP_AT`, add `--title-exe MyTitle.exe` to inspect the
+  latest dump after the last positive sample through the closing zero-present sample. The report
+  lists thread IDs and visible `xcl.exe` offsets above their first title frame. Use those sampled
+  candidates to investigate the pause. A short unwind can hide the title frame or XCL callers.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
