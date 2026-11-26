@@ -202,3 +202,30 @@ newest at the bottom.
   exactly XAsync/XNetworking/XUser — HOLDS (report.json verified, fresh
   root removed after; binary mtime verified newer than the source edit).
   Lock audit: 0 new `lock()` in the added code; `diff --check` clean.
+
+## 2026-11-26 — step-118 (task-1795714398-8c9c): empty scan, all pins re-verified
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0 — ZERO sync fallout.
+- Per-PR sequential probe `refs/pull/$i/head` #2832..#2930 (widened past
+  the first gap per mem-1795712765-78dc): #2832 `e2ecdfa9` /
+  #2833 `f5a352c3` / #2834 `653f8f13` / #2836 `43a4eb9d` /
+  #2837 `9d967cf8` / #2838 `ef36b7df` (all pins match, all still OPEN,
+  `merge-base` exit 1 each); #2835 MISSING; #2839..#2930 ALL MISSING —
+  scan complete. Nothing new beyond #2838 (ported in `aa59e8ac`).
+- Triage: nothing new. #2832 SKIP stands (d3d12x-only `pso_async`,
+  zero Linux twin refs); #2833/#2834 landed; #2836 adapted in `7645afeb`;
+  #2837 SKIP stands (Windows-only Dxgi/ID3D12Device test-only CI fix);
+  #2838 landed verbatim in `aa59e8ac`.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design, 24 `[FAIL]` lines = 12 unique, all `D3D12.X`,
+  0 non-GPU; retail fresh-root `XCL_DATA_ROOT=/tmp/xcl-step118-r`
+  exit 139 SIGSEGV `exe+0x2237320` fault `0x0` bytes `48 8b 03`
+  stubs 20 (all first_args) xgr exactly XAsync/XNetworking/XUser —
+  HOLDS (report.json verified, fresh root removed after). Out-of-gate
+  note: `launcher_e2e` shows the same 2 pre-existing platform-bug
+  failures as step-117 (`only_xcl_copy` asserts `xcl.exe`, Linux emits
+  `xcl`; plus `unreadable_shader_pack`) — untouched by this step.
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
