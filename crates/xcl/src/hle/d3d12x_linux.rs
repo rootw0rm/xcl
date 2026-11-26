@@ -14,6 +14,16 @@
 //! Vtable layout guess: public PC D3D12 order (DirectX-Headers). Every slot we do not
 //! implement is a logging stub named "<Interface>::#<slot>", so reports from real titles
 //! show exactly where the console layout differs.
+//!
+//! Slot-routing queue (M1 step-88 inventory, K-D3D-06 order; callers in
+//! `tests/testtitle/src/gpu.rs`, which reaches console slots by raw vtable
+//! index — the title has zero static d3d12 imports). Routed today: device
+//! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #11, Vulkan-list
+//! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148. Next unrouted slot: queue #30
+//! `PresentX` + device #78–#81 frame clock, consumer `present_x_frame`
+//! (`gpu.rs:312`) — the M1 first-frame gate, to route behind
+//! `XCL_VULKAN_BACKEND` (null stays default). No fake-success: the route must
+//! present a real frame or stay an honest logging stub.
 
 #![allow(non_snake_case)]
 
