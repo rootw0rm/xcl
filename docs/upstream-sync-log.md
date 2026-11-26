@@ -301,3 +301,47 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-121 (task-1795716023-7d79): #2843 triaged SKIP, all pins re-verified
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) + per-PR sequential probe #2830..#3040 (widened
+  past the first gap per mem-1795712765-78dc): #2830 `069292ca` /
+  #2831 `965806a0` / #2832 `e2ecdfa9` / #2833 `f5a352c3` /
+  #2834 `653f8f13` / #2836 `43a4eb9d` / #2837 `9d967cf8` /
+  #2838 `ef36b7df` / #2842 `344ce7b5` / #2843 `932e689c` (all pins
+  match, `merge-base --is-ancestor` exit 1 each; merge refs present for
+  all except #2832, which has no merge ref — still unmerged, not in
+  main); #2835, #2839..#2841, #2844..#3040 ALL MISSING — scan complete.
+  #2843 is new since step-120 (single commit "D3D12.X: title fence sync
+  entries own their ID3D12Fence (#2840)", head 2026-11-26 18:05:17 UTC,
+  parent = `upstream/main` `8b957bec` — a fresh PR, not a push-race).
+  The "(#2840)" in its title is an issue reference: `refs/pull/2840`
+  remains MISSING.
+- Triage: nothing portable. #2843 SKIP ("D3D12.X: title fence sync
+  entries own their ID3D12Fence", 2 files, +185/-20 in
+  `hle/d3d12x/list_x.rs` + `hle/d3d12x/real.rs`): `TitleFenceSync`
+  takes its own `ID3D12Fence` reference via the `windows` crate so
+  `prune_title_fence` never calls `GetCompletedValue` on a title-freed
+  fence; synthetic-COM-fence tests fail without the owned reference.
+  Windows-D3D12-only — `d3d12x` never compiles on Linux (`hle_linux.rs`
+  swaps in the null `d3d12x_linux` + Vulkan; zero `title_fence` /
+  `TitleFenceSync` / `SYNC_GRAPH` refs in `d3d12x_linux.rs` /
+  `hle_linux.rs`), no Linux consumer. Hunk context is the old shape in
+  our tree (`prune_title_fence(fence_raw, tf)` at `list_x.rs:1418`,
+  pool-less entry construction) but there is nothing to port it to.
+  Earlier pins stand: #2830/#2831/#2832 SKIP; #2833/#2834 landed;
+  #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim
+  in `aa59e8ac`.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step121-retail` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
