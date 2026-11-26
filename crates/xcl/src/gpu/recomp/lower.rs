@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use super::lane_masks::{self, Edge, Summary};
 use super::ssa::{Sink, Ssa, Var};
 use super::{KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
+use crate::gpu::dxil::lower::LOOP_BUDGET;
 use crate::gpu::rdna2::{self, Decoded, Variant};
 
 mod wave;
@@ -1261,22 +1262,46 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     // then for every coalesced guarded run (only the lanes with their EXEC bit enter): the run's
     // block and the one the rest of its block continues in. `tail[b]`: the IR block the
     // program's block b ends in.
-    let (exit, sstore, vstore, skip) = (n + 1, n + 2, n + 3, n + 4);
+    let mut rpo_pos = vec![usize::MAX; n];
+    for (pos, &b) in sum.order.iter().enumerate() {
+        rpo_pos[b] = pos;
+    }
+    let mut loop_header = vec![false; n];
+    for &b in &sum.order {
+        for &(s, _) in &sum.blocks[b].succ {
+            if rpo_pos[s] <= rpo_pos[b] {
+                loop_header[s] = true;
+            }
+        }
+    }
     let guarded: HashSet<u64> = sum.guarded.iter().copied().collect();
+    let mut budget_cont: Vec<Option<usize>> = vec![None; n];
     let mut splits: Vec<Vec<(std::ops::Range<usize>, usize, usize)>> = vec![Vec::new(); n]; // (run, body, cont)
-    let mut count = n + 5;
+    let mut count = n + 1;
     for (b, block) in sum.blocks.iter().enumerate() {
+        if loop_header[b] {
+            budget_cont[b] = Some(count);
+            count += 1;
+        }
         for run in coalesced_runs(insts, &block.insts, &guarded) {
             splits[b].push((run, count, count + 1));
             count += 2;
         }
     }
-    let tail: Vec<usize> = (0..n).map(|b| splits[b].last().map_or(blk(b), |s| s.2)).collect();
+    let (exit, sstore, vstore, skip) = (count, count + 1, count + 2, count + 3);
+    count += 4;
+    let body_start = |b: usize| budget_cont[b].unwrap_or(blk(b));
+    let tail: Vec<usize> = (0..n).map(|b| splits[b].last().map_or(body_start(b), |s| s.2)).collect();
     let mut partial = vec![false; count];
     let mut def_owner: Vec<usize> = (0..count).collect();
     let mut use_owner: Vec<usize> = (0..count).collect();
     for (b, p) in partial_blocks(&sum).into_iter().enumerate() {
         partial[blk(b)] = p;
+        if let Some(bc) = budget_cont[b] {
+            partial[bc] = p;
+            def_owner[bc] = blk(b);
+            use_owner[bc] = blk(b);
+        }
         for &(_, s, c) in &splits[b] {
             partial[s] = true;
             partial[c] = p;
@@ -1297,7 +1322,10 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
                 preds[blk(s)].push(tail[b]);
             }
         }
-        let mut prev = blk(b);
+        if let Some(bc) = budget_cont[b] {
+            preds[bc] = vec![blk(b)];
+        }
+        let mut prev = body_start(b);
         for &(_, s, c) in &splits[b] {
             preds[s] = vec![prev];
             preds[c] = vec![prev, s];
@@ -1311,7 +1339,12 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         preds[sstore] = vec![exit];
         preds[vstore] = vec![exit, sstore];
     }
-    preds[exit] = kernel.then_some(skip).into_iter().chain(ends.iter().map(|&b| tail[b])).collect();
+    preds[exit] = kernel
+        .then_some(skip)
+        .into_iter()
+        .chain(ends.iter().map(|&b| tail[b]))
+        .chain(sum.order.iter().copied().filter(|&b| loop_header[b]).map(blk))
+        .collect();
     for i in 0..count {
         let id = ir.new_block();
         debug_assert_eq!(id, i);
@@ -1363,6 +1396,8 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     // prologue: the SGPRs from `io` (kernel: the whole register file; compute: the user data)
     l.ir.at(0);
     l.ssa.seal(&mut l.ir, 0);
+    let budget = l.ir.int(LOOP_BUDGET);
+    l.ssa.write(0, Var::Budget, budget);
     let lane = l.lane();
     for &r in &sregs {
         let a = l.ir.int(r as u32);
@@ -1497,6 +1532,21 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         let last = block.insts.end - 1;
         let body_end = block_body_end(insts, &block.insts);
         let mut cur = ib;
+        if let Some(bc) = budget_cont[b] {
+            // cap a lane's loop iterations (matching emit.rs and dxil/kernel.rs LOOP_BUDGET)
+            let left = l.read(cur, Var::Budget);
+            let z = l.ir.int(0);
+            let exhausted = l.ir.icmp(Cmp::Eq, left, z);
+            l.ir.br_if(exhausted, exit, bc);
+            done[cur] = true;
+            l.ir.at(bc);
+            l.ssa.seal(&mut l.ir, bc);
+            sealed[bc] = true;
+            let one = l.ir.int(1);
+            let next = l.ir.bin(Bin::Sub, left, one);
+            l.ssa.write(bc, Var::Budget, next);
+            cur = bc;
+        }
         let mut split = splits[b].iter().peekable();
         let mut i = block.insts.start;
         while i < body_end {
@@ -1588,6 +1638,16 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         return l.finish(stale);
     };
     // kernel exit: every lane is here; masks the runner reads as numbers are the wave's ballots
+    let exit_stale = |l: &mut Lower<I>, var: Var, exit_v: I::V| -> bool {
+        if ends.is_empty() {
+            l.stale(exit, exit_v)
+        } else {
+            ends.iter().any(|&b| {
+                let v = l.read(tail[b], var);
+                l.stale(tail[b], v)
+            })
+        }
+    };
     let mut sval: Vec<(u8, I::V)> = Vec::new();
     let mut i = 0;
     while i < sregs.len() {
@@ -1596,7 +1656,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         let s = l.read(exit, Var::S(r));
         if l.ssa.resolve_value(s) != l.num_marker && !l.reaches(s, l.num_marker) {
             l.num_uses.push(s);
-            if l.stale(exit, s) {
+            if exit_stale(&mut l, Var::S(r), s) {
                 stale.push(r);
             }
             sval.push((r, s));
@@ -1610,7 +1670,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         }
         // read directly: a stale bit here is reported, not refused (only the ABI's store sees it)
         let m = l.read(exit, Var::M(r));
-        if r != EXEC && l.stale(exit, m) {
+        if r != EXEC && exit_stale(&mut l, Var::M(r), m) {
             stale.push(r);
             if l.wave64 {
                 stale.push(r + 1); // the upper half comes from the same mask
@@ -1627,7 +1687,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         }
     }
     let scc = l.read(exit, Var::Scc);
-    if l.stale(exit, scc) {
+    if exit_stale(&mut l, Var::Scc, scc) {
         stale.push(KERNEL_SCC_SLOT as u8);
     }
     let vval: Vec<(u16, I::V)> = vregs.iter().map(|&v| (v, l.read(exit, Var::V(v)))).collect();
@@ -1791,7 +1851,7 @@ impl<I: Ir> Lower<'_, I> {
                     let s = self.ir.icmp(Cmp::Ne, v, z);
                     self.write_scc(b, s);
                 }
-                Var::S(_) | Var::M(_) => {}
+                Var::S(_) | Var::M(_) | Var::Budget => {}
             }
         }
         if name.starts_with("V_") && !sw.is_empty() {
@@ -4572,5 +4632,22 @@ pub(crate) mod tests {
             return;
         }
         check_mem(true);
+    }
+
+    #[test]
+    fn infinite_loop_exits_at_loop_budget() {
+        let lines: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)]),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFFD)]),
+        ];
+        let (mut s, mut v) = state(32);
+        s[0] = 0;
+        s[126] = 1; // lane 0 active so the CPU interpreter finishes well within its step limit
+        v[0][1] = 0;
+        let (s, v) = run(lines, false, &s, &v);
+        assert_eq!(s[0], LOOP_BUDGET);
+        assert_eq!(v[0][1], LOOP_BUDGET);
     }
 }

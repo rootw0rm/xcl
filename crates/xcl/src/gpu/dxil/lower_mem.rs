@@ -9,7 +9,7 @@ use super::ops::AtomicOp;
 use super::lower_window::Ea;
 use super::shader::RawUav;
 use crate::gpu::rdna2::{self, Decoded};
-use crate::gpu::recomp::emit::buf_format_info;
+use crate::gpu::recomp::emit::{buf_format_info, BUF_FORMAT_32_32_UINT};
 use crate::gpu::recomp::{KERNEL_EXPORTS, KERNEL_LANES};
 
 /// Temporary SSA variables (merged across guarded blocks, never loaded / stored).
@@ -996,6 +996,35 @@ impl Lw {
         let s0 = self.cmpc(Pred::Eq, sel, 0);
         self.selc(s0, 0, v)
     }
+
+    /// A 32_32_UINT MUBUF XYZW store routes X and either Y or W into the two memory channels.
+    /// The observed routing depends on the first three selectors. Keep reserved selectors in order.
+    fn format_store_u32x2_select(&mut self, vals: &mut [Value; 4], d3: Value) {
+        let fmt = self.lshrc(d3, 12);
+        let fmt = self.andc(fmt, 0x7F);
+        let mut route = self.cmpc(Pred::Eq, fmt, BUF_FORMAT_32_32_UINT);
+        let [sx, sy, sz] = [0, 3, 6].map(|shift| {
+            let bits = self.lshrc(d3, shift);
+            self.andc(bits, 7)
+        });
+        for sel in [sx, sy, sz] {
+            let kind = self.andc(sel, 6);
+            let valid = self.cmpc(Pred::Ne, kind, 2);
+            route = self.land(route, valid);
+        }
+        let y_is_channel = self.cmpc(Pred::UGe, sy, 4);
+        let z_is_channel = self.cmpc(Pred::UGe, sz, 4);
+        let z_is_constant = self.lnot(z_is_channel);
+        let use_y = self.land(y_is_channel, z_is_constant);
+        let second = self.sel(use_y, vals[1], vals[3]);
+        let x_not_selected = self.cmpc(Pred::Ne, sx, 4);
+        let either_is_channel = self.lor(y_is_channel, z_is_channel);
+        let reverse = self.land(x_not_selected, either_is_channel);
+        let first = self.sel(reverse, second, vals[0]);
+        let last = self.sel(reverse, vals[0], second);
+        vals[0] = self.sel(route, first, vals[0]);
+        vals[1] = self.sel(route, last, vals[1]);
+    }
     fn fmt_encode(&mut self, x: Value, info: Value, c: u32) -> Value {
         let ty = self.lshrc(info, 3);
         let ty = self.andc(ty, 7);
@@ -1535,6 +1564,9 @@ impl Lw {
                     let mut out = [z; 4];
                     for (i, slot) in out.iter_mut().enumerate().take(count as usize) {
                         *slot = self.vreg(vdata + i as u64);
+                    }
+                    if d.enc.name == "ENC_MUBUF" && name == "buffer_store_format_xyzw" {
+                        self.format_store_u32x2_select(&mut out, d3);
                     }
                     out
                 };

@@ -100,7 +100,7 @@ impl DxilIr {
     fn ty(&mut self, var: Var) -> crate::gpu::dxil::module::Ty {
         match var {
             Var::M(_) | Var::Scc => self.lw.s.m.i1(),
-            Var::S(_) | Var::V(_) => self.lw.s.m.i32(),
+            Var::S(_) | Var::V(_) | Var::Budget => self.lw.s.m.i32(),
         }
     }
 
@@ -267,6 +267,7 @@ impl Ir for DxilIr {
             Var::V(n) => VAR_VGPR + n as u32,
             Var::Scc => VAR_SCC,
             Var::M(_) => unreachable!("a lane-bit view is not a register"),
+            Var::Budget => unreachable!("loop budget is not a register"),
         };
         for &(v, x) in inputs {
             self.lw.wr(var(v), x);

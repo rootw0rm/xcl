@@ -24,6 +24,8 @@ pub enum Var {
     M(u8),
     V(u16),
     Scc,
+    /// remaining loop-header iterations for this lane (`i32`)
+    Budget,
 }
 
 /// What the construction needs from the module builder.

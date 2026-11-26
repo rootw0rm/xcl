@@ -411,7 +411,20 @@ struct Block {
     has_exit: bool,
 }
 
-fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePlanTable) -> Vec<Regs> {
+/// Pixel VALU mask writes and scalar saveexec/wrexec write one dword in
+/// XCL's wave32 lowering. The instruction tables describe their wave64 pairs.
+/// Dropping a neighboring kill is conservative if two destinations touch.
+fn liveness_uses(d: &Decoded, table: &UsePlanTable, wave64: bool) -> (Regs, Regs) {
+    let (whole, written) = uses_with_table(d, table);
+    let name = d.inst.name;
+    if !wave64 && (name.starts_with("V_") || name.contains("SAVEEXEC") || name.contains("WREXEC")) {
+        (whole, written & !(written << 1))
+    } else {
+        (whole, written)
+    }
+}
+
+fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePlanTable, wave64: bool) -> Vec<Regs> {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
     let at_end = if end_reads_all { ALL } else { EXEC };
     let succ: Vec<Option<Vec<usize>>> = insts
@@ -442,7 +455,7 @@ fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePl
         .iter()
         .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
         .collect();
-    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(|d| uses_with_table(d, table)).collect();
+    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(|d| liveness_uses(d, table, wave64)).collect();
     let mut live_in = vec![0 as Regs; insts.len()];
     let mut live_out = vec![0 as Regs; insts.len()];
     loop {
@@ -528,13 +541,17 @@ fn nested_loop_ranges(mut raw: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 /// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    whole_live_out_for_width(insts, end_reads_all, true)
+}
+
+fn whole_live_out_for_width(insts: &[Decoded], end_reads_all: bool, wave64: bool) -> Vec<Regs> {
     let n = insts.len();
     if n == 0 {
         return Vec::new();
     }
     let table = use_plans();
     if !insts.windows(2).all(|w| w[0].pc < w[1].pc) {
-        return whole_live_out_unsorted(insts, end_reads_all, table);
+        return whole_live_out_unsorted(insts, end_reads_all, table, wave64);
     }
 
     let at_end = if end_reads_all { ALL } else { EXEC };
@@ -602,7 +619,7 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
     }
     let num_blocks = block_starts.len();
 
-    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(|d| uses_with_table(d, table)).collect();
+    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(|d| liveness_uses(d, table, wave64)).collect();
 
     // Summarize each basic block: because `(X & !k) | X == X` for bitmasks, the constant
     // per-block `left | EXEC` term collapses out of the intra-block composition into:
@@ -756,6 +773,22 @@ pub fn by_pc(insts: &[Decoded], end_reads_all: bool) -> BTreeMap<u64, Regs> {
     insts.iter().map(|d| d.pc).zip(whole_live_out(insts, end_reads_all)).collect()
 }
 
+/// Bit n blocks a local ballot for a mask written at SGPR n. Keep the original
+/// pair-wide admission rule. A Wave32 pixel mask also needs the full ballot
+/// when its actual single output word can still be observed as a whole.
+pub fn full_mask_destinations(insts: &[Decoded], end_reads_all: bool, wave64: bool) -> BTreeMap<u64, Regs> {
+    let mut blocked = whole_live_out(insts, end_reads_all);
+    for bits in &mut blocked {
+        *bits |= *bits >> 1;
+    }
+    if !wave64 {
+        for (veto, actual) in blocked.iter_mut().zip(whole_live_out_for_width(insts, end_reads_all, false)) {
+            *veto |= actual;
+        }
+    }
+    insts.iter().map(|d| d.pc).zip(blocked).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,6 +890,38 @@ mod tests {
     const CMP_S20: I = ("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", V + 1)]);
     const BCNT_S20: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 20)]);
     const BCNT_VCC: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+
+    #[test]
+    fn wave32_carry_into_s20_preserves_a_whole_read_of_s21() {
+        let carry = |dst| rdna2::encode("V_ADD_CO_U32", "VOP3_SDST_ENC",
+            &[("VDST", 3), ("SDST", dst), ("SRC0", 193), ("SRC1", V + 2)], None).unwrap();
+        let mut code = carry(21);
+        code.extend(carry(20));
+        code.extend(rdna2::encode("V_BCNT_U32_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 21), ("SRC1", 128)], None).unwrap());
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let p = program(&code);
+        assert_ne!(full_mask_destinations(&p, false, false)[&p[0].pc] & (1 << 21), 0);
+        assert_eq!(liveness_uses(&p[1], use_plans(), true).1, 3 << 20);
+        assert_eq!(liveness_uses(&p[1], use_plans(), false).1, 1 << 20);
+
+        // A neighbor live across a second write to s20 did not observe s20.
+        // An unconditional branch makes the read a distinct successor block.
+        let mut other = carry(20);
+        other.extend(carry(20));
+        other.extend(rdna2::encode("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)], None).unwrap());
+        other.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        other.extend(rdna2::encode("V_BCNT_U32_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 21), ("SRC1", 128)], None).unwrap());
+        other.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let q = program(&other);
+        assert_ne!(whole_live_out_for_width(&q, false, false)[0] & (1 << 21), 0);
+        let blocked = full_mask_destinations(&q, false, false);
+        assert_eq!(blocked[&q[0].pc] & (1 << 20), 0);
+        assert_ne!(blocked[&q[1].pc] & (1 << 20), 0, "retain the original conservative refusal");
+
+        // An actual scalar pair write still kills both words at either width.
+        let scalar = asm(&[("S_MOV_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128)])]);
+        assert_eq!(liveness_uses(&scalar[0], use_plans(), false).1, 3 << 20);
+    }
 
     // review findings: writes that are not full overwrites, reads the operand tables miss
 

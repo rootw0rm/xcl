@@ -123,13 +123,11 @@ fn changes(d: &Decoded) -> (u128, bool) {
                 regs |= pair(r, dwords);
             }
         }
-        // VOPC SDWA with SD=1 writes SDST from its extension word rather than VCC.
+        // an SDWA compare with SD set writes the pair in the extension dword's SDST (125: none)
         if d.variant == rdna2::Variant::Sdwa {
-            if let Some(e) = super::lower::ext_encoding(d) {
-                if rdna2::field_value(e, &d.words, "SD") == Some(1) {
-                    if let Some(r) = rdna2::field_value(e, &d.words, "SDST").filter(|&r| r < 128 && r != 125) {
-                        regs |= pair(r, 2);
-                    }
+            if let Some(e) = super::lower::ext_encoding(d).filter(|e| rdna2::field_value(e, &d.words, "SD") == Some(1)) {
+                if let Some(r) = rdna2::field_value(e, &d.words, "SDST").filter(|&r| r < 125) {
+                    regs |= pair(r, 2);
                 }
             }
         }
@@ -318,6 +316,37 @@ mod tests {
         for k in [read, vmov, cmp] {
             assert_eq!(loads(&[LOAD, k, LOAD, END]), [(0, false), (2, true)], "{}", k.0);
         }
+    }
+
+    #[test]
+    fn an_sdwa_compare_into_an_sgpr_pair_ends_it() {
+        // v_cmp_lt_f32_sdwa s[x:x+1], v1, v2 (SD = 1): the SDST is in the extension dword, not in
+        // the base words
+        let code = |sdst: u32| -> Vec<u8> {
+            let mut v = Vec::new();
+            for i in [LOAD] {
+                v.extend(rdna2::encode(i.0, i.1, i.2, None).unwrap());
+            }
+            for w in [0x7c02_04f9u32, 0x0606_8001 | sdst << 8] {
+                v.extend(w.to_le_bytes());
+            }
+            for i in [LOAD, END] {
+                v.extend(rdna2::encode(i.0, i.1, i.2, None).unwrap());
+            }
+            v
+        };
+        let avail = |sdst: u32| {
+            let c = Cfg::build(&code(sdst)).unwrap();
+            let mut v: Vec<(usize, bool)> = analyze(&c).at.iter().map(|(&(_, i), l)| (i, l.available)).collect();
+            v.sort();
+            v
+        };
+        // the base is s[4:5]: a write of s4 or of s[3:4] reaches it, one of s[6:7] does not
+        assert_eq!(avail(4), [(0, false), (2, false)]);
+        assert_eq!(avail(5), [(0, false), (2, false)]);
+        assert_eq!(avail(6), [(0, false), (2, true)]);
+        // SDST = 125 (null) writes nothing
+        assert_eq!(avail(125), [(0, false), (2, true)]);
     }
 
     #[test]
