@@ -51,30 +51,58 @@ struct Arena<H> {
 struct Arenas<H> {
     list: Vec<Arena<H>>,
     next_id: u64,
+    last_sweep: Vec<(usize, std::time::Instant)>,
 }
 
 impl<H: Clone> Arenas<H> {
     const fn new() -> Self {
-        Arenas { list: Vec::new(), next_id: 0 }
+        Arenas { list: Vec::new(), next_id: 0, last_sweep: Vec::new() }
+    }
+
+    fn record_sweep(&mut self, dev: usize, now: std::time::Instant) {
+        if !self.list.iter().any(|a| a.dev == dev) {
+            self.last_sweep.retain(|&(d, _)| d != dev);
+            return;
+        }
+        if let Some((_, t)) = self.last_sweep.iter_mut().find(|(d, _)| *d == dev) {
+            *t = now;
+        } else {
+            self.last_sweep.push((dev, now));
+        }
     }
 
     /// Return expired heaps for `dev` (preserving insertion order) to retire/drop outside `ARENAS.lock()`.
     fn sweep_dropped_for(&mut self, dev: usize, now: std::time::Instant) -> Vec<H> {
         let is_expired = |a: &Arena<H>| a.dev == dev && a.users == 0 && a.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE);
-        if !self.list.iter().any(is_expired) {
+        let dropped = if self.list.iter().any(is_expired) {
+            let mut dropped = Vec::new();
+            let mut kept = Vec::with_capacity(self.list.len());
+            for a in self.list.drain(..) {
+                if is_expired(&a) {
+                    dropped.push(a.heap);
+                } else {
+                    kept.push(a);
+                }
+            }
+            self.list = kept;
+            dropped
+        } else {
+            Vec::new()
+        };
+        self.record_sweep(dev, now);
+        dropped
+    }
+
+    /// Throttled `sweep_dropped_for` for `before_execute` when `PAGES` has no active entry for `dev`.
+    fn sweep_dropped_for_if_due(&mut self, dev: usize, now: std::time::Instant, interval: std::time::Duration) -> Vec<H> {
+        if !self.list.iter().any(|a| a.dev == dev) {
+            self.last_sweep.retain(|&(d, _)| d != dev);
             return Vec::new();
         }
-        let mut dropped = Vec::new();
-        let mut kept = Vec::with_capacity(self.list.len());
-        for a in self.list.drain(..) {
-            if is_expired(&a) {
-                dropped.push(a.heap);
-            } else {
-                kept.push(a);
-            }
+        if self.last_sweep.iter().any(|&(d, t)| d == dev && now.duration_since(t) < interval) {
+            return Vec::new();
         }
-        self.list = kept;
-        dropped
+        self.sweep_dropped_for(dev, now)
     }
 
     /// Place `bytes` at `va` (`align`) on `dev`; returns `(placement, expired_heaps)` without dropping inside `ARENAS.lock()`.
@@ -114,6 +142,7 @@ impl<H: Clone> Arenas<H> {
 unsafe impl Send for Arenas<ID3D12Heap> {}
 
 static ARENAS: Mutex<Arenas<ID3D12Heap>> = Mutex::new(Arenas::new());
+static ARENA_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// resource → its arena's id
 static ARENA_OF: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
 /// bytes of every arena made
@@ -1775,8 +1804,13 @@ fn forget_pages(resource: usize, held: bool) -> Option<RecycleInfo> {
     None
 }
 
-/// Reclaimed heaps waiting for `unmap_mark` (if any) and every live queue's fence mark on one device.
-struct RetiringBatch<H, F> { heaps: Vec<H>, unmap_mark: Option<(F, u64)>, marks: Vec<(F, u64)> }
+/// D3D12 returns `u64::MAX` from `GetCompletedValue()` after device removal; never treat it as completed.
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Reclaimed heaps waiting for `unmap_mark` (if any) and every live queue's fence mark (`None` = unarmed).
+struct RetiringBatch<H, F> { heaps: Vec<H>, unmap_mark: Option<(F, u64)>, marks: Option<Vec<(F, u64)>> }
 
 /// Per-device multi-queue retirement state (`H` = heap, `F` = fence; pure-CPU types in tests).
 struct RetireQueue<H, F> { fences: std::collections::HashMap<usize, (F, u64)>, batches: Vec<RetiringBatch<H, F>> }
@@ -1784,31 +1818,53 @@ struct RetireQueue<H, F> { fences: std::collections::HashMap<usize, (F, u64)>, b
 impl<H, F: Clone> RetireQueue<H, F> {
     fn new() -> Self { Self { fences: std::collections::HashMap::new(), batches: Vec::new() } }
 
-    /// Seal `heaps` behind `unmap_mark` and one fence signal per queue (signaled BEFORE queueing).
-    /// Returns `heaps` immediately when zero marks were signaled and `unmap_mark` is `None`.
-    fn retire_with<Q>(&mut self, heaps: Vec<H>, unmap_mark: Option<(F, u64)>, queues: &[(usize, Q)], mut make_fence: impl FnMut() -> Option<F>, mut signal: impl FnMut(&Q, &F, u64) -> bool) -> Vec<H> {
-        if heaps.is_empty() { return Vec::new(); }
+    /// Signal one fence mark on every queue in `queues`; returns `None` if ANY queue fails
+    /// `make_fence` or `signal` (keeping `*v` monotonic for any queue already signaled).
+    fn capture_marks<Q>(&mut self, queues: &[(usize, Q)], mut make_fence: impl FnMut() -> Option<F>, mut signal: impl FnMut(&Q, &F, u64) -> bool) -> Option<Vec<(F, u64)>> {
         let mut marks = Vec::with_capacity(queues.len());
         for (k, q) in queues {
             let (f, v) = match self.fences.entry(*k) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => { let Some(f) = make_fence() else { continue }; e.insert((f, 0)) }
+                std::collections::hash_map::Entry::Vacant(e) => { let f = make_fence()?; e.insert((f, 0)) }
             };
-            if signal(q, f, *v + 1) { *v += 1; marks.push((f.clone(), *v)); }
+            if !signal(q, f, *v + 1) { return None; }
+            *v += 1;
+            marks.push((f.clone(), *v));
         }
-        if marks.is_empty() && unmap_mark.is_none() { return heaps; }
+        Some(marks)
+    }
+
+    /// Seal `heaps` behind `unmap_mark` and one fence signal per queue (signaled BEFORE queueing).
+    /// Returns `heaps` immediately only when `queues` is empty and `unmap_mark` is `None`; on any
+    /// live-queue fence/signal failure, queues the batch unarmed (`marks: None`) to fail closed.
+    fn retire_with<Q>(&mut self, heaps: Vec<H>, unmap_mark: Option<(F, u64)>, queues: &[(usize, Q)], make_fence: impl FnMut() -> Option<F>, signal: impl FnMut(&Q, &F, u64) -> bool) -> Vec<H> {
+        if heaps.is_empty() { return Vec::new(); }
+        if queues.is_empty() && unmap_mark.is_none() { return heaps; }
+        let marks = self.capture_marks(queues, make_fence, signal);
         self.batches.push(RetiringBatch { heaps, unmap_mark, marks });
         Vec::new()
+    }
+
+    /// Re-arm all unarmed (`marks: None`) batches with one shared `capture_marks` pass across `queues`.
+    fn retry_unarmed_with<Q>(&mut self, queues: &[(usize, Q)], make_fence: impl FnMut() -> Option<F>, signal: impl FnMut(&Q, &F, u64) -> bool) {
+        if queues.is_empty() || !self.batches.iter().any(|b| b.marks.is_none()) { return; }
+        if let Some(marks) = self.capture_marks(queues, make_fence, signal) {
+            for b in &mut self.batches {
+                if b.marks.is_none() { b.marks = Some(marks.clone()); }
+            }
+        }
     }
 
     /// Reap completed batches and prune dead-queue fences once completed; caller drops outside locks.
     fn sweep_with(&mut self, live_queues: &HashSet<usize>, mut completed: impl FnMut(&F) -> u64) -> (Vec<RetiringBatch<H, F>>, Vec<F>) {
         let (mut done, mut kept) = (Vec::new(), Vec::new());
         for b in std::mem::take(&mut self.batches) {
-            if b.unmap_mark.as_ref().is_none_or(|(f, v)| completed(f) >= *v) && b.marks.iter().all(|(f, v)| completed(f) >= *v) { done.push(b); } else { kept.push(b); }
+            let ready = b.unmap_mark.as_ref().is_none_or(|(f, v)| fence_reached(completed(f), *v))
+                && b.marks.as_ref().is_some_and(|ms| ms.iter().all(|(f, v)| fence_reached(completed(f), *v)));
+            if ready { done.push(b); } else { kept.push(b); }
         }
         self.batches = kept;
-        let stale: Vec<usize> = self.fences.iter().filter(|(k, (f, v))| !live_queues.contains(k) && completed(f) >= *v).map(|(&k, _)| k).collect();
+        let stale: Vec<usize> = self.fences.iter().filter(|(k, (f, v))| !live_queues.contains(k) && fence_reached(completed(f), *v)).map(|(&k, _)| k).collect();
         let pruned = stale.into_iter().filter_map(|k| self.fences.remove(&k).map(|(f, _)| f)).collect();
         (done, pruned)
     }
@@ -1850,7 +1906,10 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
         let before = rq.batches.len();
-        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
+        let mut mk = || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok();
+        let mut sig = |q: &ID3D12CommandQueue, f: &ID3D12Fence, v: u64| q.Signal(f, v).is_ok();
+        rq.retry_unarmed_with(&queues, &mut mk, &mut sig);
+        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, &mut mk, &mut sig);
         let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
         (immediate, done, pruned)
@@ -2085,7 +2144,13 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         }
     }
     if do_reclaim {
-        newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
+        let mut arenas = ARENAS.lock().unwrap();
+        newly_reclaimed.extend(arenas.sweep_dropped_for(dev_key, now));
+        ARENA_COUNT.store(arenas.list.len(), std::sync::atomic::Ordering::Release);
+    } else if ARENA_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        let mut arenas = ARENAS.lock().unwrap();
+        newly_reclaimed.extend(arenas.sweep_dropped_for_if_due(dev_key, now, std::time::Duration::from_secs(1)));
+        ARENA_COUNT.store(arenas.list.len(), std::sync::atomic::Ordering::Release);
     }
     if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
@@ -2304,7 +2369,12 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
     let dev_key = dev.as_raw() as usize;
-    let (taken, expired) = ARENAS.lock().unwrap().take_for(dev_key, va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align));
+    let (taken, expired) = {
+        let mut arenas = ARENAS.lock().unwrap();
+        let r = arenas.take_for(dev_key, va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align));
+        ARENA_COUNT.store(arenas.list.len(), std::sync::atomic::Ordering::Release);
+        r
+    };
     if !expired.is_empty() {
         retire_heaps_and_sweep(dev, dev_key, expired, None, None);
     }
@@ -2753,6 +2823,72 @@ mod tests {
         assert_eq!((done[0].heaps.as_slice(), pruned.len(), rq.batches.is_empty()), (&[202][..], 1, true));
         assert!(Arc::ptr_eq(&pruned[0], &qf[&4]));
         assert_eq!(rq.retire_with(vec![303], None, &[] as &[(usize, usize)], mk, |_, _, _| true), vec![303]);
+    }
+
+    #[test]
+    fn retire_queue_fails_closed_on_fence_or_signal_failure_and_recovers() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let mut rq = RetireQueue::<u32, Arc<AtomicU64>>::new();
+        let mut qf: std::collections::HashMap<usize, Arc<AtomicU64>> = std::collections::HashMap::new();
+        let mk = || Some(Arc::new(AtomicU64::new(0)));
+        // All-fail with unmap_mark=None holds heaps unarmed instead of dropping them immediately.
+        assert!(rq.retire_with(vec![101], None, &[(1, 1usize)], || None, |_, _, _| true).is_empty());
+        // Partial 1-of-2 failure keeps queue 1's monotonic counter and holds heaps unarmed even after queue 1 completes.
+        assert!(rq.retire_with(vec![202], None, &[(1, 1usize), (2, 2)], mk, |q, f, _| { qf.entry(*q).or_insert_with(|| f.clone()); *q == 1 }).is_empty());
+        qf[&1].store(1, Ordering::SeqCst);
+        let live: HashSet<usize> = [1, 2].into_iter().collect();
+        assert!(rq.sweep_with(&live, |f| f.load(Ordering::SeqCst)).0.is_empty());
+        // Armed batch queued behind unarmed batches still reaps (no HOL blocking) while unarmed batches stay held.
+        assert!(rq.retire_with(vec![303], None, &[(1, 1usize), (2, 2)], mk, |q, f, _| { qf.entry(*q).or_insert_with(|| f.clone()); true }).is_empty());
+        qf[&1].store(2, Ordering::SeqCst);
+        qf[&2].store(1, Ordering::SeqCst);
+        let (done, _) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert_eq!((done.len(), done[0].heaps.as_slice(), rq.batches.len()), (1, &[303][..], 2));
+        // One retry_unarmed_with call captures fresh marks once (advancing Q1->3, Q2->2) and arms both unarmed batches.
+        let mut sigs = 0usize;
+        rq.retry_unarmed_with(&[(1, 1usize), (2, 2)], mk, |_, _, _| { sigs += 1; true });
+        assert_eq!(sigs, 2);
+        assert!(rq.sweep_with(&live, |f| f.load(Ordering::SeqCst)).0.is_empty());
+        qf[&1].store(3, Ordering::SeqCst);
+        qf[&2].store(2, Ordering::SeqCst);
+        let (done, _) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert_eq!((done.len(), done[0].heaps.as_slice(), done[1].heaps.as_slice(), rq.batches.is_empty()), (2, &[101][..], &[202][..], true));
+    }
+
+    #[test]
+    fn retire_queue_rejects_device_removed_sentinel() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        assert!(!fence_reached(u64::MAX, 0) && !fence_reached(u64::MAX, 1) && fence_reached(1, 1));
+        let mut rq = RetireQueue::<u32, Arc<AtomicU64>>::new();
+        let (unmap_f, qf) = (Arc::new(AtomicU64::new(u64::MAX)), Arc::new(AtomicU64::new(u64::MAX)));
+        assert!(rq.retire_with(vec![101], Some((unmap_f.clone(), 1)), &[(1, 1usize)], || Some(qf.clone()), |_, _, _| true).is_empty());
+        let (done, pruned) = rq.sweep_with(&HashSet::new(), |f| f.load(Ordering::SeqCst));
+        assert!(done.is_empty() && pruned.is_empty() && rq.fences.contains_key(&1));
+        unmap_f.store(1, Ordering::SeqCst);
+        qf.store(1, Ordering::SeqCst);
+        let (done, pruned) = rq.sweep_with(&HashSet::new(), |f| f.load(Ordering::SeqCst));
+        assert_eq!((done.len(), pruned.len(), rq.batches.is_empty()), (1, 1, true));
+    }
+
+    #[test]
+    fn arenas_sweep_dropped_for_if_due_reclaims_without_pages() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(1);
+        let mut arenas: Arenas<u32> = Arenas::new();
+        let id1 = arenas.take_for(1, 0x10_0000, PAGE, PAGE, t0, |_, _| Some(101)).0.unwrap().2;
+        let id2 = arenas.take_for(2, 0x10_0000, PAGE, PAGE, t0, |_, _| Some(202)).0.unwrap().2;
+        arenas.release(id1, t0);
+        arenas.release(id2, t0);
+        // First call sweeps (not yet expired) and records last_sweep for dev 1 only.
+        assert!(arenas.sweep_dropped_for_if_due(1, t0 + Duration::from_millis(1500), interval).is_empty());
+        assert_eq!(arenas.last_sweep.len(), 1);
+        // Within 1 s interval: throttled even after IDLE has elapsed.
+        assert!(arenas.sweep_dropped_for_if_due(1, t0 + Duration::from_millis(2200), interval).is_empty());
+        // Once interval elapses past IDLE: dev 1 reclaims and prunes last_sweep; dev 2 stays intact.
+        assert_eq!(arenas.sweep_dropped_for_if_due(1, t0 + Duration::from_millis(2500), interval), vec![101]);
+        assert!(arenas.last_sweep.is_empty() && arenas.bytes() == PAGE);
+        assert_eq!(arenas.sweep_dropped_for_if_due(2, t0 + Duration::from_millis(2500), interval), vec![202]);
+        assert!(arenas.last_sweep.is_empty() && arenas.bytes() == 0);
     }
 
     #[test]
