@@ -6,6 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+/// The last `n` lines of `s`, for an assertion message.
+const TAIL: usize = 40;
+
+fn tail(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
 use std::process::Command;
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -330,10 +337,23 @@ fn title_under_the_debug_layer(dred: bool) {
     let out = cmd.output().expect("spawn xcl");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit code {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}", out.status.code());
-    assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end:\n{stdout}\n--- stderr ---\n{stderr}");
-    let log = std::fs::read_to_string(data.join("XCL.TestTitle").join("logs").join("xcl.log")).unwrap();
-    assert!(log.contains("D3D12: debug layer enabled"), "the debug layer did not come up");
+    let log = std::fs::read_to_string(data.join("XCL.TestTitle").join("logs").join("xcl.log")).unwrap_or_default();
+    assert!(
+        out.status.success(),
+        "exit code {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- xcl.log, last {TAIL} lines ---\n{}",
+        out.status.code(),
+        tail(&log, TAIL)
+    );
+    assert!(
+        stdout.contains("xcl_testtitle: done, failures: 0"),
+        "the test title did not run to the end (exit {:?}):\n\
+         --- xcl stdout ---\n{stdout}\n\
+         --- xcl stderr ---\n{stderr}\n\
+         --- xcl.log, last {TAIL} lines ---\n{}",
+        out.status.code(),
+        tail(&log, TAIL)
+    );
+    assert!(log.contains("D3D12: debug layer enabled"), "the debug layer did not come up:\n{}", tail(&log, TAIL));
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("No root signature has been set")).collect();
     assert!(bad.is_empty(), "{} draws without a root signature, first: {}", bad.len(), bad[0]);
     // CopyMemoryToMemoryX within one window (console_list_methods) reads a buffer in COPY_SOURCE (#958)
