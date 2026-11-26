@@ -5416,6 +5416,16 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
     pc::<QueryFn>(this, PC_BEGIN_QUERY)(this, heap, ty, index);
 }
 
+#[cfg(test)]
+pub(super) fn forced_visible_for_test(heap: usize, index: u32) -> bool {
+    VISIBLE.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&(heap, index)))
+}
+
+#[cfg(test)]
+pub(super) fn forget_list_for_test(list: *mut c_void) {
+    LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+}
+
 /// command list #29 EndQuery(heap, type, index) (PC #53)
 pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     if ty != D3D12_QUERY_TYPE_TIMESTAMP {

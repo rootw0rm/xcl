@@ -1937,6 +1937,11 @@ pub fn is_pending(pso: usize) -> bool {
 
 /// A call with `pso` was put off to the submit, which will wait for it: its build goes before the
 /// workers' queue, as a wanted one.
+
+/// `pso` is a stand-in with no real pipeline: still being built, or its build failed (it draws nothing).
+pub fn is_stand_in(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.state.lock().unwrap().real == 0)
+}
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
