@@ -257,3 +257,47 @@ newest at the bottom.
   (flag is not the launcher convention) — redone with `XCL_DATA_ROOT`
   per the launcher contract; the stray empty temp root was removed.
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-120 (task-1795715310-4af0): #2830/#2831/#2842 triaged, all SKIP
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) + per-PR sequential probe #2830..#2970 (widened
+  past the first gap per mem-1795712765-78dc): #2830 `069292ca` /
+  #2831 `965806a0` / #2832 `e2ecdfa9` / #2833 `f5a352c3` /
+  #2834 `653f8f13` / #2836 `43a4eb9d` / #2837 `9d967cf8` /
+  #2838 `ef36b7df` / #2842 `344ce7b5` (all pins match, all still OPEN,
+  `merge-base --is-ancestor` exit 1 each); #2835, #2839..#2841,
+  #2843..#2970 ALL MISSING — scan complete. #2830/#2831 sit below the
+  prior #2832 window floor and were never triaged before; #2842 is the
+  step-119 critic handoff (push-race per mem-1795714025-21a1 stands:
+  head 2026-11-26 17:42:11 UTC vs the step-119 builder window).
+- Triage: nothing portable. #2830 SKIP ("Shaders: stop startup shader
+  preparation promptly when cancelled", single-file +202/-13 in
+  `shaders.rs`): `Pipelines`, `make_with_cache_path[_cancel]`,
+  `make_one`, the real `precompile`, and both new tests are all
+  `#[cfg(windows)]` (stub `precompile` on `not(windows)`); no Linux
+  consumer. Hunk context diverged anyway — our `make_one` carries an
+  extra `record: Option<u64>` param the PR base lacks
+  (`shaders.rs:1594`). #2831 SKIP ("D3D12.X: keep allocator recordings
+  held on device removal", +28/-6 in `hle/d3d12x/alloc_pool.rs`):
+  Windows-D3D12-only device-loss semantics, no Linux consumer.
+  #2842 SKIP ("D3D12.X: a timed-out readback_now keeps its job until
+  the GPU copy has run"): root-commit aggregate fork snapshot (371
+  files); the `IN_FLIGHT_RB_JOBS` / `take_readback_job` /
+  `FREE_RB_JOBS` pool infra is absent from our tree (our
+  `readback_now` at `sparse.rs:1342` is the simpler pool-less shape) —
+  hunk context absent, Windows-D3D12-only. Earlier pins stand: #2832
+  SKIP; #2833/#2834 landed; #2836 adapted in `7645afeb`; #2837 SKIP
+  stands; #2838 landed verbatim in `aa59e8ac`.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines = 12 unique, all `D3D12.X`, 0 non-GPU; retail
+  fresh-root `XCL_DATA_ROOT=/tmp/xcl-step120-retail` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
