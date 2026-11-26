@@ -1,0 +1,21 @@
+# Capture your own Legal Notices frame with Copyright selected. No image ships here.
+# All reference paths are relative to this file. References remain local.
+# Before this rule, use XCL_PRESS_AT for A at 6,9,...,54 seconds only.
+[fallback]
+button = "A"
+start = 57.0
+interval = 3.0
+
+[[rules]]
+name = "legal-notices"
+reference = "references/legal-notices.bmp"
+# Top-left 27x14 of the 64x36 grey thumbnail (normalised x,y,width,height).
+region = [0.0, 0.0, 0.421875, 0.3888888888888889]
+threshold = 5.0
+once = true
+cooldown = 3.0
+# DOWN selects the warning; wait before moving to Next.
+# The Photosensitivity Next button is enabled about 5.3 s after the screen appears.
+# The last five buttons accept privacy, terms of service and confirmation.
+# The terms screen needs about 2-3 seconds after the warning before it takes input.
+sequence = "DOWN, wait 6.5, DOWN, A, wait 3, A, DOWN, A, DOWN, A"

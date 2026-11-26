@@ -400,6 +400,81 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 </details>
 
+## Scripted input for automated testing of the retail title
+
+Timed presses alone depend on load time and cache state. Frame-matched rules let an agent
+wait for a known screen, press the virtual pad without window focus, and wait for a JSON event.
+`XCL_PRESS_AT` still works and is ORed with rule input and physical controllers.
+
+1. Capture your own reference with `XCL_FRAME_DUMP=2`. From the title's `logs/frame_<n>.bmp`,
+   keep the Legal Notices screen with Copyright selected as `references/legal-notices.bmp`
+   beside your rules file. References stay local: never commit captured game output.
+2. Copy [examples/retail-input-rules.toml](examples/retail-input-rules.toml) to a local folder.
+   It compares the top-left 27 by 14 pixels of a 64 by 36 grayscale thumbnail, using mean
+   absolute difference on a 0–255 scale. Threshold 5 is a starting point; calibrate against
+   your own target and other screens. Both images use nearest-neighbor sampling and weighted
+   grayscale (30% red, 59% green, 11% blue).
+3. Set the environment below in your usual test launcher. Wait for `GameInput: input_rule `,
+   parse the JSON suffix, and check `event == "completed"` and `rule == "legal-notices"`.
+   Keep the normal run timeout: an unmatched reference produces no completion event.
+
+```powershell
+$env:XCL_NETWORK = '0'
+$env:XCL_FRAME_DUMP = '2'
+$env:XCL_INPUT_RULES = 'C:\Tests\retail-input-rules.toml'
+$env:XCL_PRESS_AT = '6:A,9:A,12:A,15:A,18:A,21:A,24:A,27:A,30:A,33:A,36:A,39:A,42:A,45:A,48:A,51:A,54:A'
+```
+
+The example sends fallback A every three seconds from 57 seconds until a rule matches. Use no
+other automated key source after 54 seconds: duplicate presses can toggle checkboxes off.
+On a match, fallback stops before DOWN, a 6.5-second wait, DOWN and A; then the privacy,
+terms and confirmation sequence runs after a three-second screen transition wait.
+Button pulses last 0.2 seconds, with 0.8 seconds between
+button starts by default. `wait N` sets the delay from the previous button's start (or adds
+to a preceding wait). Input must be polled during the pulse to receive it.
+
+Rules and reference images load once at host startup, before title path remapping is installed.
+Use host filesystem paths, not console mounts: rules are TOML; relative reference paths resolve
+beside the rules file. Loading them after VFS setup could remap the host drive to the title's drive.
+
+```toml
+[[rules]]
+name = "legal-notices"                         # unique string, required
+reference = "references/legal-notices.bmp"     # local, uncompressed 24-bit BMP
+region = [0.0, 0.0, 0.421875, 0.3888888888888889] # normalized x, y, width, height
+threshold = 5.0                               # maximum mean absolute difference
+sequence = "DOWN, wait 6.5, DOWN, A"           # comma-separated buttons / wait seconds
+once = true                                   # default; false repeats after cooldown
+cooldown = 3.0                                # seconds between matches, default 3
+```
+
+Buttons: A, B, X, Y, UP, DOWN, LEFT, RIGHT, MENU, VIEW, LB, RB. There may be 1–32 rules,
+evaluated in file order; only one sequence runs at a time. Cooldown is at least 0.2 seconds.
+The optional `[fallback]` table has required `button` (string), `start` (nonnegative seconds)
+and `interval` (seconds, greater than 0.2). It stops permanently on the first match.
+Unknown fields, invalid regions, buttons or timings disable the configuration. A missing or
+unreadable reference disables that rule and the fallback with a `disabled` warning; other
+valid rules remain available. Neither rules nor fallback run without `XCL_FRAME_DUMP`.
+Only decoded presented frame dumps are matched; intermediate targets cannot trigger input.
+Frame dumps add readback and disk overhead; use the same settings when comparing test arms.
+
+For a frame-gated transition, split the example into two rules: `legal-notices` runs
+`DOWN, wait 6.5, DOWN, A`; a second `terms` rule matches your own reference of the terms screen
+with Privacy focused and unchecked, then runs `A, DOWN, A, DOWN, A`. This replaces the timed
+terms-screen transition wait. Capture and calibrate that second reference locally too; no image
+ships with the example. The warning countdown still needs enough time before Next can be selected.
+
+Each log event is a JSON object after the prefix, for example:
+
+```text
+GameInput: input_rule {"event":"matched","rule":"legal-notices","frame":180,"t":63.5,"diff":0.0}
+GameInput: input_rule {"event":"pressed","rule":"legal-notices","frame":180,"t":63.5,"button":"DOWN"}
+GameInput: input_rule {"event":"completed","rule":"legal-notices","frame":180,"t":77.2}
+```
+
+Times are host uptime seconds; sequence events retain the triggering frame number. Fallback
+presses use rule `$fallback`; disabled events have `rule` and `reason` (no frame or time).
+
 ## Tests
 
 ```powershell

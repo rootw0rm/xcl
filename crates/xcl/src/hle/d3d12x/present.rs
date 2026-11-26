@@ -1431,6 +1431,7 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     let n = PRESENTS.load(Ordering::Relaxed);
     // `XCL_TRACE_FRAME` also dumps intermediate targets; only the presented image belongs here.
     if tag == "frame" {
+        if decoded { crate::hle::gameinput::match_input_frame(&bmp, n); }
         if let Ok(mut last) = LAST_FRAME_DUMP.lock() {
             *last = Some(FrameDumpSample {
                 frame: n,

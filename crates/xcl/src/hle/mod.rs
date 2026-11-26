@@ -18,6 +18,7 @@ pub mod d3d12x;
 pub mod dstorage;
 pub mod dxcompiler;
 pub mod gameinput;
+mod input_rules;
 pub mod kbm;
 pub mod kernelx;
 pub mod mfplat;

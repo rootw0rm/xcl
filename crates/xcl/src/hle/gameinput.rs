@@ -223,7 +223,7 @@ fn start() -> Instant {
 }
 
 /// A button by its name in `XCL_PRESS_AT`.
-fn button_named(name: &str) -> Option<u32> {
+pub(super) fn button_named(name: &str) -> Option<u32> {
     Some(match name.to_ascii_uppercase().as_str() {
         "A" => A,
         "B" => B,
@@ -263,7 +263,65 @@ fn scripted() -> u32 {
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g) | live::held()
+    let timed = at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g);
+    let rules = frame_rules().and_then(|r| r.lock().ok()).map_or(0, |mut r| {
+        let (buttons, event) = r.buttons(t);
+        if let Some(event) = event { log_input_rule(&event); }
+        buttons
+    });
+    timed | live::held() | rules
+}
+
+fn log_input_rule(event: &super::input_rules::Event) {
+    if let Ok(json) = serde_json::to_string(event) { crate::xlog_info!("GameInput: input_rule {json}"); }
+}
+
+/// Bounded local configuration/reference reads; no title files are written.
+fn input_rule_file(path: &std::path::Path, max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(max + 1).read_to_end(&mut bytes)).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > max { return Err(format!("{} exceeds {max} bytes", path.display())); }
+    Ok(bytes)
+}
+
+/// Read host paths before the title's VFS hooks can remap their drive letters.
+pub(crate) fn init_frame_rules() { let _ = frame_rules(); }
+
+fn frame_rules() -> Option<&'static Mutex<super::input_rules::Engine>> {
+    static RULES: OnceLock<Option<Mutex<super::input_rules::Engine>>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("XCL_INPUT_RULES")?);
+        let load = || {
+            if std::env::var_os("XCL_FRAME_DUMP").is_none() { return Err("XCL_INPUT_RULES needs XCL_FRAME_DUMP=2 (presented frames)".into()); }
+            let text = String::from_utf8(input_rule_file(&path, 64 << 10)?).map_err(|e| e.to_string())?;
+            super::input_rules::Engine::parse(&text, |reference| {
+                let reference = path.parent().unwrap_or_else(|| std::path::Path::new(".")).join(reference);
+                super::input_rules::thumbnail(&input_rule_file(&reference, 32 << 20)?)
+            })
+        };
+        match load() {
+            Ok((engine, warnings)) => {
+                for (name, error) in warnings { input_rule_warning(&name, &error); }
+                Some(Mutex::new(engine))
+            }
+            Err(e) => { input_rule_warning("$config", &e); None }
+        }
+    }).as_ref()
+}
+
+fn input_rule_warning(name: &str, error: &str) {
+    let json = serde_json::json!({"event":"disabled", "rule":name, "reason":error});
+    crate::xlog_warn!("GameInput: input_rule {json}");
+}
+
+/// Only decoded, presented image dumps call this; intermediate render targets cannot trigger keys.
+pub(crate) fn match_input_frame(bmp: &[u8], frame: u64) {
+    let Some(rules) = frame_rules() else { return };
+    let Ok(image) = super::input_rules::thumbnail(bmp) else { return };
+    if let Ok(mut r) = rules.lock() {
+        if let Some(event) = r.frame(&image, frame, crate::log::uptime()) { log_input_rule(&event); }
+    }
 }
 
 /// `XCL_STICK_AT=s:x/y,…` (the left stick) and `XCL_LOOK_AT=s:x/y,…` (the right): a deflection
