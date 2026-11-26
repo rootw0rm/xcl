@@ -54,11 +54,63 @@ struct QueuedItem {
     port: u32,
 }
 
-#[derive(Clone, Copy)]
 struct Monitor {
     token: u64,
     ctx: usize,
     cb: usize,
+    state: Mutex<MonitorState>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct MonitorState {
+    revoked: bool,
+    running: usize,
+}
+
+thread_local! {
+    static MONITOR_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+impl Monitor {
+    /// Runs the callback unless the registration was revoked; returns true when a
+    /// revoked registration has no callbacks left (the caller then drops it).
+    fn invoke(&self, handle: *mut c_void, port: u32) -> bool {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.revoked {
+                return false;
+            }
+            state.running += 1;
+        }
+
+        MONITOR_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        unsafe {
+            let callback: XTaskQueueMonitorCallback = std::mem::transmute(self.cb);
+            callback(self.ctx as *mut c_void, handle, port);
+        }
+        MONITOR_DEPTH.with(|depth| depth.set(depth.get() - 1));
+
+        let mut state = self.state.lock().unwrap();
+        state.running -= 1;
+        let drained = state.revoked && state.running == 0;
+        if drained {
+            self.idle.notify_all();
+        }
+        drained
+    }
+
+    fn revoke(&self) -> bool {
+        // Keep callback-stack unregistration nonblocking. Waiting from a monitor can
+        // deadlock with itself or with another monitor that unregisters it.
+        let outside_monitor = MONITOR_DEPTH.with(|depth| depth.get() == 0);
+        let mut state = self.state.lock().unwrap();
+        state.revoked = true;
+        while outside_monitor && state.running != 0 {
+            state = self.idle.wait(state).unwrap();
+        }
+        state.running == 0
+    }
 }
 
 pub struct Port {
@@ -103,21 +155,23 @@ impl Port {
             if owner.is_terminated() {
                 continue;
             }
-            let snapshot: Vec<Monitor> = owner.monitors.lock().unwrap().clone();
+            let snapshot: Vec<Arc<Monitor>> = owner.monitors.lock().unwrap().clone();
             if snapshot.is_empty() {
                 continue;
             }
             for owner_port in 0..2 {
                 if Arc::ptr_eq(&owner.ports[owner_port], self) {
-                    for m in &snapshot {
+                    for monitor in &snapshot {
                         if owner.is_terminated() {
                             break;
                         }
                         let temp = new_handle(owner.clone()) as *mut c_void;
+                        let drained = monitor.invoke(temp, owner_port as u32);
                         unsafe {
-                            let f: XTaskQueueMonitorCallback = std::mem::transmute(m.cb);
-                            f(m.ctx as *mut c_void, temp, owner_port as u32);
                             XTaskQueueCloseHandle(temp);
+                        }
+                        if drained {
+                            owner.remove_monitor(monitor.token);
                         }
                     }
                 }
@@ -139,7 +193,7 @@ pub struct Queue {
     owns_ports: bool,
     state: Mutex<QueueState>,
     idle_cv: Condvar,
-    monitors: Mutex<Vec<Monitor>>,
+    monitors: Mutex<Vec<Arc<Monitor>>>,
 }
 
 pub struct QueueHandle {
@@ -323,6 +377,10 @@ impl Queue {
         if state.inflight[0] == 0 && state.inflight[1] == 0 {
             self.idle_cv.notify_all();
         }
+    }
+
+    fn remove_monitor(&self, token: u64) {
+        self.monitors.lock().unwrap().retain(|monitor| monitor.token != token);
     }
 
     unsafe fn execute(self: &Arc<Queue>, port: u32, item: Item) {
@@ -917,18 +975,27 @@ pub unsafe extern "win64" fn XTaskQueueRegisterMonitor(
         return E_INVALIDARG;
     }
     let id = NEXT_MONITOR_TOKEN.fetch_add(1, Ordering::Relaxed);
-    q.monitors.lock().unwrap().push(Monitor {
+    q.monitors.lock().unwrap().push(Arc::new(Monitor {
         token: id,
         ctx: ctx as usize,
         cb,
-    });
+        state: Mutex::new(MonitorState::default()),
+        idle: Condvar::new(),
+    }));
     (*token).token = id;
     S_OK
 }
 
 pub unsafe extern "win64" fn XTaskQueueUnregisterMonitor(h: *mut c_void, token: RegistrationToken) {
     let Some(q) = queue_from(h) else { return };
-    q.monitors.lock().unwrap().retain(|m| m.token != token.token);
+    // Keep the registration discoverable until its callbacks finish so concurrent
+    // unregistration calls can wait for the same drain. Never wait with the queue lock held.
+    let monitor = q.monitors.lock().unwrap().iter().find(|m| m.token == token.token).cloned();
+    if let Some(monitor) = monitor {
+        if monitor.revoke() {
+            q.remove_monitor(monitor.token);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1762,6 +1829,147 @@ mod tests {
             assert_eq!(XTaskQueueDuplicateHandle(0x1234 as *mut c_void, &mut dup_out), E_INVALIDARG);
             assert_eq!(dup_out, std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn unregister_monitor_waits_for_an_active_invocation() {
+        struct Capture {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            calls: AtomicU32,
+        }
+
+        unsafe extern "win64" fn monitor(ctx: *mut c_void, _: *mut c_void, _: u32) {
+            let capture = &*ctx.cast::<Capture>();
+            if capture.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                let _ = capture.entered.send(());
+                let _ = capture.release.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            }
+        }
+
+        unsafe extern "win64" fn work(_: *mut c_void, _: bool) {}
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let capture = Box::new(Capture { entered: entered_tx, release: Mutex::new(release_rx), calls: AtomicU32::new(0) });
+        let mut h = std::ptr::null_mut();
+        let mut token = RegistrationToken { token: 0 };
+        unsafe {
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut h), S_OK);
+            assert_eq!(XTaskQueueRegisterMonitor(h, (&*capture as *const Capture).cast_mut().cast(), monitor as usize, &mut token), S_OK);
+        }
+
+        let handle = h as usize;
+        let submit = std::thread::spawn(move || unsafe {
+            XTaskQueueSubmitCallback(handle as *mut c_void, PORT_WORK, std::ptr::null_mut(), work as usize)
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let unregister: [_; 2] = std::array::from_fn(|_| {
+            let started = started_tx.clone();
+            let finished = finished_tx.clone();
+            let id = token.token;
+            std::thread::spawn(move || unsafe {
+                let _ = started.send(());
+                XTaskQueueUnregisterMonitor(handle as *mut c_void, RegistrationToken { token: id });
+                let _ = finished.send(());
+            })
+        });
+        let started = (0..2).all(|_| started_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        let early = finished_rx.recv_timeout(Duration::from_millis(250));
+        let _ = release_tx.send(());
+        let remaining = 2 - usize::from(early.is_ok());
+        let finished = (0..remaining).all(|_| finished_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        let submitted = submit.join().unwrap();
+        for call in unregister {
+            call.join().unwrap();
+        }
+        let second = unsafe { XTaskQueueSubmitCallback(h, PORT_WORK, std::ptr::null_mut(), work as usize) };
+        unsafe { XTaskQueueCloseHandle(h) };
+
+        assert!(entered.is_ok() && started && finished, "monitor control threads did not finish their steps");
+        assert!(matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)), "unregister returned before the active monitor ended");
+        assert_eq!((submitted, second), (S_OK, S_OK));
+        assert_eq!(capture.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unregister_monitor_inside_its_callback_stops_later_invocations() {
+        struct Capture {
+            token: RegistrationToken,
+            calls: u32,
+        }
+
+        unsafe extern "win64" fn monitor(ctx: *mut c_void, queue: *mut c_void, _: u32) {
+            let capture = &mut *ctx.cast::<Capture>();
+            capture.calls += 1;
+            XTaskQueueUnregisterMonitor(queue, RegistrationToken { token: capture.token.token });
+        }
+
+        unsafe extern "win64" fn work(_: *mut c_void, _: bool) {}
+
+        let mut capture = Capture { token: RegistrationToken { token: 0 }, calls: 0 };
+        let mut h = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut h), S_OK);
+            let ctx = (&mut capture as *mut Capture).cast();
+            assert_eq!(XTaskQueueRegisterMonitor(h, ctx, monitor as usize, &mut capture.token), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h, PORT_WORK, std::ptr::null_mut(), work as usize), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h, PORT_WORK, std::ptr::null_mut(), work as usize), S_OK);
+            XTaskQueueCloseHandle(h);
+        }
+        assert_eq!(capture.calls, 1);
+    }
+
+    #[test]
+    fn unregister_monitor_skips_a_revoked_snapshot_entry() {
+        struct Gate {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        unsafe extern "win64" fn hold(ctx: *mut c_void, _: *mut c_void, _: u32) {
+            let gate = &*ctx.cast::<Gate>();
+            let _ = gate.entered.send(());
+            let _ = gate.release.lock().unwrap().recv_timeout(Duration::from_secs(5));
+        }
+
+        unsafe extern "win64" fn count(ctx: *mut c_void, _: *mut c_void, _: u32) {
+            (*ctx.cast::<AtomicU32>()).fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe extern "win64" fn work(_: *mut c_void, _: bool) {}
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Gate { entered: entered_tx, release: Mutex::new(release_rx) };
+        let calls = AtomicU32::new(0);
+        let mut h = std::ptr::null_mut();
+        let mut blocker = RegistrationToken { token: 0 };
+        let mut revoked = RegistrationToken { token: 0 };
+        unsafe {
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut h), S_OK);
+            assert_eq!(XTaskQueueRegisterMonitor(h, (&gate as *const Gate).cast_mut().cast(), hold as usize, &mut blocker), S_OK);
+            assert_eq!(XTaskQueueRegisterMonitor(h, (&calls as *const AtomicU32).cast_mut().cast(), count as usize, &mut revoked), S_OK);
+        }
+
+        let handle = h as usize;
+        let submit = std::thread::spawn(move || unsafe {
+            XTaskQueueSubmitCallback(handle as *mut c_void, PORT_WORK, std::ptr::null_mut(), work as usize)
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+        unsafe { XTaskQueueUnregisterMonitor(h, revoked) };
+        let _ = release_tx.send(());
+        let submitted = submit.join().unwrap();
+        unsafe {
+            XTaskQueueUnregisterMonitor(h, blocker);
+            XTaskQueueCloseHandle(h);
+        }
+
+        assert!(entered.is_ok(), "first monitor did not hold the notification snapshot");
+        assert_eq!(submitted, S_OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "revoked monitor still ran from an old snapshot");
     }
 
     #[test]

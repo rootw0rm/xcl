@@ -75,3 +75,41 @@ newest at the bottom.
   unique FAILs all D3D12.X GPU-only, 0 non-GPU; retail fresh-root
   SIGSEGV `exe+0x2237320` stubs 20 xgr exactly
   XAsync/XNetworking/XUser — HOLDS.
+
+## 2026-11-26 — step-115 (task-1795712765-8368): adapted #2836 monitor-drain to Port-fan-out shape, both twins
+
+- Upstream #2836 `43a4eb9d` (still OPEN) re-verified pre-commit: fetch
+  shows the same single-commit head; base `upstream/main` still
+  `8b957bec`, is-ancestor HEAD exit 0 — ZERO sync fallout.
+- Adaptation (verbatim impossible — #2021 shape divergence stands):
+  `Monitor` (+`MonitorState{revoked,running}` +`idle` Condvar
+  +`MONITOR_DEPTH` guard, `invoke(handle,port)->drained`,
+  `revoke()->drained`) in BOTH `hle/xgameruntime/taskqueue.rs`
+  (Windows twin, `extern "system"`) and `hle/xtaskqueue_linux.rs`
+  (Linux-live twin, `extern "win64"`); `Queue.monitors` becomes
+  `Vec<Arc<Monitor>>` + `remove_monitor`; `Port::notify_monitors`
+  keeps its fan-out (temp handle per monitor, terminated checks) and
+  drops drained registrations via `invoke`; register pushes
+  `Arc<Monitor>`; unregister clones-then-revokes without holding the
+  queue lock, removes when drained. `XTaskQueueTerminate`'s `clear()`
+  unchanged (registry refs drop; in-flight snapshot Arcs survive).
+- Failing-first: 3 upstream tests ported per twin (adapted to temp
+  handles + per-twin ABI). Linux twin pre-fix: 2 failed as predicted
+  (`waits_for_an_active_invocation` returned before release;
+  `skips_a_revoked_snapshot_entry` ran the revoked monitor),
+  1 passed as regression pin (self-unregister); post-fix 3/3 green.
+  Windows-twin tests mirror them but cannot execute on this Linux box
+  (module not compiled here) — rustfmt parse-verified only, noted in
+  the commit message.
+- Gates: both `cargo check`s 0 errors (22 lib + 28 lib-test
+  pre-existing warnings); lib 783 passed / 0 failed / 1 ignored (+3
+  new monitor tests); title e2e 31 passed / 19 failed with FAIL+PASS
+  sets byte-identical to the stashed baseline (bare-folder
+  files:/argv FAILs are environmental, equal both sides);
+  `target/debug/xcl` symbol-verified to contain
+  `xtaskqueue_linux::Monitor::{invoke,revoke}` +
+  `Queue::remove_monitor`; retail fresh-root exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20 (all
+  first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS. Lock
+  audit: 0 new `lock()` held across an `if let` body (named bindings
+  + statement-local temporaries only); `diff --check` clean.
