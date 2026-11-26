@@ -1842,6 +1842,14 @@ fn load_library_impl(name: Option<String>) -> usize {
     match resolver::load_library(&name) {
         Some(h) => {
             crate::xlog_debug!("LoadLibrary({name}) → {h:#x}");
+            let cached = !name.contains(['\\', '/', ':']); // as `resolver::system_module` decides
+            if cached && modules::find_mapped_by_base(h).is_none() && modules::hle_name_by_handle(h).is_none() {
+                // a real module, whose handle XCL caches and resolves imports into: the title
+                // gets a reference of its own, which its FreeLibrary gives back (a load by path
+                // took one already in `system_module`)
+                let mut r = std::ptr::null_mut();
+                unsafe { ll::GetModuleHandleExW(ll::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, h as *const u16, &mut r) };
+            }
             h
         }
         None => {
@@ -3333,6 +3341,23 @@ mod tests {
             } else if !sp.is_null() {
                 assert_eq!(VirtualFreeEx(cur, sp, 0, mem::MEM_RELEASE), 1);
             }
+        }
+    }
+
+    /// The title's LoadLibrary of a system DLL takes a reference of its own, which its FreeLibrary
+    /// gives back: the DLL stays loaded for XCL's cached handle and the imports resolved into it
+    /// (before: the title freed XCL's only reference and the DLL was unloaded).
+    #[test]
+    fn free_library_of_a_system_dll_leaves_xcl_its_reference() {
+        unsafe {
+            let w = crate::util::wide("dciman32.dll");
+            let h = LoadLibraryW(w.as_ptr());
+            assert_ne!(h, 0);
+            assert_eq!(FreeLibrary(h), 1);
+            assert_ne!(ll::GetModuleHandleW(w.as_ptr()) as usize, 0, "dciman32.dll unloaded by the title's FreeLibrary");
+            let h = LoadLibraryW(w.as_ptr());
+            assert_ne!(GetProcAddress(h, c"DCIOpenProvider".as_ptr() as *const u8), 0);
+            assert_eq!(FreeLibrary(h), 1);
         }
     }
 
