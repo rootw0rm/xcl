@@ -12,9 +12,10 @@
 
 #![allow(non_snake_case)]
 
+use std::cell::Cell;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -698,6 +699,16 @@ pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ct
         t.queue.state.lock().unwrap().inflight[t.port as usize] += 1;
         t.queue.execute(t.port, t.item);
     }
+    // Unregister any waiters still attached to `q` so termination does not leak OS wait handles
+    // or `Arc<Queue>` references if the title terminates without unregistering each waiter.
+    let waiters: Vec<Arc<Waiter>> = {
+        let mut map = waiters().lock().unwrap();
+        let keys: Vec<u64> = map.iter().filter(|(_, w)| Arc::ptr_eq(&w.queue, &q)).map(|(&k, _)| k).collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    for w in waiters {
+        unregister_waiter(w);
+    }
     let ctx = ctx as usize; // raw pointers are not Send
     let finish = move || {
         let mut g = q.state.lock().unwrap();
@@ -768,12 +779,67 @@ struct Waiter {
     queue: Arc<Queue>,
     port: u32,
     item: Item,
-    wait: usize,
+    /// Win32 registered-wait handle (0 once unregistered); locked across RegisterWaitForSingleObject
+    /// so a concurrent unregister never races with the initial store.
+    wait: Mutex<usize>,
+    /// Set before unregistering so in-flight or queued callbacks stop submitting immediately.
+    stopped: AtomicBool,
+    /// Raw pointer to the extra Arc<Waiter> reference owned by the Win32 wait callback.
+    callback_arc: AtomicUsize,
+}
+
+static NEXT_WAITER_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn waiters() -> &'static Mutex<HashMap<u64, Arc<Waiter>>> {
+    static W: OnceLock<Mutex<HashMap<u64, Arc<Waiter>>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    static IN_WAITER: Cell<usize> = const { Cell::new(0) };
+}
+
+struct InWaiterGuard(usize);
+impl Drop for InWaiterGuard {
+    fn drop(&mut self) {
+        IN_WAITER.with(|c| c.set(self.0));
+    }
+}
+
+fn unregister_waiter(w: Arc<Waiter>) {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Threading::UnregisterWaitEx;
+    w.stopped.store(true, Ordering::Release);
+    let wh = std::mem::replace(&mut *w.wait.lock().unwrap(), 0);
+    if wh == 0 {
+        return;
+    }
+    let raw = w.callback_arc.swap(0, Ordering::AcqRel);
+    let self_unregister = IN_WAITER.with(|c| c.get() == Arc::as_ptr(&w) as usize);
+    if self_unregister {
+        // Calling UnregisterWaitEx(..., INVALID_HANDLE_VALUE) from inside the wait callback
+        // deadlocks; defer the blocking unregister and callback Arc drop to the worker pool.
+        spawn(Box::new(move || unsafe {
+            UnregisterWaitEx(wh as *mut c_void, INVALID_HANDLE_VALUE);
+            if raw != 0 {
+                drop(Arc::from_raw(raw as *const Waiter));
+            }
+        }));
+    } else {
+        unsafe {
+            UnregisterWaitEx(wh as *mut c_void, INVALID_HANDLE_VALUE);
+            if raw != 0 {
+                drop(Arc::from_raw(raw as *const Waiter));
+            }
+        }
+    }
 }
 
 unsafe extern "system" fn waiter_fired(ctx: *mut c_void, _timed_out: bool) {
     let w = &*(ctx as *const Waiter);
-    if !w.queue.is_terminated() {
+    let prev = IN_WAITER.with(|c| c.replace(ctx as usize));
+    let _guard = InWaiterGuard(prev);
+    if !w.stopped.load(Ordering::Acquire) && !w.queue.is_terminated() {
         let _ = submit_now(&w.queue, w.port, w.item);
     }
 }
@@ -794,25 +860,48 @@ pub unsafe extern "system" fn XTaskQueueRegisterWaiter(
     if q.is_terminated() {
         return crate::util::E_ABORT;
     }
-    let w = Box::into_raw(Box::new(Waiter { queue: q, port, item: Item { cb, ctx: ctx as usize }, wait: 0 }));
-    let mut wh = std::ptr::null_mut();
-    if RegisterWaitForSingleObject(&mut wh, handle, Some(waiter_fired), w as *const c_void, INFINITE, WT_EXECUTEDEFAULT) == 0 {
-        drop(Box::from_raw(w));
-        return crate::util::E_FAIL;
+    let w = Arc::new(Waiter {
+        queue: q.clone(),
+        port,
+        item: Item { cb, ctx: ctx as usize },
+        wait: Mutex::new(0),
+        stopped: AtomicBool::new(false),
+        callback_arc: AtomicUsize::new(0),
+    });
+    let cb_ptr = Arc::into_raw(w.clone()) as usize;
+    w.callback_arc.store(cb_ptr, Ordering::Release);
+    {
+        let mut wh_guard = w.wait.lock().unwrap();
+        let mut wh = std::ptr::null_mut();
+        if RegisterWaitForSingleObject(&mut wh, handle, Some(waiter_fired), cb_ptr as *const c_void, INFINITE, WT_EXECUTEDEFAULT) == 0 {
+            drop(wh_guard);
+            let raw = w.callback_arc.swap(0, Ordering::AcqRel);
+            if raw != 0 {
+                drop(Arc::from_raw(raw as *const Waiter));
+            }
+            return crate::util::E_FAIL;
+        }
+        *wh_guard = wh as usize;
     }
-    (*w).wait = wh as usize;
-    (*token).token = w as u64;
+    let tok = NEXT_WAITER_TOKEN.fetch_add(1, Ordering::Relaxed);
+    waiters().lock().unwrap().insert(tok, w.clone());
+    if q.is_terminated() {
+        if let Some(removed) = waiters().lock().unwrap().remove(&tok) {
+            unregister_waiter(removed);
+        }
+        return crate::util::E_ABORT;
+    }
+    (*token).token = tok;
     S_OK
 }
 
 pub unsafe extern "system" fn XTaskQueueUnregisterWaiter(_h: *mut c_void, token: RegistrationToken) {
-    use windows_sys::Win32::System::Threading::UnregisterWaitEx;
-    let w = token.token as *mut Waiter;
-    if w.is_null() {
+    if token.token == 0 {
         return;
     }
-    UnregisterWaitEx((*w).wait as *mut c_void, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
-    drop(Box::from_raw(w));
+    if let Some(w) = waiters().lock().unwrap().remove(&token.token) {
+        unregister_waiter(w);
+    }
 }
 
 pub unsafe extern "system" fn XTaskQueueRegisterMonitor(
@@ -1409,5 +1498,138 @@ mod tests {
             WAITERS,
             "blocked pool callbacks starved the releaser callback"
         );
+    }
+
+    #[test]
+    fn unregister_waiter_is_idempotent_and_self_unregister_does_not_deadlock() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
+
+        struct SelfUnregCtx {
+            q: usize,
+            event: usize,
+            tok: std::sync::atomic::AtomicU64,
+            tx: Mutex<Option<mpsc::Sender<()>>>,
+        }
+        unsafe extern "system" fn self_unregister_cb(ctx: *mut c_void, _canceled: bool) {
+            let c = &*(ctx as *const SelfUnregCtx);
+            ResetEvent(c.event as *mut c_void);
+            let tok = RegistrationToken { token: c.tok.load(Ordering::Acquire) };
+            XTaskQueueUnregisterWaiter(c.q as *mut c_void, tok);
+            if let Some(tx) = c.tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
+
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_MANUAL, &mut h), S_OK);
+            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            assert!(!event.is_null());
+
+            let (tx, rx) = mpsc::channel();
+            let ctx = Arc::new(SelfUnregCtx {
+                q: h as usize,
+                event: event as usize,
+                tok: std::sync::atomic::AtomicU64::new(0),
+                tx: Mutex::new(Some(tx)),
+            });
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(h, PORT_WORK, event, Arc::as_ptr(&ctx) as *mut c_void, self_unregister_cb as usize, &mut tok),
+                S_OK
+            );
+            ctx.tok.store(tok.token, Ordering::Release);
+            assert_ne!(SetEvent(event), 0);
+
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("MODE_IMMEDIATE self-unregister deadlocked in UnregisterWaitEx");
+
+            // Duplicate unregister and bogus tokens must be safe no-ops.
+            XTaskQueueUnregisterWaiter(h, tok);
+            XTaskQueueUnregisterWaiter(h, RegistrationToken { token: 0x1235 });
+
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            CloseHandle(event);
+            XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn waiter_unregister_handles_duplicates_bogus_tokens_and_self_unregister() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+        struct SelfCtx {
+            queue: usize,
+            token: AtomicU64,
+            done: (Mutex<bool>, Condvar),
+        }
+
+        unsafe extern "system" fn self_unregister_cb(ctx: *mut c_void, _canceled: bool) {
+            let c = &*(ctx as *const SelfCtx);
+            // Wait until the registering thread has published the token.
+            let mut tok = c.token.load(Ordering::Acquire);
+            while tok == 0 {
+                std::thread::yield_now();
+                tok = c.token.load(Ordering::Acquire);
+            }
+            XTaskQueueUnregisterWaiter(c.queue as *mut c_void, RegistrationToken { token: tok });
+            // Duplicate unregister from the same callback must also be a safe no-op.
+            XTaskQueueUnregisterWaiter(c.queue as *mut c_void, RegistrationToken { token: tok });
+            let mut d = c.done.0.lock().unwrap();
+            *d = true;
+            c.done.1.notify_all();
+        }
+
+        unsafe {
+            // Bogus and zero tokens must not crash or double-free.
+            XTaskQueueUnregisterWaiter(std::ptr::null_mut(), RegistrationToken { token: 0 });
+            XTaskQueueUnregisterWaiter(std::ptr::null_mut(), RegistrationToken { token: 0xDEAD_BEEF_CAFE_BABE });
+
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut h), S_OK);
+            let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            assert!(!event.is_null());
+
+            let ctx = Box::new(SelfCtx {
+                queue: h as usize,
+                token: AtomicU64::new(0),
+                done: (Mutex::new(false), Condvar::new()),
+            });
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(h, PORT_WORK, event, &*ctx as *const SelfCtx as *mut c_void, self_unregister_cb as usize, &mut tok),
+                S_OK
+            );
+            ctx.token.store(tok.token, Ordering::Release);
+            assert_ne!(SetEvent(event), 0);
+
+            let (d, timed_out) = ctx
+                .done
+                .1
+                .wait_timeout_while(ctx.done.0.lock().unwrap(), Duration::from_secs(2), |done| !*done)
+                .unwrap();
+            assert!(*d && !timed_out.timed_out(), "self-unregister inside MODE_IMMEDIATE waiter callback deadlocked");
+            drop(d);
+
+            // Waiter must already be removed; unregistering again is a safe no-op.
+            assert!(!waiters().lock().unwrap().contains_key(&tok.token));
+            XTaskQueueUnregisterWaiter(h, tok);
+
+            // A waiter left registered when the queue terminates is cleaned up automatically.
+            let mut tok2 = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(h, PORT_WORK, event, &*ctx as *const SelfCtx as *mut c_void, self_unregister_cb as usize, &mut tok2),
+                S_OK
+            );
+            assert!(waiters().lock().unwrap().contains_key(&tok2.token));
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert!(!waiters().lock().unwrap().contains_key(&tok2.token));
+            XTaskQueueUnregisterWaiter(h, tok2);
+
+            CloseHandle(event);
+            XTaskQueueCloseHandle(h);
+        }
     }
 }

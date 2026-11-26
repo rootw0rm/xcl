@@ -2,8 +2,11 @@
 //!
 //! The Windows `hle/xgameruntime/taskqueue.rs` stays the implementation source of truth
 //! (GDK `XTaskQueue.h` contract, libHttpClient semantics). On Linux there is no
-//! `RegisterWaitForSingleObject`, so waiter registration is a logged `E_NOTIMPL`;
-//! everything the test title's `XTaskQueue:` checks need — manual/delayed/thread-pool
+//! `RegisterWaitForSingleObject`, so waiter registration is served by a helper thread per
+//! waiter that blocks in `kernelx_linux::WaitForSingleObject` (short poll so unregister /
+//! terminate stays prompt) and submits through the same `submit_now` path; token map,
+//! immutable waiter, self-unregister guard, and terminate cleanup mirror the Windows
+//! waiter subsystem (`#1239` + `#315`). Everything the test title's `XTaskQueue:` checks need — manual/delayed/thread-pool
 //! submit, `Dispatch` with timeout, `Terminate` (canceled drain + delayed cancel),
 //! composite ports sharing, duplicate/close handles, `IsEmpty`, process queue,
 //! monitors, plus the `XNetworking` UDP-port/connectivity shims — is real `win64`
@@ -12,13 +15,14 @@
 
 #![allow(non_snake_case)]
 
+use std::cell::Cell;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::util::{E_ABORT, E_INVALIDARG, E_NOTIMPL, HRESULT, S_OK};
+use crate::util::{E_ABORT, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 
 pub const MODE_MANUAL: u32 = 0;
 pub const MODE_THREAD_POOL: u32 = 1;
@@ -662,6 +666,17 @@ pub unsafe extern "win64" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ctx
         t.queue.state.lock().unwrap().inflight[t.port as usize] += 1;
         t.queue.execute(t.port, t.item);
     }
+    // Mirror the Windows waiter cleanup (#315): drop every waiter still attached to `q`
+    // so termination does not leak helper threads or `Arc<Queue>` references when the
+    // title terminates without unregistering each waiter.
+    let waiters: Vec<Arc<Waiter>> = {
+        let mut map = waiters().lock().unwrap();
+        let keys: Vec<u64> = map.iter().filter(|(_, w)| Arc::ptr_eq(&w.queue, &q)).map(|(&k, _)| k).collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    for w in waiters {
+        unregister_waiter(w);
+    }
     let ctx = ctx as usize;
     let finish = move || {
         let mut g = q.state.lock().unwrap();
@@ -728,11 +743,77 @@ pub struct RegistrationToken {
     pub token: u64,
 }
 
+struct Waiter {
+    queue: Arc<Queue>,
+    port: u32,
+    item: Item,
+    /// kernelx waitable handle the helper thread blocks on.
+    handle: usize,
+    /// Set before unregistering so in-flight or queued callbacks stop submitting immediately.
+    stopped: AtomicBool,
+}
+
+static NEXT_WAITER_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn waiters() -> &'static Mutex<HashMap<u64, Arc<Waiter>>> {
+    static W: OnceLock<Mutex<HashMap<u64, Arc<Waiter>>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    static IN_WAITER: Cell<usize> = const { Cell::new(0) };
+}
+
+struct InWaiterGuard(usize);
+impl Drop for InWaiterGuard {
+    fn drop(&mut self) {
+        IN_WAITER.with(|c| c.set(self.0));
+    }
+}
+
+/// Mark a waiter stopped. The helper thread exits on its next short poll (or on its
+/// current fire); removal from the map already happened at the call site, so this never
+/// blocks — unregistering from inside the waiter's own callback cannot deadlock.
+fn unregister_waiter(w: Arc<Waiter>) {
+    w.stopped.store(true, Ordering::Release);
+}
+
+fn waiter_fire(w: &Arc<Waiter>) {
+    let prev = IN_WAITER.with(|c| c.replace(Arc::as_ptr(w) as usize));
+    let _guard = InWaiterGuard(prev);
+    if !w.stopped.load(Ordering::Acquire) && !w.queue.is_terminated() {
+        submit_now(&w.queue, w.port, w.item);
+    }
+}
+
+/// Helper-thread body: Linux has no `RegisterWaitForSingleObject`, so each waiter gets a
+/// thread that blocks in `WaitForSingleObject` with a short poll. The `Waiter` is immutable
+/// after registration (no post-activation mutation race, #1239 issue 1); the 5 ms poll keeps
+/// unregister/terminate prompt without a dedicated wake mechanism.
+fn waiter_thread(w: Arc<Waiter>) {
+    use crate::hle::kernelx_linux::{WAIT_FAILED, WAIT_OBJECT_0, WaitForSingleObject};
+    loop {
+        if w.stopped.load(Ordering::Acquire) || w.queue.is_terminated() {
+            return;
+        }
+        // SAFETY: `handle` is a kernelx waitable id; invalid ids yield WAIT_FAILED.
+        let r = unsafe { WaitForSingleObject(w.handle, 5) };
+        if w.stopped.load(Ordering::Acquire) || w.queue.is_terminated() {
+            return;
+        }
+        if r == WAIT_OBJECT_0 {
+            waiter_fire(&w);
+        } else if r == WAIT_FAILED {
+            return;
+        }
+    }
+}
+
 pub unsafe extern "win64" fn XTaskQueueRegisterWaiter(
     h: *mut c_void,
     port: u32,
-    _handle: *mut c_void,
-    _ctx: *mut c_void,
+    handle: *mut c_void,
+    ctx: *mut c_void,
     cb: usize,
     token: *mut RegistrationToken,
 ) -> HRESULT {
@@ -743,11 +824,45 @@ pub unsafe extern "win64" fn XTaskQueueRegisterWaiter(
     if q.is_terminated() {
         return E_ABORT;
     }
-    crate::xlog_warn!("XTaskQueueRegisterWaiter: no host wait objects on Linux (E_NOTIMPL)");
-    E_NOTIMPL
+    let handle = handle as usize;
+    if handle == 0 {
+        return E_FAIL;
+    }
+    // Immutable after registration: the helper thread only ever reads `Waiter`.
+    let w = Arc::new(Waiter {
+        queue: q.clone(),
+        port,
+        item: Item { cb, ctx: ctx as usize },
+        handle,
+        stopped: AtomicBool::new(false),
+    });
+    let tok = NEXT_WAITER_TOKEN.fetch_add(1, Ordering::Relaxed);
+    waiters().lock().unwrap().insert(tok, w.clone());
+    // A concurrent Terminate between the first check and the insert must not leave a live
+    // waiter on a dead queue (#315 post-insert race).
+    if q.is_terminated() {
+        if let Some(removed) = waiters().lock().unwrap().remove(&tok) {
+            unregister_waiter(removed);
+        }
+        return E_ABORT;
+    }
+    std::thread::Builder::new()
+        .name("xcl-taskqueue-waiter".into())
+        .spawn(move || waiter_thread(w))
+        .map_err(|_| ())
+        .ok();
+    (*token).token = tok;
+    S_OK
 }
 
-pub unsafe extern "win64" fn XTaskQueueUnregisterWaiter(_h: *mut c_void, _token: RegistrationToken) {}
+pub unsafe extern "win64" fn XTaskQueueUnregisterWaiter(_h: *mut c_void, token: RegistrationToken) {
+    if token.token == 0 {
+        return;
+    }
+    if let Some(w) = waiters().lock().unwrap().remove(&token.token) {
+        unregister_waiter(w);
+    }
+}
 
 pub unsafe extern "win64" fn XTaskQueueRegisterMonitor(
     h: *mut c_void,
@@ -1157,6 +1272,177 @@ mod tests {
             assert!(hint.network_initialized);
             let bytes = std::slice::from_raw_parts(&hint as *const _ as *const u8, 16);
             assert_eq!(bytes[12], 1, "hint[12] is network_initialized");
+        }
+    }
+
+    #[test]
+    fn waiter_fires_once_on_signaled_event() {
+        use crate::hle::kernelx_linux::{CloseHandle, CreateEventW, SetEvent};
+        unsafe extern "win64" fn count_hit(ctx: *mut c_void, _canceled: bool) {
+            let hits = &*(ctx as *const AtomicU32);
+            hits.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+            let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            assert_ne!(event, 0);
+            // Out-of-bounds port is rejected instead of panicking in the waiter thread.
+            let mut bad = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(h, 2, event as *mut c_void, std::ptr::null_mut(), count_hit as usize, &mut bad),
+                E_INVALIDARG
+            );
+            let hits = AtomicU32::new(0);
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(
+                    h,
+                    PORT_WORK,
+                    event as *mut c_void,
+                    &hits as *const AtomicU32 as *mut c_void,
+                    count_hit as usize,
+                    &mut tok
+                ),
+                S_OK
+            );
+            assert_ne!(tok.token, 0);
+            assert_ne!(SetEvent(event), 0);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while hits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "signaled waiter never fired");
+            XTaskQueueUnregisterWaiter(h, tok);
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(CloseHandle(event), 1);
+            XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn waiter_unregister_is_idempotent_and_bogus_tokens_are_safe() {
+        use crate::hle::kernelx_linux::{CloseHandle, CreateEventW};
+        unsafe extern "win64" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+        unsafe {
+            // Zero/bogus tokens on no queue must be safe no-ops.
+            XTaskQueueUnregisterWaiter(std::ptr::null_mut(), RegistrationToken { token: 0 });
+            XTaskQueueUnregisterWaiter(std::ptr::null_mut(), RegistrationToken { token: 0xDEAD_BEEF_CAFE_BABE });
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            assert_ne!(event, 0);
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(h, PORT_WORK, event as *mut c_void, std::ptr::null_mut(), noop as usize, &mut tok),
+                S_OK
+            );
+            XTaskQueueUnregisterWaiter(h, RegistrationToken { token: tok.token });
+            // Duplicate and bogus unregisters are safe no-ops, never a double-free.
+            XTaskQueueUnregisterWaiter(h, RegistrationToken { token: tok.token });
+            XTaskQueueUnregisterWaiter(h, RegistrationToken { token: 0x1235 });
+            assert!(!waiters().lock().unwrap().contains_key(&tok.token));
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(CloseHandle(event), 1);
+            XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn waiter_self_unregister_does_not_deadlock() {
+        use crate::hle::kernelx_linux::{CloseHandle, CreateEventW, SetEvent};
+        struct SelfCtx {
+            queue: usize,
+            token: AtomicU64,
+            done: (Mutex<bool>, Condvar),
+        }
+        unsafe extern "win64" fn self_unregister_cb(ctx: *mut c_void, _canceled: bool) {
+            let c = &*(ctx as *const SelfCtx);
+            let mut tok = c.token.load(Ordering::Acquire);
+            while tok == 0 {
+                std::thread::yield_now();
+                tok = c.token.load(Ordering::Acquire);
+            }
+            XTaskQueueUnregisterWaiter(c.queue as *mut c_void, RegistrationToken { token: tok });
+            // Duplicate unregister from the same callback must also be a safe no-op.
+            XTaskQueueUnregisterWaiter(c.queue as *mut c_void, RegistrationToken { token: tok });
+            let mut d = c.done.0.lock().unwrap();
+            *d = true;
+            c.done.1.notify_all();
+        }
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut h), S_OK);
+            let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            assert_ne!(event, 0);
+            let ctx = Box::new(SelfCtx {
+                queue: h as usize,
+                token: AtomicU64::new(0),
+                done: (Mutex::new(false), Condvar::new()),
+            });
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(
+                    h,
+                    PORT_WORK,
+                    event as *mut c_void,
+                    &*ctx as *const SelfCtx as *mut c_void,
+                    self_unregister_cb as usize,
+                    &mut tok
+                ),
+                S_OK
+            );
+            ctx.token.store(tok.token, Ordering::Release);
+            assert_ne!(SetEvent(event), 0);
+            let (d, timed_out) = ctx
+                .done
+                .1
+                .wait_timeout_while(ctx.done.0.lock().unwrap(), Duration::from_secs(2), |done| !*done)
+                .unwrap();
+            assert!(*d && !timed_out.timed_out(), "self-unregister inside waiter callback deadlocked");
+            drop(d);
+            assert!(!waiters().lock().unwrap().contains_key(&tok.token));
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(CloseHandle(event), 1);
+            XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn waiter_terminated_queue_cleans_up_waiters() {
+        use crate::hle::kernelx_linux::{CloseHandle, CreateEventW, SetEvent};
+        unsafe extern "win64" fn count_hit(ctx: *mut c_void, _canceled: bool) {
+            let hits = &*(ctx as *const AtomicU32);
+            hits.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            assert_ne!(event, 0);
+            let hits = AtomicU32::new(0);
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterWaiter(
+                    h,
+                    PORT_WORK,
+                    event as *mut c_void,
+                    &hits as *const AtomicU32 as *mut c_void,
+                    count_hit as usize,
+                    &mut tok
+                ),
+                S_OK
+            );
+            assert!(waiters().lock().unwrap().contains_key(&tok.token));
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert!(!waiters().lock().unwrap().contains_key(&tok.token));
+            // Late unregister is a safe no-op; a post-terminate signal never fires.
+            XTaskQueueUnregisterWaiter(h, tok);
+            assert_ne!(SetEvent(event), 0);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "waiter fired after Terminate");
+            assert_eq!(CloseHandle(event), 1);
+            XTaskQueueCloseHandle(h);
         }
     }
 }
