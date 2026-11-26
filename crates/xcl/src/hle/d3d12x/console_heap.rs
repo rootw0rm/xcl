@@ -457,7 +457,11 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         let i = first + 2 * (k - k0);
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
     });
-    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
+    // As for samplers: a heap hosted in `GLOBAL` whose shared range is exhausted maps the slot to the
+    // null SRV / UAV pair at 0 / 1, not to `2 * k` of the shared heap, which can be another heap's
+    // views or a memory window's raw view at `MEM_HEAP_BASE` (a texture read of that hangs the GPU).
+    let (index, pc_gpu_uav, shared_srv) =
+        shared.unwrap_or((view_unmapped_index(!h.pages.is_empty(), k), if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
     Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
 }
 
@@ -653,6 +657,12 @@ fn sampler_own_index(pages: &[u32], k: u32) -> u32 {
         Some(&f) if f != UNMAPPED => f + (k % SAMPLER_PAGE_SLOTS),
         _ => sampler_unmapped_index(!pages.is_empty(), k),
     }
+}
+
+/// The SRV index of view slot `k` the shared heap has no range for: in a hosted heap the null SRV /
+/// UAV pair at 0 / 1 of `GLOBAL` (`null_views`), else the slot's own pair at `2 * k` (#2380).
+fn view_unmapped_index(hosted: bool, k: u32) -> u32 {
+    if hosted { 0 } else { 2 * k }
 }
 
 struct GlobalSampler {
@@ -1175,5 +1185,18 @@ mod tests {
         // Unhosted sampler heap (empty pages) keeps local slot index k.
         assert_eq!(sampler_own_index(&[], 0), 0);
         assert_eq!(sampler_own_index(&[], 42), 42);
+    }
+
+    /// A hosted view heap past the shared range lands on the null pair at 0 / 1, below the memory
+    /// windows' views; an unhosted one keeps its own pair (#2380).
+    #[test]
+    fn hosted_view_slots_past_the_shared_range_take_the_null_pair() {
+        let base = crate::gpu::recomp::MEM_HEAP_BASE;
+        for k in [0, 1, base / 2, base, 1000] {
+            let i = view_unmapped_index(true, k);
+            assert_eq!(i, 0, "slot {k}");
+            assert!(i + 1 < base, "slot {k}: the pair reaches the window views");
+        }
+        assert_eq!(view_unmapped_index(false, 42), 84);
     }
 }
