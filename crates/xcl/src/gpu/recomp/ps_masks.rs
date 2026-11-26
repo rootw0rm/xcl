@@ -80,7 +80,7 @@ fn per_lane(d: &Decoded) -> u128 {
         return 0;
     }
     match fv(d, "SRC2") {
-        Some(v) if d.enc.name.starts_with("ENC_VOP3") => regs(v, 2),
+        Some(v) if d.enc.name.contains("VOP3") => regs(v, 2),
         _ => VCC,
     }
 }
@@ -296,7 +296,7 @@ pub fn forms(insts: &[Decoded]) -> BTreeMap<u64, Form> {
             continue;
         }
         // both operands scalar / constant: the mask is `cond ? EXEC : 0`, no ballot needed
-        let uniform = d.enc.name.starts_with("ENC_VOP3") && fv(d, "SRC0").is_some_and(|v| v < 256) && fv(d, "SRC1").is_some_and(|v| v < 256);
+        let uniform = d.enc.name.contains("VOP3") && fv(d, "SRC0").is_some_and(|v| v < 256) && fv(d, "SRC1").is_some_and(|v| v < 256);
         if uniform {
             out.insert(d.pc, Form::Uniform);
         } else if run(insts, &succ, &indirect, &z, &region, site).is_ok() {
@@ -535,5 +535,47 @@ mod tests {
             sop2("S_AND_B64", 126, 126, 2),
         ];
         assert_eq!(forms_of(&prog), [Some(Form::Local)]);
+    }
+
+    #[test]
+    fn vop3_sdst_and_literal_encodings_are_recognized() {
+        // VOP3_SDST_ENC: V_ADD_CO_CI_U32 and V_SUB_CO_CI_U32 read carry-in from SRC2, not VCC.
+        for (op, src2) in [("V_ADD_CO_CI_U32", 20u64), ("V_SUB_CO_CI_U32", 22u64)] {
+            let bytes = rdna2::encode(
+                op,
+                "VOP3_SDST_ENC",
+                &[("VDST", 1), ("SDST", 106), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", src2)],
+                None,
+            )
+            .unwrap();
+            let inst = rdna2::decode(&bytes, 0).unwrap();
+            assert_eq!(inst.enc.name, "VOP3_SDST_ENC");
+            assert_eq!(per_lane(&inst), regs(src2, 2));
+        }
+
+        // Scalar-vs-literal VOP3 compare is recognized as Form::Uniform.
+        let mut bytes = Vec::new();
+        bytes.extend(rdna2::encode("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None).unwrap());
+        let cmp_pc = bytes.len() as u64;
+        bytes.extend(
+            rdna2::encode(
+                "V_CMP_LT_F32",
+                "ENC_VOP3",
+                &[("VDST", 106), ("SRC0", 4), ("SRC1", 255)],
+                Some(0x3F80_0000),
+            )
+            .unwrap(),
+        );
+        bytes.extend(rdna2::encode("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 22), ("SSRC0", 106)], None).unwrap());
+        bytes.extend(rdna2::encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 3)], None).unwrap());
+        bytes.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        let mut insts = Vec::new();
+        let mut off = 0;
+        while off < bytes.len() {
+            let d = rdna2::decode(&bytes[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        assert_eq!(forms(&insts).get(&cmp_pc), Some(&Form::Uniform));
     }
 }
