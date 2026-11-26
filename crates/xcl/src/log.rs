@@ -2,7 +2,7 @@
 //! hooks are installed) so logging never re-enters the VFS.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -42,7 +42,53 @@ impl Level {
 static FILE: Mutex<Option<File>> = Mutex::new(None);
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static ECHO: AtomicBool = AtomicBool::new(true);
+static WRITE_FAILED: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
+
+fn report_write_result(
+    reported: &AtomicBool,
+    result: io::Result<()>,
+    report: impl FnOnce(&io::Error),
+) {
+    if let Err(error) = result {
+        if !reported.swap(true, Ordering::Relaxed) {
+            report(&error);
+        }
+    }
+}
+
+fn report_log_write_error(error: &io::Error) {
+    let _ = writeln!(std::io::stderr().lock(), "xcl: cannot write to the log: {error}");
+}
+
+fn flush_log_file_with(
+    file: &mut impl Write,
+    reported: &AtomicBool,
+    report: impl FnOnce(&io::Error),
+) {
+    report_write_result(reported, file.flush(), report);
+}
+
+fn write_log_entry_with(
+    file: &mut impl Write,
+    line: &[u8],
+    flush: bool,
+    reported: &AtomicBool,
+    mut report: impl FnMut(&io::Error),
+) {
+    report_write_result(reported, file.write_all(line), |error| report(error));
+    if flush {
+        flush_log_file_with(file, reported, |error| report(error));
+    }
+}
+
+fn write_log_entry(file: &mut impl Write, line: &[u8], flush: bool) {
+    write_log_entry_with(file, line, flush, &WRITE_FAILED, report_log_write_error);
+}
+
+fn flush_log_file(file: &mut impl Write) {
+    flush_log_file_with(file, &WRITE_FAILED, report_log_write_error);
+}
 
 /// Seconds since the log started (the host's start) – the times log lines carry.
 pub fn uptime() -> f64 {
@@ -100,10 +146,7 @@ pub fn write(level: Level, args: std::fmt::Arguments<'_>) {
     let line = format!("[{t:9.3}][{tid:5}][{}] {args}\n", level.tag());
     if let Ok(mut g) = FILE.try_lock().or_else(|_| FILE.lock()) {
         if let Some(f) = g.as_mut() {
-            let _ = f.write_all(line.as_bytes());
-            if level <= Level::Warn {
-                let _ = f.flush();
-            }
+            write_log_entry(f, line.as_bytes(), level <= Level::Warn);
         }
     }
     if ECHO.load(Ordering::Relaxed) && level <= Level::Info {
@@ -114,7 +157,7 @@ pub fn write(level: Level, args: std::fmt::Arguments<'_>) {
 pub fn flush() {
     if let Ok(mut g) = FILE.lock() {
         if let Some(f) = g.as_mut() {
-            let _ = f.flush();
+            flush_log_file(f);
         }
     }
 }
@@ -142,6 +185,63 @@ macro_rules! xlog_trace { ($($a:tt)*) => { if $crate::log::enabled($crate::log::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FaultWriter {
+        fail_write: bool,
+        fail_flush: bool,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for FaultWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.fail_write {
+                Err(io::Error::other("write failed"))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                Err(io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn log_write_failures_are_reported_once() {
+        let reported = AtomicBool::new(false);
+        let mut messages = Vec::new();
+        let mut file = FaultWriter { fail_write: true, fail_flush: true, writes: 0, flushes: 0 };
+        write_log_entry_with(
+            &mut file,
+            b"log entry",
+            true,
+            &reported,
+            |error| messages.push(error.to_string()),
+        );
+
+        assert_eq!(file.writes, 1);
+        assert_eq!(file.flushes, 1, "flush is still attempted after a write failure");
+        assert_eq!(messages, vec![String::from("write failed")]);
+    }
+
+    #[test]
+    fn a_log_flush_failure_is_reported() {
+        let reported = AtomicBool::new(false);
+        let mut messages = Vec::new();
+        let mut file = FaultWriter { fail_write: false, fail_flush: true, writes: 0, flushes: 0 };
+
+        flush_log_file_with(&mut file, &reported, |error| messages.push(error.to_string()));
+
+        assert_eq!(file.flushes, 1);
+        assert_eq!(messages, vec![String::from("flush failed")]);
+    }
 
     #[cfg(not(windows))]
     #[test]
