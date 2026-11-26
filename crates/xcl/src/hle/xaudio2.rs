@@ -30,7 +30,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -535,6 +535,38 @@ struct DecodedVoiceState {
     title_cb: usize,
     /// Maps stable token (`&*DecodedBuffer as usize`) → owned `DecodedBuffer`.
     live_buffers: Mutex<HashMap<usize, Box<DecodedBuffer>>>,
+    /// The last buffers that ended (`ENDED_KEEP` of them), their PCM freed: `GetState` can read a
+    /// buffer's token just before its `OnBufferEnd` runs. Each keeps its allocation, so its token
+    /// is not the address of a buffer submitted after it while it is here.
+    ended: Mutex<VecDeque<Box<DecodedBuffer>>>,
+}
+
+const ENDED_KEEP: usize = 64;
+
+/// `token`'s buffer ended: taken out of `live` and kept in `ended` without its PCM (under the
+/// lock of `live`, so a lookup never finds it in neither). Returns the title's context.
+fn end_buffer(live: &Mutex<HashMap<usize, Box<DecodedBuffer>>>, ended: &Mutex<VecDeque<Box<DecodedBuffer>>>, token: usize) -> Option<usize> {
+    let mut l = live.lock().unwrap();
+    let mut removed = l.remove(&token)?;
+    let orig = removed.orig_context;
+    removed._pcm = Box::default();
+    let mut e = ended.lock().unwrap();
+    let evicted = if e.len() == ENDED_KEEP { e.pop_front() } else { None };
+    e.push_back(removed);
+    drop(e);
+    drop(l);
+    drop(evicted);
+    Some(orig)
+}
+
+/// The title's context for the context XAudio2 reports (`cur`): a live or just-ended buffer's
+/// token becomes the title's context; any other value is the title's own.
+fn title_context(live: &Mutex<HashMap<usize, Box<DecodedBuffer>>>, ended: &Mutex<VecDeque<Box<DecodedBuffer>>>, cur: usize) -> usize {
+    let l = live.lock().unwrap();
+    if let Some(b) = l.get(&cur) {
+        return b.orig_context;
+    }
+    ended.lock().unwrap().iter().rev().find(|b| &***b as *const DecodedBuffer as usize == cur).map_or(cur, |b| b.orig_context)
 }
 
 struct DecodedVoiceHandle {
@@ -612,9 +644,7 @@ unsafe extern "system" fn decoded_cb_buffer_end(this: *mut c_void, ctx: *mut c_v
     let cb = &*(this as *const DecodedCallback);
     // Remove and drop the decoded PCM buffer before invoking the title's callback so
     // the lock is released and no double-free or deadlock can occur.
-    let removed = cb.state.live_buffers.lock().unwrap().remove(&(ctx as usize));
-    let orig = removed.as_ref().map(|b| b.orig_context as *mut c_void).unwrap_or(ctx);
-    drop(removed);
+    let orig = end_buffer(&cb.state.live_buffers, &cb.state.ended, ctx as usize).map_or(ctx, |c| c as *mut c_void);
     if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
         ((*vt).buffer_end)(obj, orig);
     }
@@ -785,6 +815,7 @@ unsafe fn create_decoded_voice(
         avg_bytes,
         title_cb: cb as usize,
         live_buffers: Mutex::new(HashMap::new()),
+        ended: Mutex::new(VecDeque::new()),
     });
     let wrapped_cb = Box::into_raw(Box::new(DecodedCallback {
         vtbl: &DECODED_CALLBACK_VTBL,
@@ -1148,9 +1179,7 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
         if let Some(voice_state) = voice_state {
             let cur = (*state_out).current_buffer_context as usize;
             if cur != 0 {
-                if let Some(buf) = voice_state.live_buffers.lock().unwrap().get(&cur) {
-                    (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
-                }
+                (*state_out).current_buffer_context = title_context(&voice_state.live_buffers, &voice_state.ended, cur) as *mut c_void;
             }
         }
     }
@@ -1175,6 +1204,7 @@ unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     orig(this);
     if let Some(h) = decoded_handle {
         h.state.live_buffers.lock().unwrap().clear();
+        h.state.ended.lock().unwrap().clear();
         drop(Box::from_raw(h.cb_ptr as *mut DecodedCallback));
     }
 }
@@ -1676,6 +1706,74 @@ mod tests {
         clamp_regions(&mut b, u32::MAX);
         assert_eq!(({ b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (1, u32::MAX - 1, 0, u32::MAX, 1));
     }
+
+    /// `GetState` racing `OnBufferEnd` (#2386): the buffer's token, read by XAudio2 just before
+    /// the buffer ended, still names the title's context, not freed memory of XCL's.
+    #[test]
+    fn get_state_context_survives_buffer_end() {
+        let live: Mutex<HashMap<usize, Box<DecodedBuffer>>> = Mutex::new(HashMap::new());
+        let ended: Mutex<VecDeque<Box<DecodedBuffer>>> = Mutex::new(VecDeque::new());
+        let new_buffer = |ctx: usize| {
+            let b = Box::new(DecodedBuffer { orig_context: ctx, _pcm: vec![0u8; 4].into_boxed_slice() });
+            let token = &*b as *const DecodedBuffer as usize;
+            live.lock().unwrap().insert(token, b);
+            token
+        };
+        let token = new_buffer(0x7E57_C0DE);
+        assert_eq!(title_context(&live, &ended, token), 0x7E57_C0DE);
+        // OnBufferEnd runs between XAudio2's GetState and XCL's lookup
+        assert_eq!(end_buffer(&live, &ended, token), Some(0x7E57_C0DE));
+        assert_eq!(title_context(&live, &ended, token), 0x7E57_C0DE, "a just-ended buffer's token must not reach the title");
+        // a context XCL never made (a PCM buffer the title queued itself) is passed through
+        assert_eq!(title_context(&live, &ended, 0x1234), 0x1234);
+        assert!(end_buffer(&live, &ended, 0x1234).is_none());
+        // only the last ENDED_KEEP ended buffers are kept
+        let first = new_buffer(1);
+        assert!(end_buffer(&live, &ended, first).is_some());
+        let mut kept = Vec::new();
+        for i in 0..ENDED_KEEP {
+            let t = new_buffer(100 + i);
+            kept.push(t);
+        }
+        for &t in &kept {
+            assert!(end_buffer(&live, &ended, t).is_some());
+        }
+        assert_eq!(ended.lock().unwrap().len(), ENDED_KEEP);
+        assert!(ended.lock().unwrap().iter().all(|b| b.orig_context != 1), "the oldest ended buffer goes first");
+        assert_eq!(title_context(&live, &ended, kept[ENDED_KEEP - 1]), 100 + ENDED_KEEP - 1);
+        assert!(ended.lock().unwrap().iter().all(|b| b._pcm.is_empty()), "an ended buffer keeps no PCM");
+    }
+
+    /// An ended buffer's token stays reserved while it is in `ended` (the ABA race): buffers
+    /// submitted after it never get its address, so a stale `GetState` token cannot name a newer
+    /// buffer's context. (Whether the allocator would hand the freed address straight back is up
+    /// to it, so the hold itself is checked too.)
+    #[test]
+    fn ended_token_is_not_reused_by_a_later_buffer() {
+        let live: Mutex<HashMap<usize, Box<DecodedBuffer>>> = Mutex::new(HashMap::new());
+        let ended: Mutex<VecDeque<Box<DecodedBuffer>>> = Mutex::new(VecDeque::new());
+        let new_buffer = |ctx: usize| {
+            let b = Box::new(DecodedBuffer { orig_context: ctx, _pcm: vec![0u8; 4].into_boxed_slice() });
+            let token = &*b as *const DecodedBuffer as usize;
+            live.lock().unwrap().insert(token, b);
+            token
+        };
+        let a = new_buffer(0xA);
+        assert_eq!(end_buffer(&live, &ended, a), Some(0xA));
+        assert!(
+            ended.lock().unwrap().iter().any(|b| &**b as *const DecodedBuffer as usize == a),
+            "the ended buffer's own allocation (its token's address) is held while the token is kept"
+        );
+        // the title's OnBufferEnd submits more buffers right away (the allocator's best chance
+        // to hand out A's address again)
+        for i in 0..ENDED_KEEP - 1 {
+            let b = new_buffer(0xB00 + i);
+            assert_ne!(b, a, "buffer {i} after A got A's address while A's token is still kept");
+            assert_eq!(title_context(&live, &ended, a), 0xA, "a stale token of A names A's context");
+        }
+    }
+
+    #[test]
 
     #[test]
     fn silent_buffer_clamps_regions_and_zero_max_bytes() {
