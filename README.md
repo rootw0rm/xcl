@@ -144,6 +144,8 @@ For title and HLE modules, `GetModuleFileNameA/W` returns zero and sets
 | **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller or a PlayStation controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft; a DualShock 4 (USB) |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
+`XTaskQueueDispatch` can run a queued callback from a `SerializedThreadPool` port on the calling thread.
+
 </details>
 
 <details>
