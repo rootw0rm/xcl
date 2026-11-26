@@ -310,14 +310,7 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
         let known = o.iface.iids.contains(&i) || i == c;
         note(c, i, format!("{}: XCL{}", o.iface.name, if known { "" } else { " (interface version not in the GDK table: the main vtable)" }));
         let target = if !o.iface.forward.is_empty() {
-            if known {
-                if o.pc.load(Ordering::Acquire) == 0 {
-                    o.pc.store(pc_object(&c, &i).unwrap_or(0), Ordering::Release);
-                }
-                o
-            } else {
-                forward_alias_obj(o, c, i)
-            }
+            forward_alias_obj(o, c, i)
         } else {
             o
         };
@@ -2234,6 +2227,22 @@ mod tests {
         assert!(parse_mute_tts(Some("1")));
         assert!(parse_mute_tts(Some("true")));
         assert!(parse_mute_tts(Some("yes")));
+    }
+
+    /// A forwarding class answers with a per-IID clone holding that interface's own PC
+    /// object: the class's shared `Obj` keeps `pc` empty, so concurrent `QueryApiImpl`
+    /// calls cannot race a load-then-store on it, and a PC object made for one interface
+    /// version (a shorter PC vtable) is never shared with the others (#2399).
+    #[test]
+    fn a_forwarding_class_answers_with_a_per_iid_clone() {
+        let iid = g(0xeaf669df_5542_4590_99a3_8dc061f837cc);
+        let (hr, out) = unsafe { query(XGAMEUI, iid) };
+        assert_eq!((hr, out.is_null()), (S_OK, false));
+        let main = own(&XGAMEUI, &iid).unwrap();
+        assert!(!std::ptr::eq(main as *const Obj, out as *const Obj), "the title must not get the shared Obj");
+        assert_eq!(main.pc.load(Ordering::Relaxed), 0, "the shared Obj keeps no PC object – each clone holds its own");
+        let (hr2, out2) = unsafe { query(XGAMEUI, iid) };
+        assert_eq!((hr2, out2 == out), (S_OK, true), "the same IID answers with the same clone");
     }
 
     #[test]
