@@ -32,8 +32,11 @@ use windows_sys::Win32::System::Memory::{
 };
 
 const TILE: usize = 0x1_0000;
-/// tiles of a video-memory pool heap (64 MiB)
-const POOL_TILES: u32 = 1024;
+/// tiles of a video-memory pool heap (4 MiB). A heap goes back only when every tile of it is
+/// free (`State::retire_free_pools`), and a title frees its tiles in runs spread over all its
+/// heaps: with heaps of 64 MiB a retail title's world load unmapped 1.5 GB of its 4.6 GB of
+/// tiles and 3 of 78 heaps went back (0.2 GB); with heaps of 4 MiB 1.25 GB went back.
+const POOL_TILES: u32 = 64;
 /// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
@@ -671,7 +674,7 @@ impl State {
             return Some((t, true));
         }
         // a pool retired a moment ago (its last tile came free) is taken back before a new
-        // 64 MB heap is made: freeing and allocating a tile in turn made a new pool each time,
+        // heap is made: freeing and allocating a tile in turn made a new pool each time,
         // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
         // (zeroed), so this is no less safe than reusing a tile of a pool in use.
         if let Some((heap, _, _)) = self.retired.pop() {
@@ -711,7 +714,7 @@ impl State {
         h
     }
 
-    /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
+    /// Pools whose every tile is free again go (their video memory – and as much of the
     /// system's commit: a retail game's homes of physical pages left 0.75 GB of pools for
     /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
     fn retire_free_pools(&mut self) {
@@ -725,12 +728,13 @@ impl State {
         for &(h, _) in &self.free {
             count[h as usize] += 1;
         }
-        let gone: Vec<usize> = (0..count.len()).filter(|&h| count[h] == POOL_TILES && self.pools[h].is_some()).collect();
-        if gone.is_empty() {
+        // (a flag a pool: a title's world load frees hundreds of pools' worth of tiles at once)
+        let gone: Vec<bool> = (0..count.len()).map(|h| count[h] == POOL_TILES && self.pools[h].is_some()).collect();
+        if !gone.contains(&true) {
             return;
         }
-        self.free.retain(|&(h, _)| !gone.contains(&(h as usize)));
-        for h in gone {
+        self.free.retain(|&(h, _)| !gone[h as usize]);
+        for h in (0..gone.len()).filter(|&h| gone[h]) {
             if let Some(heap) = self.pools[h].take() {
                 self.retired.push((heap, self.value, now));
             }
@@ -2052,7 +2056,7 @@ mod tests {
 
 
     /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
-    /// back, not a new 64 MB heap each time (#913: 288 pools, 18 GB asked of a 12 GB card).
+    /// back, not a new heap each time (#913: 288 pools of 64 MB, 18 GB asked of a 12 GB card).
     #[test]
     fn a_pool_retired_a_moment_ago_is_taken_back() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -2122,6 +2126,38 @@ mod tests {
                 assert_eq!(s.retired.len(), 1, "round {round}: the retired pool was taken back, not a new one made");
                 assert_eq!(s.pools.iter().filter(|p| p.is_some()).count(), 0, "round {round}");
             }
+        }
+    }
+
+    /// A title frees its tiles in runs spread over all its pools: the pools of the freed runs go
+    /// back. With pools of 64 MiB none of these did (every pool kept the tiles still in use).
+    #[test]
+    fn pools_of_freed_runs_go_back() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            // 192 MiB of tiles, taken in order as a title's first commits take them
+            const TILES: usize = 3072;
+            let tiles: Vec<(u32, u32)> = (0..TILES).map(|_| s.take_tile().expect("a tile").0).collect();
+            let made = s.pools.iter().filter(|p| p.is_some()).count();
+            assert_eq!(made * POOL_TILES as usize, TILES, "the tiles fill whole pools");
+            // of every 64 MiB the title keeps the first 4 MiB and frees the rest
+            let (mut kept, mut freed) = (0, 0);
+            for (i, &t) in tiles.iter().enumerate() {
+                if i % 1024 < 64 {
+                    kept += 1;
+                } else {
+                    s.free.push(t);
+                    freed += 1;
+                }
+            }
+            s.retire_free_pools();
+            let left = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize;
+            assert_eq!(s.free.len() + s.retired.len() * POOL_TILES as usize, freed, "every freed tile is free or its pool retired");
+            assert!(left <= kept * 2, "{left} tiles of video memory stay in pools for {kept} tiles in use ({} MiB for {} MiB)", left * TILE >> 20, kept * TILE >> 20);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 
