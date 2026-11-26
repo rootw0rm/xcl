@@ -242,6 +242,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- Files opened with `FILE_FLAG_DELETE_ON_CLOSE` stay hidden from the title after
+  the overlay copy is deleted, while the original stays in the game folder.
 - **Switches for how a title runs** (set them in the environment of `xcl run`):
   - `XCL_SKIP_BINK`: skips the Bink 2 movies of a title that ships a `bink2*.dll` (its logos and
     intros), by taking them straight to their last frame without decoding. Off when unset or `0`,
