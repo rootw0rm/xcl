@@ -55,8 +55,9 @@ fn data_root_from(
 /// Bytes of private memory committed by the process.
 ///
 /// Windows: `PROCESS_MEMORY_COUNTERS_EX::PrivateUsage` (the commit charge) in **bytes**;
-/// Wine fills only the earlier fields, so `PagefileUsage` (the same number on Windows) is
-/// the fallback.
+/// Wine leaves PrivateUsage 0 — and its PagefileUsage is not the commit (on macOS it
+/// is the Mach task's virtual size, ~41 GiB, that a commit does not change) — so there
+/// the committed private regions are summed with VirtualQuery instead.
 ///
 /// Linux: `/proc/self/status` `VmData` (size of private writable mappings) in **KiB**,
 /// multiplied by 1024. Linux has no commit-charge counter; `VmData` is the closest
@@ -81,16 +82,36 @@ mod imp {
                 &mut c as *mut _ as *mut _,
                 c.cb,
             ) != 0
+                && c.PrivateUsage != 0
             {
-                // Wine fills the fields before PrivateUsage only; PagefileUsage is the same
-                // number on Windows (the commit charge)
-                if c.PrivateUsage != 0 {
-                    c.PrivateUsage as u64
-                } else {
-                    c.PagefileUsage as u64
-                }
-            } else {
-                0
+                return c.PrivateUsage as u64;
+            }
+        }
+        committed_private_bytes()
+    }
+
+    /// The sum of the MEM_COMMIT + MEM_PRIVATE regions of the address space.
+    pub fn committed_private_bytes() -> u64 {
+        use windows_sys::Win32::System::Memory as mem;
+        let (mut sum, mut addr) = (0u64, 0usize);
+        loop {
+            let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe {
+                mem::VirtualQuery(
+                    addr as *const std::ffi::c_void,
+                    &mut m,
+                    std::mem::size_of_val(&m),
+                )
+            } == 0
+            {
+                return sum;
+            }
+            if m.State == mem::MEM_COMMIT && m.Type == mem::MEM_PRIVATE {
+                sum += m.RegionSize as u64;
+            }
+            match (m.BaseAddress as usize).checked_add(m.RegionSize) {
+                Some(next) if next > addr => addr = next,
+                _ => return sum,
             }
         }
     }
@@ -215,5 +236,56 @@ mod tests {
     #[test]
     fn process_private_bytes_is_nonzero_on_linux() {
         assert!(process_private_bytes() > 0);
+    }
+
+    /// A 256 MB commit shows in the process's commit, by the counter and by the
+    /// VirtualQuery sum Wine falls back to (Wine's PrivateUsage is 0 and its
+    /// PagefileUsage does not move). Linux twin: a 256 MB private writable
+    /// mmap shows in VmData the same way.
+    #[cfg(windows)]
+    #[test]
+    fn process_private_bytes_counts_a_commit() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+        let size = 256usize << 20;
+        let (before, regions_before) = (
+            super::imp::process_private_bytes(),
+            super::imp::committed_private_bytes(),
+        );
+        let p = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        let (after, regions_after) = (
+            super::imp::process_private_bytes(),
+            super::imp::committed_private_bytes(),
+        );
+        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        // other tests run in this process: allow them to free up to 64 MB meanwhile
+        let min = (size as u64) - (64 << 20);
+        assert!(after.saturating_sub(before) >= min, "commit {before} -> {after}");
+        assert!(regions_after.saturating_sub(regions_before) >= min, "regions {regions_before} -> {regions_after}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_private_bytes_counts_a_commit() {
+        let size = 256usize << 20;
+        let before = process_private_bytes();
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let after = process_private_bytes();
+        assert_eq!(unsafe { libc::munmap(p, size) }, 0);
+        // other tests run in this process: allow them to free up to 64 MB meanwhile
+        let min = (size as u64) - (64 << 20);
+        assert!(after.saturating_sub(before) >= min, "commit {before} -> {after}");
     }
 }
