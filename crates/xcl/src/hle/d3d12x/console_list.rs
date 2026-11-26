@@ -758,16 +758,32 @@ unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Ve
     if bound.len() >= 2 { return; }
     let mut dev: Option<ID3D12Device> = None;
     let _ = list.GetDevice(&mut dev);
+    let view = super::console_heap::global_heap().or_else(|| {
+        if let Some(d) = &dev { super::console_heap::shared_heap(d); }
+        super::console_heap::global_heap()
+    });
     let sampler = super::console_heap::global_sampler_heap().or_else(|| {
         if let Some(d) = &dev { super::console_heap::shared_sampler_heap(d); }
         super::console_heap::global_sampler_heap()
     });
-    let view = crate::gpu::recomp::pso::heap_windows().then(super::console_heap::global_heap).flatten();
     let (view, sampler) = match dev.as_ref().map(|d| d.as_raw() as usize) {
         Some(dev_raw) => (heap_on_device(view, dev_raw), heap_on_device(sampler, dev_raw)),
         None => (view, sampler),
     };
     ensure_dispatch_heaps_with(list, bound, has_sampler, view, sampler);
+}
+
+unsafe fn bind_dispatch_root(list: &ID3D12GraphicsCommandList, root_sig: &ID3D12RootSignature, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool) {
+    ensure_dispatch_heaps(list, bound, has_sampler);
+    list.SetComputeRootSignature(root_sig);
+}
+
+fn clear_uav_gpu_handle(g: &super::console_heap::Slot, c: &super::console_heap::Slot) -> Option<u64> {
+    if g.sampler || c.sampler {
+        return None;
+    }
+    let h = if c.shared_srv != 0 && g.shared_srv != 0 && c.pc_gpu_uav != 0 { c.pc_gpu_uav } else { g.pc_gpu_uav };
+    (h != 0).then_some(h)
 }
 
 /// Turn the recorded console commands into commands on the PC list and close it.
@@ -871,16 +887,19 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let res = q(2) as *mut c_void;
                 let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
                 match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
-                    (Some(g), Some(c), Some(r)) if g.pc_gpu_uav != 0 => {
-                        let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
-                        if get(1) != 0 {
-                            let f = values.map(f32::from_bits);
-                            list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
-                        } else {
-                            list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                    (Some(g), Some(c), Some(r)) => match clear_uav_gpu_handle(&g, &c) {
+                        Some(gpu_uav) => {
+                            let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
+                            if get(1) != 0 {
+                                let f = values.map(f32::from_bits);
+                                list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
+                            } else {
+                                list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                            }
+                            out.clears += 1;
                         }
-                        out.clears += 1;
-                    }
+                        None => out.skipped += 1,
+                    },
                     _ => out.skipped += 1,
                 }
                 at += 12;
@@ -944,11 +963,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
                         let own = super::real::pso_root_signature(real_ptr).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
-                        match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
-                            Some(r) => list.SetComputeRootSignature(r),
-                            None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
-                        }
-                        ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
+                        let own_rs = own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r));
+                        let root_sig: &ID3D12RootSignature = match own_rs.as_deref() {
+                            Some(r) => r,
+                            None => rs.as_ref().ok_or("no XCL ABI root signature")?,
+                        };
+                        bind_dispatch_root(&list, root_sig, &mut bound_heaps, &mut has_sampler_heap);
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         for k in 0..4 {
@@ -1188,6 +1208,106 @@ mod tests {
             assert_eq!((bound.len(), has_sampler), (2, true));
 
             list.Close().unwrap();
+        }
+    }
+
+    #[test]
+    fn clear_uav_gpu_handle_prefers_shared_cpu_slot_and_rejects_samplers() {
+        use super::super::console_heap::Slot;
+        let slot = |pc_gpu_uav: u64, shared_srv: u64, sampler: bool| Slot { at: 0x1000, index: 1, pc_srv: 0, pc_uav: 0x20, pc_gpu_uav, sampler, shared_srv, k: 0 };
+        // Shared GLOBAL inline copy: prefer CPU slot's published UAV in the same shared heap.
+        assert_eq!(clear_uav_gpu_handle(&slot(0x5010, 0xA000, false), &slot(0x6020, 0xB000, false)), Some(0x6020));
+        assert_eq!(clear_uav_gpu_handle(&slot(0, 0xA000, false), &slot(0x6020, 0xB000, false)), Some(0x6020));
+        // Shared fallback when CPU slot has no GPU handle, non-shared, and mixed heaps use g.pc_gpu_uav.
+        assert_eq!(clear_uav_gpu_handle(&slot(0x5010, 0xA000, false), &slot(0, 0xB000, false)), Some(0x5010));
+        assert_eq!(clear_uav_gpu_handle(&slot(0x5010, 0, false), &slot(0x6020, 0, false)), Some(0x5010));
+        assert_eq!(clear_uav_gpu_handle(&slot(0x5010, 0, false), &slot(0x6020, 0xB000, false)), Some(0x5010));
+        // Samplers and zero handles are rejected.
+        assert_eq!(clear_uav_gpu_handle(&slot(0x5010, 0xA000, true), &slot(0x6020, 0xB000, false)), None);
+        assert_eq!(clear_uav_gpu_handle(&slot(0x5010, 0xA000, false), &slot(0x6020, 0xB000, true)), None);
+        assert_eq!(clear_uav_gpu_handle(&slot(0, 0, false), &slot(0, 0, false)), None);
+    }
+
+    #[test]
+    fn bind_dispatch_root_sets_view_and_sampler_heaps_before_root_signature() {
+        const CHILD: &str = "XCL_TEST_CONSOLE_LIST_BIND_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_list::tests::bind_dispatch_root_sets_view_and_sampler_heaps_before_root_signature", "--nocapture"])
+                .env(CHILD, "1")
+                .env("XCL_HEAP_WINDOWS", "0")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        assert!(!crate::gpu::recomp::pso::heap_windows());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
+        let dev = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                return crate::gpu::recomp::runner::skip_test("no DXGI");
+            };
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let adapter: Option<IDXGIAdapter1> = if sel == crate::gpu::adapter::Selector::Warp {
+                factory.EnumWarpAdapter().ok()
+            } else {
+                crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().map(|(a, _)| a).or_else(|| factory.EnumWarpAdapter().ok())
+            };
+            let Some(adapter) = adapter else {
+                return crate::gpu::recomp::runner::skip_test("no adapter");
+            };
+            let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+            };
+            dev
+        };
+        let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+        #[repr(C)]
+        struct SpyList {
+            vt: *const usize,
+            dev: ID3D12Device,
+            events: Vec<&'static str>,
+            heap_types: Vec<D3D12_DESCRIPTOR_HEAP_TYPE>,
+            root_sig: usize,
+        }
+        unsafe extern "system" fn retain(_: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn get_dev(this: *mut SpyList, _: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+            *ppv = (*this).dev.clone().into_raw();
+            S_OK
+        }
+        unsafe extern "system" fn set_heaps(this: *mut SpyList, n: u32, pp: *const *mut c_void) {
+            (*this).events.push("heaps");
+            (*this).heap_types.clear();
+            for i in 0..n as usize {
+                let h = *pp.add(i);
+                if let Some(dh) = ID3D12DescriptorHeap::from_raw_borrowed(&h) {
+                    (*this).heap_types.push(dh.GetDesc().Type);
+                }
+            }
+        }
+        unsafe extern "system" fn set_rs(this: *mut SpyList, rs: *mut c_void) {
+            (*this).events.push("rs");
+            (*this).root_sig = rs as usize;
+        }
+        let mut vt = [0usize; 64];
+        (vt[1], vt[2], vt[7], vt[28], vt[29]) = (retain as usize, retain as usize, get_dev as usize, set_heaps as usize, set_rs as usize);
+        let mut spy = SpyList { vt: vt.as_ptr(), dev: dev.clone(), events: Vec::new(), heap_types: Vec::new(), root_sig: 0 };
+        unsafe {
+            let ptr = &mut spy as *mut SpyList as *mut c_void;
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&ptr).unwrap();
+            let (mut bound, mut has_sampler) = (Vec::new(), false);
+            bind_dispatch_root(list, &rs, &mut bound, &mut has_sampler);
+            assert_eq!(spy.events, ["heaps", "rs"]);
+            assert_eq!(spy.heap_types, [D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER]);
+            assert_eq!((spy.root_sig, bound.len(), has_sampler), (rs.as_raw() as usize, 2, true));
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let real_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let (mut b2, mut hs2) = (Vec::new(), false);
+            bind_dispatch_root(&real_list, &rs, &mut b2, &mut hs2);
+            assert_eq!((b2.len(), hs2), (2, true));
+            real_list.Close().unwrap();
         }
     }
 }
