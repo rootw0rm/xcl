@@ -580,3 +580,60 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-126 (task-1795719142-50e4): #2852 triaged SKIP (already-landed superset), probe past #2852
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) tops out at #2852 (`69ebece8`) — NOTHING past
+  #2852 in the batched listing. Per-PR sequential probe #2830..#2960
+  (widened past the sixth gap per mem-1795712765-78dc): #2830 `d6cf64c1` /
+  #2831 `965806a0` / #2832 `e2ecdfa9` / #2833 `f5a352c3` /
+  #2834 `653f8f13` / #2836 `43a4eb9d` / #2837 `9d967cf8` /
+  #2838 `ef36b7df` / #2842 `344ce7b5` / #2843 `932e689c` /
+  #2844 `fc007a96` / #2845 `76b17593` / #2846 `a4421e06` /
+  #2847 `4b1780e8` / #2848 `88e56f93` / #2849 `4e93173` /
+  #2850 `cdff8f72` / #2851 `7e6e2f09` / #2852 `69ebece8` (all pins match
+  batched + sequential, `merge-base --is-ancestor` exit 1 each — all still
+  OPEN, unmerged); #2835, #2839..#2841, #2853..#2960 ALL MISSING — scan
+  complete. Critic step-125 handoff pin #2852 `69ebece8` matches the live
+  head (no force-push, no mid-window arrival — batched and sequential
+  agree).
+- Triage (one new PR):
+  - #2852 `69ebece8` (D3D12.X: forget command list before its final
+    release, single commit on `8b957bec`, cites #2690 address-reuse race):
+    `real.rs` +11/−3 replaces the `n = f(this); if n == 0 { trio }`
+    tail of `cl_release` with an AddRef probe
+    (`last = add(this) == 2`), the `list_x::on_release` + `bind::forget`
+    + `dred::forget_list` trio BEFORE the final release, and an undo
+    `f(this)` of the probe AddRef. SKIP — already-landed SUPERSET in
+    tree via `3e466e16` (port of upstream #2520 + #2691): our
+    `cl_release` (`real.rs:8155`) already probes `add(this) == 2`,
+    forgets the identical trio (factored as `forget_command_list`,
+    `:8170-8174`) while the count is still 1 (same before-release
+    ordering), AND keeps the race fallback the upstream PR dropped
+    (`if n == 0 && !last`, same comment shape as upstream's own
+    "two last-but-one releases" caveat). Base shape matches
+    (upstream pre-image = the `n == 0` tail ours replaced in
+    `3e466e16`). Windows-only file regardless: whole `hle` is
+    `#[cfg(windows)]` (`lib.rs:30-34`, `hle_linux` swap on Linux), and
+    zero `on_release` / `bind::forget` / `dred::forget` /
+    `forget_command_list` refs in `d3d12x_linux.rs` /
+    `vulkan_linux.rs` / `hle_linux.rs` (the two `list_x` hits in
+    `d3d12x_linux.rs:1437-1439` are a local test type alias `ListX`,
+    not the module). Nothing to port.
+  Earlier pins stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed;
+  #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim
+  in `aa59e8ac`; #2843/#2844-new-head/#2845/#2846/#2847/#2848/#2849/#2850/
+  #2851 SKIP.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step126r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
