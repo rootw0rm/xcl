@@ -798,3 +798,36 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-129 (task-1795721259-f1ec): scan empty past #2860, all pins re-verified
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout
+  (re-fetched pre-commit 19:39 UTC).
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) was flaky this round: the first full listing
+  topped at #2821 (truncated fetch, 2345 refs) while a re-list's raw
+  tail showed #2860 — sequential is ground truth, same lesson as
+  step-128's batch-miss in the other direction. Per-PR sequential probe
+  #2830..#3040 (widened past the sixth gap per mem-1795712765-78dc)
+  found 26 PRESENT (#2830..#2860 minus #2835/#2839-#2841/#2857 gaps);
+  all pins match step-128 (no force-push), all 26 `merge-base
+  --is-ancestor` exit 1 (all OPEN); #2861..#3040 ALL MISSING — scan
+  complete, top is still #2860. No new PRs since step-128, no push
+  race (per mem-1795714025-21a1): nothing committed in-window that was
+  not already triaged.
+- Triage: nothing new to triage. Earlier pins stand:
+  #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted
+  in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in `aa59e8ac`;
+  #2843/#2844-new-head/#2845/#2846/#2847/#2848/#2849/#2850/#2851/#2852/
+  #2853/#2854/#2855/#2856/#2858/#2859/#2860 SKIP.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step129r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
