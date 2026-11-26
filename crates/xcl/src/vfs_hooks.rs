@@ -1189,9 +1189,10 @@ fn collect_game_entries(
     if rel.is_empty() {
         return Err(vfs::ERROR_FILE_NOT_FOUND);
     }
-    let (dir_rel, pattern) = match rel.rsplit_once('\\') {
+    let rel_norm = rel.replace('/', "\\");
+    let (dir_rel, pattern) = match rel_norm.rsplit_once('\\') {
         Some((d, p)) => (d.to_string(), p.to_string()),
-        None => (String::new(), rel.to_string()),
+        None => (String::new(), rel_norm.to_string()),
     };
     if !dir_rel.is_empty() && !v.is_dir(&dir_rel) {
         return Err(vfs::ERROR_PATH_NOT_FOUND);
@@ -2047,6 +2048,13 @@ mod tests {
             .collect();
         before.sort();
         assert_eq!(before, vec![".", "..", "gone.txt", "hello.txt"]);
+        let mut fwd: Vec<String> = collect_game_entries(v, "data/*", real_collect)
+            .unwrap()
+            .iter()
+            .map(name_of)
+            .collect();
+        fwd.sort();
+        assert_eq!(fwd, before);
 
         assert_eq!(v.remove_dir("data"), Err(vfs::ERROR_DIR_NOT_EMPTY));
         assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
