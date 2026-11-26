@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HANDLE;
@@ -28,6 +28,12 @@ pub(super) enum Write {
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
     ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
+    /// A deferred `Write64BitValueBottomOfPipeX` into a registered sync cell: the store must
+    /// wait for confirmed producer-fence completion, stale values never overwrite newer memory,
+    /// and the sync-cell fence is published only after the store succeeds. The third field is
+    /// the cell's registration generation at record time; a job from a retired era neither
+    /// stores nor publishes.
+    SyncU64(usize, u64, u64),
 }
 
 struct Job {
@@ -39,10 +45,13 @@ struct Job {
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
 unsafe impl Send for Job {}
 
-/// queue → its fence and the last value signalled
+/// queue → its fence, the last value signalled, the channel feeding its worker, and the
+/// release-cancellation flag shared with that worker
 struct QueueFence {
     fence: ID3D12Fence,
     value: u64,
+    tx: mpsc::Sender<Job>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 unsafe impl Send for QueueFence {}
@@ -53,14 +62,96 @@ static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 /// queue that never gets there)
 const WAIT_MS: u32 = 10_000;
 
-fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
-    static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    W.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
-            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            for job in rx {
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
+/// Workers alive right now (test-only lifecycle evidence; compiled out of production).
+#[cfg(test)]
+pub(super) static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only seam: the queue key whose device queries all report removal. Compiled out of
+/// production builds; production removal detection uses the real D3D12 device query only.
+#[cfg(test)]
+pub(super) static REMOVAL_INJECT_QUEUE: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `queue`'s device is gone: a removed device reports its reason as an error, and a
+/// failed query is never proof of health - the only healthy answer is a successful query
+/// returning `Ok`. Never a completion signal: nothing here advances any fence or watermark.
+unsafe fn device_gone(queue: usize, fence: &ID3D12Fence) -> bool {
+    #[cfg(test)]
+    if REMOVAL_INJECT_QUEUE.load(Ordering::SeqCst) == queue {
+        return true;
+    }
+    let mut dev: Option<ID3D12Device> = None;
+    if fence.GetDevice(&mut dev).is_err() {
+        return true;
+    }
+    let Some(dev) = dev else { return true };
+    let _ = queue;
+    dev.GetDeviceRemovedReason().is_err()
+}
+
+/// The title released `queue`'s last reference (`list_x::on_queue_release`): cancel the
+/// worker's strict waits (grace-bounded, see the worker loop) and drop the sender so no new
+/// jobs are accepted. Already-buffered jobs keep their fence objects alive; a drained worker
+/// then exits on the closed channel. Cancellation never publishes anything: a job whose
+/// producer completion cannot be confirmed within the grace is dropped without storing.
+pub(super) fn on_queue_released(queue: usize) {
+    if let Some(m) = FENCES.lock().unwrap().as_mut() {
+        if let Some(qf) = m.remove(&queue) {
+            qf.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Whether `queue` still has a live worker registration (test evidence for release paths).
+#[cfg(test)]
+pub(super) fn queue_registered(queue: usize) -> bool {
+    FENCES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&queue))
+}
+
+/// Spawn one worker thread for `queue`, fed by the channel paired with the sender kept in its
+/// `QueueFence`. Per-queue workers keep a queue blocked on its own producer fence from delaying
+/// unrelated queues' writes, and give strict sync-cell jobs an independent completion path.
+fn spawn_worker(queue: usize, rx: mpsc::Receiver<Job>, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let spawned = std::thread::Builder::new().name(format!("xcl-cpu-writes-q{queue:x}")).spawn(move || unsafe {
+        #[cfg(test)]
+        LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
+        let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        for job in rx {
+            let strict = job.writes.iter().any(|w| matches!(w, Write::SyncU64(..)));
+            // Set when the device is removed before the producer batch completed: the batch
+            // provably never executed, so its sync-cell writes must never be stored.
+            let mut removed_incomplete = false;
+            // Set when a released queue's grace expired while the producer fence was still
+            // incomplete: the job is abandoned - never stored, never published.
+            let mut abandoned = false;
+            if job.fence.GetCompletedValue() < job.value {
+                if strict {
+                    // A job carrying sync-cell writes must never publish before its producer
+                    // batch completes: on console the write did not happen. Poll until the
+                    // fence completes or the device is removed; no timeout publishes early.
+                    // Queue release does not cancel the wait outright - a slow-but-legitimate
+                    // batch still lands - but bounds it: `WAIT_MS` of grace after cancellation,
+                    // then the job is abandoned rather than waiting forever.
+                    let mut deadline: Option<std::time::Instant> = None;
+                    loop {
+                        if job.fence.GetCompletedValue() >= job.value {
+                            break;
+                        }
+                        if device_gone(queue, &job.fence) {
+                            crate::xlog_warn!("D3D12.X: device removed while deferred writes waited for their queue (fence at {}, wanted {}) - dropping {} writes", job.fence.GetCompletedValue(), job.value, job.writes.len());
+                            removed_incomplete = true;
+                            break;
+                        }
+                        if cancel.load(Ordering::SeqCst) {
+                            let d = deadline.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_millis(WAIT_MS as u64));
+                            if std::time::Instant::now() >= *d {
+                                crate::xlog_warn!("D3D12.X: deferred writes on a released queue never saw their producer batch complete (fence at {}, wanted {}) - dropping {} writes", job.fence.GetCompletedValue(), job.value, job.writes.len());
+                                abandoned = true;
+                                break;
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                } else if job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
                     th::WaitForSingleObject(event, WAIT_MS);
                     if job.fence.GetCompletedValue() < job.value {
                         static LATE: AtomicU64 = AtomicU64::new(0);
@@ -70,22 +161,34 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                         }
                     }
                 }
-                for w in &job.writes {
-                    match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
+            }
+            for w in &job.writes {
+                match w {
+                    Write::Immediate(va, words) => write_now(*va, words),
+                    Write::ReadbackU64 { va, src, .. } => {
+                        let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                        write_u64_now(*va, value);
+                    }
+                    Write::SyncU64(va, value, generation) => {
+                        if removed_incomplete || abandoned {
+                            // The producer batch never provably completed: on console this
+                            // write never happened. Never store or publish it.
+                            continue;
                         }
+                        let (va, value, generation) = (*va, *value, *generation);
+                        // Staleness decision, store, watermark update and fence publication
+                        // linearize in one SYNC_GRAPH critical section inside list_x.
+                        super::list_x::sync_cell_deferred_store(va, value, generation, || write_u64_now(va, value));
                     }
                 }
             }
-        });
-        if let Err(e) = spawned {
-            crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
         }
-        Mutex::new(tx)
-    })
+        #[cfg(test)]
+        LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
+    });
+    if let Err(e) = spawned {
+        crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
+    }
 }
 
 /// The dwords at `va`, if the memory is still there and writable.
@@ -126,19 +229,25 @@ unsafe fn u64_writable_now(va: usize) -> bool {
 }
 
 /// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
-unsafe fn write_u64_now(va: usize, value: u64) {
+/// Returns whether the store actually happened: sync-cell publication depends on the answer.
+unsafe fn write_u64_now(va: usize, value: u64) -> bool {
     if u64_writable_now(va) {
         (*(va as *const AtomicU64)).store(value, Ordering::Release);
+        return true;
     }
+    false
 }
 
 /// Advance an 8-byte aligned 64-bit value at `va` to at least `value` (`fetch_max`), if the memory
 /// is still committed and writable. Best-effort check before the atomic write (same TOCTOU
 /// trade-off as `write_u64_now`: a concurrent title decommit between check and store is unguarded).
-pub(super) unsafe fn max_u64_now(va: usize, value: u64) {
+/// Returns whether the store actually happened.
+pub(super) unsafe fn max_u64_now(va: usize, value: u64) -> bool {
     if u64_writable_now(va) {
         (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel);
+        return true;
     }
+    false
 }
 
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
@@ -162,7 +271,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let job = {
+    {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let entry = match m.entry(queue as usize) {
@@ -174,18 +283,23 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
                 }
                 let Some(dev) = dev else { return };
                 let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-                v.insert(QueueFence { fence, value: 0 })
+                let (tx, rx) = mpsc::channel::<Job>();
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                spawn_worker(queue as usize, rx, cancel.clone());
+                v.insert(QueueFence { fence, value: 0, tx, cancel })
             }
         };
         entry.value += 1;
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        let nwrites = writes.len();
+        // The fence signal and the job send stay in submission order under concurrent
+        // submission: both happen inside this lock.
+        let _ = entry.tx.send(Job { fence: entry.fence.clone(), value: entry.value, writes });
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({nwrites} in the first submission)"));
     };
-    static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    let _ = worker().lock().unwrap().send(job);
 }
 
 #[cfg(test)]

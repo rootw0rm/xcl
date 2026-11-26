@@ -795,6 +795,7 @@ pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE)
 
 /// Remove a released command queue so `KickoffX` never submits to a dead queue.
 pub(super) fn on_queue_release(queue: usize) {
+    super::cpu_writes::on_queue_released(queue);
     let mut scratch = COPY_SCRATCH.lock().unwrap();
     scratch.fences.remove(&queue);
     scratch.collect_released();
@@ -1225,6 +1226,19 @@ struct SyncCell {
     /// Set once a strictly decreasing write (`value < submitted_max`) is observed at this VA,
     /// disabling GPU-fence bridging and falling back to CPU polling.
     non_monotonic: bool,
+    /// Highest value the CPU worker provably stored into this cell's memory. The one
+    /// memory-content truth: never advanced by fence bookkeeping, cycle breaks, or the watchdog
+    /// (except a cycle-break's own confirmed memory write), so publication up to it can never
+    /// claim progress memory does not have.
+    stored_max: u64,
+    /// This cell's bottom-of-pipe writes go to memory the GPU cannot write, so the CPU worker
+    /// performs them: no GPU-timeline signal of this fence may happen for them - publication
+    /// comes from the worker after the store.
+    deferred: bool,
+    /// Registration era: bumped when the cell transitions non-monotonic (its fence and
+    /// monotonic identity are retired). Deferred writes carry the era they were recorded in;
+    /// a job from a retired era neither stores nor publishes.
+    generation: u64,
     /// Active GPU `queue.Wait(&fence, v)` calls on this cell not yet confirmed completed on GPU.
     armed_waits: Vec<ArmedGpuWait>,
     /// Active GPU `queue.Signal(&fence, v)` calls on this cell not yet confirmed completed on GPU.
@@ -1486,10 +1500,19 @@ unsafe fn publish_cpu_cycle_break_with(va: u64, val: u64, uma: Option<&crate::gp
     if uma.is_some_and(|u| u.is_sparse(addr)) {
         return;
     }
-    if uma.is_some_and(|u| u.in_committed_window(addr, 8)) {
+    let stored = if uma.is_some_and(|u| u.in_committed_window(addr, 8)) {
         (*(addr as *const AtomicU64)).fetch_max(val, Ordering::AcqRel);
+        true
     } else {
-        super::cpu_writes::max_u64_now(addr, val);
+        super::cpu_writes::max_u64_now(addr, val)
+    };
+    if stored {
+        // The memory truth watermark tracks every confirmed store into the cell, whoever made
+        // it: without this a stale deferred worker job could still overwrite the newer value
+        // this cycle break just published.
+        if let Some(cell) = SYNC_GRAPH.lock().unwrap().as_mut().and_then(|gr| gr.cells.get_mut(&va)) {
+            cell.stored_max = cell.stored_max.max(val);
+        }
     }
 }
 
@@ -1759,6 +1782,15 @@ unsafe fn ensure_cell_fence(va: u64, dev: &ID3D12Device, dev_raw: usize) -> Opti
     if cell.non_monotonic {
         return None;
     }
+    if cell.deferred && cell.stored_max > 0 {
+        // A deferred cell's worker may have stored before this fence existed; a fresh fence
+        // starts at 0 and would never be signalled again. Publish what memory provably holds,
+        // under the same lock that serializes worker publication.
+        let target = cell.stored_max;
+        if created.Signal(target).is_ok() {
+            cell.cpu_signaled_max = cell.cpu_signaled_max.max(target);
+        }
+    }
     if let Some(ref existing) = cell.fence {
         return (cell.device == dev_raw).then(|| existing.clone());
     }
@@ -1794,6 +1826,9 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
             }
             cell.submitted_signals.clear();
             cell.non_monotonic = true;
+            // The cell's monotonic identity is retired: deferred jobs recorded before this
+            // transition must neither store nor publish into the new era.
+            cell.generation += 1;
             let prev_sub = cell.submitted_max;
             let old_fence = cell.fence.take();
             old_fence.filter(|_| max_armed > 0).map(|f| (f, max_armed, prev_sub))
@@ -1822,6 +1857,92 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
             );
         }
     }
+}
+
+/// Test-only seam at the publication boundary: a non-zero value is one injected transient
+/// `fence.Signal` failure for `SIGNAL_FAIL_VA`. Compiled out of production builds.
+#[cfg(test)]
+static SIGNAL_FAIL_INJECT: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static SIGNAL_FAIL_VA: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn inject_signal_failure(va: u64) -> bool {
+    if SIGNAL_FAIL_VA.load(Ordering::SeqCst) != va as usize {
+        return false;
+    }
+    SIGNAL_FAIL_INJECT
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+#[cfg(not(test))]
+fn inject_signal_failure(_va: u64) -> bool {
+    false
+}
+
+/// The one publication step shared by the worker store path and the consumer-establishment
+/// retry: signal `cell`'s fence up to `cell.stored_max` - never beyond what memory provably
+/// holds - advancing `cpu_signaled_max` only when the signal actually succeeded. A failed
+/// signal leaves both the fence and the watermark honestly behind; the next store, fence
+/// creation, or consumer arrival retries. Must be called with `SYNC_GRAPH` held so the max
+/// computation and the signal serialize.
+unsafe fn publish_cell_progress(va: u64, cell: &mut SyncCell) {
+    if cell.stored_max <= cell.cpu_signaled_max {
+        return;
+    }
+    let target = cell.stored_max;
+    if let Some(ref f) = cell.fence {
+        #[cfg(test)]
+        {
+            if inject_signal_failure(va) {
+                return;
+            }
+        }
+        if f.Signal(target).is_ok() {
+            cell.cpu_signaled_max = cell.cpu_signaled_max.max(target);
+        }
+    }
+}
+
+/// The deferred sync-cell store entry point called by the cpu_writes worker. Staleness
+/// decision, memory store, watermark update and fence publication linearize in this one
+/// `SYNC_GRAPH` critical section, so the decision never uses stale eligibility state and a
+/// stale store can never overwrite newer memory regardless of which queue's worker retires
+/// first. `generation` is the cell era the write was recorded in: a job from a retired era
+/// belongs to a registration that no longer exists and is dropped entirely.
+///
+/// `store` performs the actual memory write and returns whether it happened; it is invoked
+/// inside the critical section but only touches the target memory itself.
+pub(super) unsafe fn sync_cell_deferred_store(va: usize, value: u64, generation: u64, store: impl FnOnce() -> bool) {
+    let mut g = SYNC_GRAPH.lock().unwrap();
+    let graph = g.get_or_insert_with(SyncGraph::default);
+    let Some(cell) = graph.cells.get_mut(&(va as u64)) else {
+        // No registered cell: nothing to suppress or publish - keep legacy store behaviour.
+        drop(g);
+        let _ = store();
+        return;
+    };
+    if cell.generation != generation {
+        // A job from a retired registration era: the cell it was recorded for no longer
+        // exists. Never store into memory a new era may already read differently, never publish.
+        return;
+    }
+    if cell.non_monotonic {
+        // Non-monotonic cells never bridge and are never suppressed: store in job order.
+        let _ = store();
+        return;
+    }
+    if value <= cell.stored_max {
+        // Stale or redundant: memory already holds at least this value. Suppress the store;
+        // fall through to publication so outstanding progress is still published.
+    } else if store() {
+        cell.stored_max = value;
+    } else {
+        // Failed store: neither the watermark nor the fence may advance for this value.
+        return;
+    }
+    publish_cell_progress(va as u64, cell);
 }
 
 unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
@@ -1902,7 +2023,12 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                         if val > cell.recorded_max {
                             cell.recorded_max = val;
                         }
-                        if completed < val && cell.cpu_signaled_max < val {
+                        if cell.deferred {
+                            // A CPU-deferred cell's fence is signalled by the worker only after
+                            // the store succeeds; a GPU-timeline signal here would release
+                            // consumers before the value exists in memory.
+                            SignalAction::Skip
+                        } else if completed < val && cell.cpu_signaled_max < val {
                             cell.submitted_signals.push(SubmittedSignal { val, queue: sig_q, seq: sig_seq });
                             SignalAction::GpuSignal
                         } else {
@@ -1997,10 +2123,10 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     let pre = {
         let g = SYNC_GRAPH.lock().unwrap();
         g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| {
-            (c.non_monotonic, c.recorded_max, c.submitted_max, c.submitted_queue, c.cpu_signaled_max)
+            (c.non_monotonic, c.recorded_max, c.submitted_max, c.submitted_queue, c.cpu_signaled_max, c.deferred)
         })
     };
-    let Some((non_mono, rec_max, sub_max, sub_q, cpu_sig_max)) = pre else {
+    let Some((non_mono, rec_max, sub_max, sub_q, cpu_sig_max, deferred)) = pre else {
         return GpuWaitOutcome::FallbackCpu;
     };
     if non_mono || rec_max < w.value {
@@ -2012,8 +2138,10 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::Handled;
     }
     // Producer already submitted earlier on THIS EXACT queue: D3D12 FIFO executes it strictly
-    // before this list without needing a CPU wait or redundant queue.Wait.
-    if sub_max >= w.value && sub_q == Some(q_raw) {
+    // before this list without needing a CPU wait or redundant queue.Wait. NOT for a deferred
+    // cell: queue order says nothing about when the CPU worker's store lands, so the consumer
+    // must wait on the fence the worker publishes after the store.
+    if !deferred && sub_max >= w.value && sub_q == Some(q_raw) {
         return GpuWaitOutcome::Handled;
     }
     // Same-batch self-wait: this very submission writes `(w.va, >= w.value)`, so hoisting a GPU
@@ -2045,12 +2173,26 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                 if cell.cpu_signaled_max >= w.value {
                     return GpuWaitOutcome::Handled;
                 }
+                if cell.deferred {
+                    // A consumer arriving after a store whose publication failed (or whose
+                    // fence did not yet exist) retries publication here rather than arming a
+                    // GPU wait for progress memory already has.
+                    publish_cell_progress(w.va, cell);
+                    // Memory already satisfying the wait releases the consumer even when
+                    // publication keeps failing: memory really holds the value, and a monotonic
+                    // cell cannot regress, so the wait's semantic condition is met. Arming a
+                    // GPU wait on a fence that may never be signalled would risk blocking the
+                    // queue indefinitely instead.
+                    if cell.cpu_signaled_max >= w.value || w.is_satisfied() {
+                        return GpuWaitOutcome::Handled;
+                    }
+                }
                 let completed = prune_completed_waits(cell);
                 if completed >= w.value {
                     // Fence already reached `w.value`: trust it if CPU memory agrees (not reset).
                     return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
                 }
-                if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
+                if !cell.deferred && cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
                     return GpuWaitOutcome::Handled;
                 }
                 (cell.submitted_max < w.value, cell.recorded_list_type, cell.submitted_queue.or(cell.recorded_last_queue))
@@ -2185,6 +2327,18 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
 /// bridged to GPU-side `queue.Wait` without blocking the submitter thread on the CPU.
+/// A wait recorded after its own command list's CPU-deferred Write64 of the value it waits for,
+/// which the record-time split could not move to a segment of its own: hoisting it before the
+/// list is a deadlock (the deferred store needs this list's own completion) and skipping it
+/// drops the ordering - it is enforced on the submission thread after the list is submitted.
+unsafe fn is_deferred_self_wait(w: &PendingWait, list_writes: &[(u64, u64)]) -> bool {
+    if !w.after_write64 || w.width != 8 || w.is_satisfied() || !list_writes.iter().any(|&(wva, wv)| wva == w.va && wv >= w.value) {
+        return false;
+    }
+    let g = SYNC_GRAPH.lock().unwrap();
+    g.as_ref().and_then(|gr| gr.cells.get(&w.va)).is_some_and(|c| c.deferred && c.submitted_max < w.value)
+}
+
 pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
     if lists.is_empty() {
         return;
@@ -2213,8 +2367,36 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all_on(queue, waits, list_writes);
-        start = i;
+        // The record-time split is what orders a wait behind this list's own deferred Write64
+        // exactly. Where no split was possible the wait is neither hoisted (deadlock: the store
+        // needs this list's completion) nor skipped (the ordering is lost): the list is
+        // submitted alone, then the wait is enforced on the submission thread - the producer
+        // retires independently, so this cannot deadlock - before anything after it.
+        let mut deferred_self: Vec<PendingWait> = Vec::new();
+        let mut normal: Vec<PendingWait> = Vec::new();
+        for w in waits {
+            if is_deferred_self_wait(w, list_writes) {
+                deferred_self.push(*w);
+            } else {
+                normal.push(*w);
+            }
+        }
+        if deferred_self.is_empty() {
+            wait_all_on(queue, waits, list_writes);
+            start = i;
+            continue;
+        }
+        if !normal.is_empty() {
+            wait_all_on(queue, &normal, list_writes);
+        }
+        submit(&lists[i..i + 1]);
+        start = i + 1;
+        for w in &deferred_self {
+            if !w.wait_until_satisfied(wait_timeout()) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                warn(&N, "Wait64BitValueX", format_args!("deferred self-wait at {:#x} timed out - the producer never completed", w.va));
+            }
+        }
     }
     if start < lists.len() {
         submit(&lists[start..]);
@@ -2543,8 +2725,32 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
+            // A two-word marker-out write is a `Write64BitValueBottomOfPipeX`: when it targets
+            // a registered sync cell it becomes a strictly ordered deferred sync write whose
+            // fence is published only after the store. The registration check is scoped BEFORE
+            // the LISTS acquisition: the two locks are never nested here.
+            let sync64 = words.len() == 2 && mode == D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            let registered = if !sync64 {
+                None
+            } else {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                match g.as_mut().and_then(|gr| gr.cells.get_mut(&va)) {
+                    Some(cell) => {
+                        cell.deferred = true;
+                        Some(cell.generation)
+                    }
+                    None => None,
+                }
+            };
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-                s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                let w = match registered {
+                    Some(generation) => {
+                        let value = words[0] as u64 | (words[1] as u64) << 32;
+                        super::cpu_writes::Write::SyncU64(va as usize, value, generation)
+                    }
+                    None => super::cpu_writes::Write::Immediate(va as usize, words.to_vec()),
+                };
+                s.cpu_writes.push(w);
                 return;
             }
         }
@@ -8262,5 +8468,798 @@ mod tests {
         assert!(after[SYNC_READABLE] > before[SYNC_READABLE]);
         assert!(after[SYNC_READABLE_LARGE] > before[SYNC_READABLE_LARGE]);
         assert!(after[SYNC_COPIES] > before[SYNC_COPIES]);
+    }
+    /// D1.1 regression: a consumer GPU wait bridged on a deferred (non-UMA) sync-cell write
+    /// must not release before the CPU store of the value has actually landed in memory.
+    /// The single legacy worker is head-of-line blocked behind a job whose producer fence
+    /// never completes, so the store is provably impossible for seconds - while the
+    /// submission-time GPU signal of the cell fence fires anyway. On the unfixed baseline the
+    /// dependent GPU copy executes and reads 0; fixed, it reads 100.
+    #[test]
+    fn d11_consumer_cannot_observe_deferred_value_before_the_cpu_store() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let mkq = || d11_queue(&dev);
+            let (q_prod, q_block, q_cons): (ID3D12CommandQueue, ID3D12CommandQueue, ID3D12CommandQueue) = (mkq(), mkq(), mkq());
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            // the sync cell lives in an UPLOAD heap buffer so the GPU itself can read what
+            // the consumer would observe; bytes [8,16) are a constant sentinel proving the copy ran
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let up_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+            let rb_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let mut up: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&up_props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).unwrap();
+            let up = up.unwrap();
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&rb_props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+            let rb = rb.unwrap();
+            let mut uptr: *mut c_void = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut uptr)).unwrap();
+            let va = uptr as usize as u64;
+            // sentinel at [8,16); cell value at [0,8) starts 0
+            ((uptr as *const u64).add(1) as *mut u64).write(0x5E4710E1_5E4710E1u64);
+            // 1. head-of-line block the single legacy worker: a job on a queue whose producer
+            //    fence never completes (the queue is GPU-blocked on `hold`)
+            let dum = Box::leak(Box::new(0u32));
+            let dum_va = dum as *const u32 as usize;
+            q_block.Wait(&hold, 1).unwrap();
+            super::super::cpu_writes::after(q_block.as_raw(), vec![super::super::cpu_writes::Write::Immediate(dum_va, vec![1])]);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert_eq!((*(dum_va as *const AtomicU32)).load(Ordering::Acquire), 0, "worker must be blocked inside the blocker job");
+            // 2. production record-time path: a Write64 of 100 at `va` registers the sync cell
+            let fake_list = Box::leak(Box::new(0u64)) as *mut u64 as *mut c_void;
+            note_write64_recorded(fake_list, va, 100);
+            {
+                // write() would set this when classifying the deferred write (step 4); the test
+                // drives the two sides separately, so mirror the classification faithfully
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&va)) {
+                    cell.deferred = true;
+                }
+            }
+            // 3. production submission-time path: the per-cell fence is GPU-signalled behind the
+            //    batch. The producer queue itself is GPU-held so the signal cannot retire before
+            //    the consumer wait is armed - the armed-wait release path is what is measured.
+            let hold_prod: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            q_prod.Wait(&hold_prod, 1).unwrap();
+            signal_write64_pairs(q_prod.as_raw(), &[(va, 100)]);
+            // 4. the deferred CPU write, as write() records it for non-UMA memory: on the
+            //    unfixed baseline a plain dword-pair Immediate; fixed, the classified sync write
+            super::super::cpu_writes::after(q_prod.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va as usize, 100, 0)]);
+            // 5. production consumer path: bridge the wait on the consumer queue
+            let w = PendingWait { va, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: 100, mask: u64::MAX, after_write64: false };
+            let outcome = try_gpu_wait(q_cons.as_raw(), &w, &[]);
+            assert!(matches!(outcome, GpuWaitOutcome::Handled), "the wait should be bridged");
+            // 6. dependent GPU work behind the wait: copy the cell's 16 bytes into readback
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            cl.CopyBufferRegion(&rb, 0, &up, 0, 16);
+            cl.Close().unwrap();
+            q_cons.ExecuteCommandLists(&[Some(cl.cast::<ID3D12CommandList>().unwrap())]);
+            q_cons.Signal(&done, 1).unwrap();
+            // let the producer batch and the cell-fence signal retire: the armed consumer wait
+            // is released by the GPU timeline - provably independent of the still-blocked worker
+            hold_prod.Signal(1).unwrap();
+            // 7. the queue must complete - then inspect what the copy observed
+            let t = std::time::Instant::now();
+            while done.GetCompletedValue() < 1 {
+                assert!(t.elapsed().as_secs() < 12, "consumer queue never finished (GPU wait never released)");
+                std::thread::yield_now();
+            }
+            let mut rbptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rbptr)).unwrap();
+            let observed = (rbptr as *const u64).read();
+            let sentinel = ((rbptr as *const u64).add(1)).read();
+            assert_eq!(sentinel, 0x5E4710E1_5E4710E1u64, "the dependent copy itself did not execute");
+            assert_eq!(observed, 100, "consumer dependent GPU work observed {observed:#x} - released before the CPU store landed");
+            // cleanup: release the blocked worker so nothing is stranded, the store then lands
+            hold.Signal(1).unwrap();
+            let t = std::time::Instant::now();
+            while (*(va as usize as *const AtomicU64)).load(Ordering::Acquire) != 100 {
+                assert!(t.elapsed().as_secs() < 12, "the deferred store never landed after cleanup");
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    // ---- D1.1 integration test matrix: shared helpers ----
+
+    static D11_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe fn d11_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return None;
+        }
+        dev
+    }
+
+    /// A 256-byte upload-heap buffer whose first 8 bytes are a sync cell the GPU can read,
+    /// plus a readback buffer of the same size. Everything is deliberately leaked: freed test
+    /// memory lets a later allocation reuse the VA and collide with the persistent cell
+    /// registration keyed by address.
+    unsafe fn d11_cell_buffers(dev: &ID3D12Device) -> (usize, ID3D12Resource, ID3D12Resource) {
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let up_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+        let rb_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let mut up: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&up_props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).unwrap();
+        let up = up.unwrap();
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&rb_props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+        let rb = rb.unwrap();
+        let mut uptr: *mut c_void = std::ptr::null_mut();
+        up.Map(0, None, Some(&mut uptr)).unwrap();
+        let va = uptr as usize;
+        ((uptr as *const u64).add(1) as *mut u64).write(0x5E4710E1_5E4710E1u64);
+        let for_copy = up.clone();
+        std::mem::forget(up);
+        (va, for_copy, rb)
+    }
+
+    unsafe fn d11_register_cell(va: usize, value: u64) {
+        let fake_list = Box::leak(Box::new(0u64)) as *mut u64 as *mut c_void;
+        note_write64_recorded(fake_list, va as u64, value);
+        let mut g = SYNC_GRAPH.lock().unwrap();
+        if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&(va as u64))) {
+            cell.deferred = true;
+        }
+    }
+
+    unsafe fn d11_cell_state(va: usize) -> (u64, u64, bool) {
+        let g = SYNC_GRAPH.lock().unwrap();
+        g.as_ref().and_then(|gr| gr.cells.get(&(va as u64))).map(|c| (c.stored_max, c.cpu_signaled_max, c.non_monotonic)).unwrap_or((0, 0, false))
+    }
+
+    unsafe fn d11_read(va: usize) -> u64 {
+        (*(va as *const AtomicU64)).load(Ordering::Acquire)
+    }
+
+
+    /// A direct queue whose COM object is deliberately leaked: tests never release their
+    /// queues, and a recycled queue pointer would collide with the stale cpu_writes
+    /// registration of an earlier test - whose fence belongs to a different device, making
+    /// the submission signal fail and the job vanish. Leaking keeps pointers unique.
+    unsafe fn d11_queue(dev: &ID3D12Device) -> ID3D12CommandQueue {
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+        std::mem::forget(q.clone());
+        q
+    }
+
+    /// Wait for `cond` up to `secs`; returns false on timeout.
+    fn d11_wait_until(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
+        let t = std::time::Instant::now();
+        while !cond() {
+            if t.elapsed().as_secs() >= secs {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    /// Test 2: publication causality. Memory alone does not release the consumer - only
+    /// successful publication does. A transient publication failure keeps the armed wait
+    /// blocked even though memory already holds the value; the next store retries publication
+    /// and the consumer then reads correct data.
+    #[test]
+    fn d11_publication_not_memory_releases_the_consumer() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let mkq = || d11_queue(&dev);
+            let (q_prod, q_cons): (ID3D12CommandQueue, ID3D12CommandQueue) = (mkq(), mkq());
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (va, up, rb) = d11_cell_buffers(&dev);
+            d11_register_cell(va, 100);
+            // one injected transient publication failure at this cell
+            SIGNAL_FAIL_VA.store(va, Ordering::SeqCst);
+            SIGNAL_FAIL_INJECT.store(1, Ordering::SeqCst);
+            q_prod.Wait(&hold, 1).unwrap();
+            signal_write64_pairs(q_prod.as_raw(), &[(va as u64, 100)]);
+            super::super::cpu_writes::after(q_prod.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            let w = PendingWait { va: va as u64, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: 100, mask: u64::MAX, after_write64: false };
+            assert!(matches!(try_gpu_wait(q_cons.as_raw(), &w, &[]), GpuWaitOutcome::Handled), "wait bridged");
+            // dependent work behind the wait
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            cl.CopyBufferRegion(&rb, 0, &up, 0, 16);
+            cl.Close().unwrap();
+            q_cons.ExecuteCommandLists(&[Some(cl.cast::<ID3D12CommandList>().unwrap())]);
+            q_cons.Signal(&done, 1).unwrap();
+            hold.Signal(1).unwrap();
+            // the producer batch completes, the worker stores memory=100, but publication is
+            // injected to fail: the consumer must stay blocked - memory alone does not release
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "store never landed");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(done.GetCompletedValue(), 0, "consumer released without publication - memory alone must not release");
+            // a redundant store retries publication (suppressed store, publication proceeds)
+            super::super::cpu_writes::after(q_prod.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| done.GetCompletedValue() >= 1, 5), "consumer never released after publication retry");
+            let mut rbptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rbptr)).unwrap();
+            assert_eq!(((rbptr as *const u64).add(1)).read(), 0x5E4710E1_5E4710E1u64, "copy executed");
+            assert_eq!((rbptr as *const u64).read(), 100, "consumer read correct data after genuine publication");
+        }
+    }
+
+    /// Test 3: cross-queue inversion. Values 50 (recorded first) and 100 retire through
+    /// independent queues; when 100 lands before 50's worker completes, the stale 50 must
+    /// never overwrite memory - the watermark suppresses it, and publication still covers 100.
+    #[test]
+    fn d11_cross_queue_stale_store_never_overwrites_newer_memory() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let mkq = || d11_queue(&dev);
+            let (qa, qb): (ID3D12CommandQueue, ID3D12CommandQueue) = (mkq(), mkq());
+            let hold_a: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let hold_b: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            // consumer interest establishes the publication target, as a real wait would
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            qa.Wait(&hold_a, 1).unwrap();
+            qb.Wait(&hold_b, 1).unwrap();
+            // value 100 on qa, older value 50 on qb - both strict, both held
+            super::super::cpu_writes::after(qa.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            super::super::cpu_writes::after(qb.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 50, 0)]);
+            // retire the NEWER value first, then the older one: the inversion shape
+            hold_a.Signal(1).unwrap();
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "newer value never stored");
+            hold_b.Signal(1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(d11_read(va), 100, "stale store overwrote newer memory");
+            let (stored, _, _) = d11_cell_state(va);
+            assert_eq!(stored, 100, "watermark must hold the newer value");
+            assert!(d11_wait_until(|| d11_cell_state(va).1 >= 100, 5), "publication never covered the stored value");
+        }
+    }
+
+    /// Test 4: duplicate equal monotonic writes - the redundant store is suppressed but the
+    /// publication obligation is still fulfilled.
+    #[test]
+    fn d11_duplicate_monotonic_writes_still_publish() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            // the duplicate's publication obligation is only observable when the first
+            // publication failed: inject one transient failure so the first store lands unpublished
+            SIGNAL_FAIL_VA.store(va, Ordering::SeqCst);
+            SIGNAL_FAIL_INJECT.store(1, Ordering::SeqCst);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "first store never landed");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert_eq!(d11_cell_state(va).1, 0, "setup: injected failure must hold publication back");
+            // second equal write: suppressed as redundant, but it must still drive the retry
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| d11_cell_state(va).1 >= 100, 5), "duplicate write did not drive publication");
+            assert_eq!(d11_read(va), 100);
+        }
+    }
+
+    /// Test 5: a strictly decreasing write retires the cell's monotonic identity - consumers
+    /// fall back to CPU polling.
+    #[test]
+    fn d11_non_monotonic_fallback_and_generation_bump() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            signal_write64_pairs(q.as_raw(), &[(va as u64, 100)]);
+            // a decreasing write: the non-monotonic transition fires at record time
+            let fake_list = Box::leak(Box::new(0u64)) as *mut u64 as *mut c_void;
+            note_write64_recorded(fake_list, va as u64, 50);
+            let (_, _, non_mono) = d11_cell_state(va);
+            assert!(non_mono, "the cell must be non-monotonic after a decreasing write");
+            let w = PendingWait { va: va as u64, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: 50, mask: u64::MAX, after_write64: false };
+            assert!(matches!(try_gpu_wait(q.as_raw(), &w, &[]), GpuWaitOutcome::FallbackCpu), "non-monotonic must fall back to the CPU poll");
+        }
+    }
+
+    /// Test 6: publication failure honesty - an injected transient signal failure leaves the
+    /// fence AND the bookkeeping behind; nothing claims progress that was not published.
+    #[test]
+    fn d11_failed_publication_never_advances_published_state() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            // create the fence first so publication has a target
+            let fence = {
+                let mut d: Option<ID3D12Device> = None;
+                q.GetDevice(&mut d).unwrap();
+                let d = d.unwrap();
+                ensure_cell_fence(va as u64, &d, d.as_raw() as usize).unwrap()
+            };
+            SIGNAL_FAIL_VA.store(va, Ordering::SeqCst);
+            SIGNAL_FAIL_INJECT.store(1, Ordering::SeqCst);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "store never landed");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let (stored, published, _) = d11_cell_state(va);
+            assert_eq!(stored, 100, "the store is real - memory truth advanced");
+            assert_eq!(published, 0, "the injected failure must leave the published watermark behind");
+            assert!(fence.GetCompletedValue() < 100, "the fence itself must honestly stay behind");
+            // retry: a redundant store drives publication again, now succeeding
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| d11_cell_state(va).1 >= 100, 5), "publication retry never recovered");
+        }
+    }
+
+    /// Test 7: watchdog release with memory still unpublished. The pre-existing main-tree
+    /// policy force-releases the wait after its timeout; the honesty requirement of the new
+    /// design is that memory truth (`stored_max`) is NEVER advanced by that rescue - the
+    /// watermarks keep the rescue distinguishable from genuine publication in the bookkeeping.
+    #[test]
+    fn d11_watchdog_release_never_advances_memory_truth() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            // suppress the store entirely: no job is ever enqueued - memory can never satisfy
+            signal_write64_pairs(q.as_raw(), &[(va as u64, 100)]);
+            let w = PendingWait { va: va as u64, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: 100, mask: u64::MAX, after_write64: false };
+            let armed = try_gpu_wait(q.as_raw(), &w, &[]);
+            assert!(matches!(armed, GpuWaitOutcome::Handled), "wait should arm on the fence");
+            // the watchdog expires the wait (5 s timeout): release happens, memory never wrote
+            assert!(d11_wait_until(|| d11_cell_state(va).1 >= 100, 9), "watchdog never released the wait");
+            let (stored, published, _) = d11_cell_state(va);
+            assert_eq!(stored, 0, "HONESTY: the watchdog release must not advance memory truth");
+            assert!(published >= 100, "the rescue marks the release honestly in the release watermark");
+            assert_eq!(d11_read(va), 0, "memory never held the value - the degraded semantics are visible, not hidden");
+        }
+    }
+
+    /// Test 8: queue release during an active strict job. The cancellation is grace-bounded,
+    /// not immediate: a producer batch that completes within the grace still lands correctly.
+    /// Channel closure is immediate; no new jobs are accepted after release.
+    #[test]
+    fn d11_released_queue_strict_job_completes_within_grace() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            q.Wait(&hold, 1).unwrap();
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            let qr = q.as_raw() as usize;
+            assert!(super::super::cpu_writes::queue_registered(qr), "worker registered");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            on_queue_release(qr);
+            assert!(!super::super::cpu_writes::queue_registered(qr), "release closes the registration immediately");
+            // producer completes within the grace: the write still lands and publishes
+            hold.Signal(1).unwrap();
+            assert!(d11_wait_until(|| d11_read(va) == 100, 6), "in-grace completion must still store");
+            assert!(d11_wait_until(|| d11_cell_state(va).1 >= 100, 5), "in-grace completion must still publish");
+        }
+    }
+
+    /// Test 9: release with the grace expired - the strict job is abandoned (never stored,
+    /// never published) and jobs behind it drain past it, letting the worker exit. Bounded:
+    /// the worker cannot wait forever after release.
+    #[test]
+    fn d11_released_queue_abandons_uncompleted_strict_job_and_drains() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            let behind = Box::leak(Box::new(0u32));
+            let bva = behind as *const u32 as usize;
+            d11_register_cell(va, 100);
+            q.Wait(&hold, 1).unwrap();
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::Immediate(bva, vec![7])]);
+            let qr = q.as_raw() as usize;
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let workers_before = super::super::cpu_writes::LIVE_WORKERS.load(Ordering::SeqCst);
+            assert!(super::super::cpu_writes::queue_registered(qr), "worker registered");
+            on_queue_release(qr);
+            assert!(!super::super::cpu_writes::queue_registered(qr), "release closes the registration immediately");
+            // the grace is WAIT_MS (10 s) from cancellation: wait it out with the producer
+            // fence still unproven - the strict job must be abandoned, never stored
+            std::thread::sleep(std::time::Duration::from_millis(11_000));
+            assert_eq!(d11_read(va), 0, "ABANDONED NEVER STORES: grace expired, job dropped");
+            assert_eq!(d11_cell_state(va).0, 0, "ABANDONED NEVER PUBLISHES: memory truth untouched");
+            // NOW let the producer fence complete: the abandonment is permanent (the job is
+            // already dropped), and the ordinary job behind it drains past it immediately
+            hold.Signal(1).unwrap();
+            assert!(d11_wait_until(|| (*(bva as *const AtomicU32)).load(Ordering::Acquire) == 7, 6), "the queued job behind never drained past the abandoned strict job");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(d11_read(va), 0, "abandonment is permanent: a late-completing producer must not resurrect the store");
+            assert!(d11_wait_until(|| super::super::cpu_writes::LIVE_WORKERS.load(Ordering::SeqCst) < workers_before, 6), "worker never exited after abandonment + drain");
+        }
+    }
+
+    /// Test 10: stale-generation rejection. A strict job recorded in registration era 0 whose
+    /// cell transitions non-monotonic (era bump) before the job retires neither stores nor
+    /// publishes - the write belonged to a registration that no longer exists.
+    #[test]
+    fn d11_retired_era_job_neither_stores_nor_publishes() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            signal_write64_pairs(q.as_raw(), &[(va as u64, 100)]);
+            q.Wait(&hold, 1).unwrap();
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // the cell's monotonic identity retires before the producer completes
+            let fake_list = Box::leak(Box::new(0u64)) as *mut u64 as *mut c_void;
+            note_write64_recorded(fake_list, va as u64, 50);
+            assert!(d11_cell_state(va).2, "cell must be non-monotonic after the decreasing write");
+            hold.Signal(1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert_eq!(d11_read(va), 0, "the era-0 job must not store into the retired registration");
+            assert_eq!(d11_cell_state(va).0, 0, "the era-0 job must not advance memory truth");
+        }
+    }
+
+    /// Extra: late-consumer backfill. A deferred store landing before any consumer exists has
+    /// no fence to publish into; when the consumer later establishes one, the fence must be
+    /// created already covering what memory provably holds - otherwise the wait would never fire.
+    #[test]
+    fn d11_late_consumer_fence_backfilled_with_proven_memory() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "store never landed");
+            assert_eq!(d11_cell_state(va).1, 0, "no fence exists - nothing published yet, correctly");
+            let fence = ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            assert!(d11_wait_until(|| fence.GetCompletedValue() >= 100, 3), "fresh fence not backfilled with proven memory");
+            assert!(d11_cell_state(va).1 >= 100, "backfill must advance the published watermark");
+        }
+    }
+
+    /// D1.3 Gap A: the real interception binding. Nothing here hand-crafts a `Write::SyncU64`,
+    /// registers the cell manually, or sets the deferred flag: the test drives the production
+    /// entry point `write64_bottom_x` and the production submission path, then verifies the
+    /// write provably entered the strict deferred-sync path. The fallback discriminator is
+    /// publication: a legacy `Write::Immediate` store never publishes the cell fence, so
+    /// `cpu_signaled_max` could never reach the value - this test fails in that case.
+    #[test]
+    fn d13_interception_binds_write64_into_the_strict_deferred_sync_path() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let (q_prod, q_cons): (ID3D12CommandQueue, ID3D12CommandQueue) = (d11_queue(&dev), d11_queue(&dev));
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (va, up, rb) = d11_cell_buffers(&dev);
+            // a stand-in command-list key, as real.rs adoption would provide; the production
+            // record path keeps per-list state keyed by this pointer
+            let list = Box::leak(Box::new(0u64)) as *mut u64 as *mut c_void;
+
+            // THE REAL ENTRY POINT: console Write64BitValueBottomOfPipeX interception.
+            // Registration, classification and generation capture all happen inside production.
+            write64_bottom_x(list, va as u64, 100, 0, 0);
+
+            // Proof the real classification ran: only write()'s classification sets `deferred`,
+            // and generation capture must have recorded the cell's current era (0 = fresh).
+            let (_, _, _, deferred) = {
+                let g = SYNC_GRAPH.lock().unwrap();
+                let c = g.as_ref().and_then(|gr| gr.cells.get(&(va as u64))).expect("the real record path must register the sync cell");
+                (c.stored_max, c.cpu_signaled_max, c.generation, c.deferred)
+            };
+            assert!(deferred, "real interception must classify the write as a deferred sync-cell write");
+
+            // Production submission order: cell-fence signal handling first, deferred writes after.
+            q_prod.Wait(&hold, 1).unwrap();
+            signal_write64_fences(q_prod.as_raw(), &[list]);
+            cpu_writes_after(q_prod.as_raw(), &[list]);
+
+            // Production consumer path: arm the bridged wait, then dependent GPU work behind it.
+            let w = PendingWait { va: va as u64, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: 100, mask: u64::MAX, after_write64: false };
+            assert!(matches!(try_gpu_wait(q_cons.as_raw(), &w, &[]), GpuWaitOutcome::Handled), "wait bridged");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            cl.CopyBufferRegion(&rb, 0, &up, 0, 16);
+            cl.Close().unwrap();
+            q_cons.ExecuteCommandLists(&[Some(cl.cast::<ID3D12CommandList>().unwrap())]);
+            q_cons.Signal(&done, 1).unwrap();
+
+            // Producer fence incomplete: the strict path must neither store nor publish early.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(d11_read(va), 0, "strict path stored before producer completion");
+            assert_eq!(d11_cell_state(va).0, 0, "memory truth advanced before the store");
+            assert_eq!(d11_cell_state(va).1, 0, "published before the store - not the strict path");
+            assert_eq!(done.GetCompletedValue(), 0, "consumer released before publication");
+
+            // Complete the producer: store must land, then genuine publication must follow.
+            // A legacy Immediate fallback stores but NEVER publishes - cpu_signaled_max would
+            // stay 0 here and this test would fail.
+            hold.Signal(1).unwrap();
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "store never landed");
+            assert!(d11_wait_until(|| d11_cell_state(va).1 >= 100, 3), "no genuine publication - the write fell back to the legacy path");
+            assert!(d11_wait_until(|| done.GetCompletedValue() >= 1, 3), "consumer never released by genuine publication");
+            let mut rbptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rbptr)).unwrap();
+            assert_eq!(((rbptr as *const u64).add(1)).read(), 0x5E4710E1_5E4710E1u64, "copy executed");
+            assert_eq!((rbptr as *const u64).read(), 100, "consumer read the stored value, not the stale one");
+        }
+    }
+
+    /// D1.3 Gap A negative control: a top-of-pipe write64 through the same real entry path is
+    /// MARKER_IN, not the bottom-of-pipe deferred contract - the classification must not turn
+    /// it into a strict deferred sync-cell write.
+    #[test]
+    fn d13_top_of_pipe_write_is_not_classified_deferred() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(_dev) = d11_device() else { return };
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            let list = Box::leak(Box::new(0u64)) as *mut u64 as *mut c_void;
+            write64_top_x(list, va as u64, 100, 0);
+            let (registered, deferred) = {
+                let g = SYNC_GRAPH.lock().unwrap();
+                match g.as_ref().and_then(|gr| gr.cells.get(&(va as u64))) {
+                    Some(c) => (true, c.deferred),
+                    None => (false, false),
+                }
+            };
+            assert!(registered, "top-of-pipe writes still register the write64 signal");
+            assert!(!deferred, "MARKER_IN must not enter the deferred bottom-of-pipe contract");
+        }
+    }
+
+    /// Test-only guard resetting the removal-injection seam even when a test panics.
+    struct RemovalInjectReset;
+    impl Drop for RemovalInjectReset {
+        fn drop(&mut self) {
+            super::super::cpu_writes::REMOVAL_INJECT_QUEUE.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// D1.9 P1 regression (review: deferred same-batch self-wait). A deferred sync-cell
+    /// Write64 and a later wait on the same cell recorded in one command list, on a list with
+    /// no console wrapper to split the recording. The self-wait must not be silently dropped:
+    /// GPU work submitted behind the waiting list may only run once the deferred store really
+    /// landed. Unfixed: the wait takes CycleSkip, the trailing copy executes first and reads 0.
+    #[test]
+    fn d19_deferred_self_wait_is_not_dropped_for_following_work() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (va, up, rb) = d11_cell_buffers(&dev);
+
+            // Two real lists: the first carries the write + wait records (no GPU work of its
+            // own - the deferred write is CPU-side), the second the dependent copy. No console
+            // wrapper exists for either, so the record-time split cannot help: the residual
+            // path the review covers.
+            let alloc1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl1: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc1, None).unwrap();
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc2, None).unwrap();
+            cl2.CopyBufferRegion(&rb, 0, &up, 0, 16);
+            cl2.Close().unwrap();
+            let l1 = cl1.as_raw();
+            let l2 = cl2.as_raw();
+            // (leaked: the per-list state is keyed by this pointer, which must not be recycled)
+            std::mem::forget(cl1.clone());
+
+            // Production record path: deferred sync-cell write, then the same-list wait.
+            write64_bottom_x(l1, va as u64, 100, 0, 0);
+            wait64_x(l1, va as u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 100, 0, 0);
+            {
+                // The wait must have been recorded (not dropped at record time), flagged as
+                // following the list's own Write64, on the original list: with no wrapper the
+                // split cannot move it.
+                let g = LISTS.lock().unwrap();
+                let s = g.as_ref().and_then(|m| m.get(&(l1 as usize))).expect("list state");
+                assert_eq!(s.pending_waits.len(), 1, "the wait was not recorded");
+                assert!(s.pending_waits[0].after_write64, "the wait follows the list's own Write64");
+                assert!(!s.write64_signals.is_empty(), "the write64 signal was not recorded");
+                assert!(!s.cpu_writes.is_empty(), "the deferred write was not recorded");
+            }
+            cl1.Close().unwrap();
+
+            // Production submission path: one batch, chunk handling as q_execute_command_lists.
+            execute_with_waits_on(q.as_raw(), &[l1, l2], |chunk| {
+                let raws: Vec<Option<ID3D12CommandList>> = chunk
+                    .iter()
+                    .map(|&p| ID3D12CommandList::from_raw_borrowed(&p).cloned())
+                    .collect();
+                q.ExecuteCommandLists(&raws);
+                signal_write64_fences(q.as_raw(), chunk);
+                cpu_writes_after(q.as_raw(), chunk);
+            });
+            q.Signal(&done, 1).unwrap();
+            let t = std::time::Instant::now();
+            while done.GetCompletedValue() < 1 {
+                assert!(t.elapsed().as_secs() < 12, "queue never finished");
+                std::thread::yield_now();
+            }
+            let mut rbptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rbptr)).unwrap();
+            let observed = (rbptr as *const u64).read();
+            let sentinel = ((rbptr as *const u64).add(1)).read();
+            assert_eq!(sentinel, 0x5E4710E1_5E4710E1u64, "the dependent copy itself did not execute");
+            // the store must land eventually regardless; what matters is what the copy observed
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "the deferred store never landed");
+            on_release(l1 as usize);
+            assert_eq!(observed, 100, "GPU work after the self-wait observed {observed:#x} - it executed before the deferred marker existed");
+        }
+    }
+
+    /// D1.9: the same title recording through a real `title_list` wrapper - deferred Write64,
+    /// Wait64 on that cell, then a copy, all in ONE title command list. The record-time split
+    /// puts the wait and the copy on a second PC segment; the wait is bridged to the cell's
+    /// fence, which only the store publishes. The producer segment is held on the GPU: nothing
+    /// behind the wait may run, and the copy must read the stored value once it is released.
+    #[test]
+    fn d19_title_list_self_wait_orders_the_work_recorded_after_it() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (va, up, rb) = d11_cell_buffers(&dev);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            std::mem::forget(alloc.clone());
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            super::super::bind::reset(pc0, alloc.as_raw() as usize, 0);
+            let wrap = super::super::title_list::wrap(pc0);
+
+            // The title's recording, through the production entry points.
+            write64_bottom_x(pc0, va as u64, 100, 0, 0);
+            wait64_x(pc0, va as u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 100, 0, 0);
+            let mut segs = Vec::new();
+            assert!(super::super::title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 2, "the Wait64 after the list's own Write64 must split the recording");
+            let seg1 = segs[1];
+            {
+                let g = LISTS.lock().unwrap();
+                let m = g.as_ref().unwrap();
+                assert!(m.get(&(pc0 as usize)).is_some_and(|s| s.pending_waits.is_empty() && !s.cpu_writes.is_empty()), "the deferred write stays on the first segment");
+                assert!(m.get(&(seg1 as usize)).is_some_and(|s| s.pending_waits.len() == 1 && s.write64_signals.is_empty()), "the wait is recorded on the second segment");
+            }
+            type CopyFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+            pc::<CopyFn>(seg1, PC_COPY_BUFFER_REGION)(seg1, rb.as_raw(), 0, up.as_raw(), 0, 16);
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0, "Close on the split title list failed");
+
+            // The producer segment cannot complete until `hold` is signalled.
+            q.Wait(&hold, 1).unwrap();
+            let t = std::time::Instant::now();
+            execute_with_waits_on(q.as_raw(), &segs, |chunk| {
+                type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+                let exec: ExecFn = std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+                exec(q.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                signal_write64_fences(q.as_raw(), chunk);
+                cpu_writes_after(q.as_raw(), chunk);
+            });
+            q.Signal(&done, 1).unwrap();
+            assert!(t.elapsed().as_millis() < 1500, "the submission thread was blocked: the wait was not bridged to the GPU");
+
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(d11_read(va), 0, "stored before the producer segment completed");
+            assert_eq!(d11_cell_state(va).1, 0, "published before the store");
+            assert_eq!(done.GetCompletedValue(), 0, "work after the wait ran before the deferred marker existed");
+
+            hold.Signal(1).unwrap();
+            assert!(d11_wait_until(|| d11_read(va) == 100, 5), "the deferred store never landed");
+            assert!(d11_wait_until(|| done.GetCompletedValue() >= 1, 5), "the work after the wait was never released");
+            let mut rbptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rbptr)).unwrap();
+            assert_eq!(((rbptr as *const u64).add(1)).read(), 0x5E4710E1_5E4710E1u64, "the copy recorded after the wait did not execute");
+            assert_eq!((rbptr as *const u64).read(), 100, "the copy recorded after the wait read the cell before the store");
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+        }
+    }
+
+    /// D1.3 Gap B: device removal inside the strict wait. The removal-injection seam drives the
+    /// worker's real device-gone exit: the strict job is dropped unstored and unpublished, the
+    /// strict job queued behind it cannot publish the abandoned value either, the worker drains
+    /// in bounded time, and queue release then terminates it - no fence is signalled to clean up.
+    #[test]
+    fn d13_device_removal_exits_strict_wait_without_store_or_publication() {
+        let _g = D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = d11_device() else { return };
+            let q: ID3D12CommandQueue = d11_queue(&dev);
+            let hold: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mem = Box::leak(Box::new(0u64));
+            let va = mem as *const u64 as usize;
+            d11_register_cell(va, 100);
+            ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            let fence = ensure_cell_fence(va as u64, &dev, dev.as_raw() as usize).unwrap();
+            q.Wait(&hold, 1).unwrap();
+            // active strict job, plus a strict job queued behind it carrying the same value:
+            // if anything behind could publish the abandoned value, cpu_signaled_max would move
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            super::super::cpu_writes::after(q.as_raw(), vec![super::super::cpu_writes::Write::SyncU64(va, 100, 0)]);
+            let qr = q.as_raw() as usize;
+            assert!(super::super::cpu_writes::queue_registered(qr), "worker registered");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let workers_before = super::super::cpu_writes::LIVE_WORKERS.load(Ordering::SeqCst);
+
+            // inject device removal: the worker's next strict-loop poll observes device_gone
+            let _reset = RemovalInjectReset;
+            super::super::cpu_writes::REMOVAL_INJECT_QUEUE.store(qr, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // the abandoned strict job: never stored, never published, fence honestly at 0
+            assert_eq!(d11_read(va), 0, "device-gone job must never store");
+            assert_eq!(d11_cell_state(va).0, 0, "memory truth must not advance");
+            assert_eq!(d11_cell_state(va).1, 0, "nothing may be published for the abandoned value");
+            assert_eq!(fence.GetCompletedValue(), 0, "the cell fence must honestly stay at 0");
+
+            // the queued-behind strict job drains past the abandoned one in bounded time (its
+            // own strict loop exits on the same device-gone condition) - and also publishes nothing
+            assert_eq!(d11_cell_state(va).1, 0, "the queued job behind must not publish the abandoned value");
+
+            // queue release then terminates the idle worker: no fence was signalled anywhere
+            on_queue_release(qr);
+            assert!(!super::super::cpu_writes::queue_registered(qr), "registration closed");
+            assert!(d11_wait_until(|| super::super::cpu_writes::LIVE_WORKERS.load(Ordering::SeqCst) < workers_before, 5), "worker never exited after device-gone drain + release");
+            assert_eq!(d11_read(va), 0, "no late store after worker exit");
+        }
     }
 }
