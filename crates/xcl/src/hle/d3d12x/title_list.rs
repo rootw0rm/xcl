@@ -50,6 +50,9 @@ struct SegmentBook {
     /// finished primary's last submit, and the PC does not let a list be submitted again before
     /// that (#1452, debug layer id 553). A console does.
     first: Option<usize>,
+    /// `KickoffX` already submitted the recording and could not reset an idle target; suppress
+    /// `push_segments` until the title's next `Reset` starts a new recording.
+    kickoff_unreset: bool,
 }
 
 /// Wrapper address -> split segment book (populated lazily only for lists that split).
@@ -176,6 +179,7 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             let m = sg.get_or_insert_with(HashMap::new);
             if stand_in.is_some() || m.contains_key(&(this as usize)) {
                 let b = m.entry(this as usize).or_default();
+                b.kickoff_unreset = false;
                 let mut old = std::mem::take(&mut b.extra_active);
                 old.extend(std::mem::replace(&mut b.first, stand_in));
                 b.spares.extend(old.iter().copied());
@@ -259,6 +263,9 @@ pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
     };
     let sg = SEGMENTS.lock().unwrap();
     let book = sg.as_ref().and_then(|m| m.get(&(list as usize)));
+    if book.is_some_and(|b| b.kickoff_unreset) {
+        return true;
+    }
     out.push(book.and_then(|b| b.first).map_or(primary, |f| f as *mut c_void));
     if let Some(book) = book {
         for &seg in &book.extra_active {
@@ -274,6 +281,48 @@ pub(super) fn wrapper_of(pc: *mut c_void) -> Option<*mut c_void> {
         return None;
     }
     WRAPPER_OF.lock().unwrap().as_ref()?.get(&(pc as usize)).map(|&w| w as *mut c_void)
+}
+
+/// The primary PC list behind `wrapper` (`F_PRIMARY`).
+pub(super) unsafe fn primary_of(wrapper: *mut c_void) -> *mut c_void {
+    *((wrapper as usize + F_PRIMARY) as *const *mut c_void)
+}
+
+/// Commit a `KickoffX` active-list switch on `wrapper` after `new_active` has been reset.
+/// Keeps `F_PRIMARY` out of `book.first` / `book.spares`, moves any retired non-primary
+/// active list into `book.spares`, and updates `F_BACKING` + `WRAPPER_OF`.
+pub(super) unsafe fn switch_active_for_kickoff(wrapper: *mut c_void, old_active: *mut c_void, new_active: *mut c_void) {
+    if old_active == new_active {
+        return;
+    }
+    let primary = primary_of(wrapper) as usize;
+    let (old, new) = (old_active as usize, new_active as usize);
+    {
+        let mut sg = SEGMENTS.lock().unwrap();
+        let b = sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default();
+        b.kickoff_unreset = false;
+        if old != primary {
+            if b.first == Some(old) {
+                b.first = None;
+            }
+            if !b.spares.contains(&old) {
+                b.spares.push(old);
+            }
+        }
+        b.first = (new != primary).then_some(new);
+    }
+    *((wrapper as usize + F_BACKING) as *mut usize) = new;
+    let mut wg = WRAPPER_OF.lock().unwrap();
+    let m = wg.get_or_insert_with(HashMap::new);
+    m.remove(&old);
+    m.insert(new, wrapper as usize);
+}
+
+/// Mark `wrapper` as having no open recording after `KickoffX` submitted its active PC list and
+/// failed to obtain/reset an idle target; `push_segments` emits nothing until `Reset` clears it.
+pub(super) fn mark_kickoff_unreset(wrapper: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().kickoff_unreset = true;
 }
 
 /// Whether `wrapper` may allocate/activate `n` more split segments for this recording.
@@ -652,6 +701,71 @@ mod tests {
             assert_eq!(rel(o), 0);
             drop(Box::from_raw(primary));
             drop(Box::from_raw(seg1));
+        }
+    }
+
+    #[test]
+    fn switch_active_for_kickoff_keeps_primary_out_of_spares() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[2] = fake_release as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let spare1 = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let spare2 = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let (p, s1, s2) = (primary as *mut c_void, spare1 as *mut c_void, spare2 as *mut c_void);
+        unsafe {
+            let w = wrap(p);
+            assert_eq!(primary_of(w), p);
+            switch_active_for_kickoff(w, p, s1);
+            assert_eq!((wrapper_of(p), wrapper_of(s1)), (None, Some(w)));
+            let mut segs = Vec::new();
+            assert!(push_segments(w, &mut segs) && segs == vec![s1]);
+            switch_active_for_kickoff(w, s1, s2);
+            assert_eq!((wrapper_of(s1), wrapper_of(s2)), (None, Some(w)));
+            segs.clear();
+            assert!(push_segments(w, &mut segs) && segs == vec![s2]);
+            switch_active_for_kickoff(w, s2, p);
+            assert_eq!((wrapper_of(s2), wrapper_of(p)), (None, Some(w)));
+            segs.clear();
+            assert!(push_segments(w, &mut segs) && segs == vec![p]);
+            {
+                let sg = SEGMENTS.lock().unwrap();
+                let b = sg.as_ref().unwrap().get(&(w as usize)).unwrap();
+                assert_eq!(b.first, None);
+                assert!(!b.spares.contains(&(p as usize)));
+                assert_eq!(b.spares, vec![s1 as usize, s2 as usize]);
+            }
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            assert_eq!(rel(w), 0);
+            assert_eq!(((*primary).refs, (*spare1).refs, (*spare2).refs), (0, 0, 0));
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(spare1));
+            drop(Box::from_raw(spare2));
+        }
+    }
+
+    #[test]
+    fn kickoff_unreset_suppresses_push_segments_until_reset() {
+        unsafe extern "system" fn fake_reset_ok(_this: *mut c_void, _alloc: usize, _pso: usize) -> HRESULT {
+            0
+        }
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[2] = fake_release as usize;
+        vt[10] = fake_reset_ok as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let p = primary as *mut c_void;
+        unsafe {
+            let w = wrap(p);
+            let mut segs = Vec::new();
+            assert!(push_segments(w, &mut segs) && segs == vec![p]);
+            mark_kickoff_unreset(w);
+            segs.clear();
+            assert!(push_segments(w, &mut segs) && segs.is_empty());
+            assert_eq!(reset(w, 0, 0), 0);
+            assert!(push_segments(w, &mut segs) && segs == vec![p]);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            assert_eq!(rel(w), 0);
+            assert_eq!((*primary).refs, 0);
+            drop(Box::from_raw(primary));
         }
     }
 }
