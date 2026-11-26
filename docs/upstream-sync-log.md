@@ -1140,3 +1140,48 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-136 (task-1795727437-22ce): #2882 triaged SKIP, probe past #2881
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2360 refs, in-range set exactly
+  #2830..#2882 minus the known gaps — no refs >=2883 in batched;
+  sequential still ground truth. Per-PR sequential probe #2830..#3300
+  (widened past the sixth gap per mem-1795712765-78dc; tail
+  2921..3300 run as a background job after a 300 s foreground window
+  covered 2830..2920) found 41 PRESENT (#2830..#2882 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880
+  gaps), matching pins on all 40 previously seen heads (no force-push,
+  #2872 pin `3893df0a` + #2879 pin `63197e31` + #2881 pin `2c50cc71`
+  hold); all 41 `merge-base --is-ancestor` exit 1 (all OPEN);
+  #2883..#3300 ALL MISSING — scan complete, top is #2882.
+- Post-window push note (per mem-1795714025-21a1, NOT builder fault):
+  #2882 committed 21:10:57 UTC, 20 s after the step-135 builder close
+  (21:10:37 UTC) — handed off explicitly by the step-135 critic.
+  Triaged in-window now.
+- Triage (SKIP with hunk evidence): #2882 `3e8e2c43` SKIP,
+  single-commit on `8b957bec` (parent IS in main, exit 0), OPEN, 1 file
+  +5/-1 (`hle/d3d12x/real.rs`): `finish_two_pass` binds the `insert()`
+  replaced entry and drops it outside the `TWO_PASS` guard
+  (`TwoPassPso::drop` re-enters `pso_async::release` -> `pso_release`
+  on the same non-reentrant lock; reused mesh-pso addresses collide
+  during the boot storm; watchdog fires at game+0x23cf683) — whole
+  `hle/d3d12x` compiled only under `#[cfg(windows)]` `hle`
+  (`lib.rs`), the `TWO_PASS` static lives in `hle/d3d12x/real.rs`,
+  zero `TWO_PASS` refs in Linux-compiled files (the `finish_two_pass`
+  in `gpu/recomp/pso.rs` is a different translation-side helper).
+  Earlier pins stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834
+  landed; #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed
+  verbatim in `aa59e8ac`; #2843-#2881 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step136r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
