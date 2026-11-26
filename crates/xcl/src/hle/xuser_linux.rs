@@ -271,12 +271,12 @@ pub unsafe extern "win64" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT
         let mut g = s.inner.lock().unwrap();
         g.phase = if cleanup_now { Phase::Consumed } else { Phase::Done };
     }
+    s.cv.notify_all();
     if cb != 0 {
         if let Some(q) = xtaskqueue_linux::queue_from(queue_ptr) {
             let _ = xtaskqueue_linux::submit_now(&q, PORT_COMPLETION, xtaskqueue_linux::Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
-    s.cv.notify_all();
 }
 
 pub unsafe extern "win64" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
@@ -296,10 +296,14 @@ pub unsafe extern "win64" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) ->
 }
 
 pub unsafe extern "win64" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT {
+    // libHttpClient always writes `*bufferSize` before returning, including E_PENDING (0).
     match lookup(b) {
         Lookup::Active(s) => {
             let g = s.inner.lock().unwrap();
             if !g.is_done() {
+                if !size.is_null() {
+                    *size = 0;
+                }
                 return E_PENDING;
             }
             if !size.is_null() {
@@ -308,7 +312,7 @@ pub unsafe extern "win64" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mut
             g.status
         }
         Lookup::Finished(h) => {
-            if !size.is_null() && h.status >= 0 {
+            if !size.is_null() {
                 *size = 0;
             }
             h.status
@@ -324,10 +328,14 @@ pub unsafe extern "win64" fn XAsyncGetResult(
     buffer: *mut c_void,
     used: *mut usize,
 ) -> HRESULT {
+    // libHttpClient writes `*bufferUsed` (0) before returning E_PENDING / failure HRESULTs.
     match lookup(b) {
         Lookup::Invalid => E_INVALIDARG,
         Lookup::Finished(h) => {
             if h.status < 0 {
+                if !used.is_null() {
+                    *used = 0;
+                }
                 return h.status;
             }
             if h.flags & FLAG_CONSUMED != 0 {
@@ -336,18 +344,24 @@ pub unsafe extern "win64" fn XAsyncGetResult(
             if !used.is_null() {
                 *used = 0;
             }
-            S_OK
+            h.status
         }
         Lookup::Active(s) => {
             let (status, need) = {
                 let mut g = s.inner.lock().unwrap();
                 if !g.is_done() {
+                    if !used.is_null() {
+                        *used = 0;
+                    }
                     return E_PENDING;
                 }
                 if !identity.is_null() && s.identity != 0 && identity as usize != s.identity {
                     return E_INVALIDARG;
                 }
                 if g.status < 0 {
+                    if !used.is_null() {
+                        *used = 0;
+                    }
                     return g.status;
                 }
                 if g.result_size > 0 {
@@ -373,12 +387,12 @@ pub unsafe extern "win64" fn XAsyncGetResult(
                     map.remove(&(b as usize));
                 }
                 s.inner.lock().unwrap().phase = Phase::Consumed;
-                return hr;
+                return if hr == S_OK { status } else { hr };
             }
             if !used.is_null() {
                 *used = 0;
             }
-            S_OK
+            status
         }
     }
 }
@@ -1115,6 +1129,134 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    unsafe extern "win64" fn begins_without_work(_op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+        S_OK
+    }
+
+    /// libHttpClient always stores into `*bufferSize` before returning, including when the
+    /// operation is still pending (0). Leaving the caller's sentinel unchanged is a bug.
+    #[test]
+    fn get_result_size_writes_zero_while_pending() {
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            let mut size = 0xDEADusize;
+            assert_eq!(XAsyncGetResultSize(&mut b, &mut size), E_PENDING);
+            assert_eq!(size, 0, "pending GetResultSize must write *size = 0");
+            XAsyncComplete(&mut b, S_OK, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            size = 0xBEEF;
+            assert_eq!(XAsyncGetResultSize(&mut b, &mut size), S_OK);
+            assert_eq!(size, 0);
+        }
+    }
+
+    /// libHttpClient stores 0 into `*bufferUsed` before returning E_PENDING.
+    #[test]
+    fn get_result_writes_zero_used_while_pending() {
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            let mut used = 0xDEADusize;
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                XAsyncGetResult(&mut b, std::ptr::null(), buf.len(), buf.as_mut_ptr() as _, &mut used),
+                E_PENDING
+            );
+            assert_eq!(used, 0, "pending GetResult must write *used = 0");
+            XAsyncComplete(&mut b, S_OK, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+        }
+    }
+
+    #[test]
+    fn get_result_preserves_nonzero_success_hresult() {
+        const S_FALSE: HRESULT = 1;
+        unsafe extern "win64" fn payload_provider_ok(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_GET_RESULT {
+                std::ptr::copy_nonoverlapping(b"abcd".as_ptr(), (*data).buffer as *mut u8, 4);
+            }
+            S_OK
+        }
+        unsafe {
+            // Zero-payload completion with S_FALSE (Lookup::Finished path)
+            let mut b0: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            XAsyncComplete(&mut b0, S_FALSE, 0);
+            assert_eq!(XAsyncGetStatus(&mut b0, false), S_FALSE);
+            let mut size = 99usize;
+            assert_eq!(XAsyncGetResultSize(&mut b0, &mut size), S_FALSE);
+            assert_eq!(size, 0);
+            let mut used = 99usize;
+            assert_eq!(XAsyncGetResult(&mut b0, std::ptr::null(), 0, std::ptr::null_mut(), &mut used), S_FALSE);
+            assert_eq!(used, 0);
+
+            // Non-empty payload completion with S_FALSE (Lookup::Active path)
+            let mut b4: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b4, std::ptr::null_mut(), 0x55 as *const c_void, std::ptr::null(), payload_provider_ok as usize), S_OK);
+            XAsyncComplete(&mut b4, S_FALSE, 4);
+            assert_eq!(XAsyncGetStatus(&mut b4, false), S_FALSE);
+            let mut buf = [0u8; 4];
+            let mut used4 = 0usize;
+            assert_eq!(XAsyncGetResult(&mut b4, 0x55 as *const c_void, 4, buf.as_mut_ptr() as *mut c_void, &mut used4), S_FALSE);
+            assert_eq!(&buf, b"abcd");
+            assert_eq!(used4, 4);
+        }
+    }
+
+    /// `XAsyncComplete` must wake threads blocked in `XAsyncGetStatus(b, true)` before running
+    /// a `MODE_IMMEDIATE` completion callback synchronously on the completing thread; otherwise
+    /// a callback that synchronises with the waiting thread deadlocks deterministically.
+    #[test]
+    fn complete_wakes_waiters_before_immediate_completion_callback() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct WaitCtx {
+            rx: Mutex<Option<mpsc::Receiver<()>>>,
+            woke: AtomicBool,
+        }
+        unsafe extern "win64" fn cb_waits_for_waiter(b: *mut XAsyncBlock) {
+            let ctx = &*((*b).context as *const WaitCtx);
+            let rx = ctx.rx.lock().unwrap().take().unwrap();
+            if rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                ctx.woke.store(true, Ordering::SeqCst);
+            }
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(xtaskqueue_linux::XTaskQueueCreate(xtaskqueue_linux::MODE_MANUAL, xtaskqueue_linux::MODE_IMMEDIATE, &mut q), S_OK);
+            let (tx, rx) = mpsc::channel();
+            let ctx = WaitCtx { rx: Mutex::new(Some(rx)), woke: AtomicBool::new(false) };
+            let mut b = Box::new(std::mem::zeroed::<XAsyncBlock>());
+            b.queue = q;
+            b.context = &ctx as *const WaitCtx as *mut c_void;
+            b.callback = cb_waits_for_waiter as usize;
+            assert_eq!(XAsyncBegin(&mut *b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let b_addr = &mut *b as *mut XAsyncBlock as usize;
+            let waiter = std::thread::spawn(move || {
+                let _ = started_tx.send(());
+                let hr = XAsyncGetStatus(b_addr as *mut XAsyncBlock, true);
+                let _ = tx.send(());
+                hr
+            });
+            started_rx.recv().unwrap();
+            // Give the waiter thread a moment to enter `s.cv.wait(g)`.
+            std::thread::sleep(Duration::from_millis(20));
+
+            XAsyncComplete(&mut *b, S_OK, 0);
+            assert_eq!(waiter.join().unwrap(), S_OK);
+            assert!(ctx.woke.load(Ordering::SeqCst), "MODE_IMMEDIATE callback timed out waiting for XAsyncGetStatus waiter to wake");
+
+            xtaskqueue_linux::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            xtaskqueue_linux::XTaskQueueCloseHandle(q);
+        }
+    }
 
     #[test]
     fn user_add_and_queries() {
