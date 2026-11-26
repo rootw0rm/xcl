@@ -1481,3 +1481,50 @@ newest at the bottom.
   xgr exactly XAsync/XNetworking/XUser — HOLDS
   (fresh-root `report.json` verified before removal).
   Lock audit: 0 new `lock()` (doc-only change); `diff --check` clean.
+
+## 2026-11-26 — step-143 (task-1795733474-2eb5): #2907 PORTED, #2906/#2909/#2910 SKIP, top now #2910, probe past #2910
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2381 refs (+0 vs step-142 critic recount), in-range
+  set exactly #2830..#2910 minus the known gaps (no #2908, no refs >=2911
+  in batched); sequential still ground truth. Per-PR sequential probe
+  #2830..#3650 (widened past #2910 per mem-1795712765-78dc; foreground
+  2906..2960 + background 2961..3100 / 3101..3300 / 3301..3650, no tail
+  left open) found 62 PRESENT (#2830..#2910 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880/#2883-#2885/#2899/#2900/#2903/#2908
+  gaps); #2911..#3650 ALL MISSING — scan complete, top is now #2910.
+- Pins: all prior match (no force-push) EXCEPT #2889, which moved
+  `ca3eb153` -> `f334cc93` (still single-commit on `upstream/main`, still
+  1-file `tiling_parity.rs` +32/-8 refresh: BC5_UNORM case, `packed_start`
+  field, 0xFFFFFFFF sentinel; still 0 `cfg(windows)` gates on
+  `xcl::hle::d3d12x` — SKIP stands, pin updated).
+- Triage (4 new, all OPEN): #2907 PORTED verbatim in `a867ee61`
+  (single-commit `7575f671` on `upstream/main`, 1 file `shaders.rs` +38/-2:
+  `sweep_result` helper + 2 `direct_sweep` call-site swaps + regression
+  test `sweep_result_tells_a_panicked_worker_from_a_timeout`; hunk bodies
+  identical, only line offset from linux-only helpers; pure std, no
+  `cfg(windows)` needed). #2906 SKIP (dev-stack tip `5224220c`, parent
+  NOT in HEAD, merge-base `5bec5877`, whole-stack 100 files +44506/-4057;
+  tip-only `pack.rs`+`pso.rs`+`shaders.rs` 363 lines — same out-of-scope
+  shape as #2886). #2909 SKIP (single-commit `67c26e28`, 1-file
+  `hle/d3d12x/real.rs` compute `driver_cache` hash deferral — Windows-only).
+  #2910 SKIP (single-commit `3d345054`, 1-file `hle/d3d12x/real.rs`
+  graphics-PSO-blob persistence — Windows-only). Earlier pins stand
+  (#2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted in
+  `7645afeb`; #2837/#2842 SKIP; #2838 landed in `aa59e8ac`;
+  #2843-#2905 SKIP minus gaps, #2890 PORTED in `1efa5ac0`).
+- Gates: both `cargo check`s 0 errors (22 lib + 28 lib-test pre-existing
+  warnings); new test shown failing pre-fix (`E0425` unresolved
+  `sweep_result`), passes post-fix; lib 784 passed / 0 failed / 1 ignored
+  (`--test-threads=4`, 3 consecutive clean runs; one unidentified parallel
+  flake in the first run, non-reproducing — matches known-flake pattern);
+  title e2e 4 passed / 1 failed by design
+  (`test_title_runs_and_game_folder_is_untouched`), 12 unique `[FAIL]`
+  lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step143r` exit 139 SIGSEGV `exe+0x2237320`
+  fault `0x0` bytes `48 8b 03` stubs 20 (all first_args) xgr exactly
+  XAsync/XNetworking/XUser — HOLDS (fresh-root `report.json` verified
+  before removal). Lock audit: 0 new `lock()` (test + pure-std helper);
+  `diff --check` clean.
