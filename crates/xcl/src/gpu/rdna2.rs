@@ -4,6 +4,22 @@
 //! (`scripts/gen_rdna2.py`); this file implements the decoding rules on top:
 //! encoding identification, literal constants, SDWA/DPP extension dwords and MIMG NSA.
 //! It is the first stage of the shader recompiler (console microcode → PC shaders).
+//!
+//! M5 step-92 MISSING-audit (2026-11-26, doc-only): all 9 keep files verified vs this
+//! tree at `43838a1f` (407 `Status: open` lines, most landed-but-stale). LANDED: launcher
+//! bucket empty; mem/loader PE chain (#1216/#1134/#700, #1367, #854+#1203, #1397, #1403,
+//! #1431, #196) + phys (#1143 remainder, #1635, #608, #2048+#495, #1781) + #2544/#2362/
+//! #2618/#2673 Watch; VFS (#1170, #1259, #1362, #1054, #1038, #1264, #1662, #1779, #1433,
+//! #1106+#1092, #893, #1077, #761, #1299, #316, #2694); XAsync/task-queue/XUser (#1201/#1205/
+//! #1188/#1176, #1681/#1276, #1154, #805, #1239+#315, #1129/#1202, #1242, #641, #1610);
+//! recomp #573/#2134/#2136/#886. TRUE-GAP queue (one task each, created step-92): R1 #811
+//! SDWA ext-dword uses (this file: `sgpr_uses` has no `Variant::Sdwa` ext block; queued
+//! next); V1 VFS #644/#618 + #2425 contracts; X1 saves-atomicity; X2 networking/
+//! association; T1 harness scripts+contracts. GATED (no consumer yet): d3d12 NOWs (M1.3
+//! present path), dxil-emit specifics, emit/spirv VALU/buffer/image, #2157+#2135, #735.
+//! OUT: #464/#802/Windows-Wine-only, #1667 no-hook-point, #1355 deferred, #164b/#2111
+//! blocked, M4, #2308 already step-94. Full per-entry table in
+//! `.ralph/specs/linux-port/progress.md` (step-92 entry). Retail HOLDS `+0x2237320`.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
