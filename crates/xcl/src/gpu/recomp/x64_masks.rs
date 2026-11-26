@@ -109,6 +109,7 @@ struct DynOp {
     n: u8,
     is_write: bool,
     is_src0: bool,
+    is_per_lane_mask: bool,
 }
 
 impl DynOp {
@@ -118,6 +119,7 @@ impl DynOp {
         n: 1,
         is_write: false,
         is_src0: false,
+        is_per_lane_mask: false,
     };
 }
 
@@ -199,9 +201,6 @@ impl UsePlanTable {
                                 {
                                     continue;
                                 }
-                                if !o.output && per_lane && f == "SRC2" {
-                                    continue;
-                                }
                                 let idx = plan.op_len as usize;
                                 if idx < MAX_DYN_OPS && n <= u8::MAX as u64 {
                                     plan.ops[idx] = DynOp {
@@ -210,6 +209,7 @@ impl UsePlanTable {
                                         n: n as u8,
                                         is_write: o.output && !keeps,
                                         is_src0: f == "SRC0",
+                                        is_per_lane_mask: !o.output && per_lane && f == "SRC2",
                                     };
                                     plan.op_len += 1;
                                 } else {
@@ -271,8 +271,9 @@ fn use_plans() -> &'static UsePlanTable {
 fn uses_fallback(d: &Decoded) -> (Regs, Regs) {
     let name = d.inst.name;
     if name.starts_with("S_MOVREL") {
-        let src = rdna2::field_value(d.enc, &d.words, "SSRC0").unwrap_or(0).min(124);
-        return (range(src, 124 - src) | M0 | EXEC, 0);
+        let raw = rdna2::field_value(d.enc, &d.words, "SSRC0").unwrap_or(0);
+        let src = raw.min(124);
+        return (range(src, 124 - src) | scalar_code(raw, 1) | M0 | EXEC, 0);
     }
     let (mut whole, mut written) = (0 as Regs, 0 as Regs);
     let per_lane = reads_mask_per_lane(name);
@@ -293,10 +294,10 @@ fn uses_fallback(d: &Decoded) -> (Regs, Regs) {
     }
     for o in d.ienc.operands {
         let n = (o.size as u64).div_ceil(32).max(1);
-        let regs = match (o.field, o.ty) {
-            (_, "OPR_VCC") => VCC,
-            (_, "OPR_EXEC" | "OPR_SDST_EXEC") => EXEC,
-            (_, "OPR_SDST_M0") => M0,
+        let (regs, code) = match (o.field, o.ty) {
+            (_, "OPR_VCC") => (VCC, None),
+            (_, "OPR_EXEC" | "OPR_SDST_EXEC") => (EXEC, None),
+            (_, "OPR_SDST_M0") => (M0, None),
             (None, _) | (Some("LITERAL"), _) => continue,
             (Some(f), ty) => {
                 if o.implicit || !["SREG", "SSRC", "SDST", "OPR_SRC", "SMEM_OFFSET"].iter().any(|k| ty.contains(k)) {
@@ -305,7 +306,8 @@ fn uses_fallback(d: &Decoded) -> (Regs, Regs) {
                 if f == "SRC0" && d.variant != Variant::Plain {
                     continue;
                 }
-                scalar_code(rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f), n)
+                let code = rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f);
+                (scalar_code(code, n), Some(code))
             }
         };
         if o.output {
@@ -314,7 +316,11 @@ fn uses_fallback(d: &Decoded) -> (Regs, Regs) {
             } else {
                 written |= regs;
             }
-        } else if !(per_lane && (o.ty == "OPR_VCC" || o.field == Some("SRC2"))) {
+        } else if per_lane && o.field == Some("SRC2") {
+            if matches!(code, Some(251 | 252)) {
+                whole |= regs;
+            }
+        } else if !(per_lane && o.ty == "OPR_VCC") {
             whole |= regs;
         }
     }
@@ -335,8 +341,9 @@ fn uses_with_table(d: &Decoded, table: &UsePlanTable) -> (Regs, Regs) {
         // `smovrel`: s[src + m0] is read, s[dst + m0] written (s_movrelsd_2: both) – any
         // register from the encoded one up to s123, VCC included; nothing for certain
         // overwritten
-        let src = extract_ranges(&d.words, plan.movrel_ssrc0).min(124);
-        return (range(src, 124 - src) | M0 | EXEC, 0);
+        let raw = extract_ranges(&d.words, plan.movrel_ssrc0);
+        let src = raw.min(124);
+        return (range(src, 124 - src) | scalar_code(raw, 1) | M0 | EXEC, 0);
     }
     let mut whole = plan.const_whole;
     let mut written = plan.const_written;
@@ -361,6 +368,12 @@ fn uses_with_table(d: &Decoded, table: &UsePlanTable) -> (Regs, Regs) {
             continue;
         }
         let code = extract_ranges(&d.words, op.ranges) * op.scale as u64;
+        if op.is_per_lane_mask {
+            if matches!(code, 251 | 252) {
+                whole |= scalar_code(code, op.n as u64);
+            }
+            continue;
+        }
         let regs = scalar_code(code, op.n as u64);
         if op.is_write {
             written |= regs;
@@ -997,6 +1010,85 @@ mod tests {
         assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
     }
 
+    #[test]
+    fn sdwa_vop2_carry_always_overwrites_vcc_even_with_omod_bit47() {
+        const CBRANCH_VCCZ: I = ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 0)]);
+        // RDNA2 VOP2 carry-out SDWA uses VOP2_VOP_SDWA ([47:40] = DST_SEL/DST_UNUSED/CLAMP/OMOD),
+        // never VOP2_VOP_SDWA_SDST_ENC: OMOD=2 sets bit 47, yet carry-out still overwrites VCC.
+        for name in ["V_ADD_CO_CI_U32", "V_SUB_CO_CI_U32", "V_SUBREV_CO_CI_U32"] {
+            let f = [
+                ("VDST", 4), ("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 1),
+                ("SRC0_SEL", 6), ("SRC1_SEL", 6),
+                ("DST_SEL", 6), ("DST_UNUSED", 2), ("CLAMP", 1), ("OMOD", 2),
+            ];
+            let bytes: Vec<u8> = [
+                rdna2::encode(CMP.0, CMP.1, CMP.2, None).unwrap(),
+                rdna2::encode(name, "VOP2_VOP_SDWA", &f, None).unwrap(),
+                rdna2::encode(CBRANCH_VCCZ.0, CBRANCH_VCCZ.1, CBRANCH_VCCZ.2, None).unwrap(),
+                rdna2::encode(ENDPGM.0, ENDPGM.1, ENDPGM.2, None).unwrap(),
+            ]
+            .concat();
+            let p = program(&bytes);
+            assert_eq!(uses(&p[1]), uses_fallback(&p[1]));
+            assert_eq!(uses(&p[1]).1, VCC, "{name} VOP2_VOP_SDWA OMOD=2 must overwrite only VCC");
+            let live = whole_live_out(&p, false);
+            assert!(!mask_needed(&live, 0, 106) && mask_needed(&live, 1, 106), "{name} kills prior VCC");
+        }
+    }
+
+    #[test]
+    fn s_movreld_with_src_vccz_marks_vcc_whole_live() {
+        for name in ["S_MOVRELD_B32", "S_MOVRELD_B64"] {
+            let p = asm(&[CMP, (name, "ENC_SOP1", &[("SDST", 2), ("SSRC0", 251)]), ENDPGM]);
+            assert_eq!(uses(&p[1]), uses_fallback(&p[1]));
+            assert_eq!(uses(&p[1]).0 & VCC, VCC, "{name} SSRC0=251 must read whole VCC");
+            assert_eq!(uses(&p[1]).1, 0, "{name} must not kill destination");
+            assert!(mask_needed(&whole_live_out(&p, false), 0, 106), "{name} SSRC0=251 keeps VCC live");
+            let execz = asm(&[(name, "ENC_SOP1", &[("SDST", 2), ("SSRC0", 252)]), ENDPGM]);
+            assert_eq!(uses(&execz[0]), uses_fallback(&execz[0]));
+            assert_eq!(uses(&execz[0]).0, M0 | EXEC, "{name} SSRC0=252 reads M0 | EXEC");
+            let m0_src = asm(&[(name, "ENC_SOP1", &[("SDST", 2), ("SSRC0", 124)]), ENDPGM]);
+            assert_eq!(uses(&m0_src[0]).0, M0 | EXEC, "{name} SSRC0=124 sets no spurious bit 125");
+        }
+    }
+
+    #[test]
+    fn vop3_per_lane_mask_ops_with_src_vccz_mark_vcc_whole_live() {
+        let cases: [(&str, &str, &[(&str, u64)]); 4] = [
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 1), ("SRC2", 251)]),
+            ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", 251)]),
+            ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", 251)]),
+            ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", 251)]),
+        ];
+        for (name, enc, f) in cases {
+            let p = asm(&[CMP, (name, enc, f), ENDPGM]);
+            assert_eq!(uses(&p[1]), uses_fallback(&p[1]));
+            assert_eq!(uses(&p[1]).0 & VCC, VCC, "{name} SRC2=251 must read whole VCC");
+            assert!(mask_needed(&whole_live_out(&p, false), 0, 106), "{name} SRC2=251 keeps VCC live");
+        }
+        // SRC2=106 (VCC) and SRC2=2 (s[2:3]) stay lane-local; SRC2=252 (SRC_EXECZ) marks whole EXEC.
+        const CMP_S2: I = ("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 1)]);
+        for (src2, cmp, pair) in [(106, CMP, 106), (2, CMP_S2, 2)] {
+            for (name, enc, extra) in [
+                ("V_CNDMASK_B32", "ENC_VOP3", None),
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", Some(("SDST", 4))),
+                ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", Some(("SDST", 4))),
+                ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", Some(("SDST", 4))),
+            ] {
+                let mut f = vec![("VDST", 2), ("SRC0", V), ("SRC1", V + 1), ("SRC2", src2)];
+                if let Some(s) = extra { f.push(s); }
+                let bytes: Vec<u8> = [rdna2::encode(cmp.0, cmp.1, cmp.2, None).unwrap(), rdna2::encode(name, enc, &f, None).unwrap(), rdna2::encode(ENDPGM.0, ENDPGM.1, ENDPGM.2, None).unwrap()].concat();
+                let p = program(&bytes);
+                assert_eq!(uses(&p[1]), uses_fallback(&p[1]));
+                assert_eq!(uses(&p[1]).0 & range(pair, 2), 0, "{name} SRC2={src2} stays lane-local");
+                assert!(!mask_needed(&whole_live_out(&p, false), 0, pair), "{name} SRC2={src2} needs no exchange");
+            }
+        }
+        let execz = asm(&[("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 1), ("SRC2", 252)]), ENDPGM]);
+        assert_eq!(uses(&execz[0]), uses_fallback(&execz[0]));
+        assert_eq!(uses(&execz[0]).0 & EXEC, EXEC, "V_CNDMASK_B32 SRC2=252 must read whole EXEC");
+    }
+
     /// Reference instruction-level solver matching the original implementation verbatim.
     fn whole_live_out_reference(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
@@ -1132,6 +1224,16 @@ mod tests {
                         far_target: None,
                     };
                     assert_eq!(uses(&d), uses_fallback(&d), "{} ({}, {variant:?})", inst.name, enc.name);
+                }
+                if matches!(enc.name, "ENC_VOP1" | "ENC_VOP2" | "ENC_VOPC") {
+                    for bits in 0u32..8 {
+                        let ext = (next_u32() & !((1 << 15) | (1 << 23) | (1 << 31)))
+                            | ((bits & 1) << 15)
+                            | (((bits >> 1) & 1) << 23)
+                            | (((bits >> 2) & 1) << 31);
+                        let d = Decoded { pc: 0, inst, ienc, enc, words: vec![next_u32(), ext], len: 8, literal: None, variant: Variant::Sdwa, far_target: None };
+                        assert_eq!(uses(&d), uses_fallback(&d), "{} ({}, Sdwa bits={bits})", inst.name, enc.name);
+                    }
                 }
             }
         }
