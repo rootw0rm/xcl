@@ -55,7 +55,6 @@ struct QueuedItem {
 #[derive(Clone, Copy)]
 struct Monitor {
     token: u64,
-    queue_handle: usize,
     ctx: usize,
     cb: usize,
 }
@@ -65,6 +64,7 @@ pub struct Port {
     items: Mutex<VecDeque<QueuedItem>>,
     cv: Condvar,
     running: AtomicBool,
+    queues: Mutex<Vec<Weak<Queue>>>,
 }
 
 impl Port {
@@ -74,7 +74,53 @@ impl Port {
             items: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             running: AtomicBool::new(false),
+            queues: Mutex::new(Vec::new()),
         })
+    }
+
+    fn attach(&self, q: &Arc<Queue>) {
+        let mut qs = self.queues.lock().unwrap();
+        qs.retain(|w| w.strong_count() > 0);
+        qs.push(Arc::downgrade(q));
+    }
+
+    fn notify_monitors(self: &Arc<Port>) {
+        let owners: Vec<Arc<Queue>> = {
+            let mut qs = self.queues.lock().unwrap();
+            let mut live = Vec::with_capacity(qs.len());
+            qs.retain(|w| match w.upgrade() {
+                Some(q) => {
+                    live.push(q);
+                    true
+                }
+                None => false,
+            });
+            live
+        };
+        for owner in owners {
+            if owner.is_terminated() {
+                continue;
+            }
+            let snapshot: Vec<Monitor> = owner.monitors.lock().unwrap().clone();
+            if snapshot.is_empty() {
+                continue;
+            }
+            for owner_port in 0..2 {
+                if Arc::ptr_eq(&owner.ports[owner_port], self) {
+                    for m in &snapshot {
+                        if owner.is_terminated() {
+                            break;
+                        }
+                        let temp = new_handle(owner.clone()) as *mut c_void;
+                        unsafe {
+                            let f: XTaskQueueMonitorCallback = std::mem::transmute(m.cb);
+                            f(m.ctx as *mut c_void, temp, owner_port as u32);
+                            XTaskQueueCloseHandle(temp);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -248,23 +294,31 @@ static NEXT_MONITOR_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl Queue {
     pub fn new(work_mode: u32, completion_mode: u32) -> Arc<Queue> {
-        Arc::new(Queue {
+        let q = Arc::new(Queue {
             ports: [Port::new(work_mode), Port::new(completion_mode)],
             owns_ports: true,
             state: Mutex::new(QueueState { terminated: false, termination_cb_pending: 0, inflight: [0, 0] }),
             idle_cv: Condvar::new(),
             monitors: Mutex::new(Vec::new()),
-        })
+        });
+        q.ports[0].attach(&q);
+        q.ports[1].attach(&q);
+        q
     }
 
     pub fn composite(work: Arc<Port>, completion: Arc<Port>) -> Arc<Queue> {
-        Arc::new(Queue {
+        let q = Arc::new(Queue {
             ports: [work, completion],
             owns_ports: false,
             state: Mutex::new(QueueState { terminated: false, termination_cb_pending: 0, inflight: [0, 0] }),
             idle_cv: Condvar::new(),
             monitors: Mutex::new(Vec::new()),
-        })
+        });
+        q.ports[0].attach(&q);
+        if !Arc::ptr_eq(&q.ports[0], &q.ports[1]) {
+            q.ports[1].attach(&q);
+        }
+        q
     }
 
     pub fn is_terminated(&self) -> bool {
@@ -283,16 +337,6 @@ impl Queue {
         let canceled = self.is_terminated();
         item.run(canceled);
         self.done_one(port);
-    }
-
-    fn notify_monitors(&self, port: u32) {
-        let snapshot: Vec<Monitor> = self.monitors.lock().unwrap().clone();
-        for m in snapshot {
-            unsafe {
-                let f: XTaskQueueMonitorCallback = std::mem::transmute(m.cb);
-                f(m.ctx as *mut c_void, m.queue_handle as *mut c_void, port);
-            }
-        }
     }
 }
 
@@ -337,7 +381,7 @@ fn submit(q: &Arc<Queue>, port: u32, item: Item, terminating: bool) -> bool {
                 }
                 state.inflight[port as usize] += 1;
             }
-            q.notify_monitors(port);
+            p.notify_monitors();
             // SAFETY: Caller guarantees `item.cb` is a valid `XTaskQueueCallback` for `item.ctx`.
             unsafe { q.execute(port, item) };
         }
@@ -352,7 +396,7 @@ fn submit(q: &Arc<Queue>, port: u32, item: Item, terminating: bool) -> bool {
                 }
                 state.inflight[port as usize] += 1;
             }
-            q.notify_monitors(port);
+            p.notify_monitors();
             let q2 = q.clone();
             spawn(Box::new(move || unsafe { q2.execute(port, item) }));
         }
@@ -371,7 +415,7 @@ fn submit(q: &Arc<Queue>, port: u32, item: Item, terminating: bool) -> bool {
                 }
                 items.push_back(QueuedItem { item, queue: q.clone(), port });
             }
-            q.notify_monitors(port);
+            p.notify_monitors();
             if !p.running.swap(true, Ordering::AcqRel) {
                 let p2 = p.clone();
                 spawn(Box::new(move || drain_serialized(p2)));
@@ -397,7 +441,7 @@ fn submit(q: &Arc<Queue>, port: u32, item: Item, terminating: bool) -> bool {
             } else {
                 p.cv.notify_one();
             }
-            q.notify_monitors(port);
+            p.notify_monitors();
         }
     }
     true
@@ -671,6 +715,7 @@ pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ct
             state.termination_cb_pending += 1;
         }
     }
+    q.monitors.lock().unwrap().clear();
     // Cancel only queued items submitted through `q`; sibling queues sharing a composite port
     // keep their pending work untouched. Wake any manual-port dispatchers waiting on this port.
     for port in 0..2 {
@@ -927,7 +972,6 @@ pub unsafe extern "system" fn XTaskQueueRegisterMonitor(
     let id = NEXT_MONITOR_TOKEN.fetch_add(1, Ordering::Relaxed);
     q.monitors.lock().unwrap().push(Monitor {
         token: id,
-        queue_handle: h as usize,
         ctx: ctx as usize,
         cb,
     });
@@ -1665,6 +1709,147 @@ mod tests {
             let mut dup_out = 0xDEADBEEF as *mut c_void;
             assert_eq!(XTaskQueueDuplicateHandle(0x1234 as *mut c_void, &mut dup_out), E_INVALIDARG);
             assert_eq!(dup_out, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn monitors_fire_across_composite_ports_and_outlive_registering_handle() {
+        struct MonitorCapture {
+            events: Mutex<Vec<(usize, u32, bool, HRESULT)>>,
+            duplicated: Mutex<Vec<usize>>,
+            dispatch_inline: bool,
+        }
+
+        unsafe extern "system" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+        unsafe extern "system" fn inc_u32(ctx: *mut c_void, canceled: bool) {
+            if !canceled {
+                (*(ctx as *const AtomicU32)).fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe extern "system" fn capture_monitor(ctx: *mut c_void, q: *mut c_void, port: u32) {
+            let cap = &*(ctx as *const MonitorCapture);
+            let mut dup = std::ptr::null_mut();
+            let dup_hr = XTaskQueueDuplicateHandle(q, &mut dup);
+            if dup_hr >= 0 && !dup.is_null() {
+                cap.duplicated.lock().unwrap().push(dup as usize);
+            }
+            let dispatched = if cap.dispatch_inline { XTaskQueueDispatch(q, port, 0) } else { false };
+            cap.events.lock().unwrap().push((q as usize, port, dispatched, dup_hr));
+        }
+
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            // 1. Composite queue sharing a manual pump queue's ports: submitting to the composite
+            // queue must notify the pump queue's monitor with the pump queue's attached port index.
+            let mut main_q = std::ptr::null_mut();
+            let mut bg_q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut main_q), S_OK);
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut bg_q), S_OK);
+
+            let mut bg_work = std::ptr::null_mut();
+            let mut main_comp = std::ptr::null_mut();
+            let mut main_work = std::ptr::null_mut();
+            assert_eq!(XTaskQueueGetPort(bg_q, PORT_WORK, &mut bg_work), S_OK);
+            assert_eq!(XTaskQueueGetPort(main_q, PORT_COMPLETION, &mut main_comp), S_OK);
+            assert_eq!(XTaskQueueGetPort(main_q, PORT_WORK, &mut main_work), S_OK);
+
+            let mut comp_q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreateComposite(bg_work, main_comp, &mut comp_q), S_OK);
+            // Cross-slot composite: `main_q`'s WORK port attached as `comp_cross`'s COMPLETION port.
+            let mut comp_cross = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreateComposite(bg_work, main_work, &mut comp_cross), S_OK);
+
+            let cap = MonitorCapture {
+                events: Mutex::new(Vec::new()),
+                duplicated: Mutex::new(Vec::new()),
+                dispatch_inline: true,
+            };
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterMonitor(main_q, &cap as *const MonitorCapture as *mut c_void, capture_monitor as usize, &mut tok),
+                S_OK
+            );
+
+            let ran = AtomicU32::new(0);
+            assert_eq!(XTaskQueueSubmitCallback(comp_q, PORT_COMPLETION, &ran as *const AtomicU32 as *mut c_void, inc_u32 as usize), S_OK);
+            assert_eq!(ran.load(Ordering::SeqCst), 1, "monitor on main_q did not wake/dispatch composite completion");
+            // Each callback's temporary handle must be gone as soon as its callback returns. Checked
+            // right away: a later `XTaskQueueDuplicateHandle` can be given the freed handle's address.
+            let temp0 = cap.events.lock().unwrap()[0].0;
+            assert!(queue_from(temp0 as *mut c_void).is_none(), "temporary monitor handle leaked past callback");
+            assert_eq!(XTaskQueueSubmitCallback(comp_cross, PORT_COMPLETION, &ran as *const AtomicU32 as *mut c_void, inc_u32 as usize), S_OK);
+            assert_eq!(ran.load(Ordering::SeqCst), 2, "cross-slot composite port did not notify main_q on PORT_WORK");
+            let temp1 = cap.events.lock().unwrap()[1].0;
+            assert!(queue_from(temp1 as *mut c_void).is_none(), "temporary monitor handle leaked past callback");
+            // Submitting to `comp_q`'s `bg_work` port must NOT notify `main_q`'s monitor.
+            assert_eq!(XTaskQueueSubmitCallback(comp_q, PORT_WORK, std::ptr::null_mut(), noop as usize), S_OK);
+            assert!(XTaskQueueDispatch(bg_q, PORT_WORK, 0));
+
+            {
+                let ev = cap.events.lock().unwrap();
+                assert_eq!(ev.len(), 2);
+                assert_eq!((ev[0].1, ev[0].2, ev[0].3), (PORT_COMPLETION, true, S_OK));
+                assert_eq!((ev[1].1, ev[1].2, ev[1].3), (PORT_WORK, true, S_OK));
+            }
+            for dup in cap.duplicated.lock().unwrap().drain(..) {
+                assert!(queue_from(dup as *mut c_void).is_some(), "duplicated handle from monitor must stay valid");
+                XTaskQueueCloseHandle(dup as *mut c_void);
+            }
+
+            // 2. Closing the handle used at registration (while a duplicate stays open) and
+            // registering on the NULL process queue both pass a valid temporary handle to callbacks.
+            let mut dup_main = std::ptr::null_mut();
+            assert_eq!(XTaskQueueDuplicateHandle(main_q, &mut dup_main), S_OK);
+            XTaskQueueCloseHandle(main_q);
+            cap.events.lock().unwrap().clear();
+            assert_eq!(XTaskQueueSubmitCallback(dup_main, PORT_COMPLETION, &ran as *const AtomicU32 as *mut c_void, inc_u32 as usize), S_OK);
+            assert_eq!(ran.load(Ordering::SeqCst), 3);
+            {
+                let ev = cap.events.lock().unwrap();
+                assert_eq!(ev.len(), 1);
+                assert_ne!(ev[0].0, 0);
+                assert_eq!((ev[0].1, ev[0].2, ev[0].3), (PORT_COMPLETION, true, S_OK));
+            }
+            for dup in cap.duplicated.lock().unwrap().drain(..) {
+                XTaskQueueCloseHandle(dup as *mut c_void);
+            }
+
+            let proc_cap = MonitorCapture {
+                events: Mutex::new(Vec::new()),
+                duplicated: Mutex::new(Vec::new()),
+                dispatch_inline: false,
+            };
+            let mut proc_tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterMonitor(std::ptr::null_mut(), &proc_cap as *const MonitorCapture as *mut c_void, capture_monitor as usize, &mut proc_tok),
+                S_OK
+            );
+            assert_eq!(XTaskQueueSubmitCallback(std::ptr::null_mut(), PORT_WORK, std::ptr::null_mut(), noop as usize), S_OK);
+            XTaskQueueUnregisterMonitor(std::ptr::null_mut(), proc_tok);
+            {
+                let ev = proc_cap.events.lock().unwrap();
+                assert_eq!(ev.len(), 1);
+                assert_ne!(ev[0].0, 0, "NULL process-queue monitor received a null handle");
+                assert_eq!((ev[0].1, ev[0].3), (PORT_WORK, S_OK));
+            }
+            for dup in proc_cap.duplicated.lock().unwrap().drain(..) {
+                XTaskQueueCloseHandle(dup as *mut c_void);
+            }
+
+            // 3. Terminating the monitored queue stops notifications from sibling composite queues.
+            cap.events.lock().unwrap().clear();
+            assert_eq!(XTaskQueueTerminate(dup_main, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(comp_q, PORT_COMPLETION, std::ptr::null_mut(), noop as usize), S_OK);
+            assert!(XTaskQueueDispatch(comp_q, PORT_COMPLETION, 0));
+            assert!(cap.events.lock().unwrap().is_empty(), "terminated queue still fired monitor");
+
+            XTaskQueueTerminate(comp_cross, true, std::ptr::null_mut(), 0);
+            XTaskQueueTerminate(comp_q, true, std::ptr::null_mut(), 0);
+            XTaskQueueTerminate(bg_q, true, std::ptr::null_mut(), 0);
+            XTaskQueueCloseHandle(comp_cross);
+            XTaskQueueCloseHandle(comp_q);
+            XTaskQueueCloseHandle(bg_q);
+            XTaskQueueCloseHandle(dup_main);
         }
     }
 }
