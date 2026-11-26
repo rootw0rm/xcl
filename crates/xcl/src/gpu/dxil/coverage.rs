@@ -251,8 +251,8 @@ pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
         Mode::Kernel => kernel::translate_full(code, o),
         Mode::Compute(cs) => kernel::translate_compute(code, o, cs),
-        Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
-        Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
+        Mode::Vertex(vs) => kernel::translate_vertex(code, o, vs),
+        Mode::Pixel(ps) => kernel::translate_pixel(code, o, ps),
         Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
         Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
     }));

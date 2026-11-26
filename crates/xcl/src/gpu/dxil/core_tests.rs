@@ -187,6 +187,60 @@ fn branchy_graphics_stages_validate() {
     }
 }
 
+/// On 32-lane hardware waves (`split: true`), wave64 vertex / pixel shaders that read lanes
+/// 32–63 (as found by `upper_lanes::analyze`) must be refused by direct DXIL so `pso.rs` falls
+/// back to the HLSL `upper_lanes` path instead of caching broken wave64-only DXIL under
+/// `split=1`. Wave64 VS/PS with no upper-lane reads still translate under `split: true`, and
+/// native wave64 (`split: false`) still translates both (#1895).
+#[test]
+fn wave64_graphics_with_upper_lane_reads_refused_in_32_lane_mode() {
+    use crate::gpu::recomp::{Mode, PsInterface, VsInterface};
+    let vsi = VsInterface { inputs: vec![], outputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], attr_base: 4, params: None };
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    // Whole-wave write into lanes 32..63 followed by `v_readlane_b32` of lane 63.
+    let upper_body = |exp| {
+        prog(&[
+            ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 193)], None), // -1
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 133)], None),          // 5
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None), // lane 63
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 2)], None),
+            exp,
+        ])
+    };
+    let native_body = |exp| {
+        prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 242)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 242)], None),
+            exp,
+        ])
+    };
+    let vs_exp = ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 4), ("VSRC3", 5), ("DONE", 1)][..], None);
+    let ps_exp = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 4), ("VSRC3", 5), ("DONE", 1), ("VM", 1)][..], None);
+
+    let split_o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let native_o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+    let vs_upper = upper_body(vs_exp);
+    let ps_upper = upper_body(ps_exp);
+    let err_vs = super::kernel::translate_vertex(&vs_upper, split_o, &vsi).err().expect("VS upper-lane read must be refused when split=true");
+    assert!(err_vs.contains("lanes 32–63"), "unexpected VS error: {err_vs}");
+    let err_ps = super::kernel::translate_pixel(&ps_upper, split_o, &psi).err().expect("PS upper-lane read must be refused when split=true");
+    assert!(err_ps.contains("lanes 32–63"), "unexpected PS error: {err_ps}");
+    assert!(super::coverage::translate_mode(&vs_upper, &Mode::Vertex(vsi.clone()), split_o, false).is_err());
+    assert!(super::coverage::translate_mode(&ps_upper, &Mode::Pixel(psi.clone()), split_o, false).is_err());
+
+    // Native wave64 (`split: false`) still translates both.
+    super::kernel::translate_vertex(&vs_upper, native_o, &vsi).expect("VS native wave64");
+    super::kernel::translate_pixel(&ps_upper, native_o, &psi).expect("PS native wave64");
+
+    // Wave64 VS/PS with no upper-lane reads still translate under `split: true`.
+    let vs_native = native_body(vs_exp);
+    let ps_native = native_body(ps_exp);
+    super::kernel::translate_vertex(&vs_native, split_o, &vsi).expect("VS without upper-lane reads");
+    super::kernel::translate_pixel(&ps_native, split_o, &psi).expect("PS without upper-lane reads");
+}
+
 /// A long pixel shader (guarded memory accesses make thousands of joins between a
 /// register's write and the output stores) translates quickly and stays small: the
 /// SSA builder drops trivial phis, `Module::optimize` cleans up the rest.

@@ -622,7 +622,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
-        match direct_graphics(blob, stage, sampler_base, windows) {
+        match direct_graphics(blob, stage, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
                 return Ok((c, false));
@@ -1013,14 +1013,15 @@ fn dump_direct(blob: &[u8], dxil: &[u8]) {
 }
 
 /// A console vertex / pixel shader through the direct DXIL translator.
-fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -> Result<Compiled, String> {
+fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let want = if stage == Stage::Vertex { 4 } else { 5 };
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == want)).ok_or("no hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::fssm_wave64(f, code), split: false, mem_windows: windows, sampler_base };
+    let wave64 = super::fssm_wave64(f, code);
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     let k = match (&mode, stage) {
         (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
         (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,

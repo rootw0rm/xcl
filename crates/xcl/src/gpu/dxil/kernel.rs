@@ -205,6 +205,16 @@ fn translate_on_this_thread(
     let kernel = matches!(entry, Entry::Kernel);
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+    if gfx
+        && o.wave64
+        && o.split
+        && crate::gpu::recomp::upper_lanes::analyze(&cfg.insts)
+            .reads
+            .values()
+            .any(|&r| r != crate::gpu::recomp::upper_lanes::Read::Native)
+    {
+        return Err("wave64 VS / PS in 32-lane waves: a read of lanes 32–63".into());
+    }
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
