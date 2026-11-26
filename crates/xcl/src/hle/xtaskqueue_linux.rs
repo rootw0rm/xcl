@@ -386,27 +386,6 @@ fn submit(q: &Arc<Queue>, port: u32, item: Item, terminating: bool) -> bool {
             let q2 = q.clone();
             spawn(Box::new(move || unsafe { q2.execute(port, item) }));
         }
-        MODE_SERIALIZED_THREAD_POOL => {
-            {
-                let mut items = p.items.lock().unwrap();
-                {
-                    let mut state = q.state.lock().unwrap();
-                    if state.terminated && !terminating {
-                        return false;
-                    }
-                    if terminating {
-                        state.termination_cb_pending = state.termination_cb_pending.saturating_sub(1);
-                    }
-                    state.inflight[port as usize] += 1;
-                }
-                items.push_back(QueuedItem { item, queue: q.clone(), port });
-            }
-            p.notify_monitors();
-            if !p.running.swap(true, Ordering::AcqRel) {
-                let p2 = p.clone();
-                spawn(Box::new(move || drain_serialized(p2)));
-            }
-        }
         _ => {
             {
                 let mut items = p.items.lock().unwrap();
@@ -428,6 +407,12 @@ fn submit(q: &Arc<Queue>, port: u32, item: Item, terminating: bool) -> bool {
                 p.cv.notify_one();
             }
             p.notify_monitors();
+            // Only the serialized pool gets an automatic drain worker; a manual port
+            // waits for an explicit XTaskQueueDispatch on the caller's thread (#2806).
+            if p.mode == MODE_SERIALIZED_THREAD_POOL && !p.running.swap(true, Ordering::AcqRel) {
+                let p2 = p.clone();
+                spawn(Box::new(move || drain_serialized(p2)));
+            }
         }
     }
     true
@@ -464,9 +449,11 @@ pub fn submit_delayed(q: &Arc<Queue>, port: u32, delay_ms: u32, item: Item) -> b
     true
 }
 
+/// Dispatch one queued item on the caller's thread. Returns true when something ran.
 pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
     let p = &q.ports[port as usize];
-    if p.mode != MODE_MANUAL {
+    // Serialization applies to the automatic worker. Explicit callers can also claim queued work.
+    if !matches!(p.mode, MODE_MANUAL | MODE_SERIALIZED_THREAD_POOL) {
         return false;
     }
     let mut g = p.items.lock().unwrap();
@@ -1397,6 +1384,100 @@ mod tests {
             WAITERS,
             "blocked pool callbacks starved the releaser callback"
         );
+    }
+
+    #[test]
+    fn serialized_work_port_can_dispatch_on_the_caller() {
+        use std::sync::mpsc;
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        struct First {
+            started: mpsc::Sender<std::thread::ThreadId>,
+            release: mpsc::Receiver<()>,
+            done: mpsc::Sender<bool>,
+        }
+
+        unsafe extern "win64" fn first(ctx: *mut c_void, canceled: bool) {
+            let first = Box::from_raw(ctx.cast::<First>());
+            let _ = first.started.send(std::thread::current().id());
+            let released = first.release.recv_timeout(TIMEOUT).is_ok();
+            let _ = first.done.send(released && !canceled);
+        }
+
+        type ResultSender = mpsc::Sender<(std::thread::ThreadId, bool)>;
+
+        unsafe extern "win64" fn report_thread(ctx: *mut c_void, canceled: bool) {
+            let done = Box::from_raw(ctx.cast::<ResultSender>());
+            let _ = done.send((std::thread::current().id(), canceled));
+        }
+
+        unsafe fn submit_record(queue: *mut c_void, done: ResultSender) -> HRESULT {
+            let ctx = Box::into_raw(Box::new(done));
+            let hr = XTaskQueueSubmitCallback(queue, PORT_WORK, ctx.cast(), report_thread as usize);
+            if hr != S_OK {
+                drop(Box::from_raw(ctx));
+            }
+            hr
+        }
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (first_done_tx, first_done_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let (third_done_tx, third_done_rx) = mpsc::channel();
+        let caller = std::thread::current().id();
+
+        unsafe {
+            let mut queue = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_SERIALIZED_THREAD_POOL, MODE_MANUAL, &mut queue), S_OK);
+
+            // Callback contexts own their channels even if the caller times out.
+            let first_context = Box::into_raw(Box::new(First { started: started_tx, release: release_rx, done: first_done_tx }));
+            let first_hr = XTaskQueueSubmitCallback(queue, PORT_WORK, first_context.cast(), first as usize);
+            if first_hr != S_OK {
+                drop(Box::from_raw(first_context));
+            }
+            let first_thread = if first_hr == S_OK { started_rx.recv_timeout(TIMEOUT).ok() } else { None };
+            let empty_dispatch = first_thread.is_some() && XTaskQueueDispatch(queue, PORT_WORK, 0);
+
+            let mut second_hr = crate::util::E_ABORT;
+            let mut third_hr = crate::util::E_ABORT;
+            if first_thread.is_some() {
+                second_hr = submit_record(queue, second_done_tx);
+                third_hr = submit_record(queue, third_done_tx);
+            }
+            let dispatched = second_hr == S_OK && XTaskQueueDispatch(queue, PORT_WORK, 0);
+            let early = second_done_rx.try_recv().ok();
+            let before_release = early.is_some();
+            let third_early = third_done_rx.try_recv().ok();
+
+            let _ = release_tx.send(());
+            let first_released = first_thread.is_some() && first_done_rx.recv_timeout(TIMEOUT) == Ok(true);
+            let second_done = if second_hr == S_OK {
+                early.or_else(|| second_done_rx.recv_timeout(TIMEOUT).ok())
+            } else {
+                None
+            };
+            let third_done = if third_hr == S_OK {
+                third_early.or_else(|| third_done_rx.recv_timeout(TIMEOUT).ok())
+            } else {
+                None
+            };
+            XTaskQueueCloseHandle(queue);
+
+            let on_caller = second_done.as_ref().is_some_and(|(thread, _)| thread == &caller);
+            println!("serialized dispatch: dispatched={dispatched} before_release={before_release} on_caller={on_caller}");
+            assert_eq!(first_hr, S_OK);
+            assert!(first_released, "first callback must finish after the explicit release");
+            assert_ne!(first_thread, Some(caller), "automatic dispatch must use a pool worker");
+            assert!(!empty_dispatch, "an in-flight callback is not queued work");
+            assert_eq!(second_hr, S_OK);
+            assert_eq!(third_hr, S_OK);
+            assert_eq!(second_done.as_ref().map(|(_, canceled)| *canceled), Some(false));
+            assert!(dispatched && before_release && on_caller, "explicit dispatch must run the queued callback on its caller");
+            assert!(third_early.is_none(), "one explicit dispatch must consume only one callback");
+            assert_eq!(third_done, first_thread.map(|thread| (thread, false)), "the original worker must keep draining the port");
+        }
     }
 
     #[test]
