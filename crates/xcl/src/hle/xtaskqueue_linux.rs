@@ -950,6 +950,84 @@ pub unsafe extern "win64" fn XTaskQueueUnregisterMonitor(h: *mut c_void, token: 
 
 pub const DEFAULT_UDP_PORT: u16 = 3074;
 
+/// `XCL_NETWORK=0` on Linux: the same env the Windows `netoff` module reads
+/// (`hle_linux` has no `netoff` yet — see the LINUX-TODO in `hle_linux.rs`).
+fn network_off() -> bool {
+    std::env::var("XCL_NETWORK").is_ok_and(|v| v.trim() == "0")
+}
+
+/// The hint's level with no host to ask (Linux has no `iphlpapi`): `None` (1) with
+/// `XCL_NETWORK=0`, as on a console without a network, else `InternetAccess` (3).
+/// Mirrors the Windows `connectivity_level(None, off)` outcome (#494).
+fn connectivity_level(network_off: bool) -> u32 {
+    if network_off { 1 } else { 3 }
+}
+
+/// Split `http(s)://[user@]host[:port]/...` into its host and whether it is a plain-HTTP
+/// loopback URL. Mirrors the Windows `url_host_and_is_plain_loopback` (#1382): the whole
+/// `127.0.0.0/8` plus `::1`/`localhost` count, via `IpAddr::is_loopback`.
+/// Currently a contract pin for the test vectors (no WinHTTP handle on Linux to read a URL
+/// from — same no-consumer class as #1292/#1503/#843); a future Linux socket layer reuses it.
+#[allow(dead_code)]
+fn url_host_and_is_plain_loopback(url: &str) -> (String, bool) {
+    let lower = url.to_ascii_lowercase();
+    let is_http = lower.starts_with("http://");
+    let after_scheme = match url.split_once("://") {
+        Some((_, r)) => r,
+        None => url,
+    };
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => "",
+        }
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    let is_loopback_ip = host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let loopback = host.eq_ignore_ascii_case("localhost") || is_loopback_ip;
+    (host.to_string(), is_http && loopback)
+}
+
+/// The one notification a register function sends right away, with the current value.
+/// Mirrors the Windows `InitialNotification<T>` (#1237).
+struct InitialNotification<T> {
+    cb: usize,
+    ctx: usize,
+    value: T,
+}
+
+/// Queue `call(record)` on `queue`'s completion port; the record is freed by `call`, or here
+/// when the queue does not take it. Mirrors the Windows `notify_initial` (#1237).
+unsafe fn notify_initial<T>(queue: *mut c_void, ctx: *mut c_void, cb: usize, value: T, call: usize, what: &str) {
+    let rec = Box::into_raw(Box::new(InitialNotification { cb, ctx: ctx as usize, value }));
+    let submitted = queue_from(queue)
+        .map(|q| submit_now(&q, PORT_COMPLETION, Item { cb: call, ctx: rec as usize }))
+        .unwrap_or(false);
+    if !submitted {
+        drop(Box::from_raw(rec));
+        crate::xlog_warn!("XNetworking: the initial {what} callback could not be queued");
+    }
+}
+
+unsafe extern "win64" fn udp_port_changed_call(rec: *mut c_void, canceled: bool) {
+    let r = Box::from_raw(rec as *mut InitialNotification<u16>);
+    if !canceled {
+        let f: unsafe extern "win64" fn(*mut c_void, u16) = std::mem::transmute(r.cb);
+        f(r.ctx as *mut c_void, r.value);
+    }
+}
+
+unsafe extern "win64" fn connectivity_hint_changed_call(rec: *mut c_void, canceled: bool) {
+    let r = Box::from_raw(rec as *mut InitialNotification<XNetworkingConnectivityHint>);
+    if !canceled {
+        let f: unsafe extern "win64" fn(*mut c_void, *const XNetworkingConnectivityHint) = std::mem::transmute(r.cb);
+        f(r.ctx as *mut c_void, &r.value);
+    }
+}
+
 pub unsafe extern "win64" fn XNetworkingQueryPreferredLocalUdpMultiplayerPort(port: *mut u16) -> HRESULT {
     if port.is_null() {
         return E_INVALIDARG;
@@ -974,9 +1052,10 @@ pub unsafe extern "win64" fn XNetworkingGetConnectivityHint(out: *mut XNetworkin
     if out.is_null() {
         return E_INVALIDARG;
     }
-    // Offline headless: report InternetAccess over Ethernet, initialized, unmetered.
+    // Offline headless: InternetAccess over Ethernet when the network is on, None (1) with
+    // `XCL_NETWORK=0` as on a console without a network (#494); initialized, unmetered.
     *out = XNetworkingConnectivityHint {
-        connectivity_level: 3,
+        connectivity_level: connectivity_level(network_off()),
         connectivity_cost: 1,
         iana_interface_type: 6,
         network_initialized: true,
@@ -989,16 +1068,19 @@ pub unsafe extern "win64" fn XNetworkingGetConnectivityHint(out: *mut XNetworkin
 
 static NEXT_NET_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+/// The port never changes, but registering "always fires an initial notification callback"
+/// (GDK docs), and a title may wait for it (#1237).
 pub unsafe extern "win64" fn XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(
-    _queue: *mut c_void,
-    _ctx: *mut c_void,
-    _cb: usize,
+    queue: *mut c_void,
+    ctx: *mut c_void,
+    cb: usize,
     token: *mut u64,
 ) -> HRESULT {
-    if token.is_null() {
+    if token.is_null() || cb == 0 {
         return E_INVALIDARG;
     }
     *token = NEXT_NET_TOKEN.fetch_add(1, Ordering::Relaxed);
+    notify_initial(queue, ctx, cb, DEFAULT_UDP_PORT, udp_port_changed_call as usize, "UDP port");
     S_OK
 }
 
@@ -1006,16 +1088,21 @@ pub unsafe extern "win64" fn XNetworkingUnregisterPreferredLocalUdpMultiplayerPo
     true
 }
 
+/// Registering "sends an initial notification callback" (GDK docs) with the current hint: a
+/// title that waits for it to see `network_initialized` would otherwise wait forever (#1237).
 pub unsafe extern "win64" fn XNetworkingRegisterConnectivityHintChanged(
-    _queue: *mut c_void,
-    _ctx: *mut c_void,
-    _cb: usize,
+    queue: *mut c_void,
+    ctx: *mut c_void,
+    cb: usize,
     token: *mut u64,
 ) -> HRESULT {
-    if token.is_null() {
+    if token.is_null() || cb == 0 {
         return E_INVALIDARG;
     }
     *token = NEXT_NET_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let mut hint: XNetworkingConnectivityHint = std::mem::zeroed();
+    XNetworkingGetConnectivityHint(&mut hint);
+    notify_initial(queue, ctx, cb, hint, connectivity_hint_changed_call as usize, "connectivity hint");
     S_OK
 }
 
@@ -1321,12 +1408,83 @@ mod tests {
             assert_eq!(XNetworkingQueryPreferredLocalUdpMultiplayerPort(std::ptr::null_mut()), E_INVALIDARG);
             let mut hint: XNetworkingConnectivityHint = std::mem::zeroed();
             assert_eq!(XNetworkingGetConnectivityHint(&mut hint), S_OK);
+            // `XCL_NETWORK=0` is unset in the test env: InternetAccess (3). The off value (1)
+            // is pinned by `connectivity_level_without_network_is_none` without mutating env.
             assert_eq!(hint.connectivity_level, 3);
             assert_eq!(hint.iana_interface_type, 6);
             assert!(hint.network_initialized);
             let bytes = std::slice::from_raw_parts(&hint as *const _ as *const u8, 16);
             assert_eq!(bytes[12], 1, "hint[12] is network_initialized");
         }
+    }
+
+    #[test]
+    fn connectivity_level_without_network_is_none() {
+        // Mirrors the Windows `connectivity_level(host, off)` contract with no host to ask
+        // (Linux has no `iphlpapi`): off means None (1), on means InternetAccess (3).
+        assert_eq!(connectivity_level(true), 1);
+        assert_eq!(connectivity_level(false), 3);
+        assert!(!network_off(), "test env must not set XCL_NETWORK=0");
+    }
+
+    #[test]
+    fn networking_registers_fire_an_initial_callback() {
+        use std::sync::Mutex;
+        struct Seen {
+            calls: AtomicU32,
+            port: AtomicU32,
+            hint: Mutex<Option<XNetworkingConnectivityHint>>,
+        }
+        unsafe extern "win64" fn on_port(ctx: *mut c_void, port: u16) {
+            let seen = &*(ctx as *const Seen);
+            seen.port.store(port as u32, Ordering::SeqCst);
+            seen.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "win64" fn on_hint(ctx: *mut c_void, hint: *const XNetworkingConnectivityHint) {
+            let seen = &*(ctx as *const Seen);
+            *seen.hint.lock().unwrap() = Some(*hint);
+            seen.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut q), S_OK);
+            let seen = Seen { calls: AtomicU32::new(0), port: AtomicU32::new(0), hint: Mutex::new(None) };
+            let ctx = &seen as *const Seen as *mut c_void;
+            let mut token = 0u64;
+            assert_eq!(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(q, ctx, on_port as usize, &mut token), S_OK);
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.port.load(Ordering::SeqCst), DEFAULT_UDP_PORT as u32);
+            assert!(XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(token, true));
+
+            seen.calls.store(0, Ordering::SeqCst);
+            assert_eq!(XNetworkingRegisterConnectivityHintChanged(q, ctx, on_hint as usize, &mut token), S_OK);
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            let hint = seen.hint.lock().unwrap().expect("no connectivity hint callback");
+            assert!(hint.network_initialized);
+            assert!((1..=4).contains(&hint.connectivity_level));
+            assert!(XNetworkingUnregisterConnectivityHintChanged(token, true));
+
+            // the callback is required: null is E_INVALIDARG and queues nothing.
+            assert_eq!(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(q, ctx, 0, &mut token), E_INVALIDARG);
+            assert_eq!(XNetworkingRegisterConnectivityHintChanged(q, ctx, 0, &mut token), E_INVALIDARG);
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+
+            XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn loopback_detection_covers_subnets() {
+        // Portable half of #1382: the whole 127.0.0.0/8 plus ::1/localhost count as loopback.
+        assert_eq!(url_host_and_is_plain_loopback("http://127.0.0.1:3551/account/api/oauth/token"), ("127.0.0.1".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://127.0.0.2:8080/test"), ("127.0.0.2".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://127.1.2.3:8080/test"), ("127.1.2.3".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("https://127.0.0.1:3551/secure"), ("127.0.0.1".into(), false));
+        assert_eq!(url_host_and_is_plain_loopback("http://[::1]:8080/test"), ("::1".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("https://social.xboxlive.com/users"), ("social.xboxlive.com".into(), false));
+        assert_eq!(url_host_and_is_plain_loopback("http://user:pass@127.0.0.1:8080/test"), ("127.0.0.1".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://[::1/bad"), ("".into(), false));
+        assert_eq!(url_host_and_is_plain_loopback(""), ("".into(), false));
     }
 
     #[test]
