@@ -129,6 +129,14 @@ fn xbox_shader(kind: u32, fssms: &[Vec<u8>]) -> Vec<u8> {
     dxbc_container(&[(b"SFI0", &[0; 8]), (b"HASH", &[0; 20]), (b"DXIL", &dxil), (b"PRIV", &[7; 16])])
 }
 
+#[cfg(windows)]
+fn xbox_shader_with_osg(kind: u32, fssms: &[Vec<u8>], osg: &[u8]) -> Vec<u8> {
+    let base = xbox_shader(kind, fssms);
+    let dxil = xcl::gpu::shader::container_parts(&base).unwrap().into_iter().find(|p| p.fourcc == "DXIL").unwrap();
+    let dxil_bytes = &base[dxil.offset..dxil.offset + dxil.size];
+    dxbc_container(&[(b"SFI0", &[0; 8]), (b"OSG1", osg), (b"HASH", &[0; 20]), (b"DXIL", dxil_bytes), (b"PRIV", &[7; 16])])
+}
+
 fn rpf9_record(name: &str, payload: &[u8], usize_override: Option<u32>) -> Vec<u8> {
     let z = miniz_oxide::deflate::compress_to_vec(payload, 6);
     let mut v = vec![(name.len() + 1) as u8];
@@ -381,4 +389,221 @@ fn shaders_rejects_unknown_options_missing_values_and_mistyped_values() {
         assert!(stderr.contains(expected_msg), "args {args:?}: expected {expected_msg:?} in {stderr:?}");
         assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
     }
+}
+
+
+/// Constant S# in s[24:27] (point/clamp) + image_sample_lz -> v[10:13] + export (keeps sampler live) + s_endpgm.
+#[cfg(windows)]
+fn static_sampler_code(exp_w0: u32) -> Vec<u8> {
+    let words: [u32; 11] = [
+        0xBE98_03FF, 0x0000_0092, 0xBE99_03FF, 0x00FF_F000, 0xBE9A_0380, 0xBE9B_0380,
+        0xF09C_0F08, 0x00C4_0A00, exp_w0, 0x0D0C_0B0A, 0xBF81_0000,
+    ];
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+#[cfg(windows)]
+fn find_files_named(dir: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend(find_files_named(&p, needle));
+        } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(needle)) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn time_native_graphics_pso(vs: &xcl::gpu::recomp::pso::Compiled, ps: &xcl::gpu::recomp::pso::Compiled) -> Result<Option<f64>, String> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
+    let Ok(factory) = (unsafe { CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) }) else {
+        return Ok(None);
+    };
+    let sel = xcl::gpu::adapter::Selector::from_env_or("auto");
+    let adapter: IDXGIAdapter1 = if sel == xcl::gpu::adapter::Selector::Warp {
+        let Ok(a) = (unsafe { factory.EnumWarpAdapter() }) else { return Ok(None) };
+        a
+    } else {
+        let Some(a) = xcl::gpu::adapter::candidates(&factory, &sel)
+            .into_iter()
+            .next()
+            .map(|(a, _)| a)
+            .or_else(|| unsafe { factory.EnumWarpAdapter().ok() })
+        else {
+            return Ok(None);
+        };
+        a
+    };
+    let mut dev: Option<ID3D12Device> = None;
+    if unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
+        return Ok(None);
+    }
+    let Some(dev) = dev else { return Ok(None) };
+    let mut samplers = vs.samplers.clone();
+    samplers.extend_from_slice(&ps.samplers);
+    let rs = xcl::gpu::recomp::pso::abi_root_signature_with(&dev, true, &samplers)
+        .map_err(|e| format!("abi_root_signature_with failed: {e}"))?;
+    let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+        VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.dxil.as_ptr().cast(), BytecodeLength: vs.dxil.len() },
+        PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.dxil.as_ptr().cast(), BytecodeLength: ps.dxil.len() },
+        SampleMask: u32::MAX,
+        RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, ..Default::default() },
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    let t0 = std::time::Instant::now();
+    let pso: Result<ID3D12PipelineState, _> = unsafe { dev.CreateGraphicsPipelineState(&desc) };
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+    pso.map(|_| Some(ms))
+        .map_err(|e| format!("CreateGraphicsPipelineState failed: {e} ({:#x})", e.code().0 as u32))
+}
+
+#[cfg(windows)]
+fn spawn_child_check(test_name: &str, dir: &Path, cache: &Path, direct: &str) -> Output {
+    Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env("XCL_SHADERS_E2E_CHILD", "1")
+        .env("XCL_SHADERS_E2E_DIR", dir)
+        .env("XCL_DIRECT_DXIL", direct)
+        .env("XCL_DXIL_CACHE", cache)
+        .env_remove("XCL_TRANSLATED_CACHE")
+        .output()
+        .expect("spawn fresh child test process")
+}
+
+#[cfg(windows)]
+#[test]
+fn precompile_warms_direct_vs_ps_and_hits_in_fresh_process() {
+    use xcl::gpu::recomp::{dxc, pso};
+    if std::env::var_os("XCL_SHADERS_E2E_CHILD").is_some() {
+        let dir = PathBuf::from(std::env::var_os("XCL_SHADERS_E2E_DIR").unwrap());
+        let (vs_blob, ps_blob) = (std::fs::read(dir.join("vs.bin")).unwrap(), std::fs::read(dir.join("ps.bin")).unwrap());
+        let t0 = std::time::Instant::now();
+        let (vs_res, vs_missed) = dxc::cached_only(|| pso::console_to_dxil_in(&vs_blob, pso::Stage::Vertex, 0, false, 1));
+        let (ps_res, ps_missed) = dxc::cached_only(|| pso::console_to_dxil_in(&ps_blob, pso::Stage::Pixel, 0, false, 1));
+        let warm_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let (vs_c, ps_c) = (vs_res.expect("warm direct VS hit"), ps_res.expect("warm direct PS hit"));
+        assert!(!vs_missed && !ps_missed, "fresh process must hit translated/v2 cache");
+        assert_eq!(dxc::compile_counts().1, 0, "fresh process direct hit must invoke 0 DXC compiles");
+        match time_native_graphics_pso(&vs_c, &ps_c).expect("direct graphics PSO creation failed") {
+            Some(pso_ms) => println!("fresh_child_timing: mode=direct warm_translate_dxc_ms={warm_ms:.3} native_pso_ms={pso_ms:.3}"),
+            None => {
+                xcl::gpu::recomp::runner::skip_test("no D3D12 device");
+                println!("fresh_child_timing: mode=direct warm_translate_dxc_ms={warm_ms:.3} native_pso_ms=skipped(no_gpu)");
+            }
+        }
+        return;
+    }
+    let (dir, cache) = (TempDir::new("direct-gfx"), TempDir::new("direct-gfx-cache"));
+    std::fs::write(dir.path().join("vs.bin"), xbox_shader(1, &[fssm(&CODE, &[(4, 0)])])).unwrap();
+    std::fs::write(dir.path().join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["shaders", dir.path().to_str().unwrap(), "--precompile", "--windows", "1", "--split", "0"])
+        .env("XCL_DIRECT_DXIL", "all")
+        .env("XCL_DXIL_CACHE", cache.path())
+        .env_remove("XCL_TRANSLATED_CACHE")
+        .output()
+        .expect("spawn xcl shaders --precompile");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "precompile failed: {out:?}");
+    assert!(stdout.contains("compiled 2, already cached 0, errors 0"), "{stdout}");
+    assert!(stdout.contains("PS warmed at assumed sampler_base=0: 1"), "{stdout}");
+    let warm_out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["shaders", dir.path().to_str().unwrap(), "--precompile", "--windows", "1", "--split", "0"])
+        .env("XCL_DIRECT_DXIL", "all")
+        .env("XCL_DXIL_CACHE", cache.path())
+        .env_remove("XCL_TRANSLATED_CACHE")
+        .output()
+        .expect("spawn warm xcl shaders --precompile");
+    let warm_stdout = String::from_utf8_lossy(&warm_out.stdout);
+    assert!(warm_out.status.success(), "warm precompile failed: {warm_out:?}");
+    assert!(warm_stdout.contains("compiled 0, already cached 2, errors 0"), "{warm_stdout}");
+    let v2 = cache.path().join("translated").join("v2");
+    assert!(!find_files_named(&v2, "_Vertex_0_").is_empty(), "missing _Vertex_0_ in {}", v2.display());
+    assert!(!find_files_named(&v2, "_Pixel_0_").is_empty(), "missing _Pixel_0_ in {}", v2.display());
+    let child = spawn_child_check("precompile_warms_direct_vs_ps_and_hits_in_fresh_process", dir.path(), cache.path(), "all");
+    let c_out = String::from_utf8_lossy(&child.stdout);
+    print!("{c_out}");
+    assert!(child.status.success(), "fresh child failed: {child:?}\n{c_out}");
+    assert!(c_out.contains("fresh_child_timing: mode=direct"), "{c_out}");
+}
+
+#[cfg(windows)]
+#[test]
+fn precompile_warms_hlsl_static_samplers_and_reports_base_shift() {
+    use xcl::gpu::recomp::{dxc, pso};
+    if std::env::var_os("XCL_SHADERS_E2E_CHILD").is_some() {
+        let dir = PathBuf::from(std::env::var_os("XCL_SHADERS_E2E_DIR").unwrap());
+        let (vs_blob, ps_blob) = (std::fs::read(dir.join("vs.bin")).unwrap(), std::fs::read(dir.join("ps.bin")).unwrap());
+        let t0 = std::time::Instant::now();
+        let (vs_res, vs_missed) = dxc::cached_only(|| pso::console_to_dxil_in(&vs_blob, pso::Stage::Vertex, 0, false, 1));
+        let (ps0_res, ps0_missed) = dxc::cached_only(|| pso::console_to_dxil_in(&ps_blob, pso::Stage::Pixel, 0, false, 1));
+        let warm_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let (vs_c, ps0_c) = (vs_res.expect("warm HLSL VS hit"), ps0_res.expect("warm HLSL PS base=0 hit"));
+        assert!(!vs_missed && !ps0_missed, "fresh process must hit VS and PS(base=0)");
+        assert_eq!((vs_c.samplers.len(), ps0_c.samplers.len()), (1, 1));
+        assert_eq!(dxc::compile_counts().1, 0, "warm hits must not invoke DXC");
+        let (_ps1_probe, ps1_missed) = dxc::cached_only(|| pso::console_to_dxil_in(&ps_blob, pso::Stage::Pixel, 1, false, 1));
+        assert!(ps1_missed, "paired PS(base=1) must miss base=0 entry");
+        let ps1_c = pso::console_to_dxil_in(&ps_blob, pso::Stage::Pixel, 1, false, 1).expect("PS base=1 compile");
+        assert_eq!(ps1_c.samplers.len(), 1);
+        assert_ne!(ps1_c.dxil, ps0_c.dxil, "PS(base=1) DXIL must differ from PS(base=0)");
+        match time_native_graphics_pso(&vs_c, &ps1_c).expect("HLSL graphics PSO creation failed") {
+            Some(pso_ms) => println!("fresh_child_timing: mode=hlsl warm_translate_dxc_ms={warm_ms:.3} native_pso_ms={pso_ms:.3}"),
+            None => {
+                xcl::gpu::recomp::runner::skip_test("no D3D12 device");
+                println!("fresh_child_timing: mode=hlsl warm_translate_dxc_ms={warm_ms:.3} native_pso_ms=skipped(no_gpu)");
+            }
+        }
+        return;
+    }
+    if dxc::location().is_err() {
+        xcl::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    }
+    let (dir, cache) = (TempDir::new("hlsl-gfx"), TempDir::new("hlsl-gfx-cache"));
+    use xcl::gpu::dxil::container::{signature_part, SigPartElement};
+    let ps_osg = signature_part(&[SigPartElement { stream: 0, name: "SV_Target".into(), index: 0, system_value: 64, comp_type: 3, register: 0, mask: 0xF, rw_mask: 0, min_precision: 0 }], &[]);
+    // exp pos0 (TGT=12, DONE=1, EN=0xf) for VS and exp mrt0 (TGT=0, VM=1, DONE=1, EN=0xf) for PS.
+    std::fs::write(dir.path().join("vs.bin"), xbox_shader(1, &[fssm(&static_sampler_code(0xF800_08CF), &[(4, 0)])])).unwrap();
+    std::fs::write(dir.path().join("ps.bin"), xbox_shader_with_osg(0, &[fssm(&static_sampler_code(0xF800_180F), &[(5, 1)])], &ps_osg)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["shaders", dir.path().to_str().unwrap(), "--precompile", "--windows", "1", "--split", "0"])
+        .env("XCL_DIRECT_DXIL", "0")
+        .env("XCL_DXIL_CACHE", cache.path())
+        .env_remove("XCL_TRANSLATED_CACHE")
+        .output()
+        .expect("spawn xcl shaders --precompile");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "precompile failed: {out:?}");
+    assert!(stdout.contains("compiled 2, already cached 0, errors 0"), "{stdout}");
+    assert!(stdout.contains("PS warmed at assumed sampler_base=0: 1 (1 with static samplers); VS with static samplers shifting paired PS base: 1"), "{stdout}");
+    let warm_out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["shaders", dir.path().to_str().unwrap(), "--precompile", "--windows", "1", "--split", "0"])
+        .env("XCL_DIRECT_DXIL", "0")
+        .env("XCL_DXIL_CACHE", cache.path())
+        .env_remove("XCL_TRANSLATED_CACHE")
+        .output()
+        .expect("spawn warm hlsl xcl shaders --precompile");
+    let warm_stdout = String::from_utf8_lossy(&warm_out.stdout);
+    assert!(warm_out.status.success(), "warm hlsl precompile failed: {warm_out:?}");
+    assert!(warm_stdout.contains("compiled 0, already cached 2, errors 0"), "{warm_stdout}");
+    let child = spawn_child_check("precompile_warms_hlsl_static_samplers_and_reports_base_shift", dir.path(), cache.path(), "0");
+    let c_out = String::from_utf8_lossy(&child.stdout);
+    print!("{c_out}");
+    assert!(child.status.success(), "fresh child failed: {child:?}\n{c_out}");
+    assert!(c_out.contains("fresh_child_timing: mode=hlsl"), "{c_out}");
 }

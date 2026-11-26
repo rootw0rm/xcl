@@ -1278,16 +1278,15 @@ fn measure_pso_result(_input: &Input, _hash: u64, _repeat: usize, _windows: u32,
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
-/// (`recomp::dxc::cache_dir()`), the same HLSL the runtime will ask for, so a title does not
-/// wait for DXC on first use. Resumable: cached programs are skipped. GS halves need their
-/// pipeline partner and are left to the runtime.
-/// The cache key is the HLSL, so the options are the runtime's: `windows` memory windows as a
-/// title's unified memory has (`pso::mem_windows`, 4; `--windows 1` for a title without it),
-/// and the split wave64 form when this machine's GPU (`XCL_ADAPTER`) runs only 32-lane waves
-/// (`pso::wave32_only_for_device`). Before, the programs were translated with one window and
-/// no split form, so a title asked for other HLSL and compiled everything again. Still
-/// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
-/// mesh pass-through, which the runtime builds for its pixel shader.
+/// (`recomp::dxc::cache_dir()`), matching the runtime path so a title does not wait for translation
+/// or DXC on first use. CS, VS, and PS go through `recomp::pso::console_to_dxil_in` (warming the
+/// `translated/v2` cache, including `XCL_DIRECT_DXIL=all` direct graphics variants). Resumable:
+/// cached programs are skipped. GS halves need their pipeline partner and are left to the runtime.
+/// Options match the runtime's: `windows` memory windows (`pso::mem_windows`, 4; `--windows 1`
+/// without unified memory) and split wave64 (`pso::wave32_only_for_device` / `graphics_wave32`).
+/// Still different at run time: standalone PS records are warmed at assumed `sampler_base = 0`
+/// (shifted when paired with a VS that has static samplers) and the mesh pass-through, which the
+/// runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers), and each MS's two-pass compute pass (`--only ms`
 /// for those alone; the pass-through mesh pipeline needs the title's PS and state and is left to
@@ -1731,6 +1730,17 @@ fn precompiled_compute(blob: &[u8], mesh: bool, split: bool, windows: u32) -> Re
     Ok((recomp::pso::Compiled { dispatch_chain: None, dxil: tp.cs, samplers: tp.samplers }, path))
 }
 
+/// Like `precompiled_compute`, also reporting whether the compute program came from the
+/// in-memory or translated disk cache (`true` = cache hit). An MS's compute pass always
+/// reports newly translated: `console_mesh_in` gives no per-call cache status.
+#[cfg(windows)]
+fn precompiled_compute_cached(blob: &[u8], mesh: bool, split: bool, windows: u32) -> Result<(recomp::pso::Compiled, Option<PathBuf>, bool), String> {
+    if !mesh {
+        return recomp::pso::console_to_dxil_in_status(blob, recomp::pso::Stage::Compute, 0, split, windows).map(|(c, hit)| (c, None, hit));
+    }
+    precompiled_compute(blob, mesh, split, windows).map(|(c, path)| (c, path, false))
+}
+
 #[cfg(windows)]
 fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
     let adapter_init = ShaderPhase::start("precompile-init", None, 0);
@@ -1749,6 +1759,7 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
     let n = input.len().min(limit);
     let (next, taken) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (ps_base0, ps_static_samplers, vs_static_samplers) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
     if let Some(u) = used {
@@ -1804,14 +1815,18 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                     let record = ShaderPhase::enabled().then(|| shader::fnv64(&blob));
                     let translated = {
                         let _phase = ShaderPhase::start("precompile-translate", record, blob.len());
-                        precompiled_compute(&blob, mesh, split, windows)
+                        precompiled_compute_cached(&blob, mesh, split, windows)
                     };
                     match translated {
-                        Ok((c, path)) => {
+                        Ok((c, path, from_cache)) => {
                             if let Some(p) = pipelines {
                                 p.make_with_cache_path(&c, path, record);
                             }
-                            compiled.fetch_add(1, Ordering::Relaxed)
+                            if from_cache {
+                                cached.fetch_add(1, Ordering::Relaxed)
+                            } else {
+                                compiled.fetch_add(1, Ordering::Relaxed)
+                            }
                         }
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
@@ -1827,11 +1842,46 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                     }
                     continue;
                 }
+                let (mut warmed_vs, mut warmed_ps) = (false, false);
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                    let runtime_stage = match (&mode, f.stages.first().map(|s| s.hw)) {
+                        (recomp::Mode::Vertex(_), Some(4)) => Some((recomp::pso::Stage::Vertex, &mut warmed_vs)),
+                        (recomp::Mode::Pixel(_), Some(5)) => Some((recomp::pso::Stage::Pixel, &mut warmed_ps)),
+                        _ => None,
+                    };
+                    if let Some((stage, warmed)) = runtime_stage {
+                        if *warmed || f.programs.is_empty() {
+                            continue;
+                        }
+                        *warmed = true;
+                        match recomp::pso::console_to_dxil_in_status(&blob, stage, 0, graphics_split, windows) {
+                            Ok((c, from_cache)) => {
+                                if stage == recomp::pso::Stage::Pixel {
+                                    ps_base0.fetch_add(1, Ordering::Relaxed);
+                                    if !c.samplers.is_empty() {
+                                        ps_static_samplers.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                } else if !c.samplers.is_empty() {
+                                    vs_static_samplers.fetch_add(1, Ordering::Relaxed);
+                                }
+                                if from_cache {
+                                    cached.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    compiled.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) => {
+                                let mut g = errors.lock().unwrap();
+                                if g.len() < 10 {
+                                    g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                                }
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
-                        recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
-                        recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
                         recomp::Mode::Compute(_) => vec![("cs_6_6", None)],
                         recomp::Mode::Mesh(ms) => vec![("cs_6_6", None), ("ms_6_6", Some(recomp::mesh_passthrough(ms)))],
                         _ => {
@@ -1843,7 +1893,6 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                         let code = &f.data[p.offset..p.offset + p.len];
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
-                        let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {
@@ -1879,6 +1928,12 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    let (ps_base0, ps_static_samplers, vs_static_samplers) = (ps_base0.into_inner(), ps_static_samplers.into_inner(), vs_static_samplers.into_inner());
+    if ps_base0 > 0 || vs_static_samplers > 0 {
+        println!(
+            "graphics variants (runtime path): PS warmed at assumed sampler_base=0: {ps_base0} ({ps_static_samplers} with static samplers); VS with static samplers shifting paired PS base: {vs_static_samplers}"
+        );
+    }
     if used.is_some() {
         println!("compute programs passed over (no earlier run used their pipeline): {}", unused.into_inner());
     }

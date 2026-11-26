@@ -153,10 +153,20 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    console_to_dxil_in_status(blob, stage, sampler_base, split_wave64, windows).map(|(c, _)| c)
+}
+
+/// Like `console_to_dxil_in`, also returning whether the result came from the in-memory or
+/// translated disk cache (`true` = cache hit, `false` = newly translated/compiled).
+pub fn console_to_dxil_in_status(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<(Compiled, bool), String> {
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one().map(|(c, _)| c);
+        return compile_console_shader(blob, stage, sampler_base, windows, split_wave64).map(|(c, _)| (c, false));
     }
+    let mut from_cache = true;
+    let compile_one = || {
+        from_cache = false;
+        compile_console_shader(blob, stage, sampler_base, windows, split_wave64)
+    };
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
         stage,
@@ -168,7 +178,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| (shader.as_ref().clone(), from_cache))
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
