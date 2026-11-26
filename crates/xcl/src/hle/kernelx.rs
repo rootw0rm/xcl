@@ -96,6 +96,16 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         GetModuleHandleExA,
         GetModuleFileNameW,
         GetModuleFileNameA,
+        GetModuleFileNameExW,
+        GetModuleFileNameExA,
+        K32GetModuleFileNameExW,
+        K32GetModuleFileNameExA,
+        GetModuleBaseNameW,
+        GetModuleBaseNameA,
+        K32GetModuleBaseNameW,
+        K32GetModuleBaseNameA,
+        K32GetModuleInformation,
+        GetModuleInformation,
         FreeLibrary,
         FreeLibraryWhenCallbackReturns,
         DisableThreadLibraryCalls,
@@ -2027,6 +2037,27 @@ fn module_path_for(h: usize) -> Option<String> {
     modules::hle_name_by_handle(h).map(|n| format!("C:\\Windows\\System32\\{n}"))
 }
 
+fn module_base_name_for(h: usize) -> Option<String> {
+    let main = modules::main_module();
+    if h == 0 || main.as_ref().map(|m| m.base) == Some(h) {
+        return main.map(|m| {
+            m.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| m.name.clone())
+        });
+    }
+    if let Some(m) = modules::find_mapped_by_base(h) {
+        return Some(
+            m.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| m.name.clone()),
+        );
+    }
+    modules::hle_name_by_handle(h).map(|n| n.to_string())
+}
+
 pub unsafe extern "system" fn GetModuleFileNameW(h: usize, buf: *mut u16, size: u32) -> u32 {
     match module_path_for(h) {
         Some(p) => write_wide_out(&p, buf, size),
@@ -2039,6 +2070,117 @@ pub unsafe extern "system" fn GetModuleFileNameA(h: usize, buf: *mut u8, size: u
         Some(p) => write_ansi_out(&p, buf, size),
         None => ll::GetModuleFileNameA(h as _, buf, size),
     }
+}
+
+unsafe fn is_own_process(process: HANDLE) -> bool {
+    process == thr::GetCurrentProcess() || thr::GetProcessId(process) == thr::GetCurrentProcessId()
+}
+
+/// psapi / kernel32 GetModuleFileNameEx for the images XCL mapped.
+/// Windows' native implementation queries the PEB module loader list, which does not contain
+/// XCL's manually-mapped title and console DLLs (failing with ERROR_INVALID_HANDLE).
+pub unsafe extern "system" fn K32GetModuleFileNameExW(process: HANDLE, h: usize, buf: *mut u16, size: u32) -> u32 {
+    if is_own_process(process) {
+        if let Some(p) = module_path_for(h) {
+            if buf.is_null() || size == 0 {
+                fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            return write_wide_out(&p, buf, size);
+        }
+    }
+    windows_sys::Win32::System::ProcessStatus::K32GetModuleFileNameExW(process, h as _, buf, size)
+}
+
+pub unsafe extern "system" fn GetModuleFileNameExW(process: HANDLE, h: usize, buf: *mut u16, size: u32) -> u32 {
+    K32GetModuleFileNameExW(process, h, buf, size)
+}
+
+pub unsafe extern "system" fn K32GetModuleFileNameExA(process: HANDLE, h: usize, buf: *mut u8, size: u32) -> u32 {
+    if is_own_process(process) {
+        if let Some(p) = module_path_for(h) {
+            if buf.is_null() || size == 0 {
+                fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            return write_ansi_out(&p, buf, size);
+        }
+    }
+    windows_sys::Win32::System::ProcessStatus::K32GetModuleFileNameExA(process, h as _, buf, size)
+}
+
+pub unsafe extern "system" fn GetModuleFileNameExA(process: HANDLE, h: usize, buf: *mut u8, size: u32) -> u32 {
+    K32GetModuleFileNameExA(process, h, buf, size)
+}
+
+/// psapi / kernel32 GetModuleBaseName for the images XCL mapped.
+pub unsafe extern "system" fn K32GetModuleBaseNameW(process: HANDLE, h: usize, buf: *mut u16, size: u32) -> u32 {
+    if is_own_process(process) {
+        if let Some(b) = module_base_name_for(h) {
+            if buf.is_null() || size == 0 {
+                fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            return write_wide_out(&b, buf, size);
+        }
+    }
+    windows_sys::Win32::System::ProcessStatus::K32GetModuleBaseNameW(process, h as _, buf, size)
+}
+
+pub unsafe extern "system" fn GetModuleBaseNameW(process: HANDLE, h: usize, buf: *mut u16, size: u32) -> u32 {
+    K32GetModuleBaseNameW(process, h, buf, size)
+}
+
+pub unsafe extern "system" fn K32GetModuleBaseNameA(process: HANDLE, h: usize, buf: *mut u8, size: u32) -> u32 {
+    if is_own_process(process) {
+        if let Some(b) = module_base_name_for(h) {
+            if buf.is_null() || size == 0 {
+                fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            return write_ansi_out(&b, buf, size);
+        }
+    }
+    windows_sys::Win32::System::ProcessStatus::K32GetModuleBaseNameA(process, h as _, buf, size)
+}
+
+pub unsafe extern "system" fn GetModuleBaseNameA(process: HANDLE, h: usize, buf: *mut u8, size: u32) -> u32 {
+    K32GetModuleBaseNameA(process, h, buf, size)
+}
+
+/// psapi's GetModuleInformation for the images XCL mapped (the title's executable and DLLs).
+/// Windows' looks the module up in the PEB's loader list, which has none of them: it failed
+/// with ERROR_INVALID_HANDLE and left `info` as it was – a title asking for its own image's
+/// range got garbage. A NULL module is the title's executable, as Windows reads it from the PEB.
+pub unsafe extern "system" fn K32GetModuleInformation(process: HANDLE, h: usize, info: *mut c_void, cb: u32) -> BOOL {
+    use windows_sys::Win32::System::ProcessStatus::MODULEINFO;
+    let own = process == thr::GetCurrentProcess() || thr::GetProcessId(process) == thr::GetCurrentProcessId();
+    let mapped = if !own {
+        None
+    } else if h == 0 {
+        modules::main_module()
+    } else {
+        modules::find_mapped_by_base(h)
+    };
+    let Some(m) = mapped else {
+        return windows_sys::Win32::System::ProcessStatus::K32GetModuleInformation(process, h as _, info as *mut MODULEINFO, cb);
+    };
+    if info.is_null() || (cb as usize) < std::mem::size_of::<MODULEINFO>() {
+        fnd::SetLastError(fnd::ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    let entry = if m.entry_rva != 0 { (m.base + m.entry_rva as usize) as *mut c_void } else { std::ptr::null_mut() };
+    (info as *mut MODULEINFO).write_unaligned(MODULEINFO {
+        lpBaseOfDll: m.base as *mut c_void,
+        SizeOfImage: m.size as u32,
+        EntryPoint: entry,
+    });
+    1
+}
+
+/// psapi.h maps GetModuleInformation to K32GetModuleInformation (PSAPI_VERSION 2).
+pub unsafe extern "system" fn GetModuleInformation(process: HANDLE, h: usize, info: *mut c_void, cb: u32) -> BOOL {
+    K32GetModuleInformation(process, h, info, cb)
 }
 
 pub unsafe extern "system" fn FreeLibrary(h: usize) -> BOOL {
@@ -2152,6 +2294,47 @@ mod tests {
         assert_eq!(sleep_hold_min(Some("0")), None);
         assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
         assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
+
+    /// GetModuleInformation on an image XCL mapped: its base, size and entry point (before:
+    /// Windows' answer, FALSE with ERROR_INVALID_HANDLE, the image not being in the PEB's list).
+    /// Another process's handle and too small a buffer are not answered from the mapping.
+    #[test]
+    fn get_module_information_answers_for_mapped_images() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use windows_sys::Win32::System::ProcessStatus::MODULEINFO;
+        let base = unsafe { mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "xcl_modinfo_test.dll".into(), path: "xcl_modinfo_test.dll".into(), base, size: 0x10000, entry_rva: 0x1230, is_dll: true,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        unsafe {
+            let mut mi = MODULEINFO::default();
+            let cb = std::mem::size_of::<MODULEINFO>() as u32;
+            let me = thr::GetCurrentProcess();
+            assert_eq!(K32GetModuleInformation(me, base, &mut mi as *mut _ as *mut c_void, cb), 1);
+            assert_eq!((mi.lpBaseOfDll as usize, mi.SizeOfImage, mi.EntryPoint as usize), (base, 0x10000, base + 0x1230));
+            // a real handle to this process, as OpenProcess gives it
+            let h = thr::OpenProcess(thr::PROCESS_QUERY_INFORMATION | thr::PROCESS_VM_READ, 0, thr::GetCurrentProcessId());
+            assert!(!h.is_null());
+            let mut mi = MODULEINFO::default();
+            assert_eq!(GetModuleInformation(h, base, &mut mi as *mut _ as *mut c_void, cb), 1);
+            assert_eq!(mi.lpBaseOfDll as usize, base);
+            fnd::CloseHandle(h);
+            // too small a buffer
+            assert_eq!(K32GetModuleInformation(me, base, &mut mi as *mut _ as *mut c_void, cb - 1), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INSUFFICIENT_BUFFER);
+            // a module Windows loaded is still Windows' answer
+            let k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
+            let mut mi = MODULEINFO::default();
+            assert_eq!(K32GetModuleInformation(me, k32, &mut mi as *mut _ as *mut c_void, cb), 1);
+            assert_eq!(mi.lpBaseOfDll as usize, k32);
+        }
+        modules::unregister_mapped(base);
+        unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) };
     }
 
     #[test]
@@ -3143,6 +3326,127 @@ mod tests {
         let stub_h = modules::hle_handle("unit_stub_probe.dll");
         assert_ne!(stub_h, 0);
         assert_eq!(module_handle_in(&reg, "unit_stub_probe.dll"), stub_h);
+    }
+
+    #[test]
+    fn get_module_file_name_ex_and_base_name_answer_for_mapped_images() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let base = unsafe { mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0);
+        let fake_path = std::path::PathBuf::from(r"D:\games\scarlett\xcl_modfile_test.dll");
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "xcl_modfile_test.dll".into(),
+            path: fake_path.clone(),
+            base,
+            size: 0x10000,
+            entry_rva: 0x1000,
+            is_dll: true,
+            exports: Default::default(),
+            tls_callbacks: Mutex::new(Vec::new()),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true),
+            stack_reserve: 0,
+        }));
+
+        unsafe {
+            let me = thr::GetCurrentProcess();
+
+            // 1. GetModuleFileNameExW & K32GetModuleFileNameExW on mapped image
+            let mut buf_w = [0u16; 260];
+            let len_w = K32GetModuleFileNameExW(me, base, buf_w.as_mut_ptr(), buf_w.len() as u32);
+            assert!(len_w > 0);
+            let s_w = String::from_utf16_lossy(&buf_w[..len_w as usize]);
+            assert_eq!(s_w, fake_path.to_str().unwrap());
+
+            let mut buf_w2 = [0u16; 260];
+            let len_w2 = GetModuleFileNameExW(me, base, buf_w2.as_mut_ptr(), buf_w2.len() as u32);
+            assert_eq!(len_w, len_w2);
+            assert_eq!(&buf_w[..len_w as usize], &buf_w2[..len_w2 as usize]);
+
+            // 2. GetModuleFileNameExA & K32GetModuleFileNameExA on mapped image
+            let mut buf_a = [0u8; 260];
+            let len_a = K32GetModuleFileNameExA(me, base, buf_a.as_mut_ptr(), buf_a.len() as u32);
+            assert!(len_a > 0);
+            let s_a = std::str::from_utf8(&buf_a[..len_a as usize]).unwrap();
+            assert_eq!(s_a, fake_path.to_str().unwrap());
+
+            let mut buf_a2 = [0u8; 260];
+            let len_a2 = GetModuleFileNameExA(me, base, buf_a2.as_mut_ptr(), buf_a2.len() as u32);
+            assert_eq!(len_a, len_a2);
+            assert_eq!(&buf_a[..len_a as usize], &buf_a2[..len_a2 as usize]);
+
+            // 3. GetModuleBaseNameW & K32GetModuleBaseNameW on mapped image
+            let mut base_w = [0u16; 64];
+            let blen_w = K32GetModuleBaseNameW(me, base, base_w.as_mut_ptr(), base_w.len() as u32);
+            assert!(blen_w > 0);
+            let bs_w = String::from_utf16_lossy(&base_w[..blen_w as usize]);
+            assert_eq!(bs_w, "xcl_modfile_test.dll");
+
+            let mut base_w2 = [0u16; 64];
+            let blen_w2 = GetModuleBaseNameW(me, base, base_w2.as_mut_ptr(), base_w2.len() as u32);
+            assert_eq!(blen_w, blen_w2);
+            assert_eq!(&base_w[..blen_w as usize], &base_w2[..blen_w2 as usize]);
+
+            // 4. GetModuleBaseNameA & K32GetModuleBaseNameA on mapped image
+            let mut base_a = [0u8; 64];
+            let blen_a = K32GetModuleBaseNameA(me, base, base_a.as_mut_ptr(), base_a.len() as u32);
+            assert!(blen_a > 0);
+            let bs_a = std::str::from_utf8(&base_a[..blen_a as usize]).unwrap();
+            assert_eq!(bs_a, "xcl_modfile_test.dll");
+
+            let mut base_a2 = [0u8; 64];
+            let blen_a2 = GetModuleBaseNameA(me, base, base_a2.as_mut_ptr(), base_a2.len() as u32);
+            assert_eq!(blen_a, blen_a2);
+            assert_eq!(&base_a[..blen_a as usize], &base_a2[..blen_a2 as usize]);
+
+            // 5. OpenProcess handle to this process
+            let h = thr::OpenProcess(thr::PROCESS_QUERY_INFORMATION | thr::PROCESS_VM_READ, 0, thr::GetCurrentProcessId());
+            assert!(!h.is_null());
+            let mut open_proc_buf = [0u16; 260];
+            let open_proc_len = GetModuleFileNameExW(h, base, open_proc_buf.as_mut_ptr(), open_proc_buf.len() as u32);
+            assert_eq!(open_proc_len, len_w);
+            let mut open_proc_base = [0u16; 64];
+            let open_proc_blen = GetModuleBaseNameW(h, base, open_proc_base.as_mut_ptr(), open_proc_base.len() as u32);
+            assert_eq!(open_proc_blen, blen_w);
+            fnd::CloseHandle(h);
+
+            // 6. Null buffer or 0 size returns 0 with ERROR_INVALID_PARAMETER
+            fnd::SetLastError(0);
+            assert_eq!(K32GetModuleFileNameExW(me, base, std::ptr::null_mut(), 260), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            fnd::SetLastError(0);
+            assert_eq!(K32GetModuleFileNameExW(me, base, buf_w.as_mut_ptr(), 0), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            fnd::SetLastError(0);
+            assert_eq!(K32GetModuleBaseNameW(me, base, std::ptr::null_mut(), 64), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            fnd::SetLastError(0);
+            assert_eq!(K32GetModuleBaseNameW(me, base, base_w.as_mut_ptr(), 0), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            // 7. Native module fallback (kernel32.dll)
+            let k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
+            assert_ne!(k32, 0);
+            let mut k32_buf = [0u16; 260];
+            let k32_len = K32GetModuleFileNameExW(me, k32, k32_buf.as_mut_ptr(), k32_buf.len() as u32);
+            assert!(k32_len > 0);
+            let k32_str = String::from_utf16_lossy(&k32_buf[..k32_len as usize]).to_ascii_lowercase();
+            assert!(k32_str.ends_with("kernel32.dll"));
+
+            let mut k32_base = [0u16; 64];
+            let k32_blen = K32GetModuleBaseNameW(me, k32, k32_base.as_mut_ptr(), k32_base.len() as u32);
+            assert!(k32_blen > 0);
+            let k32_base_str = String::from_utf16_lossy(&k32_base[..k32_blen as usize]).to_ascii_lowercase();
+            assert_eq!(k32_base_str, "kernel32.dll");
+        }
+
+        modules::unregister_mapped(base);
+        unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) };
     }
 
     #[test]

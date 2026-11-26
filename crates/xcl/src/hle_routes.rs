@@ -36,7 +36,7 @@ pub fn is_console_game_dll(dll_key: &str) -> bool {
 }
 
 /// Ordered exactly like the Windows registry: the first matching pattern wins.
-pub const ROUTES: [(&str, &str); 29] = [
+pub const ROUTES: [(&str, &str); 30] = [
     ("kernelx.dll", KERNELX),
     ("kernel32.dll", KERNELX),
     ("kernelbase.dll", KERNELX),
@@ -44,6 +44,7 @@ pub const ROUTES: [(&str, &str); 29] = [
     ("kernel32legacy.dll", KERNELX),
     ("advapi32legacy.dll", KERNELX),
     ("minappmodelx.dll", KERNELX),
+    ("psapi.dll", KERNELX),
     ("api-ms-win-core-*", KERNELX),
     ("ext-ms-win-core-*", KERNELX),
     ("xgameruntime.dll", XGAMERUNTIME),

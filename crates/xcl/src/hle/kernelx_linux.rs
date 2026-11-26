@@ -6908,6 +6908,270 @@ pub unsafe extern "win64" fn GetModuleFileNameA(h: usize, buf: *mut u8, size: u3
     n
 }
 
+fn module_base_name_for(h: usize) -> Option<String> {
+    fn file_name_of(p: &std::path::Path, fallback: &str) -> String {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+    if h == 0 {
+        if let Some(m) = crate::modules::main_module() {
+            return Some(file_name_of(&m.path, &m.name));
+        }
+        return crate::state::boot().map(|b| file_name_of(&b.exe_path, "xcl"));
+    }
+    if let Some(m) = crate::modules::main_module() {
+        if m.base == h {
+            return Some(file_name_of(&m.path, &m.name));
+        }
+    }
+    if let Some(m) = crate::modules::find_mapped_by_base(h) {
+        return Some(file_name_of(&m.path, &m.name));
+    }
+    crate::modules::hle_name_by_handle(h)
+}
+
+fn is_own_process(process: usize) -> bool {
+    process == current_process_handle()
+}
+
+/// Shared `GetModuleFileNameEx` body: the mapped image path when the caller asks about
+/// the current process and XCL knows the module; `0` + `ERROR_INVALID_PARAMETER` for a
+/// null buffer/zero capacity (as on Windows); `0` + `ERROR_INVALID_HANDLE` for a foreign
+/// process or an unknown/native module (no host PEB fallback on Linux).
+unsafe fn module_file_name_ex_w(process: usize, h: usize, buf: *mut u16, size: u32) -> u32 {
+    if !is_own_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let Some(p) = module_path_for(h) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if buf.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = crate::util::write_wide_out(&p, buf, size);
+    if n == size {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    n
+}
+
+/// Shared `GetModuleFileNameEx` ANSI body (UTF-8 on Linux).
+unsafe fn module_file_name_ex_a(process: usize, h: usize, buf: *mut u8, size: u32) -> u32 {
+    if !is_own_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let Some(p) = module_path_for(h) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if buf.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = crate::util::write_ansi_out(&p, buf, size);
+    if n == size {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    n
+}
+
+/// `DWORD K32GetModuleFileNameExW(HANDLE, HMODULE, LPWSTR, DWORD)` — mapped image path.
+pub unsafe extern "win64" fn K32GetModuleFileNameExW(
+    process: usize,
+    h: usize,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    module_file_name_ex_w(process, h, buf, size)
+}
+
+/// `DWORD GetModuleFileNameExW(HANDLE, HMODULE, LPWSTR, DWORD)` — psapi alias.
+pub unsafe extern "win64" fn GetModuleFileNameExW(
+    process: usize,
+    h: usize,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    module_file_name_ex_w(process, h, buf, size)
+}
+
+/// `DWORD K32GetModuleFileNameExA(HANDLE, HMODULE, LPSTR, DWORD)` — ANSI form.
+pub unsafe extern "win64" fn K32GetModuleFileNameExA(
+    process: usize,
+    h: usize,
+    buf: *mut u8,
+    size: u32,
+) -> u32 {
+    module_file_name_ex_a(process, h, buf, size)
+}
+
+/// `DWORD GetModuleFileNameExA(HANDLE, HMODULE, LPSTR, DWORD)` — psapi alias.
+pub unsafe extern "win64" fn GetModuleFileNameExA(
+    process: usize,
+    h: usize,
+    buf: *mut u8,
+    size: u32,
+) -> u32 {
+    module_file_name_ex_a(process, h, buf, size)
+}
+
+/// Shared `GetModuleBaseName` body: the file name of the mapped image path.
+unsafe fn module_base_name_w(process: usize, h: usize, buf: *mut u16, size: u32) -> u32 {
+    if !is_own_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let Some(b) = module_base_name_for(h) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if buf.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = crate::util::write_wide_out(&b, buf, size);
+    if n == size {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    n
+}
+
+/// Shared `GetModuleBaseName` ANSI body (UTF-8 on Linux).
+unsafe fn module_base_name_a(process: usize, h: usize, buf: *mut u8, size: u32) -> u32 {
+    if !is_own_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let Some(b) = module_base_name_for(h) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if buf.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = crate::util::write_ansi_out(&b, buf, size);
+    if n == size {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    n
+}
+
+/// `DWORD K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR, DWORD)`.
+pub unsafe extern "win64" fn K32GetModuleBaseNameW(
+    process: usize,
+    h: usize,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    module_base_name_w(process, h, buf, size)
+}
+
+/// `DWORD GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR, DWORD)` — psapi alias.
+pub unsafe extern "win64" fn GetModuleBaseNameW(
+    process: usize,
+    h: usize,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    module_base_name_w(process, h, buf, size)
+}
+
+/// `DWORD K32GetModuleBaseNameA(HANDLE, HMODULE, LPSTR, DWORD)`.
+pub unsafe extern "win64" fn K32GetModuleBaseNameA(
+    process: usize,
+    h: usize,
+    buf: *mut u8,
+    size: u32,
+) -> u32 {
+    module_base_name_a(process, h, buf, size)
+}
+
+/// `DWORD GetModuleBaseNameA(HANDLE, HMODULE, LPSTR, DWORD)` — psapi alias.
+pub unsafe extern "win64" fn GetModuleBaseNameA(
+    process: usize,
+    h: usize,
+    buf: *mut u8,
+    size: u32,
+) -> u32 {
+    module_base_name_a(process, h, buf, size)
+}
+
+/// Windows `MODULEINFO` layout (`psapi.h`): base, image size, entry point.
+/// Own layout (never `windows_sys`, which never compiles on Linux); the `repr(C)`
+/// field order matches the Windows struct so the size assert below pins it.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct ModuleInfo {
+    pub lpBaseOfDll: *mut c_void,
+    pub SizeOfImage: u32,
+    pub EntryPoint: *mut c_void,
+}
+
+/// `BOOL K32GetModuleInformation(HANDLE, HMODULE, LPMODULEINFO, DWORD)` — base, size
+/// and entry point for the images XCL mapped; `0` + `ERROR_INVALID_HANDLE` for a
+/// foreign process or an unknown/native module (no host PEB fallback on Linux),
+/// `0` + `ERROR_INSUFFICIENT_BUFFER` when `cb` is too small.
+pub unsafe extern "win64" fn K32GetModuleInformation(
+    process: usize,
+    h: usize,
+    info: *mut c_void,
+    cb: u32,
+) -> i32 {
+    if !is_own_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let mapped = if h == 0 {
+        crate::modules::main_module()
+    } else {
+        crate::modules::find_mapped_by_base(h)
+    };
+    let Some(m) = mapped else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if info.is_null() || (cb as usize) < std::mem::size_of::<ModuleInfo>() {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    let entry = if m.entry_rva != 0 {
+        (m.base + m.entry_rva as usize) as *mut c_void
+    } else {
+        std::ptr::null_mut()
+    };
+    (info as *mut ModuleInfo).write_unaligned(ModuleInfo {
+        lpBaseOfDll: m.base as *mut c_void,
+        SizeOfImage: m.size as u32,
+        EntryPoint: entry,
+    });
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `BOOL GetModuleInformation(HANDLE, HMODULE, LPMODULEINFO, DWORD)` — psapi alias.
+pub unsafe extern "win64" fn GetModuleInformation(
+    process: usize,
+    h: usize,
+    info: *mut c_void,
+    cb: u32,
+) -> i32 {
+    K32GetModuleInformation(process, h, info, cb)
+}
+
 // ---------------------------------------------------------------------------------------
 // Std handles, module handles, environment, FLS and fibers (Phase C step 11c)
 // ---------------------------------------------------------------------------------------
@@ -8921,6 +9185,16 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("HeapValidate", HeapValidate as usize),
         ("GetModuleFileNameW", GetModuleFileNameW as usize),
         ("GetModuleFileNameA", GetModuleFileNameA as usize),
+        ("GetModuleFileNameExW", GetModuleFileNameExW as usize),
+        ("GetModuleFileNameExA", GetModuleFileNameExA as usize),
+        ("K32GetModuleFileNameExW", K32GetModuleFileNameExW as usize),
+        ("K32GetModuleFileNameExA", K32GetModuleFileNameExA as usize),
+        ("GetModuleBaseNameW", GetModuleBaseNameW as usize),
+        ("GetModuleBaseNameA", GetModuleBaseNameA as usize),
+        ("K32GetModuleBaseNameW", K32GetModuleBaseNameW as usize),
+        ("K32GetModuleBaseNameA", K32GetModuleBaseNameA as usize),
+        ("K32GetModuleInformation", K32GetModuleInformation as usize),
+        ("GetModuleInformation", GetModuleInformation as usize),
         // Step-11c startup neighbors: FLS, std handles, module handles, environment, fibers.
         ("FlsAlloc", FlsAlloc as usize),
         ("FlsFree", FlsFree as usize),
@@ -10523,6 +10797,246 @@ mod tests {
             assert_eq!(GetModuleFileNameW(h, std::ptr::null_mut(), 260), 0);
             assert_eq!(GetModuleFileNameW(h, wbuf.as_mut_ptr(), 0), 0);
         }
+    }
+
+    #[test]
+    fn module_file_name_ex_and_base_name_answer_for_mapped_images() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        // psapi.dll routes to KERNELX, so the Ex/BaseName imports land on the twin.
+        let reg = crate::hle::registry();
+        assert_eq!(
+            reg.hle_for("psapi.dll").map(|m| m.name),
+            Some(crate::hle::KERNELX)
+        );
+        for name in [
+            "GetModuleFileNameExW",
+            "GetModuleFileNameExA",
+            "K32GetModuleFileNameExW",
+            "K32GetModuleFileNameExA",
+            "GetModuleBaseNameW",
+            "GetModuleBaseNameA",
+            "K32GetModuleBaseNameW",
+            "K32GetModuleBaseNameA",
+        ] {
+            assert!(reg.find_any(name).is_some(), "{name} must resolve");
+        }
+
+        let base: usize = 0x1_4000_0000;
+        let fake_path = std::path::PathBuf::from("/xcl_test/xcl_modfile_test.dll");
+        crate::modules::register_mapped(Arc::new(crate::modules::MappedModule {
+            name: "xcl_modfile_test.dll".into(),
+            path: fake_path.clone(),
+            base,
+            size: 0x10000,
+            entry_rva: 0x1000,
+            is_dll: true,
+            exports: Default::default(),
+            tls_callbacks: Mutex::new(Vec::new()),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true),
+            stack_reserve: 0,
+        }));
+        unsafe {
+            let me = current_process_handle();
+            let expected = fake_path.to_string_lossy().into_owned();
+
+            // 1. Ex W + K32 alias on the mapped image.
+            let mut buf_w = [0u16; 260];
+            let len_w = K32GetModuleFileNameExW(me, base, buf_w.as_mut_ptr(), buf_w.len() as u32);
+            assert!(len_w > 0);
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+            assert_eq!(
+                String::from_utf16_lossy(&buf_w[..len_w as usize]),
+                expected
+            );
+            let mut buf_w2 = [0u16; 260];
+            let len_w2 = GetModuleFileNameExW(me, base, buf_w2.as_mut_ptr(), buf_w2.len() as u32);
+            assert_eq!(len_w, len_w2);
+            assert_eq!(&buf_w[..len_w as usize], &buf_w2[..len_w2 as usize]);
+
+            // 2. Ex A + K32 alias.
+            let mut buf_a = [0u8; 260];
+            let len_a = K32GetModuleFileNameExA(me, base, buf_a.as_mut_ptr(), buf_a.len() as u32);
+            assert!(len_a > 0);
+            assert_eq!(
+                std::str::from_utf8(&buf_a[..len_a as usize]).unwrap(),
+                expected
+            );
+            let mut buf_a2 = [0u8; 260];
+            let len_a2 = GetModuleFileNameExA(me, base, buf_a2.as_mut_ptr(), buf_a2.len() as u32);
+            assert_eq!(len_a, len_a2);
+            assert_eq!(&buf_a[..len_a as usize], &buf_a2[..len_a2 as usize]);
+
+            // 3. BaseName W + alias.
+            let mut base_w = [0u16; 64];
+            let blen_w = K32GetModuleBaseNameW(me, base, base_w.as_mut_ptr(), base_w.len() as u32);
+            assert!(blen_w > 0);
+            assert_eq!(
+                String::from_utf16_lossy(&base_w[..blen_w as usize]),
+                "xcl_modfile_test.dll"
+            );
+            let mut base_w2 = [0u16; 64];
+            let blen_w2 = GetModuleBaseNameW(me, base, base_w2.as_mut_ptr(), base_w2.len() as u32);
+            assert_eq!(blen_w, blen_w2);
+            assert_eq!(&base_w[..blen_w as usize], &base_w2[..blen_w2 as usize]);
+
+            // 4. BaseName A + alias.
+            let mut base_a = [0u8; 64];
+            let blen_a = K32GetModuleBaseNameA(me, base, base_a.as_mut_ptr(), base_a.len() as u32);
+            assert!(blen_a > 0);
+            assert_eq!(
+                std::str::from_utf8(&base_a[..blen_a as usize]).unwrap(),
+                "xcl_modfile_test.dll"
+            );
+            let mut base_a2 = [0u8; 64];
+            let blen_a2 = GetModuleBaseNameA(me, base, base_a2.as_mut_ptr(), base_a2.len() as u32);
+            assert_eq!(blen_a, blen_a2);
+            assert_eq!(&base_a[..blen_a as usize], &base_a2[..blen_a2 as usize]);
+
+            // 5. HLE pseudo-handles answer too.
+            let hle = crate::modules::hle_handle("kernelx_ex_probe.dll");
+            let mut hle_buf = [0u16; 260];
+            let hle_len = K32GetModuleFileNameExW(me, hle, hle_buf.as_mut_ptr(), hle_buf.len() as u32);
+            assert!(hle_len > 0);
+            let mut hle_base = [0u16; 64];
+            let hle_blen = K32GetModuleBaseNameW(me, hle, hle_base.as_mut_ptr(), hle_base.len() as u32);
+            assert!(hle_blen > 0);
+            assert_eq!(
+                String::from_utf16_lossy(&hle_base[..hle_blen as usize]),
+                "kernelx_ex_probe.dll"
+            );
+
+            // 6. Null buffer / zero size => ERROR_INVALID_PARAMETER.
+            crate::util::set_last_error(0);
+            assert_eq!(K32GetModuleFileNameExW(me, base, std::ptr::null_mut(), 260), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            crate::util::set_last_error(0);
+            assert_eq!(
+                K32GetModuleFileNameExW(me, base, buf_w.as_mut_ptr(), 0),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            crate::util::set_last_error(0);
+            assert_eq!(
+                K32GetModuleBaseNameW(me, base, std::ptr::null_mut(), 64),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            crate::util::set_last_error(0);
+            assert_eq!(
+                K32GetModuleBaseNameW(me, base, base_w.as_mut_ptr(), 0),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            // 7. Foreign process + unknown module => ERROR_INVALID_HANDLE.
+            crate::util::set_last_error(0);
+            assert_eq!(
+                K32GetModuleFileNameExW(0x1234, base, buf_w.as_mut_ptr(), 260),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            crate::util::set_last_error(0);
+            assert_eq!(
+                K32GetModuleBaseNameW(0x1234, base, base_w.as_mut_ptr(), 64),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            crate::util::set_last_error(0);
+            assert_eq!(
+                K32GetModuleFileNameExW(me, 0xDEAD_BEEF_1234, buf_w.as_mut_ptr(), 260),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+        }
+        crate::modules::unregister_mapped(base);
+    }
+
+    #[test]
+    fn module_information_answers_for_mapped_images() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        assert_eq!(
+            std::mem::size_of::<ModuleInfo>(),
+            24,
+            "ModuleInfo must match Windows MODULEINFO (ptr,u32,pad,ptr)"
+        );
+        let reg = crate::hle::registry();
+        assert!(reg.find_any("K32GetModuleInformation").is_some());
+        assert!(reg.find_any("GetModuleInformation").is_some());
+
+        let base: usize = 0x1_4100_0000;
+        crate::modules::register_mapped(Arc::new(crate::modules::MappedModule {
+            name: "xcl_modinfo_test.dll".into(),
+            path: "/xcl_test/xcl_modinfo_test.dll".into(),
+            base,
+            size: 0x10000,
+            entry_rva: 0x1230,
+            is_dll: true,
+            exports: Default::default(),
+            tls_callbacks: Mutex::new(Vec::new()),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true),
+            stack_reserve: 0,
+        }));
+        unsafe {
+            let me = current_process_handle();
+            let cb = std::mem::size_of::<ModuleInfo>() as u32;
+            let mut mi = ModuleInfo::default();
+            assert_eq!(
+                K32GetModuleInformation(me, base, &mut mi as *mut _ as *mut c_void, cb),
+                1
+            );
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+            assert_eq!(mi.lpBaseOfDll as usize, base);
+            assert_eq!(mi.SizeOfImage, 0x10000);
+            assert_eq!(mi.EntryPoint as usize, base + 0x1230);
+
+            // Alias answers the same.
+            let mut mi2 = ModuleInfo::default();
+            assert_eq!(
+                GetModuleInformation(me, base, &mut mi2 as *mut _ as *mut c_void, cb),
+                1
+            );
+            assert_eq!(mi2.lpBaseOfDll as usize, base);
+
+            // Foreign process is not answered from the mapping.
+            crate::util::set_last_error(0);
+            let mut mi3 = ModuleInfo::default();
+            assert_eq!(
+                K32GetModuleInformation(0x1234, base, &mut mi3 as *mut _ as *mut c_void, cb),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+
+            // Unknown module is not answered from the mapping.
+            crate::util::set_last_error(0);
+            let mut mi4 = ModuleInfo::default();
+            assert_eq!(
+                K32GetModuleInformation(me, 0xDEAD_BEEF_1234, &mut mi4 as *mut _ as *mut c_void, cb),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+
+            // Too small a buffer + null info => ERROR_INSUFFICIENT_BUFFER.
+            crate::util::set_last_error(0);
+            let mut mi5 = ModuleInfo::default();
+            assert_eq!(
+                K32GetModuleInformation(me, base, &mut mi5 as *mut _ as *mut c_void, cb - 1),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+            crate::util::set_last_error(0);
+            assert_eq!(
+                K32GetModuleInformation(me, base, std::ptr::null_mut(), cb),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        }
+        crate::modules::unregister_mapped(base);
     }
 
     #[test]
