@@ -886,3 +886,54 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-131 (task-1795722975-275e): #2865/#2868/#2870/#2871 triaged SKIP, probe past #2871
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) topped at #2868 (2350 refs) — truncated again:
+  it MISSED #2870/#2871, which the sequential probe found. Sequential
+  is ground truth. Per-PR sequential probe #2830..#3110 (widened past
+  the sixth gap per mem-1795712765-78dc) found 33 PRESENT
+  (#2830..#2871 minus #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869
+  gaps); all pins match prior steps (no force-push), all 33
+  `merge-base --is-ancestor` exit 1 (all OPEN); #2872..#3110 ALL
+  MISSING — scan complete, top is #2871.
+- Push-race note (per mem-1795714025-21a1, NOT builder fault): #2868
+  committed 19:56:46 UTC (~30s after task creation 19:56:15 UTC) and
+  #2870/#2871 committed ~21:03-21:04 UTC mid-window — all postdate the
+  step-130 critic scan to #3080. Triaged in-window now.
+- Triage (all SKIP with hunk evidence): #2865 `2f4b4082` SKIP,
+  STACKED tip on `71b8e6e0` (NOT in main, exit 1; 98-file stack diff
+  vs main), tip-only 3 files +46/-2 (`gpu/dxil/kernel.rs` +
+  `gpu/recomp/mod.rs` + `gpu/recomp/tests.rs`) gating per-region loop
+  budgets to compute/kernel only; `budget_regions` occurs NOWHERE in
+  the linux tree (`grep -rl` count 0 — the PR #2793 per-region-budget
+  callee is itself unlanded), so the tip has no Linux consumer.
+  #2868 `8edc0e03` SKIP, STACKED on the same `71b8e6e0` base, 2 files
+  +19/-6 (`hle/d3d12x/pso_async.rs` `avail_commit_bytes` pub(super)
+  + `hle/d3d12x/real.rs` commit-not-RAM throttle + test); whole
+  `hle` `cfg(windows)` (`windows_sys::Win32` in the diff), zero
+  `avail_commit_bytes`/`big_compile`/`pso_async` refs in the Linux
+  shims. #2870 `ba0df574` SKIP, STACKED (parent `b0d2fb81` NOT in
+  main), 3 files +149/-0 scripts-only (README `XCL_SHADER_DIAG`
+  bundle docs + new `scripts/analyze_shader.py` + its test, both
+  absent from the linux tree) — dev-only diagnostic tooling, no
+  launcher behavior. #2871 `57a80785` SKIP, STACKED on #2870 itself
+  (parent `ba0df574` NOT in main), 4 files +196/-0 scripts-only
+  (README RGA section + `analyze_shader.py` RGA hooks + new
+  `scripts/shader_rga.py` + its test). Earlier pins stand:
+  #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted
+  in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in
+  `aa59e8ac`; #2843-#2864 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step131r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
