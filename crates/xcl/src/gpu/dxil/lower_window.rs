@@ -28,7 +28,7 @@ impl Lw {
     /// The high dword of the UMA base (`IO_UMA_BASE_HI` of the io buffer, `xcl_uma_base`),
     /// hoisted to the entry block so multi-window shaders load it once rather than on every
     /// memory operation.
-    fn uma_base(&mut self) -> Value {
+    pub(super) fn uma_base(&mut self) -> Value {
         if let Some(v) = self.uma_base_val {
             return v;
         }

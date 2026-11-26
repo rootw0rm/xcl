@@ -465,6 +465,24 @@ fn multi_window_mem_format_and_bvh_validate() {
     }
 }
 
+/// Multi-window `image_bvh_intersect_ray` uses node-type-aware end-of-node span (112 B for Box32,
+/// 64 B for Triangle/Box16) and initializes invalid Triangle lanes to RDNA2's `[+inf, 1.0, 0, 0]`
+/// miss sentinel rather than `[u32::MAX; 4]` (NaN).
+#[test]
+fn bvh_multi_window_guard_and_triangle_miss_sentinel() {
+    let code = prog(&[
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+        ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 28), ("VADDR", 0), ("SRSRC", 3), ("DMASK", 0xF)], None),
+    ]);
+    let dxil = translate(&code, KernelOptions { wave64: true, split: false, mem_windows: 2, sampler_base: 0 })
+        .unwrap_or_else(|e| panic!("multi-window BVH translate failed: {}", &e[..e.len().min(800)]));
+    if let Ok(dis) = super::validate::disassemble(&dxil) {
+        assert!(dis.contains("2139095040"), "expected +inf (0x7F800000) triangle miss sentinel in DXIL:\n{dis}");
+        assert!(dis.contains("1065353216"), "expected 1.0f (0x3F800000) triangle miss sentinel in DXIL:\n{dis}");
+        assert!(dis.contains("i64 111") && dis.contains("i64 63"), "expected 112 B Box32 (111) and 64 B non-Box32 (63) end-of-node offsets in DXIL:\n{dis}");
+    }
+}
+
 /// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
 /// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
 /// the same S#, and validates.
