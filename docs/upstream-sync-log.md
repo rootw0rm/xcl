@@ -1236,3 +1236,51 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-138 (task-1795728781-2d0e): #2887 triaged SKIP (ps1-only), probe past #2886
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2362 refs (+1 vs step-137), in-range set exactly
+  #2830..#2887 minus the known gaps — no refs >=2888 in batched;
+  sequential still ground truth. Per-PR sequential probe #2830..#3400
+  (widened past #2886 per mem-1795712765-78dc; foreground chunks
+  2830..2930 + 2931..3060 + 3061..3200 + 3201..3400, no tail left open)
+  found 43 PRESENT (#2830..#2887 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880
+  gaps), all 42 prior pins match (no force-push, #2872 pin `3893df0a` +
+  #2879 pin `63197e31` + #2881 pin `2c50cc71` + #2882 pin `3e8e2c43` +
+  #2886 pin `237b7181` hold); #2888..#3400 ALL MISSING — scan complete,
+  top is #2887.
+- Replication-lag note (per mem-1795714025-21a1, NOT builder fault):
+  #2887 tip `128ee21f` committed 21:30:57 UTC, yet the step-137 scans to
+  #3350 reported it MISSING — same handoff treatment as
+  #2873/#2875/#2877/#2878/#2879/#2881/#2886. Triaged in-window now.
+- Triage (SKIP with hunk evidence): #2887 `128ee21f` SKIP — 5-commit
+  stack off `upstream/main` (`merge-base upstream/main 128ee21f` =
+  `8b957bec`, ancestor of upstream/main, exit 0; parents NOT in main),
+  whole-stack diff vs merge-base is 3 files +456/-0 (`README.md` +30,
+  `scripts/perf-run.ps1` +277 new, `scripts/perf-run.tests.ps1` +149
+  new). Tip commit alone is 1 file +1 plus `perf-run.ps1` +7/-2 and
+  `perf-run.tests.ps1` +19/-1: `Invoke-PerfRun` accepts the
+  `No report - see the log: <path>` line (crashed runs print it instead
+  of `Log: <path>`) so a crashed run's log is kept and its exit code
+  recorded, plus a `MOCK_XCL_CRASH` fixture path. Zero Rust code —
+  `scripts/perf-run*` are Windows-only PowerShell (absent from the
+  `linux` tree: `git ls-tree -r HEAD | grep perf-run` exit 1) and the
+  `README.md` hunk is one doc sentence. Zero Linux consumers.
+  Earlier pins stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834
+  landed; #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed
+  verbatim in `aa59e8ac`; #2843-#2886 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings per the `generated`
+  summaries); lib 783 passed / 0 failed / 1 ignored
+  (`--test-threads=4`); title e2e 4 passed / 1 failed by design
+  (`test_title_runs_and_game_folder_is_untouched`), 24 `[FAIL]` lines,
+  all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step138r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
