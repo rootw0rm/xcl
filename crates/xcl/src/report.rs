@@ -17,6 +17,12 @@ pub struct StubCall {
     pub function: String,
     pub calls: u64,
     pub first_caller: String,
+    /// first call's R8/R9 (3rd/4th Win64 argument registers), hex `"{r8:#x} {r9:#x}"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_args: Option<String>,
+    /// most recent call's R8/R9, same format
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_args: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -126,11 +132,16 @@ fn called_stubs() -> Vec<StubCall> {
     let mut called: Vec<StubCall> = crate::stubs::all_stubs()
         .into_iter()
         .filter(|s| s.calls.load(Ordering::Relaxed) > 0)
-        .map(|s| StubCall {
-            dll: s.dll.clone(),
-            function: s.name.clone(),
-            calls: s.calls.load(Ordering::Relaxed),
-            first_caller: crate::modules::describe_address(s.first_caller.load(Ordering::Relaxed)),
+        .map(|s| {
+            let args = crate::stubs::stub_args(s);
+            StubCall {
+                dll: s.dll.clone(),
+                function: s.name.clone(),
+                calls: s.calls.load(Ordering::Relaxed),
+                first_caller: crate::modules::describe_address(s.first_caller.load(Ordering::Relaxed)),
+                first_args: args.map(|(fr8, fr9, _, _)| format!("{fr8:#x} {fr9:#x}")),
+                last_args: args.map(|(_, _, lr8, lr9)| format!("{lr8:#x} {lr9:#x}")),
+            }
         })
         .collect();
     called.sort_by(|a, b| b.calls.cmp(&a.calls));

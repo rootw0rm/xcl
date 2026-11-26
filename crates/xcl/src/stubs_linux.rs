@@ -39,6 +39,39 @@ pub type StubHook = fn(&StubInfo, usize);
 static ALL: Mutex<Vec<&'static StubInfo>> = Mutex::new(Vec::new());
 static ARENA: Mutex<(usize, usize)> = Mutex::new((0, 0)); // (next, end)
 static BY_KEY: OnceLock<Mutex<HashMap<String, (usize, &'static StubInfo)>>> = OnceLock::new();
+/// (first_ord, last_ord, first_r8, first_r9, last_r8, last_r9) of every thunk-called stub,
+/// keyed by info address. The ordinal pair travels with the args so a caller that grabs its
+/// ordinal before another but enters the table after it still records its args as first/last.
+static ARGS: OnceLock<Mutex<HashMap<usize, (u64, u64, u64, u64, u64, u64)>>> = OnceLock::new();
+
+/// Test-only injection point: blocks the ordinal-holding caller between fetch_add and the
+/// side-table update so a two-thread fixture can force the first caller into the table second.
+/// Only the caller whose info matches the armed key waits; others proceed. Consumed (taken)
+/// on use; None in release builds.
+#[cfg(test)]
+static BEFORE_TABLE_UPDATE: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>, usize)>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+fn arm_before_table_update(key: usize) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (arrived, arrive_rx) = std::sync::mpsc::channel();
+    *BEFORE_TABLE_UPDATE.lock().unwrap() = Some((arrived, resume_rx, key));
+    (resume_tx, arrive_rx)
+}
+
+#[cfg(test)]
+fn pause_before_table_update(info: &StubInfo) {
+    let mut guard = BEFORE_TABLE_UPDATE.lock().unwrap();
+    if let Some((_, _, armed_key)) = guard.as_ref() {
+        if (info as *const StubInfo as usize) == *armed_key {
+            let Some((arrived, resume, _)) = guard.take() else { return };
+            drop(guard);
+            let _ = arrived.send(());
+            let _ = resume.recv();
+        }
+    }
+}
 
 const THUNK_SIZE: usize = 48;
 const ARENA_CHUNK: usize = 64 * 1024;
@@ -63,11 +96,64 @@ pub fn record_call(info: &StubInfo, caller: usize) {
     }
 }
 
-// Win64 ABI: the thunk passes `info` in RCX and the caller in RDX.
-unsafe extern "win64" fn stub_report(info: *const StubInfo, caller: usize) -> u64 {
+// Win64 ABI: the thunk passes `info` in RCX and the caller in RDX; R8/R9 pass
+// through untouched from the guest's Win64 convention, so they are the real
+// 3rd/4th stub args on both ABIs.
+unsafe extern "win64" fn stub_report(info: *const StubInfo, caller: usize, r8: u64, r9: u64) -> u64 {
     let info = &*info;
-    record_call(info, caller);
+    record_call_with_args(info, caller, r8, r9);
     info.ret
+}
+
+/// Count a call, log the first one, run the hook. `r8`/`r9` are the 3rd/4th Win64 argument
+/// registers of the stub call (recorded in the side table keyed by `info`).
+pub fn record_call_with_args(info: &StubInfo, caller: usize, r8: u64, r9: u64) {
+    let n = info.calls.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    pause_before_table_update(info);
+    // Hold the ARGS mutex across the table update so the args recorded first/last always
+    // match the ordinal implied by their label. The first-call log and hook stay outside the mutex.
+    {
+        let key = info as *const StubInfo as usize;
+        let mut g = ARGS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        let entry = g.entry(key).or_insert((n, n, r8, r9, r8, r9));
+        if n < entry.0 {
+            // an earlier ordinal arrived late: this is the first call
+            entry.0 = n;
+            entry.2 = r8;
+            entry.3 = r9;
+        }
+        if n > entry.1 {
+            // a later ordinal arrived (last)
+            entry.1 = n;
+            entry.4 = r8;
+            entry.5 = r9;
+        }
+    }
+    if n == 0 {
+        info.first_caller.store(caller, Ordering::Relaxed);
+        crate::xlog_warn!(
+            "[STUB] {}!{} first called from {} → returning {:#x}",
+            info.dll,
+            info.name,
+            crate::modules::describe_address(caller),
+            info.ret
+        );
+    }
+    let h = info.hook.load(Ordering::Acquire);
+    if h != 0 {
+        let f: StubHook = unsafe { std::mem::transmute(h) };
+        f(info, caller);
+    }
+}
+
+/// (first_r8, first_r9, last_r8, last_r9) recorded for `info`, if any call went through
+/// a thunk (or `record_call_with_args`).
+pub fn stub_args(info: &'static StubInfo) -> Option<(u64, u64, u64, u64)> {
+    let key = info as *const StubInfo as usize;
+    let g = ARGS.get()?.lock().ok()?;
+    let (_, _, fr8, fr9, lr8, lr9) = g.get(&key).copied()?;
+    Some((fr8, fr9, lr8, lr9))
 }
 
 /// A StubInfo that is not backed by a stub thunk (used by D3D12.X slot guards).
@@ -266,6 +352,10 @@ pub fn init_db(overrides: &std::collections::BTreeMap<String, String>) {
 pub fn db() -> &'static StubDb {
     DB.get_or_init(|| StubDb::parse(BUILTIN_DB, &Default::default()))
 }
+
+#[cfg(test)]
+#[path = "stubs_args_tests.rs"]
+mod stubs_args_tests;
 
 #[cfg(test)]
 mod tests {
