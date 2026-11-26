@@ -7545,15 +7545,28 @@ unsafe extern "system" fn cl_execute_indirect(
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
 }
 
+/// The last reference: what XCL keeps by the list's address goes before the runtime frees it,
+/// as a list created on another thread can get the address at once. (Two last-but-one releases
+/// at once miss each other here; the list's state then goes after it, as before.)
 unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let add: RefFn = std::mem::transmute(orig_fn(this, 1));
+    let f: RefFn = std::mem::transmute(orig_fn(this, 2));
+    let last = add(this) == 2;
+    f(this);
+    if last {
+        forget_command_list(this);
+    }
     let n = f(this);
-    if n == 0 {
-        super::list_x::on_release(this as usize);
-        super::bind::forget(this);
-        super::dred::forget_list(this);
+    if n == 0 && !last {
+        forget_command_list(this);
     }
     n
+}
+
+fn forget_command_list(list: *mut c_void) {
+    super::list_x::on_release(list as usize);
+    super::bind::forget(list);
+    super::dred::forget_list(list);
 }
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
@@ -10389,3 +10402,55 @@ mod native_host_tests {
         }
     }
 }
+#[cfg(test)]
+mod list_release_tests {
+    use super::*;
+
+    #[repr(C)]
+    struct FakeList {
+        vtable: usize,
+        refs: u32,
+    }
+
+    const ALLOC: usize = 0x7E57_A130;
+    const PSO: usize = 0x7E57_D002;
+
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        let l = &mut *(this as *mut FakeList);
+        l.refs += 1;
+        l.refs
+    }
+
+    // the runtime frees the list, and a list created on another thread gets its address at once
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        let l = &mut *(this as *mut FakeList);
+        l.refs -= 1;
+        if l.refs == 0 {
+            super::super::bind::reset(this, ALLOC, PSO);
+            super::super::alloc_pool::created_on(this as usize, ALLOC, 0);
+        }
+        l.refs
+    }
+
+    #[test]
+    fn a_new_list_at_a_released_lists_address_keeps_its_state() {
+        let pc = [0, add_ref as usize, release as usize];
+        let ext = [pc.as_ptr() as usize, 0];
+        let mut list = FakeList { vtable: ext.as_ptr() as usize + 8, refs: 2 };
+        let this = &mut list as *mut FakeList as *mut c_void;
+        super::super::bind::reset(this, ALLOC + 0x10, PSO + 0x10);
+        let (kept, n) = unsafe {
+            assert_eq!(cl_release(this), 1);
+            (super::super::bind::tracked_pso(this), cl_release(this))
+        };
+        let pso = super::super::bind::tracked_pso(this);
+        let backing = super::super::alloc_pool::recording_backing_for_test(this as usize);
+        super::super::bind::forget(this);
+        super::super::alloc_pool::forget_list(this as usize);
+        assert_eq!(kept, PSO + 0x10, "another reference is left");
+        assert_eq!(n, 0);
+        assert_eq!(pso, PSO, "the new list's bind state");
+        assert_eq!(backing, Some(ALLOC), "the new list's allocator");
+    }
+}
+

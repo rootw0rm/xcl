@@ -253,6 +253,16 @@ pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
 }
 
+/// Like `rtv_resource`, but the resource comes back with a reference of its own, taken while the
+/// table is locked; the caller releases it. `note_rtv` drops the table's reference when it
+/// replaces or clears a handle, so a bare pointer can be freed before the caller has used it.
+unsafe fn rtv_resource_addref(handle: usize) -> Option<usize> {
+    let g = RTVS.lock().unwrap();
+    let res = g.as_ref()?.get(&handle).copied()?;
+    add_ref(res);
+    Some(res)
+}
+
 /// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
 pub fn rt0_resource(list: usize) -> Option<usize> {
     let h = *LISTS.lock().unwrap().as_ref()?.get(&list)?;
@@ -366,18 +376,21 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
         lists.iter().rev().find_map(|l| m.get(&(*l as usize)).copied())
     };
     let Some(h) = handle else { return };
-    let res = RTVS.lock().unwrap().as_ref().and_then(|m| m.get(&h).copied());
-    let Some(res) = res else { return };
+    let Some(res) = rtv_resource_addref(h) else { return };
     if backbuffer_like(res).is_none() {
+        release(res);
         return;
     }
     {
         let mut c = CANDIDATE.lock().unwrap();
         if c.map(|(_, r)| r) != Some(res) {
-            add_ref(res);
+            // the reference taken above is the candidate's
             if let Some((_, old)) = c.replace((queue as usize, res)) {
                 release(old);
             }
+        } else {
+            // the candidate already holds one
+            release(res);
         }
     }
     // no console present call seen recently → present on submissions (rate limited)
@@ -1665,6 +1678,101 @@ mod tests {
         assert_eq!(source_uv_rect(got[0].1, 1600, 900), [0.1, 0.1, 0.5, 0.5]);
         assert_eq!(source_uv_rect(got[1].1, 3840, 2160), [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(source_uv_rect(Some([0, 0, 4000, 900]), 1920, 1080), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// A COM-shaped object that only counts references and notes the release that took the count
+    /// to zero. The test owns the memory, so reading `freed` afterwards is safe.
+    #[repr(C)]
+    struct FakeRes {
+        vt: usize,
+        refs: AtomicIsize,
+        freed: AtomicBool,
+    }
+
+    unsafe extern "system" fn fake_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *const FakeRes)).refs.fetch_add(1, Ordering::SeqCst) as u32 + 1
+    }
+
+    unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
+        let this = &*(this as *const FakeRes);
+        let left = this.refs.fetch_sub(1, Ordering::SeqCst) - 1;
+        if left == 0 {
+            this.freed.store(true, Ordering::SeqCst);
+        }
+        left as u32
+    }
+
+    impl FakeRes {
+        /// One reference: the title's own.
+        fn new() -> Box<FakeRes> {
+            static VT: OnceLock<[usize; 3]> = OnceLock::new();
+            let vt = VT.get_or_init(|| [0, fake_add_ref as usize, fake_release as usize]);
+            Box::new(FakeRes { vt: vt.as_ptr() as usize, refs: AtomicIsize::new(1), freed: AtomicBool::new(false) })
+        }
+
+        fn addr(&self) -> usize {
+            self as *const FakeRes as usize
+        }
+
+        fn freed(&self) -> bool {
+            self.freed.load(Ordering::SeqCst)
+        }
+    }
+
+    // RTVS is process-global: these tests use handles no other test does.
+    #[test]
+    fn rtv_resource_addref_holds_a_reference_of_its_own() {
+        const H: usize = 0x5751_0001;
+        let res = FakeRes::new(); // the title's reference
+        unsafe {
+            note_rtv(H, res.addr() as *mut c_void); // the table's
+            let held = rtv_resource_addref(H).expect("the handle names a resource");
+            assert_eq!(held, res.addr());
+            // the title rewrites the descriptor and lets go of the resource: the caller's reference is all that is left
+            note_rtv(H, std::ptr::null_mut());
+            release(res.addr());
+            assert!(!res.freed(), "the caller's reference keeps the resource alive");
+            release(held);
+            assert!(res.freed());
+            assert_eq!(rtv_resource_addref(H), None, "a cleared handle names nothing");
+        }
+    }
+
+    #[test]
+    fn rtv_resource_addref_never_returns_a_freed_resource() {
+        const H: usize = 0x5751_0002;
+        const ROUNDS: usize = 20_000;
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // the title's thread: each round points the handle at a new resource (the table lets go of
+            // the one it replaces) and drops its own reference, so the table owns the newest alone
+            let writer = s.spawn(|| {
+                let mut all = Vec::with_capacity(ROUNDS);
+                for _ in 0..ROUNDS {
+                    let r = FakeRes::new();
+                    unsafe {
+                        note_rtv(H, r.addr() as *mut c_void);
+                        release(r.addr());
+                    }
+                    all.push(r);
+                }
+                done.store(true, Ordering::SeqCst);
+                all
+            });
+            while !done.load(Ordering::SeqCst) {
+                unsafe {
+                    if let Some(p) = rtv_resource_addref(H) {
+                        assert!(!(*(p as *const FakeRes)).freed(), "got a resource that was already freed");
+                        release(p);
+                    }
+                }
+            }
+            let all = writer.join().unwrap();
+            unsafe { note_rtv(H, std::ptr::null_mut()) }; // the newest one
+            for r in &all {
+                assert!(r.freed() && r.refs.load(Ordering::SeqCst) == 0, "each resource is released exactly to zero");
+            }
+        });
     }
 }
 
