@@ -83,6 +83,7 @@ pub unsafe extern "system" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAs
     if port.is_null() {
         return E_INVALIDARG;
     }
+    *port = 0;
     XAsyncGetResult(b, &UDP_PORT_ID as *const u8 as *const c_void, std::mem::size_of::<u16>(), port as *mut c_void, std::ptr::null_mut())
 }
 
@@ -185,12 +186,18 @@ unsafe fn security_info_result(
     if !out_ptr.is_null() {
         *out_ptr = std::ptr::null_mut();
     }
+    if !buffer_used.is_null() {
+        *buffer_used = 0;
+    }
+    if out_ptr.is_null() || buffer.is_null() {
+        return E_INVALIDARG;
+    }
     let mut used = 0usize;
     let hr = XAsyncGetResult(b, identity, buffer_size, buffer as *mut c_void, &mut used);
     if !buffer_used.is_null() {
         *buffer_used = used;
     }
-    if hr >= 0 && !out_ptr.is_null() {
+    if hr >= 0 {
         *out_ptr = buffer as *mut XNetworkingSecurityInformation;
     }
     hr
@@ -355,7 +362,8 @@ fn url_host_and_is_plain_loopback(url: &str) -> (String, bool) {
     } else {
         hostport.split(':').next().unwrap_or("")
     };
-    let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    let is_loopback_ip = host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let loopback = host.eq_ignore_ascii_case("localhost") || is_loopback_ip;
     (host.to_string(), is_http && loopback)
 }
 
@@ -430,7 +438,7 @@ unsafe fn check_thumbprints(security_info: *const XNetworkingSecurityInformation
         let expected = std::slice::from_raw_parts(tp.thumbprint_buffer, SHA1_LEN);
         let matched = match tp.thumbprint_type {
             0 => chain_sha1s.first().is_some_and(|c| c.as_slice() == expected),
-            1 => chain_sha1s.get(1).is_some_and(|c| c.as_slice() == expected),
+            1 => chain_sha1s.iter().skip(1).take(chain_sha1s.len().saturating_sub(2)).any(|c| c.as_slice() == expected),
             2 => chain_sha1s.last().is_some_and(|c| c.as_slice() == expected),
             _ => return PinCheck::InvalidMetadata,
         };
@@ -449,6 +457,26 @@ pub unsafe fn verify_thumbprints(security_info: *const XNetworkingSecurityInform
     matches!(check_thumbprints(security_info, chain_sha1s), PinCheck::NoPins | PinCheck::Matched)
 }
 
+/// The request's URL (`WINHTTP_OPTION_URL`) and the bytes WinHTTP reported, or its Win32
+/// error. A URL longer than the first buffer leaves the bytes it needs in the length: query
+/// again with that much.
+unsafe fn request_url(query: WinHttpQueryOptionFn, request: *mut c_void) -> Result<(Vec<u16>, usize), u32> {
+    let mut url_buf = vec![0u16; 2048];
+    let mut url_bytes = (url_buf.len() * 2) as u32;
+    if query(request, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        if err != windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER || url_bytes as usize <= url_buf.len() * 2 {
+            return Err(err);
+        }
+        url_buf.resize((url_bytes as usize).div_ceil(2), 0);
+        url_bytes = (url_buf.len() * 2) as u32;
+        if query(request, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
+            return Err(windows_sys::Win32::Foundation::GetLastError());
+        }
+    }
+    Ok((url_buf, url_bytes as usize))
+}
+
 pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
     request_handle: *mut c_void,
     security_info: *const XNetworkingSecurityInformation,
@@ -463,12 +491,10 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
         return crate::util::E_FAIL;
     };
 
-    let mut url_buf = [0u16; 2048];
-    let mut url_bytes = (url_buf.len() * 2) as u32;
-    if (procs.winhttp_query_option)(request_handle, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
-        return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
-    }
-    let url_bytes = url_bytes as usize;
+    let (url_buf, url_bytes) = match request_url(procs.winhttp_query_option, request_handle) {
+        Ok(u) => u,
+        Err(err) => return win32_failure_hr(err),
+    };
     if url_bytes == 0 || url_bytes > url_buf.len() * 2 || (url_bytes & 1) != 0 {
         return crate::util::E_FAIL;
     }
@@ -785,6 +811,8 @@ mod tests {
         }
 
         assert_eq!(url_host_and_is_plain_loopback("http://127.0.0.1:3551/account/api/oauth/token"), ("127.0.0.1".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://127.0.0.2:8080/test"), ("127.0.0.2".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://127.1.2.3:8080/test"), ("127.1.2.3".into(), true));
         assert_eq!(url_host_and_is_plain_loopback("https://127.0.0.1:3551/secure"), ("127.0.0.1".into(), false));
         assert_eq!(url_host_and_is_plain_loopback("http://[::1]:8080/test"), ("::1".into(), true));
         assert_eq!(url_host_and_is_plain_loopback("https://social.xboxlive.com/users"), ("social.xboxlive.com".into(), false));
@@ -882,6 +910,207 @@ mod tests {
             };
             assert_eq!(check_thumbprints(&info_wrong_len, &chain), PinCheck::InvalidMetadata);
             assert!(!verify_thumbprints(&info_wrong_len, &chain));
+        }
+    }
+
+    /// The URL of a request is read whatever its length. The query stands in for
+    /// WinHttpQueryOption(WINHTTP_OPTION_URL) as Windows answers it (measured): a buffer too
+    /// small fails with ERROR_INSUFFICIENT_BUFFER and the bytes needed; a big enough one gets the
+    /// URL and its bytes without the terminator. (Not through WinHTTP itself: the XCL_NETWORK=0
+    /// test hooks WinHttpConnect for the whole test process.)
+    #[test]
+    fn request_url_reads_a_url_of_any_length() {
+        use windows_sys::Win32::Foundation::{SetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE};
+        static URL: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+        unsafe extern "system" fn query(_h: *mut c_void, option: u32, buf: *mut c_void, len: *mut u32) -> i32 {
+            assert_eq!(option, WINHTTP_OPTION_URL);
+            let url = URL.lock().unwrap();
+            if (*len as usize) < (url.len() + 1) * 2 {
+                *len = ((url.len() + 1) * 2) as u32;
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            std::ptr::copy_nonoverlapping(url.as_ptr(), buf as *mut u16, url.len());
+            *(buf as *mut u16).add(url.len()) = 0;
+            *len = (url.len() * 2) as u32;
+            1
+        }
+        unsafe extern "system" fn invalid(_h: *mut c_void, _option: u32, _buf: *mut c_void, _len: *mut u32) -> i32 {
+            SetLastError(ERROR_INVALID_HANDLE);
+            0
+        }
+        for url in ["http://localhost/short".to_string(), format!("http://localhost/{}", "a".repeat(3000))] {
+            *URL.lock().unwrap() = url.encode_utf16().collect();
+            let (buf, bytes) = unsafe { request_url(query, std::ptr::null_mut()) }.expect("URL read");
+            assert_eq!(bytes, url.len() * 2);
+            assert_eq!(String::from_utf16_lossy(&buf[..bytes / 2]), url);
+        }
+        assert_eq!(unsafe { request_url(invalid, std::ptr::null_mut()) }.unwrap_err(), ERROR_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn security_info_result_validates_pointers_and_nulls_on_error() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XNetworkingQuerySecurityInformationForUrlAsync(b"https://example.invalid/\0".as_ptr(), &mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+
+            let mut used = 123usize;
+            let mut ptr: *mut XNetworkingSecurityInformation = 0xDEAD_BEEF as *mut _;
+            let mut buf = [0u8; 32];
+
+            // Null out_ptr is rejected with E_INVALIDARG and clears buffer_used.
+            assert_eq!(
+                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used, buf.as_mut_ptr(), std::ptr::null_mut()),
+                E_INVALIDARG
+            );
+            assert_eq!(used, 0);
+
+            // Null buffer is rejected with E_INVALIDARG and nulls out_ptr and buffer_used.
+            assert_eq!(
+                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used, std::ptr::null_mut(), &mut ptr),
+                E_INVALIDARG
+            );
+            assert!(ptr.is_null());
+            assert_eq!(used, 0);
+
+            // Successfully retrieve result into valid buffer and out_ptr.
+            assert_eq!(
+                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used, buf.as_mut_ptr(), &mut ptr),
+                S_OK
+            );
+            assert_eq!(used, std::mem::size_of::<XNetworkingSecurityInformation>());
+            assert_eq!(ptr, buf.as_mut_ptr() as *mut _);
+
+            // An invalid or already consumed block zeroes out_ptr and buffer_used.
+            let mut ptr2: *mut XNetworkingSecurityInformation = 0xDEAD_BEEF as *mut _;
+            let mut used2 = 456usize;
+            let hr = XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used2, buf.as_mut_ptr(), &mut ptr2);
+            assert!(hr < 0);
+            assert!(ptr2.is_null());
+            assert_eq!(used2, 0);
+
+            // UDP multiplayer port async result zeroes port on error.
+            let mut uncompleted_b: XAsyncBlock = std::mem::zeroed();
+            let mut port = 0x1234u16;
+            assert_eq!(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(&mut uncompleted_b, std::ptr::null_mut()), E_INVALIDARG);
+            let hr_port = XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(&mut uncompleted_b, &mut port);
+            assert!(hr_port < 0);
+            assert_eq!(port, 0);
+        }
+    }
+
+    #[test]
+    fn issuer_pin_matches_any_intermediate_or_issuing_cert_in_chain() {
+        let leaf = vec![0x11u8; 20];
+        let sub1 = vec![0x22u8; 20];
+        let sub2 = vec![0x33u8; 20];
+        let root = vec![0x44u8; 20];
+        let unrelated = vec![0x55u8; 20];
+        let chain = vec![leaf.clone(), sub1.clone(), sub2.clone(), root.clone()];
+
+        unsafe {
+            // Issuer pin (type 1) matching first intermediate (sub1)
+            let pin_sub1 = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: sub1.len(),
+                thumbprint_buffer: sub1.as_ptr(),
+            };
+            let info_sub1 = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_sub1,
+            };
+            assert_eq!(check_thumbprints(&info_sub1, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_sub1, &chain));
+
+            // Issuer pin (type 1) matching secondary intermediate (sub2)
+            let pin_sub2 = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: sub2.len(),
+                thumbprint_buffer: sub2.as_ptr(),
+            };
+            let info_sub2 = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_sub2,
+            };
+            assert_eq!(check_thumbprints(&info_sub2, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_sub2, &chain));
+
+            // A root must only match a root pin, not an issuer pin
+            let pin_root_as_issuer = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: root.len(),
+                thumbprint_buffer: root.as_ptr(),
+            };
+            let info_root_as_issuer = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_root_as_issuer,
+            };
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &chain), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info_root_as_issuer, &chain));
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[leaf.clone(), root.clone()]), PinCheck::Mismatch);
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[root.clone()]), PinCheck::Mismatch);
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[]), PinCheck::Mismatch);
+
+            // Issuer pin (type 1) matching unrelated cert must reject with Mismatch
+            let pin_unrelated = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: unrelated.len(),
+                thumbprint_buffer: unrelated.as_ptr(),
+            };
+            let info_unrelated = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_unrelated,
+            };
+            assert_eq!(check_thumbprints(&info_unrelated, &chain), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info_unrelated, &chain));
+
+            // Issuer pin (type 1) against leaf cert must reject with Mismatch
+            let pin_leaf_as_issuer = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: leaf.len(),
+                thumbprint_buffer: leaf.as_ptr(),
+            };
+            let info_leaf_as_issuer = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_leaf_as_issuer,
+            };
+            assert_eq!(check_thumbprints(&info_leaf_as_issuer, &chain), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info_leaf_as_issuer, &chain));
+
+            // Leaf pin (type 0) must only match leaf
+            let pin_leaf = XNetworkingThumbprint {
+                thumbprint_type: 0,
+                thumbprint_buffer_byte_count: leaf.len(),
+                thumbprint_buffer: leaf.as_ptr(),
+            };
+            let info_leaf = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_leaf,
+            };
+            assert_eq!(check_thumbprints(&info_leaf, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_leaf, &chain));
+
+            // Root pin (type 2) must only match root
+            let pin_root = XNetworkingThumbprint {
+                thumbprint_type: 2,
+                thumbprint_buffer_byte_count: root.len(),
+                thumbprint_buffer: root.as_ptr(),
+            };
+            let info_root = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_root,
+            };
+            assert_eq!(check_thumbprints(&info_root, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_root, &chain));
         }
     }
 }
