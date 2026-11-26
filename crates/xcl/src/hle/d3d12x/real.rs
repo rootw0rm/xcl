@@ -3592,7 +3592,7 @@ pub fn end_title(code: u32) -> ! {
         let _ = std::thread::Builder::new().name("xcl-end-watchdog".into()).spawn(move || {
             let _ = tx.send(windows_sys::Win32::System::Threading::GetCurrentThreadId());
             std::thread::sleep(std::time::Duration::from_secs(15));
-            windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
+            crate::eh::end_process_now(code as i32);
         });
         let watchdog = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or(0);
         crate::log::flush();

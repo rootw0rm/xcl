@@ -69,9 +69,10 @@ fn crash_deadline(
 }
 
 /// Ends the process through the raw `_exit` (not the hooked terminate path, whose thread dump
-/// could hang the same way the title's crash filter did), with the access-violation status
-/// the crash already reported.
-fn end_process_now(status: i32) -> ! {
+/// could hang the same way the title's crash filter did, nor `std::process::exit` cleanup,
+/// which takes locks a title thread may hold at the end of a run — upstream #2698). The
+/// report is written and the log flushed before this runs; the status is the caller's.
+pub(crate) fn end_process_now(status: i32) -> ! {
     unsafe { libc::_exit(status) }
 }
 
@@ -1107,6 +1108,39 @@ mod tests {
             assert!(did && called);
             assert!(started.elapsed() >= Duration::from_millis(95), "the wait starts at the crash, not before");
         });
+    }
+
+    /// The end of a run ends the process past anything that allocates: another thread
+    /// churning the allocator must not delay the exit (Linux twin of upstream #2698, whose
+    /// Windows test holds the process heap — no stable user-space handle for that on Linux).
+    #[test]
+    fn end_of_run_exits_past_allocator_churn() {
+        const CHILD: &str = "XCL_TEST_END_PAST_ALLOC";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::spawn(|| loop {
+                // keep the allocator busy: the exit below must not wait on it
+                let mut v = Vec::with_capacity(4096);
+                v.extend(0u8..=255u8);
+                std::hint::black_box(v.len());
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            end_process_now(7);
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "eh::tests::end_of_run_exits_past_allocator_churn", "--nocapture"])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(20) {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(7));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        panic!("the process did not end while another thread churned the allocator");
     }
 
     std::arch::global_asm!(

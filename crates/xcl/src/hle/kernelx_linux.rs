@@ -504,7 +504,9 @@ pub unsafe extern "win64" fn ExitProcess(code: u32) -> ! {
         // (The report itself was written by `begin_termination` above.)
         crate::log::flush();
     }
-    std::process::exit(code as i32);
+    // Upstream #2698 twin: past any cleanup path that allocates — a title thread may hold
+    // the allocator at the end of a run; the report is written and the log flushed above.
+    crate::eh::end_process_now(code as i32);
 }
 
 pub unsafe extern "win64" fn TerminateProcess(proc_: usize, code: u32) -> i32 {
@@ -526,7 +528,9 @@ pub unsafe extern "win64" fn TerminateProcess(proc_: usize, code: u32) -> i32 {
         }
         crate::log::flush();
     }
-    std::process::exit(code as i32);
+    // Upstream #2698 twin: past any cleanup path that allocates — a title thread may hold
+    // the allocator at the end of a run; the report is written and the log flushed above.
+    crate::eh::end_process_now(code as i32);
 }
 
 pub unsafe extern "win64" fn CreateThread(
