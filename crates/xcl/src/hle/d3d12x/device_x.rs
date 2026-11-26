@@ -14,7 +14,7 @@
 //! are mapped onto PC ones.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -375,8 +375,13 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
         for i in 0..n {
             // D3D12_INPUT_ELEMENT_DESC { SemanticName @0; … }
             let mut e = ((p + 32 * i) as *const [u8; 32]).read_unaligned();
-            let s = rd64(&e, 0) as *const c_char;
-            let name = if s.is_null() { CString::default() } else { CStr::from_ptr(s).to_owned() };
+            let s = rd64(&e, 0) as *const u8;
+            let name = if s.is_null() {
+                CString::default()
+            } else {
+                let Some(c) = real::read_cstr_checked(s) else { return };
+                c
+            };
             e[0..8].copy_from_slice(&(name.as_ptr() as u64).to_le_bytes());
             names.push(name);
             elems.push(e);

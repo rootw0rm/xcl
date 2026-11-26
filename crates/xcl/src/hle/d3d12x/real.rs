@@ -4350,12 +4350,14 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
         if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
-            note_pso_rs(*ppv, rs as *mut c_void);
-            super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
-            if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-                PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+            if !ppv.is_null() && !(*ppv).is_null() {
+                note_pso_rs(*ppv, rs as *mut c_void);
+                super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+                if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+                    PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+                }
+                note_translated_compute(0, ppv);
             }
-            note_translated_compute(0, ppv);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
         }
@@ -4387,12 +4389,14 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    note_pso_rs(*ppv, rs);
-    super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
-    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    if !ppv.is_null() && !(*ppv).is_null() {
+        note_pso_rs(*ppv, rs);
+        super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+        if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+            PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+        }
+        note_translated_compute(hr, ppv);
     }
-    note_translated_compute(hr, ppv);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -4464,8 +4468,9 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         hr = retried;
         in_driver += took;
     }
+    let has_pso = !ppv.is_null() && !(*ppv).is_null();
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hr >= 0 && !reused {
+    if hr >= 0 && !reused && has_pso {
         keep_compute_blob(key, *ppv, dxil.len());
         if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
             driver_cache::keep(p, &b, in_driver);
@@ -4942,11 +4947,10 @@ unsafe fn graphics_blob_key(
         feed_u32(&mut h, op.StencilFunc.0 as u32);
     }
     feed_u32(&mut h, copy.InputLayout.NumElements);
-    if copy.InputLayout.NumElements > 0 && !copy.InputLayout.pInputElementDescs.is_null() {
-        let elems = std::slice::from_raw_parts(copy.InputLayout.pInputElementDescs, copy.InputLayout.NumElements as usize);
+    if let Ok(elems) = input_layout_slice(&copy.InputLayout) {
         for e in elems {
-            if !e.SemanticName.0.is_null() {
-                feed(&mut h, std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_bytes_with_nul());
+            if let Some(name) = read_cstr_checked(e.SemanticName.0) {
+                feed(&mut h, name.as_bytes_with_nul());
             } else {
                 feed(&mut h, &[0]);
             }
@@ -5284,7 +5288,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
     let hr = build.hr;
-    if build.cache_eligible {
+    let has_pso = !ppv.is_null() && !(*ppv).is_null();
+    if build.cache_eligible && has_pso {
         keep_graphics_blob(gkey, *ppv, bytes);
         if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
             driver_cache::keep(p, &b, build.in_driver);
@@ -5304,22 +5309,25 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    note_pso_rs(*ppv, rs);
-    super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
-    TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
-    note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
-    if super::present::trace_frame() {
+    if has_pso {
+        note_pso_rs(*ppv, rs);
+        super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
+        TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+    }
+    if has_pso && super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
         // the input layout (semantic index, format, slot, offset) – what the vertices are read as
-        let il = &d.InputLayout;
-        let elems: Vec<String> = if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
-            std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize)
+        let elems: Vec<String> = match input_layout_slice(&d.InputLayout) {
+            Ok(slice) => slice
                 .iter()
-                .map(|e| format!("{}{} fmt {} slot {} @{}", e.SemanticName.to_string().unwrap_or_default(), e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset as i32))
-                .collect()
-        } else {
-            Vec::new()
+                .map(|e| {
+                    let name = read_cstr_checked(e.SemanticName.0).and_then(|s| s.into_string().ok()).unwrap_or_default();
+                    format!("{name}{} fmt {} slot {} @{}", e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset as i32)
+                })
+                .collect(),
+            Err(()) => Vec::new(),
         };
         PSO_LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, elems.join(", "));
         static N: AtomicU64 = AtomicU64::new(0);
@@ -5425,8 +5433,116 @@ impl OwnedDesc {
     }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+/// Read a NUL-terminated C string up to 1024 bytes, checking page readability before each chunk.
+/// None for null, unreadable or unterminated within 1024 bytes (callers reject the desc then).
+pub(super) unsafe fn read_cstr_checked(p: *const u8) -> Option<std::ffi::CString> {
+    const MAX_LEN: usize = 1024;
+    if p.is_null() {
+        return None;
+    }
+    let mut cur = p as usize;
+    let mut out = Vec::new();
+    while out.len() < MAX_LEN {
+        let page_left = 0x1000 - (cur & 0xFFF);
+        let step = page_left.min(MAX_LEN - out.len());
+        if !crate::gpu::shader::readable(cur, step) {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(cur as *const u8, step);
+        if let Some(nul) = slice.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&slice[..nul]);
+            return std::ffi::CString::new(out).ok();
+        }
+        out.extend_from_slice(slice);
+        cur = cur.checked_add(step)?;
+    }
+    None
+}
+
+fn unreadable_bytecode(b: &D3D12_SHADER_BYTECODE) -> bool {
+    let (p, n) = (b.pShaderBytecode as usize, b.BytecodeLength);
+    p != 0 && n != 0 && !crate::gpu::shader::readable(p, n)
+}
+
+fn unreadable_cached_pso(c: &D3D12_CACHED_PIPELINE_STATE) -> bool {
+    let (p, n) = (c.pCachedBlob as usize, c.CachedBlobSizeInBytes);
+    p != 0 && n != 0 && !crate::gpu::shader::readable(p, n)
+}
+
+/// Validate and slice `InputLayout`. Empty or null returns `Ok(&[])`; an overflowing or
+/// unreadable element array returns `Err(())`.
+unsafe fn input_layout_slice<'a>(il: &D3D12_INPUT_LAYOUT_DESC) -> Result<&'a [D3D12_INPUT_ELEMENT_DESC], ()> {
+    if il.NumElements == 0 || il.pInputElementDescs.is_null() {
+        return Ok(&[]);
+    }
+    let n = il.NumElements as usize;
+    let bytes = n.checked_mul(std::mem::size_of::<D3D12_INPUT_ELEMENT_DESC>()).ok_or(())?;
+    if !crate::gpu::shader::readable(il.pInputElementDescs as usize, bytes) {
+        return Err(());
+    }
+    Ok(std::slice::from_raw_parts(il.pInputElementDescs, n))
+}
+
+unsafe fn compute_desc_has_unreadable_pointers(desc: *const c_void) -> bool {
+    if desc.is_null() {
+        return false;
+    }
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return true;
+    }
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    unreadable_bytecode(&d.CS) || unreadable_cached_pso(&d.CachedPSO)
+}
+
+unsafe fn graphics_desc_has_unreadable_pointers(desc: *const c_void) -> bool {
+    if desc.is_null() {
+        return false;
+    }
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return true;
+    }
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    if [&d.VS, &d.PS, &d.DS, &d.HS, &d.GS].into_iter().any(unreadable_bytecode) || unreadable_cached_pso(&d.CachedPSO) {
+        return true;
+    }
+    let Ok(elems) = input_layout_slice(&d.InputLayout) else {
+        return true;
+    };
+    if elems.iter().any(|e| !e.SemanticName.0.is_null() && read_cstr_checked(e.SemanticName.0).is_none()) {
+        return true;
+    }
+    let so = &d.StreamOutput;
+    if so.NumEntries > 0 && !so.pSODeclaration.is_null() {
+        let n = so.NumEntries as usize;
+        let Some(bytes) = n.checked_mul(std::mem::size_of::<D3D12_SO_DECLARATION_ENTRY>()) else {
+            return true;
+        };
+        if !crate::gpu::shader::readable(so.pSODeclaration as usize, bytes) {
+            return true;
+        }
+        let decls = std::slice::from_raw_parts(so.pSODeclaration, n);
+        if decls.iter().any(|e| !e.SemanticName.0.is_null() && read_cstr_checked(e.SemanticName.0).is_none()) {
+            return true;
+        }
+    }
+    if so.NumStrides > 0 && !so.pBufferStrides.is_null() {
+        let n = so.NumStrides as usize;
+        let Some(bytes) = n.checked_mul(std::mem::size_of::<u32>()) else {
+            return true;
+        };
+        if !crate::gpu::shader::readable(so.pBufferStrides as usize, bytes) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Copy a shader blob into `blobs` and point `b` at the copy. Returns false when a non-null,
+/// non-empty shader pointer is unreadable.
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) -> bool {
+    if unreadable_bytecode(b) {
+        return false;
+    }
     if let Some(bytes) = shader_bytes(b) {
         blobs.push(bytes.to_vec());
         let v = blobs.last().unwrap();
@@ -5434,35 +5550,45 @@ unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
     } else {
         *b = D3D12_SHADER_BYTECODE::default();
     }
+    true
 }
 
 unsafe fn own_compute(desc: *const c_void) -> Option<OwnedDesc> {
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
     let mut d: Box<D3D12_COMPUTE_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC));
     let mut blobs = Vec::new();
-    own_shader(&mut d.CS, &mut blobs);
+    if !own_shader(&mut d.CS, &mut blobs) {
+        return None;
+    }
     d.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     Some(OwnedDesc::Compute(d, blobs))
 }
 
-/// None with stream output (not copied; such pipelines are built in the call).
+/// None when the desc or any referenced shader / input layout / semantic name is unreadable, or
+/// with stream output (not copied; such pipelines are built in the call).
 unsafe fn own_graphics(desc: *const c_void) -> Option<OwnedDesc> {
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
     let mut d: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC));
     if d.StreamOutput.NumEntries > 0 {
         return None;
     }
     let mut blobs = Vec::new();
     for b in [&mut d.VS, &mut d.PS, &mut d.DS, &mut d.HS, &mut d.GS] {
-        own_shader(b, &mut blobs);
-    }
-    let n = d.InputLayout.NumElements as usize;
-    let mut elems = Vec::new();
-    let mut names = Vec::new();
-    if n > 0 && !d.InputLayout.pInputElementDescs.is_null() {
-        elems = std::slice::from_raw_parts(d.InputLayout.pInputElementDescs, n).to_vec();
-        for e in &mut elems {
-            names.push(std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_owned());
-            e.SemanticName = PCSTR(names.last().unwrap().as_ptr() as *const u8);
+        if !own_shader(b, &mut blobs) {
+            return None;
         }
+    }
+    let slice = input_layout_slice(&d.InputLayout).ok()?;
+    let mut elems = slice.to_vec();
+    let mut names = Vec::with_capacity(elems.len());
+    for e in &mut elems {
+        let name = read_cstr_checked(e.SemanticName.0)?;
+        names.push(name);
+        e.SemanticName = PCSTR(names.last().unwrap().as_ptr() as *const u8);
     }
     d.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: if elems.is_empty() { std::ptr::null() } else { elems.as_ptr() }, NumElements: elems.len() as u32 };
     d.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
@@ -5685,6 +5811,9 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
 unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
+    if graphics_desc_has_unreadable_pointers(desc) {
+        return E_INVALIDARG;
+    }
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
@@ -5730,6 +5859,9 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
+    if compute_desc_has_unreadable_pointers(desc) {
+        return E_INVALIDARG;
+    }
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
@@ -8644,6 +8776,96 @@ mod mesh_stream_tests {
             // Case 2: caller passes ppv == null
             let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, std::ptr::null_mut());
             assert_eq!(hr, E_INVALIDARG);
+        }
+    }
+}
+
+#[cfg(test)]
+mod pso_pointer_guard_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+
+    #[test]
+    fn read_cstr_checked_handles_null_unreadable_valid_and_guard_page() {
+        unsafe {
+            assert!(read_cstr_checked(std::ptr::null()).is_none());
+            assert!(read_cstr_checked(0x1000 as *const u8).is_none());
+            let s = read_cstr_checked(b"POSITION\0".as_ptr()).expect("valid C string");
+            assert_eq!(s.to_str().unwrap(), "POSITION");
+
+            let base = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            let page0 = VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE) as *mut u8;
+            assert!(!page0.is_null());
+            std::ptr::write_bytes(page0.add(0xFF0), b'X', 16);
+            assert!(read_cstr_checked(page0.add(0xFF0)).is_none(), "unterminated string crossing into uncommitted page");
+            *page0.add(0xFFF) = 0;
+            let bounded = read_cstr_checked(page0.add(0xFF0)).expect("terminated string at page end");
+            assert_eq!(bounded.as_bytes().len(), 15);
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn own_graphics_and_own_compute_reject_null_and_unreadable_pointers() {
+        unsafe {
+            assert!(own_compute(std::ptr::null()).is_none());
+            assert!(own_compute(0x1000 as *const c_void).is_none());
+            assert!(own_graphics(std::ptr::null()).is_none());
+            assert!(own_graphics(0x1000 as *const c_void).is_none());
+
+            let bad_bc = D3D12_SHADER_BYTECODE { pShaderBytecode: 0x1000 as *const c_void, BytecodeLength: 64 };
+            let mut cmp = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+            cmp.CS = bad_bc;
+            assert!(own_compute(&cmp as *const _ as *const c_void).is_none());
+            assert!(compute_desc_has_unreadable_pointers(&cmp as *const _ as *const c_void));
+
+            let mut gfx = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            gfx.VS = bad_bc;
+            assert!(own_graphics(&gfx as *const _ as *const c_void).is_none());
+            assert!(graphics_desc_has_unreadable_pointers(&gfx as *const _ as *const c_void));
+
+            // Null SemanticName in InputLayout must not dereference NULL
+            let null_elem = D3D12_INPUT_ELEMENT_DESC::default();
+            let mut gfx_null_sem = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            gfx_null_sem.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: &null_elem, NumElements: 1 };
+            assert!(own_graphics(&gfx_null_sem as *const _ as *const c_void).is_none());
+
+            // Unreadable pInputElementDescs & overflowing NumElements
+            let mut gfx_bad_il = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            gfx_bad_il.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: 0x1000 as *const D3D12_INPUT_ELEMENT_DESC, NumElements: 1 };
+            assert!(own_graphics(&gfx_bad_il as *const _ as *const c_void).is_none());
+            assert!(graphics_desc_has_unreadable_pointers(&gfx_bad_il as *const _ as *const c_void));
+
+            let valid_elem = D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(b"TEXCOORD\0".as_ptr()),
+                SemanticIndex: 2,
+                ..Default::default()
+            };
+            let mut gfx_huge_il = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            gfx_huge_il.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: &valid_elem, NumElements: u32::MAX };
+            assert!(own_graphics(&gfx_huge_il as *const _ as *const c_void).is_none());
+            assert!(graphics_desc_has_unreadable_pointers(&gfx_huge_il as *const _ as *const c_void));
+
+            // graphics_blob_key tolerates unreadable InputLayout without crashing
+            let _ = graphics_blob_key(&gfx_bad_il, &[1, 2, 3, 4], None, None, &[]);
+
+            // Valid graphics desc clones shaders and semantic names cleanly
+            let shader = vec![0x44u8, 0x58, 0x42, 0x43, 1, 2, 3, 4];
+            let mut gfx_ok = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            gfx_ok.VS = bytecode(&shader);
+            gfx_ok.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: &valid_elem, NumElements: 1 };
+            assert!(!graphics_desc_has_unreadable_pointers(&gfx_ok as *const _ as *const c_void));
+            let OwnedDesc::Graphics(owned_d, blobs, elems, names) = own_graphics(&gfx_ok as *const _ as *const c_void).expect("valid graphics desc") else {
+                panic!("expected Graphics");
+            };
+            assert_eq!(blobs.len(), 1);
+            assert_eq!(blobs[0], shader);
+            assert_eq!(elems.len(), 1);
+            assert_eq!(names.len(), 1);
+            assert_eq!(names[0].to_str().unwrap(), "TEXCOORD");
+            assert_eq!(owned_d.InputLayout.NumElements, 1);
+            assert_eq!(owned_d.InputLayout.pInputElementDescs, elems.as_ptr());
         }
     }
 }
