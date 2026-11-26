@@ -174,8 +174,12 @@ fn timer() -> &'static (Mutex<BinaryHeap<Timed>>, Condvar) {
                         None => g = cv.wait(g).unwrap(),
                         Some(t) if t.at <= now => {
                             let t = g.pop().unwrap();
+                            // Reserve an inflight slot before releasing the timer lock so a
+                            // concurrent XTaskQueueTerminate cannot observe inflight == 0 and
+                            // drop or outrun this due callback.
+                            t.queue.state.lock().unwrap().inflight[t.port as usize] += 1;
                             drop(g);
-                            let _ = submit_now(&t.queue, t.port, t.item);
+                            dispatch_due_timed(&t.queue, t.port, t.item);
                             g = m.lock().unwrap();
                         }
                         Some(t) => {
@@ -331,6 +335,16 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
         }
     }
     true
+}
+
+/// Dispatch a delayed item popped from the timer heap whose `inflight` slot was already
+/// reserved under the timer lock so `XTaskQueueTerminate` cannot finish before it runs.
+fn dispatch_due_timed(q: &Arc<Queue>, port: u32, item: Item) {
+    if submit_now(q, port, item) {
+        q.done_one(port);
+    } else {
+        unsafe { q.execute(port, item) };
+    }
 }
 
 /// Submit an item to `port` after `delay_ms`. Returns `false` if `q` is already terminated.
@@ -556,9 +570,14 @@ pub unsafe extern "system" fn XTaskQueueDispatch(h: *mut c_void, port: u32, time
 pub unsafe extern "system" fn XTaskQueueIsEmpty(h: *mut c_void, port: u32) -> bool {
     match queue_from(h) {
         Some(q) if port <= 1 => {
+            // A delayed callback not yet due is still queued (libHttpClient: m_pendingList).
+            // Lock order: timer -> p.items -> q.state.
+            let delayed = timer().0.lock().unwrap();
             let items = q.ports[port as usize].items.lock().unwrap();
             let state = q.state.lock().unwrap();
-            !items.iter().any(|qi| Arc::ptr_eq(&qi.queue, &q)) && state.inflight[port as usize] == 0
+            !delayed.iter().any(|t| t.port == port && Arc::ptr_eq(&t.queue, &q))
+                && !items.iter().any(|qi| Arc::ptr_eq(&qi.queue, &q))
+                && state.inflight[port as usize] == 0
         }
         _ => true,
     }
@@ -1063,6 +1082,23 @@ mod tests {
     }
 
     #[test]
+    fn is_empty_counts_delayed_callbacks_not_yet_due() {
+        unsafe extern "system" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut h), S_OK);
+            assert!(XTaskQueueIsEmpty(h, PORT_WORK));
+            assert_eq!(XTaskQueueSubmitDelayedCallback(h, PORT_WORK, 60_000, std::ptr::null_mut(), noop as usize), S_OK);
+            assert!(!XTaskQueueIsEmpty(h, PORT_WORK), "a delayed callback not yet due is still queued");
+            assert!(XTaskQueueIsEmpty(h, PORT_COMPLETION), "it is queued on the work port only");
+            // termination cancels it: nothing is left
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert!(XTaskQueueIsEmpty(h, PORT_WORK));
+            XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
     fn register_waiter_validates_port_and_ignores_terminated_queue() {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
@@ -1099,6 +1135,91 @@ mod tests {
 
             CloseHandle(event);
             XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn due_delayed_callback_is_canceled_before_terminate_finishes() {
+        struct RaceState {
+            item_runs: AtomicU32,
+            item_canceled: AtomicBool,
+            item_ran_after_term: AtomicBool,
+            term_done: AtomicBool,
+        }
+        unsafe extern "system" fn item_cb(ctx: *mut c_void, canceled: bool) {
+            let s = &*(ctx as *const RaceState);
+            if s.term_done.load(Ordering::Acquire) {
+                s.item_ran_after_term.store(true, Ordering::Release);
+            }
+            if canceled {
+                s.item_canceled.store(true, Ordering::Release);
+            }
+            s.item_runs.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn term_cb(ctx: *mut c_void) {
+            let s = &*(ctx as *const RaceState);
+            s.term_done.store(true, Ordering::Release);
+        }
+
+        // Deterministic check of the pop-then-terminate window: reserve inflight (as timer()
+        // does under the timer lock), start XTaskQueueTerminate(wait=true), confirm Terminate
+        // waits while terminated==true, then dispatch the due item and verify it runs canceled
+        // before term_cb.
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+            let q = queue_from(h).unwrap();
+            let state = Arc::new(RaceState {
+                item_runs: AtomicU32::new(0),
+                item_canceled: AtomicBool::new(false),
+                item_ran_after_term: AtomicBool::new(false),
+                term_done: AtomicBool::new(false),
+            });
+
+            q.state.lock().unwrap().inflight[PORT_WORK as usize] += 1;
+            let h_addr = h as usize;
+            let s_addr = Arc::as_ptr(&state) as usize;
+            let term_thread = std::thread::spawn(move || {
+                XTaskQueueTerminate(h_addr as *mut c_void, true, s_addr as *mut c_void, term_cb as usize)
+            });
+            while !q.is_terminated() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(!state.term_done.load(Ordering::Acquire), "Terminate fired term_cb while due timer item was inflight");
+
+            dispatch_due_timed(&q, PORT_WORK, Item { cb: item_cb as usize, ctx: Arc::as_ptr(&state) as usize });
+            assert_eq!(term_thread.join().unwrap(), S_OK);
+            assert!(state.term_done.load(Ordering::Acquire));
+            assert_eq!(state.item_runs.load(Ordering::SeqCst), 1);
+            assert!(state.item_canceled.load(Ordering::Acquire));
+            assert!(!state.item_ran_after_term.load(Ordering::Acquire));
+            XTaskQueueCloseHandle(h);
+        }
+
+        // Real timer-thread race over 40 iterations: every accepted delayed callback runs
+        // exactly once and never after term_cb.
+        for iter in 0..40 {
+            unsafe {
+                let mut h = std::ptr::null_mut();
+                assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+                let state = Arc::new(RaceState {
+                    item_runs: AtomicU32::new(0),
+                    item_canceled: AtomicBool::new(false),
+                    item_ran_after_term: AtomicBool::new(false),
+                    term_done: AtomicBool::new(false),
+                });
+                let hr = XTaskQueueSubmitDelayedCallback(h, PORT_WORK, 1, Arc::as_ptr(&state) as *mut c_void, item_cb as usize);
+                assert_eq!(hr, S_OK);
+                if iter % 2 == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(XTaskQueueTerminate(h, true, Arc::as_ptr(&state) as *mut c_void, term_cb as usize), S_OK);
+                assert!(state.term_done.load(Ordering::Acquire));
+                assert_eq!(state.item_runs.load(Ordering::SeqCst), 1, "delayed callback dropped or double-run on iter {iter}");
+                assert!(!state.item_ran_after_term.load(Ordering::Acquire), "delayed callback ran after term_cb on iter {iter}");
+                XTaskQueueCloseHandle(h);
+            }
         }
     }
 }
