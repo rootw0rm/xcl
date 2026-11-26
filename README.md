@@ -364,6 +364,22 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   those on which the GPU completed at least one operation. For each, it names the translated
   pipeline bound at the last operation DRED saw complete and those bound after it, by their
   console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
+- **One draw or dispatch, alone.** `XCL_CAPTURE_DRAW=<hash>[:N]` (the fnv64 of a console VS, PS
+  or CS container, hex, as in the DRED lines) writes the Nth draw / dispatch of that shader
+  (default the first) to `captures\<hash>_<N>_<time>\` in the title's data folder: the shader
+  containers, pipeline description, root arguments, the unified memory its descriptor tables
+  and buffers name, and the textures it reads and draws into as they are where the call
+  stands. The shader's calls are not run in that run (`XCL_CAPTURE_RUN=1` runs them): the switch
+  is for a call that hangs the GPU. `XCL_CAPTURE_DRAW=list` only logs each translated pipeline's
+  shader hashes (`CAPTURE: pipeline …`). `xcl.log` lists the first 20 matching calls with their
+  arguments (`CAPTURE: …`). `xcl replay <folder>` then runs the call alone on a device of its
+  own, in seconds: it translates the shaders with the current build, prints the GPU time, and
+  writes PNG / raw files of the targets and UAV textures to `replay_<NAME>\`. A call that hangs
+  ends the replay's child process (`timed out` / `device removed after N ms`), not your session.
+  `--sub "FROM=>TO||…"` rewrites the translated HLSL, `--loops` counts the passes of each loop
+  of the pixel shader per lane, `--no-run` only translates and compiles. Not captured:
+  multisampled textures, ExecuteIndirect arguments, geometry and mesh stages; captures are
+  game data – keep them on your machine.
 - `XCL_HOST_DXR=1` enables an experimental shadow-build capture of XboxBvhBuilder
   build, rehydrate and copy calls on DXR 1.1 devices. It snapshots triangle inputs from
   mapped UMA windows and rewrites readable CPU instance arrays to native BLAS addresses.

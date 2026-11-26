@@ -351,6 +351,41 @@ pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, 
     b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
 }
 
+/// The fixed-function state a list last set (`capture`).
+pub(super) struct CaptureState {
+    pub topology: Option<u32>,
+    pub viewports: Vec<D3D12_VIEWPORT>,
+    pub scissors: Vec<windows::Win32::Foundation::RECT>,
+    pub blend: Option<[f32; 4]>,
+    pub stencil: Option<u32>,
+    /// the handle of each render target
+    pub rtvs: Vec<usize>,
+    pub dsv: Option<usize>,
+    /// the PC views
+    pub vertex_buffers: Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>,
+    pub index_buffer: Option<D3D12_INDEX_BUFFER_VIEW>,
+}
+
+pub(super) fn capture_state(list: *mut c_void) -> Option<CaptureState> {
+    let g = LISTS.lock().unwrap();
+    let s = g.as_ref()?.get(&(list as usize))?;
+    let b = &s.bindings;
+    let rt = b.render_targets.as_ref();
+    // (a single handle names a range of descriptors, 32 bytes each: `real::cl_om_set_render_targets`)
+    let rtvs = rt.map_or(Vec::new(), |rt| (0..rt.num_targets as usize).filter_map(|k| if rt.single != 0 { rt.handles.first().map(|h| h + 32 * k) } else { rt.handles.get(k).copied() }).collect());
+    Some(CaptureState {
+        topology: b.topology,
+        viewports: b.viewports.clone(),
+        scissors: b.scissors.clone(),
+        blend: b.blend,
+        stencil: b.stencil,
+        rtvs,
+        dsv: rt.and_then(|rt| rt.dsv),
+        vertex_buffers: b.vertex_buffers.iter().map(|(&k, &v)| (k, v)).collect(),
+        index_buffer: s.index_buffer,
+    })
+}
+
 /// `pc_va` for other modules.
 pub(super) fn pc_va_of(va: u64) -> u64 {
     pc_va(va)
@@ -4404,6 +4439,11 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if uav_transition && !any_uav {
         out.push([2, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    if super::capture::on() {
+        for b in out.iter().filter(|b| b[0] == 0) {
+            super::capture::note_transition(this as usize, (b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], b[6]);
+        }
     }
     // the states uploads into textures kept in step start from once this list has run
     if super::title_textures::any() {

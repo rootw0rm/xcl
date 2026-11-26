@@ -550,12 +550,14 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     let mut w = [0u32; 8];
     unsafe { std::ptr::copy_nonoverlapping(src.at as *const u32, w.as_mut_ptr(), n) };
     if src.sampler {
+        super::capture::copy_sampler(src.index, dst.index);
         w[3] = (w[3] & !0xFFF) | (dst.index & 0xFFF);
     } else if w[3] >> 28 >= 8 {
         w[0] = dst.index;
     }
     write(dst, &w[..n]);
     if !src.sampler {
+        super::capture::copy_views(src.index, dst.index);
         note_resource(dst, resource_at(src.at).unwrap_or(0));
     }
 }

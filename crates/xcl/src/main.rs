@@ -58,6 +58,13 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl replay <capture folder> [--timeout S] [--repeat N] [--out NAME] [--debug] [--no-run]
+             [--sub FROM=>TO||…] [--profile ps_6_7] [--split 0|1] [--loops]
+      Runs one draw / dispatch captured with XCL_CAPTURE_DRAW alone on a device of its own:
+      its GPU time, and PNG / raw files of what it wrote in the folder replay_<NAME> of the
+      capture. --timeout: seconds the call may take (15); --no-run: translate and compile
+      only; --debug: with the D3D12 debug layer. --sub: text substitutions in the translated
+      HLSL; --loops: the passes of each loop of the pixel shader, per lane.
   xcl --version
 ";
 
@@ -93,6 +100,8 @@ fn main() {
         }
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
+        #[cfg(windows)]
+        Some("replay") if args.len() >= 2 => xcl::replay::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0

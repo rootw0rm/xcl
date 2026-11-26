@@ -1692,6 +1692,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::capture::forget_resource(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -1880,6 +1881,7 @@ fn forget_pso(pso: usize) {
     if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
+    super::capture::forget_pso(pso);
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
@@ -1984,6 +1986,7 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| s.sampler) else { return f(this, desc, cpu) };
     f(this, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
+    super::capture::note_sampler(slot.index, desc);
     super::console_heap::write(&slot, &[0, 0, 0, slot.index & 0xFFF]);
 }
 
@@ -2184,7 +2187,8 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
-    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::capture::note_target_view(cpu as usize, res as usize, copy.as_ref().map_or(desc, |c| c as *const _));
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2332,6 +2336,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
+    super::capture::note_view(slot.index, res as usize, desc);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {
@@ -2720,6 +2725,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
+    super::capture::note_view(slot.index + 1, if no_uav { 0 } else { res as usize }, desc);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing
@@ -2771,6 +2777,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
         g(this, srv_res, &srv, slot.pc_srv);
         super::console_heap::publish(&slot, false);
+        super::capture::note_view(slot.index, res as usize, &srv as *const D3D12_SHADER_RESOURCE_VIEW_DESC);
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
     let d = if dim == 8 { (d >> mip).max(1) } else { d };
@@ -4486,6 +4493,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
         }
         note_translated_compute(hr, ppv);
+        super::capture::note_compute_pso(*ppv as usize, cs, wave32_only(this));
     }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
@@ -5404,6 +5412,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
         note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+        super::capture::note_graphics_pso(*ppv as usize, d, &copy, rect_gs.is_some() && !copy.GS.pShaderBytecode.is_null(), split);
     }
     if has_pso && super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
@@ -7322,6 +7331,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
+    super::capture::note_target_view(handle, res as usize, desc as *const D3D12_RENDER_TARGET_VIEW_DESC);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -7715,6 +7725,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::capture::before_execute(&mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());
@@ -7726,6 +7737,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
+    super::capture::after_execute(this, &mapped);
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }
