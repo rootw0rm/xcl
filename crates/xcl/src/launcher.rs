@@ -7,6 +7,83 @@ use crate::config::{Boot, Config};
 use crate::manifest::{decode_game_config, xml_attrs};
 use crate::util::wide;
 
+
+/// Data root: `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`.
+pub fn data_root() -> PathBuf {
+    if let Ok(p) = std::env::var("XCL_DATA_ROOT") {
+        return PathBuf::from(p);
+    }
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+    PathBuf::from(base).join("XCL")
+}
+
+/// Values of `attr` on every `<tag …>` element (so "<Executable" != "<ExecutableList").
+pub(crate) fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
+    let open = format!("<{tag}");
+    let key = format!("{attr}=\"");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open).map(|i| from + i) {
+        from = i + open.len();
+        let Some(next) = xml[from..].chars().next() else { break };
+        if !(next.is_whitespace() || next == '/' || next == '>') {
+            continue;
+        }
+        let Some(end) = xml[from..].find('>') else { break };
+        let t = &xml[from..from + end];
+        // attribute must start at a whitespace boundary ("Name=" but not "DisplayName=")
+        let mut pos = 0;
+        while let Some(k) = t[pos..].find(&key).map(|k| pos + k) {
+            if k == 0 || t[..k].ends_with(char::is_whitespace) {
+                let a = k + key.len();
+                if let Some(b) = t[a..].find('"') {
+                    out.push(xml_unescape(&t[a..a + b]));
+                }
+                break;
+            }
+            pos = k + key.len();
+        }
+    }
+    out
+}
+
+/// An attribute value with XML's character references replaced: the five named ones
+/// ("Ratchet &amp; Clank") and numeric ones (`&#39;`, `&#x27;`). Anything else stays as written.
+fn xml_unescape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').and_then(|end| {
+            let c = match &rest[1..end] {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                r => {
+                    let n = r.strip_prefix("#x").map(|h| u32::from_str_radix(h, 16)).or_else(|| r.strip_prefix('#').map(|d| d.parse()))?;
+                    char::from_u32(n.ok()?)?
+                }
+            };
+            Some((c, end + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     xml_attrs(xml, tag, attr).into_iter().next()
 }
@@ -173,6 +250,14 @@ fn quote(a: &str) -> String {
 }
 
 pub fn run(target: &Path, args: &[String]) -> i32 {
+    run_with_ui(target, args, false)
+}
+
+pub fn run_from_menu(target: &Path) -> i32 {
+    run_with_ui(target, &[], true)
+}
+
+fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
     let (root, explicit_exe, title) = match resolve_location(target) {
         Ok(x) => x,
         Err(e) => {
@@ -275,7 +360,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         cmdline.push(' ');
         cmdline.push_str(&quote(a));
     }
-    let code = match spawn_host(&cmdline, &root, &boot_path) {
+    let code = match spawn_host(&cmdline, &root, &boot_path, menu) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("xcl: failed to start the game process: {e}");
@@ -335,12 +420,20 @@ pub fn missing_console_cpu_features() -> Vec<&'static str> {
     })
 }
 
-fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {
+fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path, menu: bool) -> Result<u32, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
     };
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE};
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    // An inheritable, synchronize-only handle identifies this exact launcher even after PID reuse.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 1, GetCurrentProcessId()) };
+    if handle.is_null() { return Err(std::io::Error::last_os_error().to_string()); }
+    let parent = unsafe { OwnedHandle::from_raw_handle(handle) };
+    std::env::set_var("XCL_PREPARATION_PARENT", (parent.as_raw_handle() as usize).to_string());
+    if menu { std::env::set_var("XCL_PREPARATION_MENU", "1"); }
     std::env::set_var("XCL_HOST", boot_path);
     let app = wide(&me.to_string_lossy());
     let mut cmd = wide(cmdline);
@@ -361,9 +454,12 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
             &si,
             &mut pi,
         );
+        let error = GetLastError();
         std::env::remove_var("XCL_HOST");
+        std::env::remove_var("XCL_PREPARATION_PARENT");
+        std::env::remove_var("XCL_PREPARATION_MENU");
         if ok == 0 {
-            return Err(format!("CreateProcessW: error {}", GetLastError()));
+            return Err(format!("CreateProcessW: error {error}"));
         }
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut code = 0u32;

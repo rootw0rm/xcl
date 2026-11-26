@@ -1047,8 +1047,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used: Option<std::collections::HashSet<u64>> = None;
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        // `--sample N`: only the first N programs `--only` lets through (all without it)
-        return precompile(&input, opts.limit, opts.sample.unwrap_or(usize::MAX), windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0);
+        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0, None) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
+        };
     }
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
@@ -1513,14 +1515,21 @@ unsafe impl Sync for Pipelines {}
 
 #[cfg(windows)]
 impl Pipelines {
-    fn new() -> Result<Pipelines, String> {
+    fn new() -> Result<Pipelines, String> { Self::for_adapter("auto") }
+
+    fn for_adapter(adapter: &str) -> Result<Pipelines, String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
-            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
-            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
-            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+            let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
+            let dev = if sel == crate::gpu::adapter::Selector::Warp {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
+                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+            } else {
+                let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+                crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+            };
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines {
@@ -1708,51 +1717,74 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-/// An MS the runtime builds as two-pass pipelines (`pso::console_mesh`): its first NGG variant
-/// (hardware stage 7) has a triangle interface (lines / points are not translated).
-#[cfg(windows)]
-fn two_pass_mesh(blob: &[u8], sh: &xbox::XboxShader) -> bool {
-    sh.stage == "MS"
-        && sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).is_some_and(|f| matches!(recomp::interface(blob, sh, f), Some(recomp::Mode::Mesh(_))))
+#[derive(Default)]
+pub(crate) struct LaunchPreparation {
+    pub adapter: String,
+    pub done: AtomicUsize,
+    pub total: AtomicUsize,
+    pub cancel: std::sync::atomic::AtomicBool,
 }
 
-/// The compute pipeline a title makes from a console program, as the runtime makes it, and the
-/// file the runtime looks for its driver blob in: a CS's own pipeline (`pso::console_to_dxil_in`;
-/// None: `Pipelines` keys it as the runtime keys compute pipelines), or, for an MS (`mesh`), the
-/// compute pass of its two-pass pipelines (`pso::console_mesh_in` with no pixel shader – the
-/// compute pass does not depend on it –, `real::two_pass_compute_blob_path`).
+/// Unpacked shader containers in the title's shaders directory. Do not follow directory
+/// junctions into another tree or back into the shader directory.
+// Windows-only (std::os::windows + DXC preparation flow); Linux gets its own
+// preparation when the SPIR-V backend lands (Phase D).
 #[cfg(windows)]
-fn precompiled_compute(blob: &[u8], mesh: bool, split: bool, windows: u32) -> Result<(recomp::pso::Compiled, Option<PathBuf>), String> {
-    if !mesh {
-        return recomp::pso::console_to_dxil_in(blob, recomp::pso::Stage::Compute, 0, split, windows).map(|c| (c, None));
-    }
-    let tp = recomp::pso::console_mesh_in(blob, None, split, windows)?;
-    let path = crate::hle::d3d12x::real::two_pass_compute_blob_path(&tp.cs);
-    Ok((recomp::pso::Compiled { dispatch_chain: None, dxil: tp.cs, samplers: tp.samplers }, path))
-}
-
-/// Like `precompiled_compute`, also reporting whether the compute program came from the
-/// in-memory or translated disk cache (`true` = cache hit). An MS's compute pass always
-/// reports newly translated: `console_mesh_in` gives no per-call cache status.
-#[cfg(windows)]
-fn precompiled_compute_cached(blob: &[u8], mesh: bool, split: bool, windows: u32) -> Result<(recomp::pso::Compiled, Option<PathBuf>, bool), String> {
-    if !mesh {
-        return recomp::pso::console_to_dxil_in_status(blob, recomp::pso::Stage::Compute, 0, split, windows).map(|(c, hit)| (c, None, hit));
-    }
-    precompiled_compute(blob, mesh, split, windows).map(|(c, path)| (c, path, false))
-}
-
-#[cfg(windows)]
-fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
-    let adapter_init = ShaderPhase::start("precompile-init", None, 0);
-    let pipelines = if pipelines {
-        match Pipelines::new() {
-            Ok(p) => Some(p),
-            Err(e) => {
-                eprintln!("xcl shaders --pipelines: no GPU device: {e}");
-                return 2;
-            }
+fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 { continue; }
+        let path = entry.path();
+        if metadata.is_dir() {
+            loose_inputs(&path, files)?;
+        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dxbc")) {
+            files.push(path);
         }
+    }
+    Ok(())
+}
+
+// Windows-only (DXC pipeline cache + D3D12 device); Linux gets its own
+// preparation when the SPIR-V backend lands (Phase D).
+#[cfg(windows)]
+pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
+    let mut inputs = Vec::new();
+    let pack = root.join("shaders.rpf");
+    if pack.try_exists().map_err(|e| e.to_string())? {
+        let data = std::fs::read(&pack).map_err(|e| format!("Reading {}: {e}", pack.display()))?;
+        if !data.starts_with(pack::RPF9_MAGIC) { return Err(format!("Unrecognized shader pack: {}", pack.display())); }
+        let records = pack::scan(&data, 0x40);
+        if records.is_empty() { return Err(format!("No readable shader records in {}", pack.display())); }
+        inputs.push(Input::Pack { data, records });
+    }
+    let loose = root.join("shaders");
+    if loose.is_dir() {
+        let mut files = Vec::new();
+        loose_inputs(&loose, &mut files).map_err(|e| format!("Reading {}: {e}", loose.display()))?;
+        if !files.is_empty() { inputs.push(Input::Files(files)); }
+    }
+    progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
+    let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
+    if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
+    for input in inputs {
+        if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
+        precompile(&input, usize::MAX, windows, None, None, true, None, std::time::Instant::now(), Some(progress))?;
+    }
+    Ok(())
+}
+
+// Windows-only (Pipelines/DXC/D3D12); see the Linux stub below.
+#[cfg(windows)]
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
+    let pipelines = if pipelines {
+        let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
+            .map_err(|e| format!("No pipeline device: {e}"))?;
+        if startup.is_some() && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
+            p.max_dxil = 0;
+        }
+        Some(p)
     } else {
         None
     };
@@ -1769,12 +1801,12 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
-    recomp::dxc::set_memory_reserve(2);
+    if startup.is_none() { recomp::dxc::set_memory_reserve(2); }
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
-    let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
-    let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
-    drop(adapter_init);
+    let startup_device = pipelines.filter(|_| startup.is_some());
+    let graphics_split = split.unwrap_or_else(|| startup_device.map_or_else(recomp::runner::graphics_wave32, |p| recomp::pso::graphics_wave32_for_device(&p.dev)));
+    let split = split.unwrap_or_else(|| startup_device.map_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w), |p| recomp::pso::wave32_only_for_device(&p.dev)));
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
@@ -1786,15 +1818,31 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
+                if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { break; }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
                 }
+                let record_done = || {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(p) = startup { p.done.fetch_add(1, Ordering::Relaxed); }
+                    if d % 200 == 0 { eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64()); }
+                };
                 let (name, blob) = input.get(i);
-                let Some(blob) = blob else { continue };
-                let Some(sh) = xbox::parse(&blob) else { continue };
+                let Some(blob) = blob else {
+                    if startup.is_some() { failed.fetch_add(1, Ordering::Relaxed); }
+                    record_done();
+                    continue;
+                };
+                let Some(sh) = xbox::parse(&blob) else {
+                    if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    record_done();
+                    continue;
+                };
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
-                    done.fetch_add(1, Ordering::Relaxed);
+                    record_done();
                     continue;
                 }
                 // `--sample N`: the first N programs `--only` lets through
@@ -1810,7 +1858,7 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                     // a mesh pipeline's key has its PS too: `--used-only` passes the MSs over
                     if used.is_some_and(|u| mesh || !used_compute(&blob, u)) {
                         unused.fetch_add(1, Ordering::Relaxed);
-                        done.fetch_add(1, Ordering::Relaxed);
+                        record_done();
                         continue;
                     }
                     let record = ShaderPhase::enabled().then(|| shader::fnv64(&blob));
@@ -1821,12 +1869,10 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                     match translated {
                         Ok((c, path, from_cache)) => {
                             if let Some(p) = pipelines {
-                                p.make_with_cache_path(&c, path, record);
-                            }
-                            if from_cache {
-                                cached.fetch_add(1, Ordering::Relaxed)
-                            } else {
-                                compiled.fetch_add(1, Ordering::Relaxed)
+                                p.make(&c);
+                                if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
+                                    p.make_one(&c.dxil, &c.samplers, true, None);
+                                }
                             }
                         }
                         Err(e) => {
@@ -1837,10 +1883,7 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                             failed.fetch_add(1, Ordering::Relaxed)
                         }
                     };
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 200 == 0 {
-                        eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
-                    }
+                    record_done();
                     continue;
                 }
                 let (mut warmed_vs, mut warmed_ps) = (false, false);
@@ -1895,10 +1938,21 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
-                        let Ok(t) = recomp::translate(code, &opt) else { continue };
-                        if !t.complete() {
-                            continue;
-                        }
+                        let t = match recomp::translate(code, &opt) {
+                            Ok(t) if t.complete() => t,
+                            Ok(_) => {
+                                if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
+                                continue;
+                            }
+                            Err(e) => {
+                                if startup.is_some() {
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    let mut logs = errors.lock().unwrap();
+                                    if logs.len() < 10 { logs.push(format!("{name}: {e}")); }
+                                }
+                                continue;
+                            }
+                        };
                         for (profile, src) in &jobs {
                             match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
@@ -1914,18 +1968,17 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
                         }
                     }
                 }
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 200 == 0 {
-                    eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
-                }
+                record_done();
             });
         }
     });
+    let failed = failed.into_inner();
+    let skipped_reason = if startup.is_some() { "runtime pairing or unsupported translation" } else { "GS – paired at pipeline creation" };
     println!(
-        "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
+        "compiled {}, already cached {}, errors {}, skipped ({skipped_reason}) {}, time {:.1} s",
         compiled.into_inner(),
         cached.into_inner(),
-        failed.into_inner(),
+        failed,
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
@@ -1950,18 +2003,28 @@ fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: O
             println!("pipelines over the {} MiB DXIL cap, left to the runtime: {} ({} MiB of DXIL; XCL_PIPELINE_MAX_KB)", p.max_dxil >> 20, capped, p.capped_bytes.load(Ordering::Relaxed) >> 20);
         }
     }
-    for e in errors.into_inner().unwrap() {
-        println!("  {e}");
+    let errors = errors.into_inner().unwrap();
+    for e in &errors { println!("  {e}"); }
+    if let Some(progress) = startup {
+        if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
+        let p = pipelines.expect("startup requested pipelines");
+        let refused = p.refused.load(Ordering::Relaxed);
+        let capped = p.capped.load(Ordering::Relaxed);
+        if failed + refused + capped > 0 {
+            let cause = errors.first().map(String::as_str).unwrap_or(
+                if capped > 0 { "Raise XCL_PIPELINE_MAX_KB or set it to 0 to prepare larger pipelines." }
+                else { "Check the shader pack and driver diagnostics." });
+            return Err(format!("Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap. {cause}"));
+        }
     }
-    0
+    Ok(())
 }
 
 /// `--precompile` compiles into the DXC cache, which is Windows-only until the SPIR-V backend.
 // LINUX-TODO: Phase D — fill the cache from the SPIR-V backend.
 #[cfg(not(windows))]
-fn precompile(_input: &Input, _limit: usize, _sample: usize, _windows: u32, _split: Option<bool>, _only: Option<&str>, _pipelines: bool, _used: Option<&std::collections::HashSet<u64>>, _t0: std::time::Instant) -> i32 {
-    eprintln!("xcl shaders --precompile: DXC is Windows-only; not supported on Linux yet (Phase D)");
-    2
+fn precompile(_input: &Input, _limit: usize, _windows: u32, _split: Option<bool>, _only: Option<&str>, _pipelines: bool, _used: Option<&std::collections::HashSet<u64>>, _t0: std::time::Instant, _startup: Option<&LaunchPreparation>) -> Result<(), String> {
+    Err("xcl shaders --precompile: DXC is Windows-only; not supported on Linux yet (Phase D)".into())
 }
 
 /// Compile the kept HLSL samples with DXC on all cores: (ok, failures with the first error line).

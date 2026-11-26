@@ -372,14 +372,26 @@ mod tests {
             pViewInstanceLocations: 0x5000 as *const _,
             ..Default::default()
         });
-        with_empty.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &D3D12_SHADER_BYTECODE {
-            pShaderBytecode: 0x6000 as *const _,
-            BytecodeLength: 0,
-        });
+        let empty_shader = D3D12_SHADER_BYTECODE { pShaderBytecode: 0x6000 as *const _, BytecodeLength: 0 };
+        for stage in [
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
+        ] {
+            with_empty.put(stage, &empty_shader);
+        }
 
         unsafe {
             let key = two_pass_stream_key(&base.0, &[], 1, 4).expect("base mesh key");
             assert_eq!(two_pass_stream_key(&with_empty.0, &[], 1, 4), Some(key));
+
+            let mut empty_ms = StreamOut::default();
+            empty_ms.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &empty_shader);
+            assert_eq!(two_pass_stream_key(&empty_ms.0, &[], 1, 4), None);
         }
     }
 
