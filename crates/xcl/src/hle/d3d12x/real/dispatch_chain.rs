@@ -43,7 +43,7 @@ impl PipelineBuilder {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
-            dxil, self.record, iid, &mut raw, true);
+            dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
         (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
     }
 }

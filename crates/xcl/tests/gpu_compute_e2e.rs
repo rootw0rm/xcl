@@ -89,6 +89,86 @@ fn console_cs_flags(code: &[u8], rsrc2: u32, threads: [u32; 3], flags: u32) -> V
 
 const V: u64 = 256; // VALU source code of v0
 
+/// Make several guarded arithmetic blocks so the same shader has both whole and split forms.
+fn guarded_adds() -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut op = |name, enc, fields: &[(&str, u64)]| code.extend(encode(name, enc, fields, None).unwrap());
+    op("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)]);
+    op("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)]);
+    for add in 1..=5 {
+        op("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128 + add)]);
+        op("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)]);
+        op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 128 + add), ("VSRC1", 2)]);
+        op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 135), ("VSRC1", 2)]);
+    }
+    op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 0), ("VSRC1", 4)]);
+    op("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 128)]);
+    op("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 2), ("SADDR", 0x7d)]);
+    op("S_ENDPGM", "ENC_SOPP", &[]);
+    code
+}
+
+#[test]
+fn split_compute_prefers_the_offline_whole_pipeline() {
+    use std::{fs, process::Command};
+    let blob = console_cs(&guarded_adds(), 2 << 1 | 1 << 7, [32,1,1]);
+    if let Ok(case) = std::env::var("XCL_TEST_WHOLE_CASE") {
+        assert_eq!(xcl::hle::d3d12x::backend(), xcl::hle::d3d12x::Backend::Real);
+        let raw = real::device_raw();
+        let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+        let compiled = xcl::gpu::recomp::pso::console_to_dxil_for(&blob, xcl::gpu::recomp::pso::Stage::Compute, 0, true).unwrap();
+        assert!(compiled.dispatch_chain.is_some());
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: blob.as_ptr().cast(), BytecodeLength: blob.len(),
+        }, ..Default::default() };
+        let pso: ID3D12PipelineState = unsafe { dev.CreateComputePipelineState(&desc) }.unwrap();
+        let resolved = pso_async::resolve_wait(pso.as_raw() as usize);
+        assert!(real::is_translated_compute(resolved));
+        let rs = real::pso_root_signature(resolved).unwrap() as *mut std::ffi::c_void;
+        assert_eq!(Some(rs) == real::abi_rs_cached(), case == "hit", "selected root signature");
+        if case == "hit" {
+            let raw = resolved as *mut std::ffi::c_void;
+            let real = unsafe { ID3D12PipelineState::from_raw_borrowed(&raw) }.unwrap();
+            let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs) }.unwrap();
+            let mut expected = vec![0xdeadbeef; 64];
+            let out = runner::dispatch_on(dev, real, rs, [1,1,1], &[32,3], &expected).unwrap();
+            for lane in 0..32 {
+                expected[8+lane] = [1,2,4,5].into_iter().fold(lane as u32, |v, add| (v + add) ^ 7);
+            }
+            assert_eq!(out, expected);
+        }
+        return;
+    }
+    if xcl::gpu::recomp::dxc::location().is_err() || !runner::wave32_supported().unwrap_or(false) {
+        return runner::skip_test("requires DXC and a wave32 GPU");
+    }
+    let dir = std::env::temp_dir().join(format!("xcl-guarded-adds-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("guarded.bin"), blob).unwrap();
+    let run = |cmd: &mut Command| {
+        let out = cmd.env("XCL_DIRECT_DXIL","1")
+            .env("XCL_DXIL_CACHE",&cache).env("XCL_PSO_DISK_CACHE","1").output().unwrap();
+        assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    };
+    // Seed the ordinary whole PSO offline, then force the runtime to choose between it and a split chain.
+    run(Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input).args(["--precompile","--pipelines"])
+        .env("XCL_DIRECT_SPLIT_INSTRUCTIONS","12500"));
+    let mut files = fs::read_dir(cache.join("driver")).unwrap();
+    let blob = files.next().unwrap().unwrap().path();
+    assert!(files.next().is_none() && blob.metadata().unwrap().len() > 0);
+    for case in ["hit","stale","miss"] {
+        if case == "stale" { fs::write(&blob, b"rejected driver cache fixture").unwrap(); }
+        run(Command::new(std::env::current_exe().unwrap()).args(["--exact","split_compute_prefers_the_offline_whole_pipeline","--nocapture"])
+            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS","12").env("XCL_TEST_WHOLE_CASE",case));
+        assert_eq!(blob.exists(), case == "hit");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn offline_compute_pipeline_is_reused_by_a_second_process() {
     use std::{fs, process::Command};
@@ -110,6 +190,7 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     let run = |enabled: bool| {
         let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
             .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
+            .env("TMP", &dir).env("TEMP", &dir).env("XCL_DXIL_DUMP", "all")
             .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
@@ -118,8 +199,10 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     run(false);
     assert!(!cache.join("driver").exists());
     run(true);
-    let dxil_file = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).unwrap();
+    let direct = dir.join("xcl-dxil-dump");
+    let dxil_dir = if direct.is_dir() { &direct } else { &cache };
+    let dxil_file = fs::read_dir(dxil_dir).unwrap().map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).expect("compiled fixture DXIL");
     let dxil = fs::read(dxil_file).unwrap();
     let name = format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len());
     let driver_file = cache.join("driver").join(name);
@@ -127,7 +210,10 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     let warm = run(true);
     // A blob from an earlier driver can be refused. The normal build must still succeed.
     fs::write(&driver_file, b"invalid cached pipeline").unwrap();
-    run(true);
+    let stale = run(true);
+    assert!(stale.contains("pipelines loaded from the driver cache 0"), "{stale}");
+    let repaired = run(true);
+    assert!(repaired.contains("pipelines loaded from the driver cache 1"), "{repaired}");
     let _ = fs::remove_dir_all(&dir);
     assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
 }

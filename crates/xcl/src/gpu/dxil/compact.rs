@@ -39,15 +39,28 @@ impl Plan {
     }
 }
 
-/// Whether a program takes the form by itself: large, mostly repeated blocks, small tables.
-pub fn wanted(cfg: &Cfg, p: &Plan, tables: usize) -> bool {
+/// A consumed atomic result prevents cutting a dispatch into independent pipelines.
+/// Consider a compact whole pipeline for branch-heavy split-wave compute shaders instead.
+pub(super) fn atomic_candidate(cfg: &Cfg) -> bool {
+    cfg.rpo.len() >= 250 && cfg.rpo.iter().flat_map(|&b| &cfg.blocks[b].insts).any(|&i| {
+        let d = &cfg.insts[i];
+        d.inst.name == "BUFFER_ATOMIC_ADD" && crate::gpu::rdna2::field_value(d.enc, &d.words, "GLC") == Some(1)
+    })
+}
+
+pub fn automatic_plan(cfg: &Cfg, lw: &Lw, split_compute: bool, tables: usize) -> Option<Plan> {
+    let large = large(cfg);
+    if !large && !(split_compute && atomic_candidate(cfg)) { return None; }
+    let p = plan(cfg, lw)?;
+    if p.words() > tables { return None; }
     let insts = |n: usize| cfg.blocks[p.order[n]].insts.len();
     let all: usize = (0..p.order.len()).map(insts).sum();
     let once: usize = p.rep.iter().map(|&n| insts(n)).sum();
-    large(cfg) && once * 10 < all * 3 && p.words() <= tables
+    let repeated = if large { once * 10 < all * 3 } else { p.rep.len() * 4 <= p.order.len() };
+    repeated.then_some(p)
 }
 
-/// Whether a program is large enough for `wanted` to be asked.
+/// Whether to consider compaction based on instruction count alone.
 pub fn large(cfg: &Cfg) -> bool {
     cfg.rpo.iter().map(|&b| cfg.blocks[b].insts.len()).sum::<usize>() >= 20_000
 }

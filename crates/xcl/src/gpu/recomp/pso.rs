@@ -15,6 +15,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use super::{dxc, interface, translate, Mode, Options};
 use crate::gpu::xbox;
 
+#[cfg(test)]
+mod offline_cold_profile;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     Vertex,

@@ -1632,6 +1632,14 @@ pub(crate) fn dispatch_split(
 pub(crate) fn dispatch_split_by(
     chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], mem: &[u32], most: u64,
 ) -> Result<Vec<u32>, String> {
+    dispatch_split_samples(chain, groups, &[], mem, most, 1, false).map(|(m, _)| m)
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_split_samples(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], sgprs: &[u32], mem: &[u32],
+    most: u64, reps: usize, timed: bool,
+) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|e| e.clone())?;
     let rs = super::pso::dispatch_chain_root_signature(&gpu.dev, &[])?;
@@ -1642,8 +1650,8 @@ pub(crate) fn dispatch_split_by(
             ..Default::default()
         }).map_err(e)
     }).collect::<Result<_,_>>()?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pieces[0], &rs, groups, &[], mem, 1, false,
-                  Some((&pieces, chain.dwords_per_group, most))).map(|(m,_)| m)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pieces[0], &rs, groups, sgprs, mem, reps, timed,
+                  Some((&pieces, chain.dwords_per_group, most)))
 }
 
 /// `dispatch` run `reps` times in one command list (a UAV barrier between them, memory not
@@ -1661,6 +1669,58 @@ pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32],
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
     dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true, None).map(|(_, t)| t)
+}
+
+#[cfg(test)]
+pub(crate) fn profile_buffer_forms(
+    whole: &[u8], chains: [&crate::gpu::dxil::kernel::DispatchChain; 2], groups: [u32; 3],
+    sgprs: &[u32], mem: &[u32], expected: &[u32], budget: u64,
+) -> Result<(), String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|e| e.clone())?;
+    let rs = super::pso::dispatch_chain_root_signature(&gpu.dev, &[])?;
+    let blob = std::env::var_os("XCL_SAMPLE_REPLAY_WHOLE_PSO").map(std::fs::read).transpose().map_err(|err| err.to_string())?;
+    let build = |code: &[u8], signature: &ID3D12RootSignature, cache: Option<&[u8]>| unsafe {
+        gpu.dev.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(signature),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            CachedPSO: cache.map(|bytes| D3D12_CACHED_PIPELINE_STATE {
+                pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len(),
+            }).unwrap_or_default(),
+            ..Default::default()
+        }).map_err(e)
+    };
+    let base = build(whole, &gpu.rs, blob.as_deref())?;
+    let alternative = std::env::var_os("XCL_SAMPLE_ALTERNATE_WHOLE").map(|path| {
+        let dxil = std::fs::read(path).map_err(|err| err.to_string())?;
+        build(&dxil, &gpu.rs, None)
+    }).transpose()?;
+    let count = if alternative.is_some() { 1 } else { 2 };
+    let pieces: Vec<Vec<_>> = chains[..count].iter().map(|c| c.pieces.iter().map(|p| build(p, &rs, None)).collect::<Result<_,_>>()).collect::<Result<_,_>>()?;
+    let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+    for round in 0..12 {
+        for pass in 0..3 {
+            let variant = (round / 2 + if round % 2 == 0 { pass } else { 2 - pass }) % 3;
+            let whole = match variant { 0 => Some(&base), 2 => alternative.as_ref(), _ => None };
+            let (pso, signature, chain) = if let Some(pso) = whole { (pso, &gpu.rs, None) } else {
+                let i = variant - 1;
+                let words = chains[i].dwords_per_group;
+                let most = (budget / (u64::from(words) * 4)).max(1);
+                (&pieces[i][0], &rs, Some((pieces[i].as_slice(), words, most)))
+            };
+            let (out, times) = dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, pso, signature,
+                groups, sgprs, mem, 12, true, chain)?;
+            if out != expected { return Err(format!("replay readback differs for form {variant}")); }
+            if round >= 3 { samples[variant].extend_from_slice(&times[2..]); }
+        }
+    }
+    for (i, row) in samples.iter_mut().enumerate() {
+        row.sort_by(f64::total_cmp);
+        let mid = row.len() / 2;
+        println!("FORM_TIME form={i} groups={groups:?} budget={budget} n={} median_us={:.3} p90_us={:.3}",
+            row.len(), 500.0 * (row[mid-1]+row[mid]), row[row.len()*9/10]*1000.0);
+    }
+    Ok(())
 }
 
 /// Dispatch with an existing compute pipeline on `dev` (its own queue), e.g. one the D3D12.X

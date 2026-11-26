@@ -145,6 +145,9 @@ impl Shader {
                 stride = stride.checked_add(words)?;
             }
         }
+        if cfg!(test) && std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_some() {
+            (stride, slots) = self.m.reuse_piece_slots(&plan, &slots)?;
+        }
         stride.checked_mul(threads[0])?.checked_mul(4)?;
         let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix)).collect::<Option<Vec<_>>>()?;
         Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(threads[0])? })
@@ -316,6 +319,38 @@ fn inst(v: Value) -> Option<usize> {
 }
 
 impl Module {
+    fn reuse_piece_slots(&self, plan: &Plan, slots: &BTreeMap<Value, u32>) -> Option<(u32, BTreeMap<Value, u32>)> {
+        let mut stage = vec![0; self.blocks.len()];
+        for (i, blocks) in plan.blocks.iter().enumerate() {
+            for block in blocks { stage[block.0 as usize] = i; }
+        }
+        let mut last = BTreeMap::new();
+        for edge in &plan.edges {
+            for &v in &edge.live {
+                let end = last.entry(v).or_insert(0);
+                *end = (*end).max(stage[edge.to.0 as usize]);
+            }
+        }
+        let mut ranges = Vec::with_capacity(slots.len());
+        for &v in slots.keys() {
+            let start = stage[self.def_block[inst(v)?].0 as usize];
+            ranges.push((start, v, last[&v], self.transport_words(v)? as usize));
+        }
+        ranges.sort_unstable();
+        let mut occupied_until = Vec::new();
+        let mut layout = BTreeMap::new();
+        for (start, v, end, size) in ranges {
+            // A restore can be sunk to the end of its piece, so even values last
+            // consumed in the writer's own piece must keep separate slots.
+            let index = occupied_until.windows(size).position(|words| words.iter().all(|&e| e < start))
+                .unwrap_or(occupied_until.len());
+            occupied_until.resize(occupied_until.len().max(index + size), end);
+            occupied_until[index..index + size].fill(end);
+            layout.insert(v, u32::try_from(index + 1).ok()?);
+        }
+        Some((u32::try_from(occupied_until.len() + 1).ok()?, layout))
+    }
+
     fn global_root(&self, v: Value) -> Option<usize> {
         match v {
             Value::Global(g) => Some(g as usize),
@@ -1094,6 +1129,44 @@ mod tests {
             assert_eq!(reference, expected, "unsplit {threads}");
             let result = runner::dispatch_split(&chain, [2, 3, 2], &initial).unwrap();
             assert_eq!(result, expected, "split {threads}");
+            if std::env::var_os("XCL_SAMPLE_CHAIN_TIMINGS").is_some() {
+                for depth in [2, 128] {
+                    let groups = [2, 3, depth];
+                    let words = (threads * 6 * depth) as usize;
+                    let initial: Vec<_> = (0..words + 16).map(|i| if i < words { i as u32 + 17 } else { 0xdeadbeef }).collect();
+                    let mut expected = initial.clone();
+                    for _ in 0..9 {
+                        for (i, v) in expected[..words].iter_mut().enumerate() {
+                            let (scale, bias): (u32, u32) = match i % 4 {
+                                0 => { *v = 100_000 + i as u32; continue; }
+                                1 => (17, 200),
+                                2 => (49, 408),
+                                _ => (33, 144),
+                            };
+                            *v = v.wrapping_mul(scale).wrapping_add(bias);
+                        }
+                    }
+                    let mut rows = [Vec::new(), Vec::new()];
+                    for round in 0..4 {
+                        for pass in 0..2 {
+                            let variant = (round + pass) % 2;
+                            let samples = if variant == 0 {
+                                runner::dispatch_timed(&whole, groups, &[], &initial, 9).unwrap()
+                            } else {
+                                let (out, times) = runner::dispatch_split_samples(&chain, groups, &[], &initial, u64::MAX, 9, true).unwrap();
+                                assert_eq!(out, expected, "timed chain {threads} at depth {depth}");
+                                times
+                            };
+                            rows[variant].extend_from_slice(&samples[1..]);
+                        }
+                    }
+                    for (variant, row) in rows.iter_mut().enumerate() {
+                        row.sort_by(f64::total_cmp);
+                        println!("CHAIN_TIME lanes={threads} groups={} variant={variant} n={} median_us={:.3}", 6 * depth,
+                            row.len(), 500.0 * (row[row.len()/2 - 1] + row[row.len()/2]));
+                    }
+                }
+            }
             // in slabs: single groups, a row (and a part of one), a plane, all
             for most in [1, 2, 3, 6, 7, 12] {
                 let result = runner::dispatch_split_by(&chain, [2, 3, 2], &initial, most).unwrap();

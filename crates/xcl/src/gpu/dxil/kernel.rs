@@ -74,7 +74,7 @@ pub fn dispatch_piece_limit() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
-/// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset leaves it to `compact::wanted`.
+/// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
 pub fn compact_mode() -> Option<bool> {
     match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
         Ok("1") => Some(true),
@@ -278,8 +278,12 @@ fn translate_on_this_thread(
         }
     }
 
-    let plan = if (compute || kernel) && compact.unwrap_or_else(|| super::compact::large(&cfg)) { super::compact::plan(&cfg, &lw) } else { None };
-    let plan = plan.filter(|p| compact.unwrap_or_else(|| super::compact::wanted(&cfg, p, tables)));
+    let plan = match compact {
+        _ if !compute && !kernel => None,
+        Some(false) => None,
+        Some(true) => super::compact::plan(&cfg, &lw),
+        None => super::compact::automatic_plan(&cfg, &lw, compute && split, tables),
+    };
     if let Some(p) = &plan {
         crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());
     }

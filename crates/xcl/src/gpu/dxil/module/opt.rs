@@ -99,6 +99,7 @@ impl Module {
         match op {
             Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) | Op::Gep(..) => Cse::Dom,
             Op::Load(p, _) if self.is_const_global_ptr(*p) => Cse::Dom,
+            Op::Phi(_) if cfg!(test) && std::env::var_os("XCL_SAMPLE_PHI_CSE").is_some() => Cse::Block,
             Op::Call(f, _) if self.funcs[*f as usize].attrs == FnAttrs::ReadNone => Cse::Dom,
             Op::Call(f, _) if self.wave_call(*f) && !self.funcs[*f as usize].name.starts_with("dx.op.waveIsFirstLane") => Cse::Block,
             _ => Cse::No,

@@ -4342,7 +4342,12 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     let record = crate::gpu::shader::fnv64(cs);
-    if let Some(plan) = compiled.dispatch_chain {
+    let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
+        let rs = abi_rs_for(this, &compiled.samplers)?;
+        let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
+        (result.0 >= 0).then_some((rs, result))
+    });
+    if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
         if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
@@ -4355,9 +4360,14 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             return Some(Ok(0));
         }
     }
-    let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
+    let (rs, (hr, in_driver, reused)) = match warm {
+        Some(hit) => hit,
+        None => {
+            let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
+            (rs, compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::Whole))
+        }
+    };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
-    let (hr, in_driver, reused) = compute_container(this, f, d, rs, &dxil, record, riid, ppv, false);
     if hr < 0 {
         // A huge program's verdict in the log itself: `note_translation_error` goes to the
         // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
@@ -4395,10 +4405,18 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
 
-/// `chained`: built with the dispatch chain's root signature (`dispatch_chain`), whose driver blobs
-/// are kept apart on disk from the same DXIL's under the title's.
+#[derive(Clone, Copy, PartialEq)]
+enum ComputeBuild {
+    Whole,
+    // Try the existing whole program before building a chain. A miss or rejected blob falls
+    // through to building the pieces, whose cold build is cheaper.
+    CachedWhole,
+    // The chain root signature has a separate on-disk namespace.
+    Chain,
+}
+
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
-    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, chained: bool) -> (HRESULT, std::time::Duration, bool) {
+    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
@@ -4408,13 +4426,15 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, chained);
+    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
     }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    } else if mode == ComputeBuild::CachedWhole {
+        return (E_INVALIDARG, std::time::Duration::ZERO, false);
     }
     // in the background, a few at a time and within the commit headroom the program asks for
     let (mut hr, mut in_driver) = driver_compile_identified(
@@ -4429,6 +4449,9 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         forget_compute_blob(key);
         if from_disk {
             driver_cache::note(false, disk.as_deref());
+        }
+        if mode == ComputeBuild::CachedWhole {
+            return (hr, in_driver, false);
         }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         let (retried, took) = driver_compile_identified(
@@ -4683,6 +4706,54 @@ fn forget_compute_blob(key: (u64, usize, i32)) {
 
 #[cfg(test)]
 mod compute_blob_tests {
+    #[test]
+    fn recorded_split_selects_cached_whole_or_pieces() {
+        use super::*;
+        use crate::gpu::recomp::pso::{console_to_dxil_for, Stage};
+        let Some(input) = std::env::var_os("XCL_SAMPLE_RUNTIME_COMPUTE") else { return };
+        let cache = std::path::PathBuf::from(std::env::var_os("XCL_DXIL_CACHE").expect("private empty replay cache"));
+        let mode = std::env::var("XCL_SAMPLE_CACHE_CASE").unwrap();
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let raw = device_raw();
+        let code = std::fs::read(input).unwrap();
+        let c = console_to_dxil_for(&code, Stage::Compute, 0, wave32_only(raw)).unwrap();
+        assert!(c.dispatch_chain.is_some());
+        let path = driver_cache::path(&c.dxil, 0).unwrap();
+        assert!(path.starts_with(&cache));
+        assert_eq!(path.exists(), mode == "offline", "expected driver cache entry at {}", path.display());
+        unsafe {
+            let root = abi_rs_for(raw, &c.samplers).unwrap();
+            let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateComputePipelineState")));
+            let iid = pc_iid(Kind::PipelineState);
+            match mode.as_str() {
+                "hit" => {
+                    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root), CS: bytecode(&c.dxil), ..Default::default()
+                    };
+                    let mut ptr = std::ptr::null_mut();
+                    assert!(create(raw, (&desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast(), &iid, &mut ptr) >= 0);
+                    let blob = ID3D12PipelineState::from_raw(ptr).GetCachedBlob().unwrap();
+                    assert!(driver_cache::write(&path, std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize())));
+                }
+                "stale" => assert!(driver_cache::write(&path, b"invalid driver blob")),
+                "miss" | "offline" => (),
+                _ => panic!("unknown replay case"),
+            }
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: bytecode(&code), ..Default::default() };
+            let mut out = std::ptr::null_mut();
+            let start = std::time::Instant::now();
+            let hr = translated_compute_pso_once(raw, create, (&desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast(), &iid, &mut out)
+                .expect("recognized compute shader").expect("translated pipeline");
+            assert!(hr >= 0 && !out.is_null());
+            let whole = LAST_COMPUTE_RS.with(|s| s.get()) == root as usize;
+            println!("RUNTIME_CACHE case={mode} whole={whole} elapsed_ms={:.2}", start.elapsed().as_secs_f64()*1000.);
+            let expected_whole = matches!(mode.as_str(), "hit" | "offline");
+            assert_eq!(whole, expected_whole);
+            assert_eq!(path.exists(), expected_whole);
+            drop(ID3D12PipelineState::from_raw(out));
+        }
+    }
+
     #[test]
     fn a_blob_is_found_only_for_the_same_program_root_signature_and_flags_and_is_forgotten() {
         let dxil = vec![7u8; 1000];
