@@ -138,7 +138,7 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
 
 /// The real pipeline of `pso` (waits when it is a stand-in still being built).
 fn real_pso(pso: &ID3D12PipelineState) -> ID3D12PipelineState {
-    let real = xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void;
+    let real = xcl::hle::d3d12x::pso_async::wait_built(pso.as_raw() as usize) as *mut std::ffi::c_void;
     unsafe { ID3D12PipelineState::from_raw_borrowed(&real) }.unwrap().clone()
 }
 
@@ -181,7 +181,7 @@ fn pso_through_hook_raw(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CS
     let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }.expect("CreateGraphicsPipelineState through the backend hook");
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
     // built in the background behind a stand-in when its shaders were not compiled yet
-    xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize);
+    xcl::hle::d3d12x::pso_async::wait_built(pso.as_raw() as usize);
     let after = real::stats();
     assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO was not built from the translated shaders: {:?}", after.translation_errors);
     assert_eq!(after.fallback_pipelines, before.fallback_pipelines, "fallback shaders were used");
@@ -350,7 +350,7 @@ fn retail_pipelines_built_in_the_background_behind_a_stand_in() {
     let raw = mesh.as_raw() as usize;
     // the title's description is gone (scribbled over); the worker builds from its own copy
     unsafe { std::ptr::write_bytes(&mut st as *mut Stream, 0xCD, 1) };
-    assert_ne!(pso_async::resolve_wait(raw), raw);
+    assert_ne!(pso_async::wait_built(raw), raw);
     assert!(real::two_pass_of(raw).is_some(), "the two-pass parts through the stand-in");
     println!("mesh: the call returned after {call:?}, the real pipeline was ready after {:?}", t0.elapsed());
     // the title releases the stand-in: its real pipeline goes with it, the address is forgotten

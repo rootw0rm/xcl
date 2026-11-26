@@ -7526,7 +7526,7 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     }
 }
 
-/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
+/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use, up to `XCL_PSO_WAIT_MS`).
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
     cl_set_pipeline_state(this, pso)

@@ -642,6 +642,45 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
     }
 }
 
+/// The rest of a direct list's state a PC Reset clears, on `list` (a segment going on from
+/// another): depth bias for `bound_pso`, index buffer, depth bounds.
+unsafe fn restore_direct(list: *mut c_void, dev_raw: usize, bound_pso: usize, depth_bias: Option<DepthBias>, index_buffer: Option<D3D12_INDEX_BUFFER_VIEW>, depth_bounds: Option<(f32, f32)>) {
+    let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
+    let mut applied_native = false;
+    if let Some((true, static_bias)) = info {
+        let target = depth_bias.unwrap_or(static_bias);
+        if target.is_zero() {
+            applied_native = true;
+        } else if try_native_depth_bias(list, target) {
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                s.native_bias = target;
+            }
+            applied_native = true;
+        }
+    } else if bound_pso == 0 {
+        if let Some(b) = depth_bias {
+            if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(list, b) {
+                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                    s.native_bias = b;
+                }
+                applied_native = true;
+            }
+        }
+    }
+    if depth_bias.is_some() && !applied_native {
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            s.pso_dirty = true;
+        }
+        DEPTH_BIAS_USED.store(true, Ordering::Release);
+    }
+    if let Some(ref view) = index_buffer {
+        set_index_buffer(list, Some(view));
+    }
+    if let Some((min, max)) = depth_bounds {
+        pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(list, PC_OM_SET_DEPTH_BOUNDS)(list, min, max);
+    }
+}
+
 #[derive(Default)]
 struct ListState {
     allocator: usize,
@@ -689,6 +728,9 @@ struct ListState {
     predication: Option<D3D12_PREDICATION_OP>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
+    /// queries begun on this recording and not ended yet (all types but timestamps): a call is
+    /// not put off to a segment of its own meanwhile (Begin and End must be in one PC list)
+    queries_open: u32,
     /// what this segment records at the submit (`defer`)
     deferred: Option<Deferred>,
     /// on a title list's first segment: the allocator its deferred segments record on (the title's may be recording another list by the submit)
@@ -697,7 +739,7 @@ struct ListState {
     retained_psos: HashMap<usize, ID3D12PipelineState>,
 }
 
-/// A `Dispatch` or a dispatching `ExecuteIndirect` put off to the submit, with its arguments.
+/// A `Dispatch` or an `ExecuteIndirect` (dispatching or drawing) put off to the submit, with its arguments.
 pub(super) enum Deferred {
     Dispatch(u32, u32, u32),
     Indirect(usize, u32, usize, u64, usize, u64),
@@ -2994,34 +3036,36 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     Some(next_pc)
 }
 
-/// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
+/// Gives a call whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+    // With bounded waits (`XCL_PSO_WAIT_MS`) the call is recorded now and its bind waits at most
+    // that long, as before calls were put off: a segment per unbuilt call ran a retail title out
+    // of command list memory (Close: E_OUTOFMEMORY, then the device was removed, 0x887a0001)
+    // when its world start bound thousands of them with `XCL_PSO_WAIT_MS=1`.
+    if super::pso_async::waits_bounded() {
+        return false;
+    }
     if split(list, Some(what)).is_none() {
         return false;
     }
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
-        crate::xlog_info!("D3D12.X: dispatch with a pipeline still being built put off to the submit (#{n})");
+        crate::xlog_info!("D3D12.X: a call with a pipeline still being built put off to the submit (#{n})");
     }
     true
 }
 
-/// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.
-const WANTED_AT_ONCE: usize = 4;
-
-/// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
+/// Records the deferred dispatches of `wrapper`'s recording, each once its pipeline is built
+/// (`pso_async::wait_for_submit`: not bounded by `XCL_PSO_WAIT_MS`).
 pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let mut segs = Vec::new();
     super::title_list::push_segments(wrapper, &mut segs);
     let Some(&first) = segs.first() else { return };
     segs.retain(|&seg| seg == first || LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(seg as usize))).is_some_and(|s| s.deferred.is_some()));
     let mut last: Option<*mut c_void> = None;
-    for (i, &seg) in segs.iter().enumerate().skip(1) {
-        for &ahead in segs[i..].iter().take(WANTED_AT_ONCE) {
-            super::bind::want_bound(ahead);
-        }
-        let Some((what, ty, heaps)) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(seg as usize))).and_then(|s| Some((s.deferred.take()?, s.list_type?, s.bindings.heaps.clone()))) else {
+    for &seg in segs.iter().skip(1) {
+        let Some((what, ty, bindings, depth_bias, index_buffer, depth_bounds)) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(seg as usize))).and_then(|s| Some((s.deferred.take()?, s.list_type?, s.bindings.clone(), s.depth_bias, s.index_buffer, s.depth_bounds))) else {
             continue;
         };
         let Some(own) = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(first as usize))?.own_alloc.clone()) else {
@@ -3034,8 +3078,14 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             Some(_) => 0,
             None => super::alloc_pool::title_reset(own).unwrap_or_else(|| real::reset_pc_allocator(own)),
         };
+        // a drawing ExecuteIndirect starts with the pipeline it was recorded with, waited for as a
+        // bind did: one whose build failed goes to the PC with the stand-in bound, as in its
+        // list (a dispatch binds its own pipeline or is skipped)
+        let bound_pso = super::bind::tracked_pso(seg);
+        let draws = matches!(what, Deferred::Indirect(..)) && !super::real::is_console_compute(bound_pso);
+        let init_pso = if draws { super::pso_async::resolve_wait(bound_pso) } else { 0 };
         if hr >= 0 {
-            hr = super::alloc_pool::reset_list(seg as usize, own as usize, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(seg, PC_RESET)(seg, pc_alloc, 0));
+            hr = super::alloc_pool::reset_list(seg as usize, own as usize, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(seg, PC_RESET)(seg, pc_alloc, init_pso));
         }
         real::preserve_vtable(seg, ext);
         if hr < 0 {
@@ -3045,22 +3095,57 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             continue;
         }
         reset_copy_scratch(seg);
-        if !heaps.is_empty() {
-            pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(seg, 28)(seg, heaps.len() as u32, heaps.as_ptr());
+        restore_bindings(seg, &bindings, ty);
+        if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
+            restore_direct(seg, device_of(seg).map_or(0, |d| d.as_raw() as usize), bound_pso, depth_bias, index_buffer, depth_bounds);
         }
         if let Some(last) = last {
             super::bind::pass_arena(last, seg);
             real::dispatch_chain::list_follows(last as usize, seg as usize);
         }
+        super::bind::wait_for_bound(seg);
         match what {
             Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
         }
         let ext = *(seg as *const usize);
-        pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
+        let hr = segment_close(wrapper, seg);
         real::preserve_vtable(seg, ext);
+        if hr < 0 {
+            // a recording the runtime refused is not submitted: the segment leaves the recording
+            // (a list whose Close failed is still open and cannot be reset), its call is dropped,
+            // and the next one does not follow it
+            static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
+            warn(&CLOSE_ERR, "deferred call", format_args!("Close failed ({hr:#x}), the call is dropped"));
+            super::bind::dispatch_dropped();
+            super::title_list::drop_segment(wrapper, seg);
+            continue;
+        }
         last = Some(seg);
     }
+}
+
+/// (tests) What the next native Close of a put-off segment of this wrapper does instead
+/// (`segment_close`; tests run in parallel, so it is the given wrapper's only).
+#[cfg(test)]
+type CloseHook = Box<dyn FnOnce(*mut c_void) -> i32 + Send>;
+#[cfg(test)]
+static CLOSE_HOOK: Mutex<Vec<(usize, CloseHook)>> = Mutex::new(Vec::new());
+
+/// The native Close of `wrapper`'s put-off segment `p`: its HRESULT.
+unsafe fn segment_close(wrapper: *mut c_void, p: *mut c_void) -> i32 {
+    #[cfg(test)]
+    {
+        let hook = {
+            let mut g = CLOSE_HOOK.lock().unwrap();
+            g.iter().position(|h| h.0 == wrapper as usize).map(|i| g.remove(i).1)
+        };
+        if let Some(hook) = hook {
+            return hook(p);
+        }
+    }
+    let _ = wrapper;
+    pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p)
 }
 
 /// The allocator `list`'s put-off calls recorded on is reset once the GPU is done with them, so
@@ -3087,8 +3172,9 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
     let deferred = match dispatch {
         Some(what) => {
-            // (a predicated call stays in its list)
-            let plain = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.allocator != 0 && s.predication.is_none());
+            // (a predicated call stays in its list, and one inside a query: put off, the query would
+            // not count it, and its Begin and End would be in different PC lists)
+            let plain = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.allocator != 0 && s.predication.is_none() && s.queries_open == 0);
             if !plain {
                 return None;
             }
@@ -3096,7 +3182,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
         None => None,
     };
-    let (alloc, last_queue, bound_pso, bound_resolved, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
+    let (alloc, last_queue, bound_pso, bound_resolved, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings, queries_open) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.as_mut()?.get_mut(&(list as usize))?;
         if s.allocator == 0 {
@@ -3120,6 +3206,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
             ended_early,
             s.written_ranges.clone(),
             s.bindings.clone(),
+            s.queries_open,
         )
     };
 
@@ -3222,6 +3309,8 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
                 pred_in_state: false,
                 predication,
                 bindings: bindings.clone(),
+                // (a query a Wait split ended up spanning still holds put-off calls back)
+                queries_open,
                 ..Default::default()
             },
         );
@@ -3234,40 +3323,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     restore_bindings(next_pc, &bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
-        let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
-        let mut applied_native = false;
-        if let Some((true, static_bias)) = info {
-            let target = depth_bias.unwrap_or(static_bias);
-            if target.is_zero() {
-                applied_native = true;
-            } else if try_native_depth_bias(next_pc, target) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                    s.native_bias = target;
-                }
-                applied_native = true;
-            }
-        } else if bound_pso == 0 {
-            if let Some(b) = depth_bias {
-                if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(next_pc, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                        s.native_bias = b;
-                    }
-                    applied_native = true;
-                }
-            }
-        }
-        if depth_bias.is_some() && !applied_native {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                s.pso_dirty = true;
-            }
-            DEPTH_BIAS_USED.store(true, Ordering::Release);
-        }
-        if let Some(ref view) = index_buffer {
-            set_index_buffer(next_pc, Some(view));
-        }
-        if let Some((min, max)) = depth_bounds {
-            pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(next_pc, PC_OM_SET_DEPTH_BOUNDS)(next_pc, min, max);
-        }
+        restore_direct(next_pc, dev_raw, bound_pso, depth_bias, index_buffer, depth_bounds);
     }
     if ty != D3D12_COMMAND_LIST_TYPE_COPY {
         if let (Some(op), Some(ref pb)) = (predication, pred_buf) {
@@ -3285,7 +3341,13 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
             let mut g = LISTS.lock().unwrap();
             let s = g.get_or_insert_with(HashMap::new).entry(seg as usize).or_default();
             s.list_type = Some(ty);
-            s.bindings.heaps = bindings.heaps.clone();
+            // (what a draw put off to the submit needs again there: `record_deferred`; the title's
+            // pipeline stays the key when the real one is bound there, as on its list)
+            s.bindings = bindings.clone();
+            s.bound_pso = bound_pso;
+            s.depth_bias = depth_bias;
+            s.index_buffer = index_buffer;
+            s.depth_bounds = depth_bounds;
             s.deferred = Some(what);
         }
         super::bind::inherit_for_split(list, seg, alloc);
@@ -3326,8 +3388,15 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
         None => real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)?,
     };
     let ext = *(p as *const usize);
-    pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+    let hr = segment_close(wrapper, p);
     real::preserve_vtable(p, ext);
+    if hr < 0 {
+        // a list that did not close is no segment: the call waits in its list instead
+        static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
+        warn(&CLOSE_ERR, "put-off segment", format_args!("Close failed ({hr:#x})"));
+        super::title_list::put_spare(wrapper, p);
+        return None;
+    }
     super::title_list::push_segment(wrapper, p);
     Some(p)
 }
@@ -3904,7 +3973,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // the list records anew (reset here, not through `cl_reset`)
     super::dred::reset(target);
     if bound_pso != 0 {
-        super::dred::mark_pipeline(target, bound_pso, init_pso);
+        super::dred::mark_pipeline(target, bound_pso, init_pso.ptr());
     }
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
@@ -4878,7 +4947,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // a new recording: a console list's Reset reaches its PC list here, not through `cl_reset`
     super::dred::reset(this);
     if pso != 0 {
-        super::dred::mark_pipeline(this, pso, resolved);
+        super::dred::mark_pipeline(this, pso, resolved.ptr());
     }
 
     super::host_bvh::forget_list(this as usize);
@@ -5319,6 +5388,9 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
 /// command list #28 BeginQuery(heap, type, index) (PC #52)
 pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
+    if ty != D3D12_QUERY_TYPE_TIMESTAMP {
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().queries_open += 1;
+    }
     if is_occlusion(ty) {
         let outer = LISTS
             .lock()
@@ -5343,6 +5415,11 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
 
 /// command list #29 EndQuery(heap, type, index) (PC #53)
 pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
+    if ty != D3D12_QUERY_TYPE_TIMESTAMP {
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            s.queries_open = s.queries_open.saturating_sub(1);
+        }
+    }
     if is_occlusion(ty) {
         let (forward, force_visible) = LISTS
             .lock()
@@ -7295,6 +7372,9 @@ mod tests {
             let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let ca1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let ca2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            for a in [&da, &ca1, &ca2] {
+                super::super::alloc_pool::forget(a.as_raw() as usize);
+            }
             let dl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
             let cl1: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca1, None).unwrap();
             let cl2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca2, None).unwrap();
@@ -8041,7 +8121,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dispatch_with_a_pipeline_still_building_waits_at_the_submit() {
+    fn a_dispatch_with_a_pipeline_still_building_is_recorded_at_once_and_skipped() {
         use super::super::{bind, pso_async, title_list};
         use std::time::{Duration, Instant};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -8081,31 +8161,32 @@ mod tests {
             bind::reset(pc0, alloc.as_raw() as usize, standin);
             let wrap = title_list::wrap(pc0);
 
+            // (no `XCL_PSO_WAIT_MS`: nothing waits for the build, so no dispatch is put off to the
+            // submit; each is recorded at once and skipped as a stand-in's)
             const DISPATCHES: usize = 210;
-            let mut segs = vec![pc0];
+            let skipped = bind::counts_snapshot()[4];
             for n in 1..=DISPATCHES {
                 let t = Instant::now();
-                bind::dispatch(*segs.last().unwrap(), 1, 1, 1);
+                bind::dispatch(pc0, 1, 1, 1);
                 assert!(t.elapsed() < Duration::from_millis(700), "dispatch {n} waited for the build ({:?})", t.elapsed());
-                segs.clear();
-                assert!(title_list::push_segments(wrap, &mut segs));
             }
-            assert_eq!(segs.len(), 1 + 2 * DISPATCHES, "the list before each dispatch, the dispatch, the list after it");
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 1, "a dispatch was put off to the submit");
+            assert!(bind::counts_snapshot()[4] >= skipped + DISPATCHES as u64, "each dispatch is skipped at the bind");
             assert!(pso_async::is_pending(standin));
 
             let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
             assert_eq!(close_fn(wrap), 0);
             assert!(pso_async::is_pending(standin), "Close waited for the build");
 
-            let skipped = bind::counts_snapshot()[4];
-            let build = std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_millis(300));
-                BUILD.store(true, Ordering::Release);
-            });
             record_deferred(wrap);
-            assert!(!pso_async::is_pending(standin), "the submit waits for the build");
-            assert!(bind::counts_snapshot()[4] > skipped, "the dispatch of a build that failed is skipped, at the submit");
-            build.join().unwrap();
+            assert!(pso_async::is_pending(standin), "the submit waited for the build");
+            BUILD.store(true, Ordering::Release);
+            let t = Instant::now();
+            while pso_async::is_pending(standin) && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
 
             type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
             let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
@@ -8115,6 +8196,579 @@ mod tests {
 
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             assert_eq!(rel_fn(wrap), 0);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    /// With `XCL_PSO_WAIT_MS`, a dispatch put off to the submit whose pipeline is built after the
+    /// budget (and that a bind already found `late`) is recorded with the built pipeline: its
+    /// output is written, as is the `Write64` after it in the list. Before, the submit's bind gave
+    /// up after the budget and left the dispatch out while the label still fired.
+    #[test]
+    fn a_put_off_dispatch_runs_at_the_submit_when_its_build_outlasts_the_wait_budget() {
+        use super::super::{bind, pso_async, title_list};
+        use crate::gpu::recomp::runner;
+        use crate::gpu::xbox::tests::{fssm, sample};
+        use std::time::{Duration, Instant};
+
+        if crate::gpu::recomp::dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        if super::super::backend() != super::super::Backend::Real {
+            return runner::skip_test("no GPU");
+        }
+        if runner::wave64_programs_supported() != Ok(true) {
+            return runner::skip_test("no wave64");
+        }
+        if real::uma_window_vas().is_empty() {
+            return runner::skip_test("no unified memory on the GPU");
+        }
+        const MARK: u32 = 0x600D_F00D;
+        const LABEL: u64 = 0x1AB_E15E_7000_0001;
+        unsafe {
+            let raw = real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap().clone();
+            // s[0:1]: the argument table; its first 8 bytes say where the program stores MARK
+            let code: Vec<u8> = [
+                ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 0x7D)][..], None),
+                ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)][..], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 4)][..], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 5)][..], None),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 255)][..], Some(MARK)),
+                ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7D)][..], None),
+                ("S_ENDPGM", "ENC_SOPP", &[][..], None),
+            ]
+            .iter()
+            .flat_map(|(n, e, f, l)| crate::gpu::rdna2::encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}")))
+            .collect();
+            let mut f = fssm(&code, &[(6, 1)]);
+            // COMPUTE_PGM_RSRC2 (2 user SGPRs) and numthreads
+            for (k, x) in [2u32 << 1, 64, 1, 1].into_iter().enumerate() {
+                f[0x138 + 4 * k..0x13C + 4 * k].copy_from_slice(&x.to_le_bytes());
+            }
+            let blob = sample(5, &[f]);
+            let game_rs: ID3D12RootSignature = {
+                let mut ser = None;
+                D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+                let ser = ser.unwrap();
+                dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+            };
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
+                ..Default::default()
+            };
+            let made: windows::core::Result<ID3D12PipelineState> = dev.CreateComputePipelineState(&desc);
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+            let made = made.expect("CreateComputePipelineState through the backend hook");
+            let built = pso_async::resolve_wait(made.as_raw() as usize);
+            assert!(real::is_translated_compute(built), "not translated: {:?}", real::stats().translation_errors);
+
+            // the title's pipeline: a stand-in whose build ends once the submit has begun
+            let standin = 0x7E57_D0F1usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(move || {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    ID3D12PipelineState::from_raw_borrowed(&(built as *mut c_void)).unwrap().clone().into_raw() as usize
+                }),
+            );
+            pso_async::set_wait_budget_for_test(Some(Duration::from_millis(50)));
+            assert_eq!(pso_async::resolve_wait(standin), standin, "a bind as the title records: past the budget, late");
+
+            let u = crate::gpu::uma::get().unwrap();
+            let out = u.alloc(256, 256).unwrap();
+            std::ptr::write_bytes(out, 0, 256);
+            let label = out.add(64) as *mut u64;
+
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let pc0 = real::create_raw_pc_command_list(raw, ty, a, 0).expect("a PC command list");
+            on_create(pc0, a, 0, ty);
+            bind::reset(pc0, a, standin);
+            let wrap = title_list::wrap(pc0);
+            bind::set_args_for_test(pc0, (out as u64).to_le_bytes().to_vec());
+
+            bind::dispatch(pc0, 1, 1, 1);
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the dispatch was not put off");
+            write64_bottom_x(*segs.last().unwrap(), label as u64, LABEL, 0, 0);
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+
+            let build = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(400));
+                BUILD.store(true, Ordering::Release);
+            });
+            let t = Instant::now();
+            record_deferred(wrap);
+            let took = t.elapsed();
+            pso_async::set_wait_budget_for_test(None);
+            build.join().unwrap();
+
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            segs.clear();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let q = queue.as_raw();
+            let exec: ExecFn = if real::is_adopted(q) {
+                std::mem::transmute(real::orig_fn(q, PC_QUEUE_EXECUTE_COMMAND_LISTS))
+            } else {
+                std::mem::transmute(*(*(q as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS))
+            };
+            exec(q, segs.len() as u32, segs.as_ptr());
+            queue.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the list runs");
+            let (mark, labelled) = (std::ptr::read_volatile(out as *const u32), std::ptr::read_volatile(label));
+            let removed = dev.GetDeviceRemovedReason();
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            rel_fn(wrap);
+            pso_async::release(pso_async::released(standin));
+            drop(made);
+            // the allocator's type must not outlive the test: a stale one makes a later list_x test
+            // reset a compute list on a direct backing allocator
+            super::super::alloc_pool::forget(alloc.as_raw() as usize);
+
+            assert!(removed.is_ok());
+            assert_eq!(labelled, LABEL, "the Write64 after the dispatch");
+            assert_eq!(mark, MARK, "the put-off dispatch was left out (the submit waited {took:?})");
+            assert!(took >= Duration::from_millis(300), "the submit did not wait for the build ({took:?})");
+        }
+    }
+
+    #[test]
+    fn a_reset_with_a_compute_pipeline_still_building_does_not_wait() {
+        use super::super::{bind, pso_async, title_list};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            if crate::gpu::recomp::dxc::location().is_err() {
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+
+            // the shared driver pipeline a stand-in binds in its place (`standin::shell`)
+            let dxil = crate::gpu::recomp::dxc::compile("[RootSignature(\"RootFlags(0)\")] [numthreads(1, 1, 1)] void main() {}", "main", "cs_6_0", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let driver: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let standin = 0x7E57_D002usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(|| {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    0
+                }),
+            );
+            pso_async::shared(standin, driver.as_raw() as usize);
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&pc0).unwrap();
+            list.Close().unwrap();
+            let t = Instant::now();
+            let hr = reset_pc(pc0, alloc.as_raw() as usize, standin);
+            assert!(t.elapsed() < Duration::from_millis(700), "Reset waited for the build ({:?})", t.elapsed());
+            assert!(hr >= 0, "Reset failed ({hr:#x})");
+            assert!(pso_async::is_pending(standin), "Reset waited for the build");
+            assert_eq!(LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(pc0 as usize))).map(|s| s.bound_pso), Some(standin));
+
+            // the dispatch that follows is still left for the submit, as after a SetPipelineState
+            let wrap = title_list::wrap(pc0);
+            let t = Instant::now();
+            bind::dispatch(pc0, 1, 1, 1);
+            assert!(t.elapsed() < Duration::from_millis(700), "the dispatch waited for the build ({:?})", t.elapsed());
+            assert!(pso_async::is_pending(standin));
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the list before the dispatch, the dispatch, the list after it");
+
+            BUILD.store(true, Ordering::Release);
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    /// A direct queue, its allocator and a title list wrapped as XCL wraps one, bound to `standin`
+    /// (None: no adapter).
+    unsafe fn put_off_rig(standin: usize) -> Option<(ID3D12Device, ID3D12CommandQueue, ID3D12CommandAllocator, *mut c_void, *mut c_void)> {
+        use super::super::{bind, title_list};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+            if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                return None;
+            }
+        }
+        let dev = dev.unwrap();
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+        let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+        let pc0 = raw.into_raw();
+        real::adopt(pc0, real::Kind::CommandList);
+        on_create(pc0, alloc.as_raw() as usize, 0, ty);
+        bind::reset(pc0, alloc.as_raw() as usize, standin);
+        let wrap = title_list::wrap(pc0);
+        Some((dev, queue, alloc, pc0, wrap))
+    }
+
+    /// A put-off call whose recording the driver refuses at the submit (its segment's Close
+    /// fails) is not submitted as it is: the segment goes out empty, the call is dropped, and the
+    /// rest of the submission runs (its fence is signalled, the device stays).
+    #[test]
+    fn a_put_off_call_whose_close_fails_is_not_submitted() {
+        use super::super::{bind, pso_async, title_list};
+        use std::time::{Duration, Instant};
+        unsafe {
+            let standin = 0x7E57_C105usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            pso_async::submit(standin, true, Box::new(|| {
+                let t = Instant::now();
+                while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                0
+            }));
+            let Some((dev, queue, _alloc, pc0, wrap)) = put_off_rig(standin) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            bind::dispatch(pc0, 1, 1, 1);
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the dispatch was put off");
+
+            // the replay's recording fails in the runtime: a query begun and never ended
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION, Count: 1, NodeMask: 0 }, &mut heap).unwrap();
+            let heap = heap.unwrap();
+            let h = heap.as_raw() as usize;
+            static REFUSED: AtomicU32 = AtomicU32::new(0);
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(move |p| unsafe {
+                pc::<QueryFn>(p, PC_BEGIN_QUERY)(p, h, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+                REFUSED.store(hr as u32, Ordering::Release);
+                hr
+            })));
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+            BUILD.store(true, Ordering::Release);
+            record_deferred(wrap);
+            assert!(!CLOSE_HOOK.lock().unwrap().iter().any(|h| h.0 == wrap as usize), "the replay closed its segment");
+            assert!((REFUSED.load(Ordering::Acquire) as i32) < 0, "the runtime refused the recording ({:#x})", REFUSED.load(Ordering::Acquire));
+            // what the submit collects after the replay (`q_execute_command_lists`)
+            segs.clear();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 2, "the refused segment is not submitted");
+
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            exec(queue.as_raw(), segs.len() as u32, segs.as_ptr());
+            queue.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 2000).expect("the submission runs");
+            assert!(dev.GetDeviceRemovedReason().is_ok(), "the device stays");
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            rel_fn(wrap);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    /// A graphics `ExecuteIndirect` whose pipeline is still being built is put off to the submit
+    /// like a dispatch: the title's thread goes on to its next bind, so the pipelines one list
+    /// binds are built on the workers at once, not one after another on that thread.
+    #[test]
+    fn a_graphics_execute_indirect_with_a_pipeline_still_building_waits_at_the_submit() {
+        use super::super::{bind, pso_async, title_list};
+        use crate::gpu::recomp::dxc;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::*;
+
+        if dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            if crate::gpu::recomp::dxc::location().is_err() {
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+
+            // the shared driver pipeline a stand-in binds in its place (`standin::shell`)
+            let dxil = crate::gpu::recomp::dxc::compile("[RootSignature(\"RootFlags(0)\")] [numthreads(1, 1, 1)] void main() {}", "main", "cs_6_0", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let driver: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let standin = 0x7E57_D002usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(|| {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    0
+                }),
+            );
+            pso_async::shared(standin, driver.as_raw() as usize);
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&pc0).unwrap();
+            list.Close().unwrap();
+            // the real pipelines the builds give (the stand-ins' addresses are never bound)
+            let vs = dxc::compile(r#"[RootSignature("RootFlags(0)")] float4 main() : SV_Position { return float4(0, 0, 0, 1); }"#, "main", "vs_6_0", &[]).unwrap();
+            let ps = dxc::compile("float4 main() : SV_Target { return 1; }", "main", "ps_6_0", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &vs).unwrap();
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&rs),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+            let real = [0; 5].map(|_| dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&pd).unwrap().into_raw() as usize);
+
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, ..Default::default() };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            dev.CreateCommandSignature(&D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 16, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 }, None, &mut sig).unwrap();
+            let sig = sig.unwrap();
+            // (as `create_command_signature_x` notes it: a signature that only draws)
+            bind::note_signature_draws_only(sig.as_raw() as usize, true);
+            let mut args: Option<ID3D12Resource> = None;
+            let buffer = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COMMON, None, &mut args).unwrap();
+            let args = args.unwrap();
+
+            // two builds that last until the test lets them end, counting how many run at once
+            static RUNNING: AtomicUsize = AtomicUsize::new(0);
+            static MOST: AtomicUsize = AtomicUsize::new(0);
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            let standins = [0x7E57_E001usize, 0x7E57_E002usize];
+            let driver = real[4];
+            for (&standin, &real) in standins.iter().zip(&real) {
+                pso_async::submit_lazy(
+                    standin,
+                    false,
+                    Box::new(move || {
+                        MOST.fetch_max(RUNNING.fetch_add(1, Ordering::AcqRel) + 1, Ordering::AcqRel);
+                        let t = Instant::now();
+                        while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        RUNNING.fetch_sub(1, Ordering::AcqRel);
+                        real
+                    }),
+                    0,
+                );
+                // binds get a driver pipeline while it builds, as a shared stand-in's (`standin::shell`)
+                pso_async::shared(standin, driver);
+            }
+
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, ty);
+            bind::reset(pc0, alloc.as_raw() as usize, 0);
+            let wrap = title_list::wrap(pc0);
+
+            let mut segs = vec![pc0];
+            for (n, &standin) in standins.iter().enumerate() {
+                let list = *segs.last().unwrap();
+                // SetPipelineState: the lazy build goes to the workers, both trackers note the pipeline (`cl_set_pipeline_state`)
+                pso_async::resolve(standin);
+                bind::clear_state(list, standin);
+                on_set_pipeline_state(list, standin);
+                let t = Instant::now();
+                bind::execute_indirect(list, sig.as_raw() as usize, 1, args.as_raw() as usize, 0, 0, 0);
+                assert!(t.elapsed() < Duration::from_millis(700), "ExecuteIndirect {n} waited for the build ({:?})", t.elapsed());
+                segs.clear();
+                assert!(title_list::push_segments(wrap, &mut segs));
+            }
+            assert_eq!(segs.len(), 1 + 2 * standins.len(), "the list before each ExecuteIndirect, the ExecuteIndirect, the list after it");
+            // the put-off segment keeps the title's pipeline as its key (depth bias, `on_set_pipeline_state`)
+            let seg_pso = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(segs[1] as usize))).map(|s| s.bound_pso);
+            assert_eq!(seg_pso, Some(standins[0]));
+            if dxc::compile_threads() >= 2 {
+                let t = Instant::now();
+                while MOST.load(Ordering::Acquire) < 2 && t.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(MOST.load(Ordering::Acquire), 2, "the two builds ran at once on the workers");
+            }
+
+            // inside an occlusion query the call stays in its list (put off, the query would not count it)
+            let mut queries: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION, Count: 1, NodeMask: 0 }, &mut queries).unwrap();
+            let query_heap = queries.unwrap();
+            let queries = query_heap.as_raw() as usize;
+            let counted = 0x7E57_E003usize;
+            let built = real[2];
+            pso_async::submit_lazy(counted, false, Box::new(move || built), 0);
+            pso_async::shared(counted, driver);
+            let list = *segs.last().unwrap();
+            begin_query_x(list, queries, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            pso_async::resolve(counted);
+            bind::clear_state(list, counted);
+            bind::execute_indirect(list, sig.as_raw() as usize, 1, args.as_raw() as usize, 0, 0, 0);
+            end_query_x(list, queries, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            segs.clear();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 1 + 2 * standins.len(), "an ExecuteIndirect inside an occlusion query was put off");
+            assert!(!pso_async::is_pending(counted));
+
+            // nor inside another query: its Begin and End must stay in one PC list
+            let mut stats_heap: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, Count: 1, NodeMask: 0 }, &mut stats_heap).unwrap();
+            let stats_heap = stats_heap.unwrap();
+            let stats = 0x7E57_E004usize;
+            let built = real[3];
+            pso_async::submit_lazy(stats, false, Box::new(move || built), 0);
+            pso_async::shared(stats, driver);
+            let list = *segs.last().unwrap();
+            begin_query_x(list, stats_heap.as_raw() as usize, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            pso_async::resolve(stats);
+            bind::clear_state(list, stats);
+            bind::execute_indirect(list, sig.as_raw() as usize, 1, args.as_raw() as usize, 0, 0, 0);
+            end_query_x(list, stats_heap.as_raw() as usize, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            segs.clear();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 1 + 2 * standins.len(), "an ExecuteIndirect inside a pipeline-statistics query was put off");
+            assert!(!pso_async::is_pending(stats));
+
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+            assert!(standins.iter().all(|&s| pso_async::is_pending(s)), "Close waited for a build");
+
+            BUILD.store(true, Ordering::Release);
+            record_deferred(wrap);
+            assert!(standins.iter().all(|&s| !pso_async::is_pending(s)), "the submit waits for the builds");
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+            for s in standins.into_iter().chain([counted, stats]) {
+                pso_async::release(pso_async::released(s));
+            }
+            pso_async::release(driver);
+        }
+    }
+
+    /// A put-off segment that does not close when it is made is not used: the call waits in its
+    /// list instead of being put off.
+    #[test]
+    fn a_put_off_segment_that_does_not_close_is_not_used() {
+        use super::super::{bind, pso_async, title_list};
+        unsafe {
+            let standin = 0x7E57_C106usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            pso_async::submit(standin, true, Box::new(|| {
+                let t = std::time::Instant::now();
+                while !BUILD.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                0
+            }));
+            let Some((_dev, _queue, _alloc, pc0, wrap)) = put_off_rig(standin) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(|p| unsafe {
+                pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
+                windows::Win32::Foundation::E_FAIL.0
+            })));
+            // (the call that is not put off waits for the build in the call; started here, after
+            // the device is made, so the build is still going when the call comes)
+            let ends = std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                BUILD.store(true, Ordering::Release);
+            });
+            bind::dispatch(pc0, 1, 1, 1);
+            ends.join().unwrap();
+            assert!(!CLOSE_HOOK.lock().unwrap().iter().any(|h| h.0 == wrap as usize), "the put-off segment was closed");
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 1, "nothing was put off");
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            rel_fn(wrap);
             let _ = pso_async::released(standin);
         }
     }
@@ -8151,6 +8805,9 @@ mod tests {
             let q_dir: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let a_comp: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let a_dir: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            // a freed allocator of an earlier test may have had these addresses: drop its stale type
+            super::super::alloc_pool::forget(a_comp.as_raw() as usize);
+            super::super::alloc_pool::forget(a_dir.as_raw() as usize);
             let raw_c: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_comp, None).unwrap();
             let raw_d: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a_dir, None).unwrap();
             let done_c: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
