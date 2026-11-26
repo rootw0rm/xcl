@@ -15,7 +15,6 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -102,31 +101,74 @@ const MAGIC: u64 = 0x5843_4C51_5545_5545; // "XCLQUEUE"
 
 type Job = Box<dyn FnOnce() + Send>;
 
-fn pool() -> &'static Mutex<mpsc::Sender<Job>> {
-    static POOL: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let rx = Arc::new(Mutex::new(rx));
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
-        for i in 0..n {
-            let rx = rx.clone();
-            std::thread::Builder::new()
-                .name(format!("xcl-taskqueue-{i}"))
-                .spawn(move || loop {
-                    let job = { rx.lock().unwrap().recv() };
-                    match job {
-                        Ok(j) => j(),
-                        Err(_) => break,
-                    }
-                })
-                .expect("spawn task queue worker");
-        }
-        Mutex::new(tx)
+const MAX_WORKERS: usize = 256;
+const IDLE_EXIT: Duration = Duration::from_secs(30);
+
+struct Pool {
+    jobs: Mutex<PoolState>,
+    cv: Condvar,
+    base: usize,
+}
+
+struct PoolState {
+    queue: VecDeque<Job>,
+    workers: usize,
+    idle: usize,
+}
+
+fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| Pool {
+        jobs: Mutex::new(PoolState { queue: VecDeque::new(), workers: 0, idle: 0 }),
+        cv: Condvar::new(),
+        base: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8),
     })
 }
 
+fn worker(p: &'static Pool) {
+    let mut g = p.jobs.lock().unwrap();
+    loop {
+        if let Some(job) = g.queue.pop_front() {
+            drop(g);
+            job();
+            g = p.jobs.lock().unwrap();
+            continue;
+        }
+        g.idle += 1;
+        let (mut ng, t) = p.cv.wait_timeout(g, IDLE_EXIT).unwrap();
+        ng.idle -= 1;
+        if t.timed_out() && ng.queue.is_empty() && ng.workers > p.base {
+            ng.workers -= 1;
+            return;
+        }
+        g = ng;
+    }
+}
+
 fn spawn(job: Job) {
-    let _ = pool().lock().unwrap().send(job);
+    let p = pool();
+    let mut g = p.jobs.lock().unwrap();
+    g.queue.push_back(job);
+    if g.idle >= g.queue.len() {
+        p.cv.notify_one();
+        return;
+    }
+    if g.workers >= MAX_WORKERS {
+        p.cv.notify_one();
+        return;
+    }
+    let id = g.workers;
+    g.workers += 1;
+    drop(g);
+    if std::thread::Builder::new()
+        .name(format!("xcl-taskqueue-{id}"))
+        .spawn(move || worker(p))
+        .is_err()
+    {
+        let mut g = p.jobs.lock().unwrap();
+        g.workers -= 1;
+        p.cv.notify_one();
+    }
 }
 
 struct Timed {
@@ -1058,6 +1100,47 @@ mod tests {
             assert_eq!(*ran_on.lock().unwrap(), Some(std::thread::current().id()));
             XTaskQueueCloseHandle(h);
         }
+    }
+
+    #[test]
+    fn thread_pool_callbacks_finish_when_more_block_than_there_are_cores() {
+        static POOL_RELEASED: AtomicBool = AtomicBool::new(false);
+        static POOL_WAITERS_DONE: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "win64" fn waiter(_ctx: *mut c_void, _canceled: bool) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !POOL_RELEASED.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            POOL_WAITERS_DONE.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe extern "win64" fn releaser(_ctx: *mut c_void, _canceled: bool) {
+            POOL_RELEASED.store(true, Ordering::SeqCst);
+        }
+
+        POOL_RELEASED.store(false, Ordering::SeqCst);
+        POOL_WAITERS_DONE.store(0, Ordering::SeqCst);
+
+        const WAITERS: u32 = 16;
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+            for _ in 0..WAITERS {
+                assert_eq!(XTaskQueueSubmitCallback(h, PORT_WORK, std::ptr::null_mut(), waiter as usize), S_OK);
+            }
+            assert_eq!(XTaskQueueSubmitCallback(h, PORT_WORK, std::ptr::null_mut(), releaser as usize), S_OK);
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            XTaskQueueCloseHandle(h);
+        }
+        assert_eq!(
+            POOL_WAITERS_DONE.load(Ordering::SeqCst),
+            WAITERS,
+            "blocked pool callbacks starved the releaser callback"
+        );
     }
 
     #[test]
