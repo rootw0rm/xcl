@@ -1376,3 +1376,72 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (fresh-root `report.json` verified before removal).
   Lock audit: 0 new `lock()` (doc-only change); `diff --check` clean.
+
+## 2026-11-26 — step-141 (task-1795731748-57f1): 11 new PRs #2892-#2905
+(all SKIP with hunk evidence), top now #2905, probe past #2891
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2377 refs (+11 vs step-140), in-range set exactly
+  #2830..#2905 minus the known gaps — no refs >=2906 in batched;
+  sequential still ground truth. Per-PR sequential probe #2830..#3550
+  (widened past #2891 per mem-1795712765-78dc; foreground 2892..2960 +
+  parallel 2906..3550 + parallel pin re-check, no tail left open) found
+  58 PRESENT (#2830..#2905 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880/#2883-#2885/#2899/#2900/#2903
+  gaps), all 47 prior pins match (no force-push, #2872 pin `3893df0a` +
+  #2879 pin `63197e31` + #2881 pin `2c50cc71` + #2882 pin `3e8e2c43` +
+  #2886 pin `237b7181` + #2887 pin `128ee21f` + #2888 pin `5fefeb15` +
+  #2889 pin `ca3eb153` + #2890 pin `c6c14a15` + #2891 pin `0246ae43`
+  hold, all OPEN); #2906..#3550 ALL MISSING — scan complete, top is #2905.
+- Triage (all 11 new OPEN, head-NOT-ancestor-of-upstream exit 1, all SKIP):
+  #2892 `f9362ed3` / #2893 `20e38b05` / #2894 `7716b4cf` / #2895 `f3cd0a5b` /
+  #2896 `33c18faf` / #2897 `d24b4250` / #2898 `8cf249e5` / #2901 `2902398f` /
+  #2902 `8e16f9ca` / #2905 `d900644d` are wm17/prs dev-stack tips (parent NOT
+  in main; merge-base `5bec5877` ancestor of upstream/main; ~1692-1733
+  commits, 90-100 files +35176/+46188 vs merge-base) — whole-stack port out
+  of hourly-sync scope, same shape as #2886. Tip-only: #2892 `eh.rs` +149
+  (CLZERO-loop native patch via `VirtualAlloc`/`VirtualProtect`) +
+  `loader.rs` +4 — `windows_sys` memory APIs, a `cfg(windows)`-only dep;
+  Linux twins `eh_linux.rs`/`loader_linux.rs` carry zero
+  `patch_clzero_loops`/`cpu_has_clzero` refs. #2893 `hle/d3d12x`
+  (`bind.rs`/`pso_async.rs`/`dispatch_chain.rs`) +69/-3, #2894
+  (`pso_async.rs`/`real.rs`) +30/-1, #2895 `sparse.rs` +16, #2896
+  `vram.rs` +24 plus `host.rs` +3 (a `page_owners()` log line inside the
+  Windows-`host.rs` pools block at `host.rs:87` — `host_linux.rs` has no
+  such block), #2897 (`list_x.rs` +2/`sparse.rs` +426/-14), #2898
+  `sparse.rs` +190/-29, #2901 `bind.rs` +3/-1 — all hunks inside
+  `hle/d3d12x`, which is `#[cfg(windows)]`-gated (`lib.rs:30`); zero refs
+  from Linux-compiled files. #2902 tip-only 6 files +87/-16: the
+  `hle/d3d12x/bind.rs` half (two-pass slice staging, `group_base` param) is
+  Windows-only, and the portable half (`recomp/mod.rs`
+  `IO_MESH_GROUP_BASE=118` + `emit.rs` v5 init + `dxil/kernel.rs` group
+  base + `recomp/tests.rs` slice test) does NOT apply verbatim — our IO
+  layout is `[114,115,116]` (`mod.rs:260`, slot 113 reserved for #1428)
+  while the stack renumbered to `[115,116,117]` (`LOOP_BUDGET=113`,
+  `GROUP_LIMIT=114`), so slot 118 has no free-slot equivalent here without
+  renumbering against that reservation; without the `bind.rs` writer the
+  slot stays 0 (behavior-neutral). Held for a numbered-slot adaptation,
+  not a verbatim port. #2905 tip-only `gpu/uma.rs` +41/-... and
+  `hle/kernelx.rs` +105/-30 — full `uma.rs` is `#[cfg(windows)]` (Linux
+  stub is constants-only, `gpu/mod.rs`), `kernelx.rs` uses `windows_sys`;
+  same shape as #2886 SKIP. #2904 `059f4eca` is the one single-commit on
+  `8b957bec`: 1 file `hle/xaudio2.rs` +207/-6 (source-voice slot 23
+  `Discontinuity` + Opus revision tracking + 2 tests calling real
+  `XAudio2Create`/`MSOpusDecoder.dll`) — `hle/xaudio2.rs` is the Windows
+  engine file ("on top of the Windows XAudio2 2.9"); Linux compiles the
+  separate twin `hle/xaudio2_linux.rs` (`hle_linux.rs:36-37`), zero refs
+  to the Windows module. Earlier pins stand: #2830-new-head/#2831/#2832
+  SKIP; #2833/#2834 landed; #2836 adapted in `7645afeb`; #2837/#2842 SKIP;
+  #2838 landed verbatim in `aa59e8ac`; #2843-#2891 SKIP (minus gaps).
+- Gates (doc-only, tree CLEAN throughout): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step141r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (fresh-root `report.json` verified before removal).
+  Lock audit: 0 new `lock()` (doc-only change); `diff --check` clean.
