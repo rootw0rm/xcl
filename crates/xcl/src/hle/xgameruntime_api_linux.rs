@@ -758,7 +758,7 @@ unsafe extern "win64" fn display_deferral(out: *mut usize) -> HRESULT {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XVersion {
     pub major: u16,
     pub minor: u16,
@@ -974,10 +974,14 @@ pub unsafe extern "win64" fn XGameGetXboxTitleId(out: *mut u32) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
-    let t = &crate::state::config().title_id;
-    *out = u32::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
+    let config = crate::state::config();
+    *out = config.title_id_value().unwrap_or(0);
     if *out == 0 {
-        crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0");
+        if config.title_id.trim().is_empty() {
+            crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0");
+        } else {
+            crate::xlog_warn!("XGameGetXboxTitleId: TitleId {:?} (MicrosoftGame.Config / xcl.toml) is not a nonzero 32-bit hex title id → 0", config.title_id);
+        }
     }
     S_OK
 }
@@ -1056,25 +1060,78 @@ struct PackageDetails {
     title_id: *const u8,
 }
 
-/// XPackageEnumeratePackages(kind, scope, context, callback): the game itself (no DLC).
+/// What XPackageDetails says about the running game, from its MicrosoftGame.Config:
+/// `<Identity Version>` (1.0.0.0 when not given, as the schema defaults it), `<StoreId>` and
+/// `<ShellVisuals>`'s DefaultDisplayName / PublisherDisplayName / Description. A value that
+/// names a localized string (`ms-resource:`) is resolved from the package's resources.pri on
+/// a console; XCL does not read that file, so such a display name falls back to the
+/// identity name (`title`) and the other strings to empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GameDetails {
+    version: XVersion,
+    display_name: String,
+    publisher: String,
+    description: String,
+    store_id: String,
+}
+
+/// "a.b.c.d" (missing parts 0) → XVersion; None for anything else.
+fn parse_version(v: &str) -> Option<XVersion> {
+    let mut p = [0u16; 4];
+    let parts: Vec<&str> = v.trim().split('.').collect();
+    if parts.len() > 4 {
+        return None;
+    }
+    for (k, s) in parts.iter().enumerate() {
+        p[k] = s.trim().parse().ok()?;
+    }
+    Some(XVersion { major: p[0], minor: p[1], build: p[2], revision: p[3] })
+}
+
+fn game_details(m: Option<&crate::manifest::Manifest>, title: &str) -> GameDetails {
+    let text = |v: Option<&String>| v.filter(|s| !s.starts_with("ms-resource:")).cloned();
+    GameDetails {
+        version: m.and_then(|m| m.version.as_deref()).and_then(parse_version).unwrap_or(XVersion { major: 1, minor: 0, build: 0, revision: 0 }),
+        display_name: text(m.and_then(|m| m.display_name.as_ref())).unwrap_or_else(|| title.to_string()),
+        publisher: text(m.and_then(|m| m.publisher_display_name.as_ref())).unwrap_or_default(),
+        description: text(m.and_then(|m| m.description.as_ref())).unwrap_or_default(),
+        store_id: m.and_then(|m| m.store_id.clone()).unwrap_or_default(),
+    }
+}
+
+fn current_game_details() -> &'static GameDetails {
+    static D: OnceLock<GameDetails> = OnceLock::new();
+    D.get_or_init(|| {
+        let boot = crate::state::boot();
+        let m = boot.and_then(|b| crate::manifest::load(&b.game_root));
+        game_details(m.as_ref(), &boot.map(|b| b.title.clone()).unwrap_or_default())
+    })
+}
+
+/// XPackageEnumeratePackages(kind, scope, context, callback): the game itself (no DLC), in
+/// every scope – XCL runs one unpacked package, with no hub or related products installed.
 unsafe extern "win64" fn enumerate_packages(kind: u32, _scope: u32, ctx: *mut c_void, cb: Option<unsafe extern "win64" fn(*mut c_void, *const PackageDetails) -> bool>) -> HRESULT {
     let Some(cb) = cb else { return E_INVALIDARG };
     if kind != 0 {
         return S_OK;
     }
-    let c = |s: String| std::ffi::CString::new(s).unwrap_or_default();
-    let id = c(package_identifier());
-    let title = c(crate::state::boot().map(|b| b.title.clone()).unwrap_or_default());
-    let title_id = c(crate::state::config().title_id.trim_start_matches("0x").to_ascii_uppercase());
-    let empty = c(String::new());
+    let c = |s: &str| std::ffi::CString::new(s.replace('\0', "")).unwrap_or_default();
+    let g = current_game_details();
+    let id = c(&package_identifier());
+    let title = c(&g.display_name);
+    let publisher = c(&g.publisher);
+    let description = c(&g.description);
+    let store_id = c(&g.store_id);
+    // the number XGameGetXboxTitleId gives, as 8 hex digits; none where it gives 0
+    let title_id = c(&crate::state::config().title_id_value().map(|v| format!("{v:08X}")).unwrap_or_default());
     let d = PackageDetails {
         package_identifier: id.as_ptr() as *const u8,
-        version: XVersion { major: 1, minor: 0, build: 0, revision: 0 },
+        version: g.version,
         kind: 0,
         display_name: title.as_ptr() as *const u8,
-        description: empty.as_ptr() as *const u8,
-        publisher: empty.as_ptr() as *const u8,
-        store_id: empty.as_ptr() as *const u8,
+        description: description.as_ptr() as *const u8,
+        publisher: publisher.as_ptr() as *const u8,
+        store_id: store_id.as_ptr() as *const u8,
         installing: false,
         index: 0,
         count: 1,
@@ -1405,6 +1462,31 @@ mod tests {
             assert_eq!(ERR_SEEN.load(Ordering::SeqCst), crate::util::E_FAIL as u32);
             set_cb(err, 0, std::ptr::null_mut());
         }
+    }
+
+    /// XPackageDetails of the running game come from its MicrosoftGame.Config; localized
+    /// (`ms-resource:`) strings XCL cannot resolve fall back instead of reaching the title.
+    #[test]
+    fn package_details_come_from_the_game_config() {
+        let m = crate::manifest::parse(
+            r#"<Game><Identity Name="41336Pub.Game" Publisher="CN=X" Version="1.6.2.21"/><StoreId>9NZTKMP36L8J</StoreId>
+<ShellVisuals DefaultDisplayName="Example Game" PublisherDisplayName="Example Publisher" Description="ms-resource:ApplicationDescription"/></Game>"#,
+        );
+        let d = game_details(Some(&m), "41336Pub.Game");
+        assert_eq!(d.version, XVersion { major: 1, minor: 6, build: 2, revision: 21 });
+        assert_eq!((d.display_name.as_str(), d.publisher.as_str(), d.description.as_str(), d.store_id.as_str()), ("Example Game", "Example Publisher", "", "9NZTKMP36L8J"));
+        let loc = crate::manifest::parse(r#"<Game><ShellVisuals DefaultDisplayName="ms-resource:ApplicationDisplayName"/></Game>"#);
+        assert_eq!(game_details(Some(&loc), "41336Pub.Game").display_name, "41336Pub.Game");
+        let none = game_details(None, "T");
+        assert_eq!((none.version, none.display_name.as_str(), none.store_id.as_str()), (XVersion { major: 1, minor: 0, build: 0, revision: 0 }, "T", ""));
+        assert_eq!(parse_version("2.0"), Some(XVersion { major: 2, minor: 0, build: 0, revision: 0 }));
+        assert_eq!(parse_version("1.2.3.70000"), None);
+        assert_eq!(parse_version("1.2.3.4.5"), None);
+        // the single title-id reading: the number XGameGetXboxTitleId gives, as 8 hex digits
+        assert_eq!(crate::config::parse_title_id("0x1a2b3c").map(|v| format!("{v:08X}")).as_deref(), Some("001A2B3C"));
+        assert_eq!(crate::config::parse_title_id("1234ABCD").map(|v| format!("{v:08X}")).as_deref(), Some("1234ABCD"));
+        assert_eq!(crate::config::parse_title_id("0Xffffffff").map(|v| format!("{v:08X}")).as_deref(), Some("FFFFFFFF"));
+        assert_eq!(std::mem::size_of::<PackageDetails>(), 80);
     }
 
     #[test]

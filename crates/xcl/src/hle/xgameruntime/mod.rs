@@ -252,7 +252,7 @@ pub unsafe extern "system" fn XSystemGetXboxLiveSandboxId(size: usize, buf: *mut
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XVersion {
     pub major: u16,
     pub minor: u16,

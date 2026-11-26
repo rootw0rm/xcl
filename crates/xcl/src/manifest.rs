@@ -16,6 +16,16 @@ pub struct Manifest {
     pub title_id: Option<String>,
     /// `<Resources><Resource Language="..."/>`: declared package locales in manifest order
     pub languages: Vec<String>,
+    /// `<Identity Version="a.b.c.d">`
+    pub version: Option<String>,
+    /// `<StoreId>`
+    pub store_id: Option<String>,
+    /// `<ShellVisuals DefaultDisplayName="...">`
+    pub display_name: Option<String>,
+    /// `<ShellVisuals PublisherDisplayName="...">`
+    pub publisher_display_name: Option<String>,
+    /// `<ShellVisuals Description="...">`
+    pub description: Option<String>,
 }
 
 fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
@@ -142,6 +152,11 @@ fn decode_text(raw: &[u8]) -> Option<String> {
     String::from_utf16(&units).ok()
 }
 
+/// The first `<tag attr="...">` value, trimmed; None when missing or empty.
+fn attr(xml: &str, tag: &str, name: &str) -> Option<String> {
+    xml_attrs(xml, tag, name).into_iter().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 pub fn parse(xml: &str) -> Manifest {
     let pls = element(xml, "PersistentLocalStorage").and_then(|section| element(section, "SizeMB"));
     let languages = element(xml, "Resources")
@@ -159,6 +174,11 @@ pub fn parse(xml: &str) -> Manifest {
         lockhart_memory: element(xml, "XboxLockhartTitleMemory").map(str::to_string),
         title_id: element(xml, "TitleId").map(str::to_string),
         languages,
+        version: attr(xml, "Identity", "Version"),
+        store_id: element(xml, "StoreId").map(str::to_string).filter(|s| !s.is_empty()),
+        display_name: attr(xml, "ShellVisuals", "DefaultDisplayName"),
+        publisher_display_name: attr(xml, "ShellVisuals", "PublisherDisplayName"),
+        description: attr(xml, "ShellVisuals", "Description"),
     }
 }
 
@@ -191,6 +211,26 @@ mod tests {
         assert_eq!(m.pls_mb, Some(2048));
         assert_eq!((m.anaconda_memory.as_deref(), m.lockhart_memory.as_deref()), (Some("Advanced"), Some("Advanced")));
         assert_eq!(parse("<Game/>"), Manifest::default());
+    }
+
+    #[test]
+    fn reads_the_package_identity_and_shell_visuals() {
+        let xml = r#"<Game configVersion="1">
+  <Identity Name="41336PublisherName.ExampleGame" Publisher="CN=A4954634-DF4B-47C7-AB70-D3215D246AF1" Version="1.6.0.0"/>
+  <StoreId>9NZTKMP36L8J</StoreId>
+  <ShellVisuals DefaultDisplayName="Example Game &amp; Co"
+      PublisherDisplayName="Example Publisher"
+      StoreLogo="StoreLogoFile.png"
+      Description="ms-resource:ApplicationDescription"/>
+</Game>"#;
+        let m = parse(xml);
+        assert_eq!(m.version.as_deref(), Some("1.6.0.0"));
+        assert_eq!(m.store_id.as_deref(), Some("9NZTKMP36L8J"));
+        assert_eq!(m.display_name.as_deref(), Some("Example Game & Co"));
+        assert_eq!(m.publisher_display_name.as_deref(), Some("Example Publisher"));
+        assert_eq!(m.description.as_deref(), Some("ms-resource:ApplicationDescription"));
+        let bare = parse(r#"<Game><Identity Name="A.B" Publisher="CN=X"/><ShellVisuals DefaultDisplayName=""/></Game>"#);
+        assert_eq!((bare.version, bare.display_name, bare.store_id), (None, None, None));
     }
 
     #[test]
