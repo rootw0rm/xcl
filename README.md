@@ -252,9 +252,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   the overlay copy is deleted, while the original stays in the game folder.
 - **Switches for how a title runs** (set them in the environment of `xcl run`):
   - `XCL_SKIP_BINK`: skips the Bink 2 movies of a title that ships a `bink2*.dll` (its logos and
-    intros), by taking them straight to their last frame without decoding. Off when unset or `0`,
-    `off`, `false` or `no`; `all` also skips looping movies; any other value (`1`, `intro` …)
-    skips the ones that do not loop.
+    intros), by taking them straight to their last frame without decoding. The value is trimmed
+    and case-insensitive. The switch is off when unset, empty, `0`, `off`, `false`, or `no`.
+    `all` also skips looping movies. Any other value (`1`, `intro` …) skips non-looping movies.
   - `XCL_MUTE_TTS`: the title gets no Windows speech synthesis: its XAccessibility requests are
     answered by XCL's own object, which has closed captions and high contrast only. Off by
     default; any value except empty, `0`, `off` or `false` (in any case) turns it on.
