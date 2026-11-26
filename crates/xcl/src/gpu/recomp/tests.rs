@@ -3115,6 +3115,162 @@ fn tsharp(index: u32, format: u32, ty: u32) -> [u32; 8] {
     [index, format << 20, 0, ty << 28, 0, 0, 0, 0]
 }
 
+fn sample_grad_program(op: &str, dim: u64, a16: bool) -> Vec<u8> {
+    prog(&[(op, "ENC_MIMG", &[
+        ("VDATA", 12), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6),
+        ("DMASK", 0xF), ("DIM", dim), ("A16", u64::from(a16)),
+    ], None)])
+}
+
+#[test]
+fn direct_sample_grad_g16_widens_packed_gradients() {
+    let cases = [
+        ("IMAGE_SAMPLE_D", 1, false, 5, 0),
+        ("IMAGE_SAMPLE_D", 2, true, 7, 3),
+        ("IMAGE_SAMPLE_D_G16", 1, false, 3, 4),
+        ("IMAGE_SAMPLE_D_G16", 5, true, 3, 7),
+        ("IMAGE_SAMPLE_D_G16", 2, true, 5, 9),
+    ];
+    for (op, dim, a16, last_addr, half_components) in cases {
+        let code = sample_grad_program(op, dim, a16);
+        let decoded = crate::gpu::rdna2::disassemble(&code, 0, true);
+        assert!(decoded[0].text.contains(&format!("v[0:{last_addr}]")), "{}", decoded[0].text);
+        let dxil = runner::direct_kernel_full(&code, false).unwrap().dxil;
+        let ir = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
+        assert!(ir.contains("call %dx.types.ResRet.f32 @dx.op.sampleGrad.f32"), "{op} DIM={dim} A16={a16}");
+        let half_conversions = ir.lines().filter(|line| line.contains("call float @dx.op.legacyF16ToF32")).count();
+        assert_eq!(half_conversions, half_components, "{op} DIM={dim} A16={a16}");
+    }
+}
+
+#[test]
+fn gpu_direct_sample_grad_g16_uses_packed_coordinate_slots() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+
+    let samplers = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let cases = [
+        ("IMAGE_SAMPLE_D", TexDim::D2, 1, 9, false, 4, 1),
+        ("IMAGE_SAMPLE_D_G16", TexDim::D2, 1, 9, false, 2, 1),
+        ("IMAGE_SAMPLE_D_G16", TexDim::D2Array, 5, 13, true, 2, 2),
+        ("IMAGE_SAMPLE_D_G16", TexDim::D3, 2, 10, true, 4, 2),
+    ];
+    let xy_half = [0x3000, 0x3600, 0x3900, 0x3B00]; // 4-wide texel centers
+    let mut failures = Vec::new();
+    for (op, tex_dim, dim, ty, a16, coords, depth) in cases {
+        let code = sample_grad_program(op, dim, a16);
+        let kernel = runner::direct_kernel_full(&code, false).unwrap();
+        let mut state = KernelState::default();
+        state.sgpr[16..24].copy_from_slice(&tsharp(0, 77, ty));
+        for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+            let (x, y, z) = (lane % 4, lane / 4 % 4, lane / 16 % depth);
+            if a16 {
+                let z_half = if tex_dim == TexDim::D3 { [0x3400, 0x3A00] } else { [0, 0x3C00] };
+                regs[coords] = xy_half[x] | (xy_half[y] << 16);
+                regs[coords + 1] = z_half[z];
+                regs[coords + 2] = xy_half[3 - x] | (xy_half[3 - y] << 16);
+                regs[coords + 3] = z_half[1 - z];
+            } else {
+                let center = |index| f((index as f32 + 0.5) / 4.0);
+                regs[coords] = center(x);
+                regs[coords + 1] = center(y);
+                regs[coords + 2] = center(3 - x);
+                regs[coords + 3] = center(3 - y);
+            }
+        }
+        let mut data = Vec::new();
+        for z in 0..depth {
+            for y in 0..4 {
+                for x in 0..4 {
+                    for value in [x as f32, y as f32, z as f32, 1.0] {
+                        data.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let textures = [TestTexture {
+            dim: tex_dim, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4,
+            depth: depth as u32, texel_bytes: 16, data, uav: false,
+        }];
+        let result = runner::run_with_statics(&kernel.dxil, &state, &[], &textures, &samplers, &kernel.static_samplers).unwrap();
+        let mismatch = (0..32).find_map(|lane| {
+            let expected = [(lane % 4) as f32, (lane / 4 % 4) as f32, (lane / 16 % depth) as f32, 1.0];
+            let got = [12, 13, 14, 15].map(|reg| f32::from_bits(result.vgpr[lane][reg]));
+            (got != expected).then_some(format!("{op} {tex_dim:?} lane {lane}: {got:?}, expected {expected:?}"))
+        });
+        if let Some(mismatch) = mismatch {
+            failures.push(mismatch);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn gpu_direct_sample_grad_g16_nonzero_half_selects_mip() {
+    if !gpu_ready() {
+        return;
+    }
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC};
+
+    let opts = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let vs = translate_vertex(&draw_passthrough_vs(), opts, &draw_vsi()).unwrap();
+    let vertices = [
+        -1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+        -1.0, -3.0, 0.0, 0.0, 0.0, 0.0,
+         3.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+    ];
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let colors = [[1.0f32, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]];
+    let mut data = Vec::new();
+    for (color, texels) in colors.into_iter().zip([16, 4]) {
+        for _ in 0..texels {
+            data.extend(color.into_iter().flat_map(f32::to_le_bytes));
+        }
+    }
+    let format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 4, Height: 4,
+        DepthOrArraySize: 1, MipLevels: 2, Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 2, ..Default::default() };
+    let textures = [runner::ViewTexture { res, srv, data, row_bytes: 4 * 16 }];
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    let s_sharp = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 1 << 26, 0];
+    sgprs[24..28].copy_from_slice(&s_sharp);
+    let samplers = [crate::gpu::desc::sampler_d3d12(&s_sharp, false)];
+
+    // The two layouts read the same coordinates. A 0.5 derivative in the upper half
+    // of v8 selects mip 1, while interpreting that dword as f32 leaves the sample in mip 0.
+    for (gradient, expected) in [(0, colors[0]), (0x3800_0000, colors[1])] {
+        let mut code = Vec::new();
+        for (reg, value) in (8..).zip([gradient, 0, f(0.125), f(0.125), f(0.125), f(0.125)]) {
+            code.extend(encode("V_MOV_B32", "ENC_VOP1", &[("VDST", reg), ("SRC0", 255)], Some(value)).unwrap());
+        }
+        code.extend(prog(&[
+            ("IMAGE_SAMPLE_D_G16", "ENC_MIMG", &[("VDATA", 16), ("VADDR", 8), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 16), ("VSRC1", 17), ("VSRC2", 18), ("VSRC3", 19), ("DONE", 1), ("VM", 1)], None),
+        ]));
+        let ps = translate_pixel(&code, opts, &draw_psi()).unwrap();
+        let pixels = runner::draw_views(&vs.dxil, &ps.dxil, &layout, &vertices, 24, &sgprs, &[], &textures, &samplers, 4, [-1.0; 4]).unwrap();
+        assert_eq!(pixels, vec![expected; 16], "packed gradient {gradient:#010x}");
+    }
+}
+
 /// A cube T# of two cubes: the face coordinate (face + 8 · cube, as v_cubeid and the console's
 /// compiler give it) picks the cube, and image_get_resinfo gives the layers (6 per cube).
 #[test]

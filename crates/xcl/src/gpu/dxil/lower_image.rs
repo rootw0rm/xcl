@@ -987,9 +987,13 @@ impl Lw {
                 i_cmp = Some(shape.len());
                 shape.push((32, true));
             }
+            let g16 = mods.contains(&"g16");
             i_grad = shape.len();
-            for _ in 0..2 * grad_n {
-                shape.push((32, true));
+            // Packed gradients start each derivative direction at a new dword.
+            for _ in 0..2 {
+                for component in 0..grad_n {
+                    shape.push(if g16 { (16, component == 0) } else { (32, true) });
+                }
             }
             i_body = shape.len();
             for k in 0..body {

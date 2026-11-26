@@ -153,3 +153,52 @@ newest at the bottom.
   stubs 20 (all first_args) xgr exactly XAsync/XNetworking/XUser —
   HOLDS (report.json verified, fresh root removed after). Lock audit:
   0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-117 (task-1795713741-13e2): ported #2838 (G16 packed gradients)
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0 — ZERO sync fallout.
+- Per-PR sequential probe `refs/pull/$i/head` #2832..#2920 (widened past
+  the first gap per mem-1795712765-78dc): #2832 `e2ecdfa9` /
+  #2833 `f5a352c3` / #2834 `653f8f13` / #2836 `43a4eb9d` /
+  #2837 `9d967cf8` / #2838 `ef36b7df` (all pins match, all still OPEN,
+  `merge-base` exit 1 each); #2835 MISSING; #2839..#2920 ALL MISSING —
+  scan complete. Race note: #2838's head commit is 2026-11-26 17:13:59 UTC
+  but step-116 (window ending ~17:22 UTC) probed it MISSING — a push race,
+  not builder fault (per mem-1795714025-21a1); the step-117 probe caught it.
+- #2838 = "Recompiler: decode packed G16 gradients in direct DXIL"
+  (single-commit `ef36b7df`, +162/-2: `lower_image.rs` G16 gradient-shape
+  fix + `sample_grad_program` helper + 3 tests in `recomp/tests.rs`).
+  Verdict KEEPER, verbatim-ported in this step: the fix hunk's context
+  (`for _ in 0..2 * grad_n { shape.push((32, true)); }`) is byte-identical
+  in our tree (`lower_image.rs:990-993`); `g16` detection via
+  `mods.contains(&"g16")` works unchanged (`base = "sample_d_g16"` ->
+  `mods = ["d", "g16"]`); downstream `compf(i_grad + k)` /
+  `compf(i_grad + grad_n + k)` indexing is preserved (dx block then dy
+  block). All four additions verified byte-identical to upstream head
+  (`git apply --check` clean, post-apply `awk`-extract diff empty).
+  Failing-first (static, Windows-gated): the non-GPU test
+  `direct_sample_grad_g16_widens_packed_gradients` asserts
+  `legacyF16ToF32` counts of 3/4/7/9 for G16 cases; pre-fix code emits
+  only `(32, true)` gradient slots so the count is 0 — fails pre-fix by
+  construction. The `recomp/tests.rs` module is
+  `#[cfg(all(test, windows))]` (as are all dxil lowering test modules),
+  so the new tests cannot execute on this Linux box: ported verbatim,
+  `rustfmt`-parse-verified (remaining `--check` diffs are upstream's own
+  over-length lines, kept verbatim per the no-reformat rule), execution
+  waits for Windows CI. The `lower_image.rs` fix itself is Linux-live
+  platform-independent code (only `VIEW_HEAP_MAX_SRV` is cfg-gated) and
+  is compiled + regression-covered by the Linux gates below.
+  #2832 SKIP stands; #2833/#2834 landed; #2836 adapted in `7645afeb`;
+  #2837 SKIP stands (step-116 evidence re-verified: still OPEN).
+- Gates (fix + tests): both `cargo check`s 0 errors (22 lib + 28 lib-test
+  pre-existing warnings); lib 783 passed / 0 failed / 1 ignored
+  (`--test-threads=4`; count correctly unchanged — new tests are
+  Windows-gated); title e2e 4 passed / 1 failed by design
+  (`test_title_runs_and_game_folder_is_untouched`), 24 `[FAIL]` lines =
+  12 unique, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step117-r` exit 139 SIGSEGV `exe+0x2237320`
+  fault `0x0` unmapped bytes `48 8b 03` stubs 20 (all first_args) xgr
+  exactly XAsync/XNetworking/XUser — HOLDS (report.json verified, fresh
+  root removed after; binary mtime verified newer than the source edit).
+  Lock audit: 0 new `lock()` in the added code; `diff --check` clean.
