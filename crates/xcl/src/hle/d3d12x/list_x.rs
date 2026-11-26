@@ -3277,7 +3277,9 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     let old_next = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
-        let old = m.remove(&(next_pc as usize));
+        let mut old = m.remove(&(next_pc as usize));
+        // (a spare that was a first segment keeps the allocator its deferred segments recorded on: the GPU may still run them)
+        let own_alloc = old.as_mut().and_then(|o| o.own_alloc.take());
         if let Some(ref o) = old {
             if !o.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -3311,6 +3313,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
                 bindings: bindings.clone(),
                 // (a query a Wait split ended up spanning still holds put-off calls back)
                 queries_open,
+                own_alloc,
                 ..Default::default()
             },
         );
@@ -8770,6 +8773,70 @@ mod tests {
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             rel_fn(wrap);
             let _ = pso_async::released(standin);
+        }
+    }
+
+    /// A recording's first segment stood in for its primary list and holds the allocator its
+    /// deferred dispatches recorded on. At the next Reset it goes to the spares; a split of a later
+    /// recording reuses it while those dispatches still run on the GPU (a block after a Wait64).
+    /// The allocator must outlive them.
+    #[test]
+    fn a_spare_reused_by_a_split_keeps_an_own_allocator_still_on_the_gpu() {
+        use super::super::{alloc_pool, bind, title_list};
+
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let new_list = |on: &ID3D12CommandAllocator| {
+                let l = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, on, None).unwrap().into_raw();
+                real::adopt(l, real::Kind::CommandList);
+                on_create(l, on.as_raw() as usize, 0, ty);
+                l
+            };
+            // the old first segment and the allocator of its deferred segments
+            let own: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let spare = new_list(&alloc);
+            assert_eq!(pc::<unsafe extern "system" fn(*mut c_void) -> i32>(spare, PC_CLOSE)(spare), 0);
+            let primary = new_list(&alloc);
+            bind::reset(primary, a, 0);
+            let w = title_list::wrap(primary);
+            LISTS.lock().unwrap().as_mut().unwrap().get_mut(&(spare as usize)).unwrap().own_alloc = Some(own.clone());
+            title_list::put_spare(w, spare);
+
+            // a deferred segment recorded on it, held on the GPU behind a queue Wait
+            let deferred = new_list(&own);
+            assert_eq!(pc::<unsafe extern "system" fn(*mut c_void) -> i32>(deferred, PC_CLOSE)(deferred), 0);
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            q.Wait(&gate, 1).unwrap();
+            exec(q.as_raw(), 1, &deferred);
+            alloc_pool::executed(q.as_raw(), &[deferred]);
+            assert!(alloc_pool::allocator_in_flight(own.as_raw() as usize));
+
+            // a later recording splits and gets the spare (its own submit is done)
+            let next = split(primary, None);
+            assert_eq!(next, Some(spare), "the split reuses the spare");
+            // (this test holds one reference; the spare's state held the other)
+            let refs = (Interface::vtable(&own).base__.base__.base__.base__.AddRef)(own.as_raw());
+            (Interface::vtable(&own).base__.base__.base__.base__.Release)(own.as_raw());
+
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the queue finishes");
+            let removed = dev.GetDeviceRemovedReason();
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            assert_eq!(release(w), 0);
+            drop(ID3D12GraphicsCommandList::from_raw(deferred));
+
+            assert_eq!(refs, 3, "the allocator of work still on the GPU stays held");
+            assert!(removed.is_ok());
         }
     }
 
