@@ -81,7 +81,9 @@ def main(src, dst):
         if entry == 0:
             ix = [r.i16() for _ in range(32)]
         else:
-            r.u16()  # the widths again; not indices
+            repeated = [r.u8(), r.u8()]
+            if repeated != bits:
+                raise SystemExit(f'BC7 entry {entry}: repeated index widths {repeated} do not match {bits}')
             ix = [r.i16() for _ in range(31)] + [0]  # set 1 has 15 slots, unused
         bc7.append((ctrl, ep, bits, ix))
     assert r.i == len(r.b), (r.i, len(r.b))
