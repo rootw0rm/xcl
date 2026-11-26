@@ -345,3 +345,77 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-122 (task-1795716845-3db8): #2844/#2845/#2846/#2847/#2848 triaged, all SKIP, all pins re-verified
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) + per-PR sequential probe #2830..#2875 (widened
+  past the second gap per mem-1795712765-78dc): #2830 `069292ca` /
+  #2831 `965806a0` / #2832 `e2ecdfa9` / #2833 `f5a352c3` /
+  #2834 `653f8f13` / #2836 `43a4eb9d` / #2837 `9d967cf8` /
+  #2838 `ef36b7df` / #2842 `344ce7b5` / #2843 `932e689c` /
+  #2844 `25dfc2c0` / #2845 `76b17593` / #2846 `a4421e06` /
+  #2847 `4b1780e8` / #2848 `88e56f93` (all pins match batched +
+  sequential, `merge-base --is-ancestor` exit 1 each — all still OPEN,
+  unmerged); #2835, #2839..#2841, #2849..#2875 ALL MISSING — scan
+  complete. #2844 is the step-121 critic handoff (push-race per
+  mem-1795714025-21a1 stands: 2-commit stack `b84e0378` +
+  `25dfc2c0`, merge ref `adbc9a65` present); #2845/#2846/#2847/#2848
+  are NEW since (single commits, each parented on `upstream/main`
+  `8b957bec` — fresh PRs, not push-races; the re-fetched batched
+  listing tops out at #2848, and the sequential tail #2849..#2875 is
+  empty).
+- Triage: nothing portable. #2844 SKIP ("D3D12.X: coherent UMA windows
+  in a driver heap at the title's address on NVIDIA", 5 files,
+  +508/-42: `gpu/uma.rs` +25, `hle/d3d12x/mod.rs` +1,
+  `real.rs` +24, `title_textures.rs` +290, new `uma_driver.rs` +210):
+  the `gpu/uma.rs` hunk (new `driver: AtomicU32` bitmask,
+  `set/is/has_driver_window`, `watch_regions` skipping driver
+  windows) is inert on Linux — every producer/consumer lives in
+  `hle/d3d12x` (`uma_driver::wanted/remake` needs `ID3D12Device` +
+  `windows`/`windows_sys` + kernel32 `GetWriteWatch` + NVIDIA PCI
+  vendor check; `real.rs` `open_uma` remake path; `title_textures`
+  `queue_driver_window_changes`), which never compiles on Linux
+  (`lib.rs` swaps `hle` for `hle_linux.rs`: null `d3d12x_linux` +
+  Vulkan; zero `uma_driver` / `set_driver_window` /
+  `is_driver_window` / `has_driver_windows` refs in
+  `d3d12x_linux.rs` / `hle_linux.rs` / `gpu/uma.rs`). With `driver`
+  stuck at 0 the `watch_regions` branch is a no-op. Our `uma.rs`
+  base shape matches (`pool` at `:118`, `watch_regions` at `:582`).
+  #2845 SKIP ("D3D12.X: clear the preparation screen when the
+  presentation window is missing", +48/-3 in
+  `hle/d3d12x/present/preparation.rs`): `activate()` refactor + 2
+  tests around `ensure_window`/HWND; `hle/d3d12x` never compiles on
+  Linux (zero `preparation`/`ensure_window` refs in `host_linux.rs` /
+  `d3d12x_linux.rs`). COMPETES with #2847 (same file, same
+  missing-window bug — land-once rule §3, and both SKIP anyway).
+  #2846 SKIP ("D3D12.X: clear Flags in null heap GetDesc", +15/-3 in
+  `hle/d3d12x/null.rs`): `Hidden_ZeroDesc40` → `Hidden_ZeroDesc48` +
+  test; the Windows null backend only (Linux uses
+  `d3d12x_linux.rs`); our base shape matches (`Hidden_ZeroDesc40`
+  at `null.rs:178,287`). #2847 SKIP ("D3D12.X: clear ACTIVE/SCREEN
+  when preparation window creation fails", +8/-1, same file as
+  #2845): inline match + clear, no tests — the narrower twin of
+  #2845's fix; Windows-only per #2845. #2848 SKIP ("Shaders: key
+  DXIL toolchain identity off DLL bytes, not mtime", +9/-6 in
+  `gpu/recomp/dxc.rs` `toolchain_identity`): `pub mod dxc` is
+  `#[cfg(windows)]` (`recomp/mod.rs:56-57`); the DXIL cache identity
+  (`dxcompiler.dll`/`dxil.dll` bytes, `XCL_DXIL_CACHE` /
+  `%LOCALAPPDATA%`) has no Linux reader — Linux keys its shader
+  disk cache on translator-source hash (`build.rs`) and emits
+  SPIR-V. Our base shape matches (mtime-based code at
+  `dxc.rs:657`). Earlier pins stand: #2830/#2831/#2832 SKIP;
+  #2833/#2834 landed; #2836 adapted in `7645afeb`; #2837/#2842 SKIP;
+  #2838 landed verbatim in `aa59e8ac`; #2843 SKIP.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step122r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
