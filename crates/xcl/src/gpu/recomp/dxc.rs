@@ -500,6 +500,12 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 /// takes the direct DXIL translator instead (`pso::compile_console_shader`).
 pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
 
+/// An empty `IDxcBlob` reports a null buffer pointer; `slice::from_raw_parts` on it is
+/// UB even at length 0 (#2413) – a null pointer is an empty slice.
+unsafe fn blob_bytes<'a>(p: *const u8, n: usize) -> &'a [u8] {
+    if p.is_null() { &[] } else { std::slice::from_raw_parts(p, n) }
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     // compute (also what MS and GS programs run as): DXC's time for its memory accesses is
     // linear this way (`emit::linked_form`). Anything wrong with it: as one program, as before.
@@ -607,7 +613,7 @@ unsafe fn output(status: windows::core::Result<HRESULT>, errors: windows::core::
         let msg = errors
             .ok()
             .map(|b| {
-                let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
+                let s = blob_bytes(b.GetBufferPointer() as *const u8, b.GetBufferSize());
                 String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
             })
             .unwrap_or_default();
@@ -619,7 +625,7 @@ unsafe fn output(status: windows::core::Result<HRESULT>, errors: windows::core::
         return Err(format!("dxc: {msg}"));
     }
     let blob = result.map_err(|e| format!("{e}"))?;
-    Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+    Ok(blob_bytes(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
 }
 
 fn compile_whole(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
@@ -1618,5 +1624,19 @@ mod accessor_library_tests {
         assert!(gate.close());
         assert!(!gate.open());
         assert!(!gate.close());
+    }
+}
+
+#[cfg(test)]
+mod blob_bytes_tests {
+    /// An empty `IDxcBlob`'s `GetBufferPointer` is null: `blob_bytes` maps it to an
+    /// empty slice instead of the UB `from_raw_parts` would be on a null pointer (#2413).
+    #[test]
+    fn a_null_blob_buffer_is_an_empty_slice() {
+        unsafe {
+            assert!(super::blob_bytes(std::ptr::null(), 0).is_empty());
+            let data = [1u8, 2, 3];
+            assert_eq!(super::blob_bytes(data.as_ptr(), data.len()), &data[..]);
+        }
     }
 }
