@@ -632,6 +632,35 @@ mod tests {
     }
 
     #[test]
+    fn oversize_block_is_rejected_without_overflow_or_allocation() {
+        // Linux has no carrier DLL: blocks come straight from `alloc_zeroed`, and the
+        // #1403 overflow class (round-then-clamp past u64/u32::MAX) must surface as a
+        // clean `Err`, never a panic or a giant allocation. The size guard runs before
+        // the install lock and before any allocation, so a rejection is side-effect
+        // free by construction (no NEXT_SLOT assertion: sibling tests install in
+        // parallel and legitimately advance the counter concurrently).
+        for total_len in [u64::MAX, u64::MAX - 15, isize::MAX as u64 + 1] {
+            let err = unsafe {
+                install(ImageSpec {
+                    name: "tls-test-oversize".into(),
+                    template: 0,
+                    template_len: 0,
+                    total_len,
+                    index_ptr: leaked_index(),
+                    hinst: 0,
+                    callbacks: Vec::new(),
+                    main: false,
+                })
+            }
+            .expect_err("oversize TLS block must be rejected");
+            assert!(
+                err.contains("does not fit") || err.contains("too large"),
+                "unexpected error for {total_len:#x}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn attach_is_idempotent_and_detach_is_safe_without_attach() {
         detach_current_thread();
         attach_current_thread().expect("attach");

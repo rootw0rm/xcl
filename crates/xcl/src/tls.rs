@@ -72,10 +72,12 @@ fn put64(b: &mut [u8], o: usize, v: u64) {
     b[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+const MAX_CARRIER_TEMPLATE: u32 = (u32::MAX - 0x10000) & !15;
+
 /// TLS block size the carrier must provide for a game template of `total_len` bytes.
 pub fn carrier_template_size_for(total_len: u64) -> u32 {
-    let n = total_len.max(16);
-    (((n + 15) & !15).min(u32::MAX as u64 - 0x10000)) as u32
+    let n = total_len.clamp(16, MAX_CARRIER_TEMPLATE as u64);
+    ((n + 15) & !15) as u32
 }
 
 pub fn build_carrier_dll(template_size: u32) -> Vec<u8> {
@@ -84,7 +86,7 @@ pub fn build_carrier_dll(template_size: u32) -> Vec<u8> {
 
 /// Build a minimal x64 DLL whose TLS block is exactly `template_size` bytes.
 pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> {
-    let template_size = template_size.max(16);
+    let template_size = template_size.clamp(16, MAX_CARRIER_TEMPLATE);
     let data_vsize = OFF_TEMPLATE + template_size;
     let size_of_image = (DATA_RVA + data_vsize + 0xFFF) & !0xFFF;
     let mut f = vec![0u8; FILE_ALIGN * 4];
@@ -542,6 +544,17 @@ mod tests {
         assert_eq!(carrier_template_size_for(0), 16);
         assert_eq!(carrier_template_size_for(17), 32);
         assert_eq!(carrier_template_size_for(0x1000), 0x1000);
+    }
+
+    #[test]
+    fn carrier_size_and_build_clamp_without_overflow() {
+        let clamped = carrier_template_size_for(u64::MAX);
+        assert!(clamped >= 16 && clamped % 16 == 0);
+        let bytes = build_carrier_dll(u32::MAX);
+        let pe = Pe::parse(&bytes, Layout::File).unwrap();
+        let tls = pe.tls().unwrap().unwrap();
+        assert_eq!(tls.template_len(), clamped as u64);
+        assert!(pe.size_of_image >= DATA_RVA + OFF_TEMPLATE + clamped);
     }
 
     /// Diagnostic: which carrier variants does this Windows build honour?
