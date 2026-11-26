@@ -1342,3 +1342,37 @@ newest at the bottom.
   (fresh-root `report.json` verified before removal; first fresh-root
   run's report was deleted unverified and re-run).
   Lock audit: 0 new `lock()` (test-only change); `diff --check` clean.
+
+## 2026-11-26 — step-140 (task-1795730722-8254): scan empty, top still #2891, probe past #2891
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2366 refs (+1 vs step-139), in-range set exactly
+  #2830..#2891 minus the known gaps — no refs >=2892 in batched;
+  sequential still ground truth. Per-PR sequential probe #2830..#3500
+  (widened past #2891 per mem-1795712765-78dc; foreground 2830..2920 +
+  background 2921..3100 + background 3101..3300 + background 3301..3500,
+  no tail left open) found 47 PRESENT (#2830..#2891 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880/#2883-#2885
+  gaps), all prior pins match (no force-push, #2872 pin `3893df0a` +
+  #2879 pin `63197e31` + #2881 pin `2c50cc71` + #2882 pin `3e8e2c43` +
+  #2886 pin `237b7181` + #2887 pin `128ee21f` + #2888 pin `5fefeb15` +
+  #2889 pin `ca3eb153` + #2890 pin `c6c14a15` + #2891 pin `0246ae43`
+  hold; #2891 re-verified OPEN, head NOT ancestor of upstream/main);
+  #2892..#3500 ALL MISSING — scan complete, top is still #2891.
+- Triage: nothing new since step-139. #2890 stays PORTED (`1efa5ac0`);
+  #2888/#2889/#2891 SKIP stand; earlier pins stand:
+  #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted
+  in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in `aa59e8ac`;
+  #2843-#2887 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only, tree CLEAN throughout): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step140r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (fresh-root `report.json` verified before removal).
+  Lock audit: 0 new `lock()` (doc-only change); `diff --check` clean.
