@@ -4379,12 +4379,17 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> SlotGuard {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let mut n = slots.n.lock().unwrap();
+    // (a worker of the pipeline queue that has to wait gets a helper in its place meanwhile)
+    let mut parked = None;
     loop {
         let is_wanted = wanted();
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
         if *n < cap && (is_wanted || commit_free()) {
             *n += 1;
             return SlotGuard(slots);
+        }
+        if parked.is_none() {
+            parked = Some(super::pso_async::parked());
         }
         n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
     }

@@ -328,26 +328,130 @@ fn drop_unstarted_job(p: &Pending) {
 
 type Work = Box<dyn FnOnce() + Send>;
 
+type Inbox = Arc<Mutex<mpsc::Receiver<Work>>>;
+
+/// the workers' end of `queue()`, for the helpers `parked` starts
+static INBOX: OnceLock<Inbox> = OnceLock::new();
+
 fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
+        let rx = INBOX.get_or_init(|| Arc::new(Mutex::new(rx)));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
-                }
-                work();
-            });
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || serve(&rx, false));
         }
         Mutex::new(tx)
     })
+}
+
+/// A worker of `queue()`: takes work until the queue is gone; a helper (`parked`) only while
+/// more workers are parked than helpers run.
+fn serve(rx: &Mutex<mpsc::Receiver<Work>>, helper: bool) {
+    POOL_WORKER.with(|w| w.set(true));
+    loop {
+        if helper && retire_helper() {
+            return;
+        }
+        // (a helper looks again now and then whether the worker it stands in for is back)
+        let next = if helper {
+            match rx.lock().unwrap().recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(w) => w,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    HELPERS.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
+            }
+        } else {
+            match rx.lock().unwrap().recv() {
+                Ok(w) => w,
+                Err(_) => return,
+            }
+        };
+        while let Some(p) = next_needed() {
+            build_queued(&p);
+        }
+        next();
+    }
+}
+
+thread_local! {
+    /// this thread is one of `queue()`'s workers (or a helper of theirs)
+    static POOL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Workers of `queue()` waiting for a turn among the big driver compiles (`parked`), and the
+/// helpers that take the queue in their place.
+static PARKED: AtomicUsize = AtomicUsize::new(0);
+static HELPERS: AtomicUsize = AtomicUsize::new(0);
+
+/// A worker of `queue()` is about to wait for a turn among the big driver compiles
+/// (`real::big_compile_turn`): one at a time by default, each after 3 GB of commit is free. It
+/// keeps its thread while it waits. When a retail title starts its world, every worker took
+/// one of its huge compute programs and waited there, one or two of them compiling: the queued
+/// graphics pipelines had no worker left, and the title's thread built them itself, one after
+/// another (`resolve_wait`), for minutes. A helper takes the queue for each parked worker (up to
+/// as many as the pool has) and leaves once the worker is back. Not a worker: nothing happens.
+pub(super) fn parked() -> Parked {
+    if !POOL_WORKER.with(|w| w.get()) {
+        return Parked(false);
+    }
+    let parked = PARKED.fetch_add(1, Ordering::AcqRel) + 1;
+    let most = parked.min(crate::gpu::recomp::dxc::compile_threads());
+    let mut helpers = HELPERS.load(Ordering::Acquire);
+    while helpers < most {
+        match HELPERS.compare_exchange(helpers, helpers + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                spawn_helper(helpers);
+                break;
+            }
+            Err(now) => helpers = now,
+        }
+    }
+    Parked(true)
+}
+
+pub(super) struct Parked(bool);
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        if self.0 {
+            PARKED.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn spawn_helper(k: usize) {
+    let Some(rx) = INBOX.get().cloned() else {
+        HELPERS.fetch_sub(1, Ordering::AcqRel);
+        return;
+    };
+    let n = HELPERS_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a pipeline worker waits for a turn among the big driver compiles – a helper takes the queue meanwhile ({n} helpers so far)");
+    }
+    let spawned = std::thread::Builder::new().name(format!("xcl-pso-h{k}")).stack_size(64 << 20).spawn(move || serve(&rx, true));
+    if spawned.is_err() {
+        HELPERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+static HELPERS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// A helper leaves when there are more helpers than parked workers (true: this one left).
+fn retire_helper() -> bool {
+    let mut helpers = HELPERS.load(Ordering::Acquire);
+    while helpers > PARKED.load(Ordering::Acquire) {
+        match HELPERS.compare_exchange(helpers, helpers - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => helpers = now,
+        }
+    }
+    false
 }
 
 fn enqueue(p: Arc<Pending>) {
@@ -1410,6 +1514,67 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert_eq!(total_drops.load(Ordering::Acquire), expected, "every stand-in and real PSO must be released cleanly");
+    }
+
+    /// Every worker waiting for a turn among the big driver compiles (`parked`) does not stop
+    /// the queue: a job sent after them is built by a helper, and the helpers leave once the
+    /// workers are back.
+    #[test]
+    fn workers_parked_for_big_compiles_leave_the_queue_to_helpers() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+
+        struct OpenGate(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for OpenGate {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let open = OpenGate(gate.clone());
+        for _ in 0..n {
+            let (tx, g) = (started_tx.clone(), gate.clone());
+            let _ = queue().lock().unwrap().send(Box::new(move || {
+                let _parked = parked();
+                let _ = tx.send(());
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+            }));
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(10)).expect("every worker parked");
+        }
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let _ = queue().lock().unwrap().send(Box::new(move || {
+            let _ = ran_tx.send(());
+        }));
+        let ran = ran_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        drop(open);
+        assert!(ran, "a job queued behind {n} parked workers was not built");
+        let start = Instant::now();
+        while HELPERS.load(Ordering::Acquire) > PARKED.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(PARKED.load(Ordering::Acquire), 0, "the parked workers are back");
+        assert_eq!(HELPERS.load(Ordering::Acquire), 0, "the helpers left");
+    }
+
+    /// `parked` on a thread that is not a worker of the queue (a title's thread, a test) starts
+    /// no helper.
+    #[test]
+    fn parked_outside_the_pool_starts_no_helper() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = HELPERS.load(Ordering::Acquire);
+        let p = parked();
+        assert_eq!(PARKED.load(Ordering::Acquire), 0);
+        assert_eq!(HELPERS.load(Ordering::Acquire), before);
+        drop(p);
     }
 }
 
