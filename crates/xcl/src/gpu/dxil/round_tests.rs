@@ -161,7 +161,7 @@ fn ref_sqrt(a: u32, m: Mode) -> Option<u32> {
         return Some((s as u32) << 31);
     }
     if s {
-        return None;
+        return Some(0x7FC0_0000);
     }
     // sqrt(ma · 2^ea): make the exponent even and the integer large (≥ 2^100)
     let (mut mm, mut e) = (ma, ea);
@@ -346,6 +346,11 @@ fn directed_reference_basics() {
     assert_eq!(ref_sqrt(2.0f32.to_bits(), m(3)), Some(2f32.sqrt().to_bits()));
     assert_eq!(ref_sqrt(2.0f32.to_bits(), m(1)), Some(2f32.sqrt().to_bits() + 1));
     assert_eq!(ref_sqrt(4.0f32.to_bits(), m(1)), Some(2.0f32.to_bits()));
+    let flush = |rm| Mode { rm, keep_in: false, keep_out: false };
+    assert_eq!(ref_sqrt(0x8000_0001, m(1)), Some(0x7FC0_0000));
+    assert_eq!(ref_sqrt(0x8000_0001, flush(1)), Some(0x8000_0000));
+    assert_eq!(ref_sqrt(0xBF80_0000, m(1)), Some(0x7FC0_0000));
+    assert_eq!(ref_sqrt(0x8000_0000, m(1)), Some(0x8000_0000));
     assert_eq!(ref_cvt_int(0x0100_0001, false, m(1)), 16777218f32.to_bits());
     assert_eq!(ref_cvt_int(0x0100_0001, false, m(3)), 16777216f32.to_bits());
     // RNE reference agrees with the host on random sums / products
@@ -363,7 +368,7 @@ fn directed_reference_basics() {
             assert!(r == fa.mul_add(fb, fc).to_bits() || is_nan(r), "fma {a:#x} {b:#x} {c:#x}");
         }
         if let Some(r) = ref_sqrt(a, m(0)) {
-            assert_eq!(r, fa.sqrt().to_bits(), "sqrt {a:#x}");
+            assert!(r == fa.sqrt().to_bits() || (is_nan(r) && fa.sqrt().is_nan()), "sqrt {a:#x}");
         }
         // directed results bracket the exact value: RTN ≤ RNE ≤ RTP, RTZ toward zero
         if let (Some(lo), Some(hi)) = (ref_add(a, b, m(2)), ref_add(a, b, m(1))) {
