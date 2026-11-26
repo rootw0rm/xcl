@@ -142,7 +142,7 @@ impl TlsDir {
         self.end_raw.saturating_sub(self.start_raw)
     }
     pub fn total_len(&self) -> u64 {
-        self.template_len() + self.size_of_zero_fill as u64
+        self.template_len().saturating_add(self.size_of_zero_fill as u64)
     }
 }
 
@@ -338,7 +338,8 @@ impl<'a> Pe<'a> {
             }
             Layout::File => {
                 if rva < self.size_of_headers {
-                    return Some(rva as usize);
+                    let off = rva as usize;
+                    return (off < self.data.len()).then_some(off);
                 }
                 for s in &self.sections {
                     let size = s.mapped_size().max(s.raw_size);
@@ -347,7 +348,8 @@ impl<'a> Pe<'a> {
                         if delta >= s.raw_size {
                             return None; // in zero-filled tail, not present in file
                         }
-                        return Some(s.raw_ptr as usize + delta as usize);
+                        let off = (s.raw_ptr as usize).checked_add(delta as usize)?;
+                        return (off < self.data.len()).then_some(off);
                     }
                 }
                 None
@@ -1231,5 +1233,79 @@ mod tests {
         assert_eq!(imps[0].entries[0].iat_rva, headers);
         let tls = pe.tls().unwrap().unwrap();
         assert_eq!(pe.va_to_rva(tls.address_of_index), Some(headers));
+    }
+
+    #[test]
+    fn tls_dir_total_len_saturates_instead_of_overflowing() {
+        let dir = TlsDir {
+            start_raw: 0,
+            end_raw: u64::MAX,
+            size_of_zero_fill: 16,
+            ..Default::default()
+        };
+        assert_eq!(dir.total_len(), u64::MAX);
+    }
+
+    // Needs kernel32.dll from disk: Windows-only (same reason as the other
+    // `system_file` tests above). The synthetic twin below pins the same
+    // boundaries on every platform.
+    #[cfg(windows)]
+    #[test]
+    fn rva_to_offset_in_file_layout_rejects_offsets_past_eof() {
+        let mut data = system_file("kernel32.dll");
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        let sec = pe.sections.iter().find(|s| s.raw_size >= 64 && s.raw_ptr as usize >= pe.size_of_headers as usize).unwrap().clone();
+        // Truncate inside the section so raw_ptr + 16 lands exactly on data.len().
+        let exact_end = sec.raw_ptr as usize + 16;
+        let header_end = pe.size_of_headers as usize;
+        drop(pe);
+        data.truncate(exact_end.min(data.len()));
+        let mid = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(mid.rva_to_offset(sec.va + 15), Some(data.len() - 1));
+        assert_eq!(
+            mid.rva_to_offset(sec.va + 16),
+            None,
+            "rva_to_offset must return None when raw_ptr + delta == data.len()"
+        );
+        // Truncate right after the headers so the section start itself is past EOF.
+        data.truncate(header_end.min(data.len()));
+        let truncated = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(
+            truncated.rva_to_offset(sec.va),
+            None,
+            "rva_to_offset must return None when section raw_ptr + delta >= data.len()"
+        );
+    }
+
+    #[test]
+    fn rva_to_offset_in_file_layout_rejects_offsets_past_eof_synthetic() {
+        // Linux-runnable twin of the kernel32 truncation test above: `pe_with_headers`
+        // builds a minimal PE32+ with SizeOfHeaders = 0x400 and one section
+        // (va 0x1000, raw_ptr 0x400, 64 raw bytes); the truncation boundaries
+        // are identical, plus a mid-headers truncation for the header branch.
+        let headers = 0x400u32;
+        let full = pe_with_headers(headers, 0x14000_0000, 0x1000, &[0xAB; 64]);
+        // Truncate inside the section so raw_ptr + 16 lands exactly on data.len().
+        let mut data = full.clone();
+        data.truncate(headers as usize + 16);
+        let mid = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(mid.rva_to_offset(0x1000 + 15), Some(data.len() - 1));
+        assert_eq!(
+            mid.rva_to_offset(0x1000 + 16),
+            None,
+            "rva_to_offset must return None when raw_ptr + delta == data.len()"
+        );
+        // Truncate right after the headers so the section start itself is past EOF.
+        data.truncate(headers as usize);
+        let truncated = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(
+            truncated.rva_to_offset(0x1000),
+            None,
+            "rva_to_offset must return None when section raw_ptr + delta >= data.len()"
+        );
+        // Truncate mid-headers: an rva inside the headers but past EOF is rejected too.
+        data.truncate(0x200);
+        let short = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(short.rva_to_offset(0x300), None);
     }
 }
