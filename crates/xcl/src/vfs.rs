@@ -140,12 +140,52 @@ fn trim_sep(s: &str) -> String {
     s.trim_end_matches(['\\', '/']).to_string()
 }
 
-/// A game-relative path in the one form the mount and whiteout tables use:
-/// backslash-separated with no leading/trailing separators (upstream #1299).
-/// `logical` folds `/` to `\` first so forward, leading and trailing slashes
-/// all name the same entry.
-fn clean_rel(rel: &str) -> String {
-    trim_sep(logical(rel).trim_start_matches('\\'))
+/// Canonicalise a relative path within the game / overlay directory (upstream
+/// #1560 audit):
+/// 1. Replaces forward slashes '/' with backslashes '\'.
+/// 2. Strips leading and trailing backslashes.
+/// 3. Normalises consecutive backslashes into a single backslash.
+/// 4. Resolves '.' (current directory) and '..' (parent directory).
+/// 5. Boundary check: returns `None` if '..' attempts to escape above the root
+///    (when the component stack is empty), or if the path contains a drive letter
+///    (e.g. "C:") or device prefix.
+/// A `None` rel must never touch the host: callers fail with the Win32 code for
+/// the operation (PATH_NOT_FOUND / FILE_NOT_FOUND) instead.
+pub fn clean_rel(rel: &str) -> Option<String> {
+    if rel.is_empty() {
+        return Some(String::new());
+    }
+    let norm_str = rel.replace('/', "\\");
+    if norm_str.starts_with(r"\\") {
+        return None;
+    }
+    let trimmed = norm_str.trim_matches('\\');
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in trimmed.split('\\') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+            s => {
+                if s.contains(':') {
+                    return None;
+                }
+                parts.push(s);
+            }
+        }
+    }
+    Some(parts.join("\\"))
 }
 
 /// A `..` in a console path stops at its mount's root: resolve `.`/`..` inside
@@ -294,11 +334,18 @@ fn checked_mount_path(root: &str, tail: &str) -> Result<String, u32> {
 }
 
 fn strip_verbatim(p: &str) -> String {
-    if let Some(r) = p.strip_prefix("\\\\?\\").or_else(|| p.strip_prefix("\\??\\")) {
-        if r.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("UNC\\")) {
-            return format!("\\\\{}", &r[4..]);
-        }
-        return r.to_string();
+    // Upstream #1560: `UNC` matches case-insensitively and either separator
+    // may follow it (`\\?\UNC\` vs `\\?\unc/...`).
+    let bytes = p.as_bytes();
+    if bytes.len() >= 8
+        && (p.starts_with(r"\\?\") || p.starts_with(r"\??\"))
+        && p[4..7].eq_ignore_ascii_case("unc")
+        && (bytes[7] == b'\\' || bytes[7] == b'/')
+    {
+        return format!(r"\\{}", &p[8..]);
+    }
+    if p.starts_with(r"\\?\") || p.starts_with(r"\??\") {
+        return p[4..].to_string();
     }
     p.to_string()
 }
@@ -400,27 +447,60 @@ fn logical_drives() -> u32 {
 
 impl Vfs {
     pub fn new(game_root: &Path, data_dir: &Path, mounts: Vec<(String, String)>) -> Vfs {
+        // Upstream #1560: roots go through `full_path` + `strip_verbatim` + `norm`
+        // and mount prefixes lowercase with `/` normalised, so `MNT/DIR:` matches
+        // `mnt/dir:/...`. Linux keeps `host_path_string` (absolutise + lexically
+        // normalise to `/`) for host folders — plain `norm` would fold host `/`
+        // to `\` — and `logical` (`/` -> `\`) for console-spelled prefixes.
+        #[cfg(windows)]
+        let game_root = {
+            let game_root_s = game_root.to_string_lossy();
+            let game_root_norm = trim_sep(&strip_verbatim(&norm(&game_root_s)));
+            let game_root = full_path(&game_root_norm).unwrap_or(game_root_norm);
+            trim_sep(&strip_verbatim(&norm(&game_root)))
+        };
+        #[cfg(not(windows))]
         let game_root = trim_sep(&strip_verbatim(&host_path_string(&game_root.to_string_lossy())));
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
-            .map(|s| s.lines().filter(|l| !l.is_empty()).map(Self::wkey).collect())
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| Self::wkey(l.trim()))
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
             .map(|(p, t)| {
-                (
-                    p.to_ascii_lowercase()
-                        .trim_end_matches(['\\', '/'])
-                        .to_string(),
-                    trim_sep(&host_path_string(&t)),
-                )
+                let p_clean = logical(&p).to_ascii_lowercase();
+                let p_clean = p_clean.trim_end_matches('\\').to_string();
+                #[cfg(windows)]
+                let t_clean = {
+                    let t_norm = trim_sep(&strip_verbatim(&norm(&t)));
+                    let t_clean = full_path(&t_norm).unwrap_or(t_norm);
+                    trim_sep(&strip_verbatim(&norm(&t_clean)))
+                };
+                #[cfg(not(windows))]
+                let t_clean = trim_sep(&host_path_string(&t));
+                (p_clean, t_clean)
             })
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let data_root = data_dir.to_string_lossy();
-        let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
+        #[cfg(windows)]
+        let data_root = {
+            let data_root_norm = trim_sep(&strip_verbatim(&norm(&data_root)));
+            let data_root = full_path(&data_root_norm).unwrap_or(data_root_norm);
+            trim_sep(&strip_verbatim(&norm(&data_root)))
+        };
+        #[cfg(not(windows))]
+        let data_root = {
+            let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
+            trim_sep(&strip_verbatim(&norm(&data_root)))
+        };
         let pls_root = Path::new(&data_root).join("pls");
         let pls_root_lc = trim_sep(&strip_verbatim(&norm(&pls_root.to_string_lossy()))).to_lowercase();
         Vfs {
@@ -692,9 +772,15 @@ impl Vfs {
             if ensure_mount_contained(Path::new(&self.game_root), Path::new(&abs)).is_err() {
                 return Target::Reject(ERROR_ACCESS_DENIED);
             }
-            return Target::Game {
-                rel: rel_from_host(rel),
-            };
+            // Upstream #1560: canonicalise the game rel; a `None` rel (drive,
+            // colon, UNC, or `..` past the root) becomes the `..` sentinel the
+            // open path fails with PATH_NOT_FOUND. Linux keeps the #1170 clamp
+            // in `apply_mounts_checked`, so genuine mount escapes never reach
+            // this sentinel — only hostile rel spellings do.
+            if let Some(clean) = clean_rel(&rel_from_host(rel)) {
+                return Target::Game { rel: clean };
+            }
+            return Target::Game { rel: "..".to_string() };
         }
         if translated {
             Target::Translated(abs)
@@ -748,11 +834,18 @@ impl Vfs {
     }
 
     pub fn overlay_path(&self, rel: &str) -> String {
-        join_rel(&self.overlay, &clean_rel(rel))
+        // Upstream #1560: build from the canonical rel so every spelling names
+        // the same file; `join_rel` keeps the platform join (Linux `/`).
+        let clean =
+            clean_rel(rel).unwrap_or_else(|| rel.replace('/', "\\").trim_matches('\\').to_string());
+        join_rel(&self.overlay, &clean)
     }
 
     pub fn original_path(&self, rel: &str) -> String {
-        join_rel(&self.game_root, &clean_rel(rel))
+        // Same canonicalisation as `overlay_path` (upstream #1560).
+        let clean =
+            clean_rel(rel).unwrap_or_else(|| rel.replace('/', "\\").trim_matches('\\').to_string());
+        join_rel(&self.game_root, &clean)
     }
 
     #[cfg(not(windows))]
@@ -793,12 +886,16 @@ impl Vfs {
         Ok(path)
     }
 
-    fn wkey(rel: &str) -> String {
-        clean_rel(rel).to_lowercase()
+    fn wkey(rel: &str) -> Option<String> {
+        // Upstream #1560: whiteout keys are the canonical rel, ASCII-folded;
+        // a `None` rel (traversal/drive/UNC) never names a whiteout.
+        clean_rel(rel).map(|s| s.to_ascii_lowercase())
     }
 
     pub fn is_whiteout(&self, rel: &str) -> bool {
-        let k = Self::wkey(rel);
+        let Some(k) = Self::wkey(rel) else {
+            return false;
+        };
         let g = self.whiteouts.lock().unwrap();
         if g.is_empty() {
             return false;
@@ -818,7 +915,9 @@ impl Vfs {
     }
 
     pub fn has_whiteouts_under(&self, rel_dir: &str) -> bool {
-        let k = Self::wkey(rel_dir);
+        let Some(k) = Self::wkey(rel_dir) else {
+            return false;
+        };
         let g = self.whiteouts.lock().unwrap();
         if k.is_empty() {
             return !g.is_empty();
@@ -840,18 +939,18 @@ impl Vfs {
     }
 
     fn add_whiteout(&self, rel: &str) {
-        let mut g = self.whiteouts.lock().unwrap();
-        if g.insert(Self::wkey(rel)) {
-            self.persist_whiteouts(&g);
+        if let Some(k) = Self::wkey(rel) {
+            let mut g = self.whiteouts.lock().unwrap();
+            if g.insert(k) {
+                self.persist_whiteouts(&g);
+            }
         }
     }
 
     fn remove_whiteout(&self, rel: &str) {
-        #[cfg(not(windows))]
-        if Self::checked_rel(rel).is_err() {
+        let Some(k) = Self::wkey(rel) else {
             return;
-        }
-        let k = Self::wkey(rel);
+        };
         if k.is_empty() {
             return;
         }
@@ -878,7 +977,7 @@ impl Vfs {
                     .and_then(|path| std::fs::read_dir(path).ok());
                 if let Some(entries) = entries {
                     for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_lowercase();
+                        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
                         g.insert(format!("{prefix}\\{name}"));
                     }
                 }
@@ -894,51 +993,70 @@ impl Vfs {
     }
 
     fn record_write(&self, rel: &str) {
+        // Upstream #1560: log the canonical spelling.
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.to_string());
         let mut w = self.writes.lock().unwrap();
-        if w.len() < 10_000 && w.insert(rel.to_string()) {
-            crate::xlog_info!("[VFS] write to a game file redirected to the overlay: {rel}");
+        if w.len() < 10_000 && w.insert(clean.clone()) {
+            crate::xlog_info!("[VFS] write to a game file redirected to the overlay: {clean}");
         }
     }
 
     pub fn visible_in_overlay(&self, rel: &str) -> bool {
+        let Some(clean) = clean_rel(rel) else {
+            return false;
+        };
         #[cfg(windows)]
-        let path = self.overlay_path(rel);
+        let path = self.overlay_path(&clean);
         #[cfg(not(windows))]
-        let Ok(path) = self.checked_overlay_path(rel) else {
+        let Ok(path) = self.checked_overlay_path(&clean) else {
             return false;
         };
         Path::new(&path).exists()
     }
 
     pub fn visible_in_original(&self, rel: &str) -> bool {
-        if self.is_whiteout(rel) {
+        let Some(clean) = clean_rel(rel) else {
+            return false;
+        };
+        if self.is_whiteout(&clean) {
             return false;
         }
         #[cfg(windows)]
-        let path = self.original_path(rel);
+        let path = self.original_path(&clean);
         #[cfg(not(windows))]
-        let Ok(path) = self.checked_original_path(rel) else {
+        let Ok(path) = self.checked_original_path(&clean) else {
             return false;
         };
         Path::new(&path).exists()
     }
 
     pub fn exists(&self, rel: &str) -> bool {
-        self.visible_in_overlay(rel) || self.visible_in_original(rel)
+        clean_rel(rel).is_some_and(|c| self.visible_in_overlay(&c) || self.visible_in_original(&c))
     }
 
     pub fn is_dir(&self, rel: &str) -> bool {
+        let Some(clean) = clean_rel(rel) else {
+            return false;
+        };
         #[cfg(windows)]
-        let overlay = self.overlay_path(rel);
+        let overlay = self.overlay_path(&clean);
         #[cfg(not(windows))]
-        let Ok(overlay) = self.checked_overlay_path(rel) else {
-            return self.visible_in_original(rel)
-                && Path::new(&self.original_path(rel)).is_dir();
+        let Ok(overlay) = self.checked_overlay_path(&clean) else {
+            return self.visible_in_original(&clean)
+                && self
+                    .checked_original_path(&clean)
+                    .is_ok_and(|path| Path::new(&path).is_dir());
         };
         if let Ok(m) = std::fs::metadata(overlay) {
             return m.is_dir();
         }
-        self.visible_in_original(rel) && Path::new(&self.original_path(rel)).is_dir()
+        #[cfg(windows)]
+        let original_is_dir = Path::new(&self.original_path(&clean)).is_dir();
+        #[cfg(not(windows))]
+        let original_is_dir = self
+            .checked_original_path(&clean)
+            .is_ok_and(|path| Path::new(&path).is_dir());
+        self.visible_in_original(&clean) && original_is_dir
     }
 
     /// Real path to read `path` from. None = hidden by a whiteout.
@@ -953,19 +1071,23 @@ impl Vfs {
     }
 
     pub fn read_path_rel(&self, rel: &str) -> Option<String> {
-        if self.visible_in_overlay(rel) {
-            return self.checked_overlay_path(rel).ok();
+        let clean = clean_rel(rel)?;
+        if self.visible_in_overlay(&clean) {
+            #[cfg(windows)]
+            return Some(self.overlay_path(&clean));
+            #[cfg(not(windows))]
+            return self.checked_overlay_path(&clean).ok();
         }
-        if self.is_whiteout(rel) {
+        if self.is_whiteout(&clean) {
             return None;
         }
         #[cfg(windows)]
         {
-            Some(self.original_path(rel))
+            Some(self.original_path(&clean))
         }
         #[cfg(not(windows))]
         {
-            self.checked_original_path(rel).ok()
+            self.checked_original_path(&clean).ok()
         }
     }
 
@@ -978,14 +1100,17 @@ impl Vfs {
     }
 
     fn stage_write_unlocked(&self, rel: &str) -> Result<String, u32> {
-        let rel_clean = clean_rel(rel);
+        // Upstream #1560: traversal rels fail before anything is created.
+        let Some(rel_clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
         if let Some((parent_rel, _)) = rel_clean.rsplit_once('\\') {
             if !self.is_dir(parent_rel) {
                 return Err(ERROR_PATH_NOT_FOUND);
             }
         }
         #[cfg(windows)]
-        let ov = self.overlay_path(rel);
+        let ov = self.overlay_path(&rel_clean);
         #[cfg(not(windows))]
         let ov = self.checked_overlay_path(&rel_clean)?;
         if let Some(parent) = Path::new(&ov).parent() {
@@ -1010,8 +1135,10 @@ impl Vfs {
         if Self::checked_rel(rel).is_err() {
             return;
         }
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        // Upstream #1560: record the canonical spelling.
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.to_string());
+        self.remove_whiteout(&clean);
+        self.record_write(&clean);
     }
 
     /// Commit a staged game-file open once the underlying host open succeeded. The
@@ -1029,12 +1156,14 @@ impl Vfs {
         if Self::checked_rel(rel).is_err() {
             return;
         }
+        // Upstream #1560: record the canonical spelling.
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.to_string());
         // A new overlay entry replaces a whiteout. Reopening an existing entry
         // must keep the whiteout that hides its original after delete-on-close.
         if is_new {
-            self.remove_whiteout(rel);
+            self.remove_whiteout(&clean);
         }
-        self.record_write(rel);
+        self.record_write(&clean);
     }
 
     /// Record removal of an overlay file and hide the game file it covered.
@@ -1048,16 +1177,18 @@ impl Vfs {
         if Self::checked_rel(rel).is_err() {
             return;
         }
+        // Upstream #1560: record the canonical spelling.
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.to_string());
         #[cfg(windows)]
-        let original_exists = Path::new(&self.original_path(rel)).exists();
+        let original_exists = Path::new(&self.original_path(&clean)).exists();
         #[cfg(not(windows))]
         let original_exists = self
-            .checked_original_path(rel)
+            .checked_original_path(&clean)
             .is_ok_and(|path| Path::new(&path).exists());
         if original_exists {
-            self.add_whiteout(rel);
+            self.add_whiteout(&clean);
         }
-        self.record_write(rel);
+        self.record_write(&clean);
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
@@ -1071,10 +1202,15 @@ impl Vfs {
     }
 
     fn prepare_write_staged_unlocked(&self, rel: &str, keep_content: bool) -> Result<(String, bool), u32> {
-        // Clean first so forward/leading/trailing slashes name the same entry (upstream #1299).
-        let rel_clean = clean_rel(rel);
-        // Linux first: reject traversals/absolute rels with the containment error
-        // before the parent check below can shadow it as PATH_NOT_FOUND.
+        // Upstream #1560: canonicalise first; a traversal rel fails with
+        // PATH_NOT_FOUND before the parent check or the containment layer.
+        // (Linux keeps `checked_rel` on the cleaned rel for absolute/symlink
+        //  roots, and #29's pin moves to PATH_NOT_FOUND with this audit.)
+        let Some(rel_clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
+        // Linux: reject absolute rels with the containment error before the
+        // parent check below can shadow it as PATH_NOT_FOUND.
         #[cfg(not(windows))]
         Self::checked_rel(&rel_clean)?;
         // Win32 fails a create-write with ERROR_PATH_NOT_FOUND when the parent folder
@@ -1185,12 +1321,17 @@ impl Vfs {
                 (Decision::Use(p), None)
             }
             Target::Game { rel } => {
-                let in_ov = self.visible_in_overlay(&rel);
-                let in_orig = self.visible_in_original(&rel);
+                // Upstream #1560: a traversal rel (e.g. the `..` sentinel from
+                // `classify`) fails safely instead of probing the host.
+                let Some(clean) = clean_rel(&rel) else {
+                    return (Decision::Fail(ERROR_PATH_NOT_FOUND), None);
+                };
+                let in_ov = self.visible_in_overlay(&clean);
+                let in_orig = self.visible_in_original(&clean);
                 let visible = in_ov || in_orig;
                 let write = Self::is_write(access, disposition, flags) || (disposition == OPEN_ALWAYS && !visible);
                 if !write {
-                    let decision = match self.read_path_rel(&rel) {
+                    let decision = match self.read_path_rel(&clean) {
                         Some(p) => Decision::Use(p),
                         None => Decision::Fail(ERROR_FILE_NOT_FOUND),
                     };
@@ -1207,16 +1348,16 @@ impl Vfs {
                 }
                 let ov_entry = in_ov || {
                     #[cfg(windows)]
-                    let overlay_entry = Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
+                    let overlay_entry = Path::new(&self.overlay_path(&clean)).symlink_metadata().is_ok();
                     #[cfg(not(windows))]
-                    let overlay_entry = match self.checked_overlay_path(&rel) {
+                    let overlay_entry = match self.checked_overlay_path(&clean) {
                         Ok(path) => Path::new(&path).symlink_metadata().is_ok(),
                         Err(error) => return (Decision::Fail(error), None),
                     };
                     overlay_entry
                 };
                 if disposition == TRUNCATE_EXISTING {
-                    let check_path = if in_ov { self.overlay_path(&rel) } else { self.original_path(&rel) };
+                    let check_path = if in_ov { self.overlay_path(&clean) } else { self.original_path(&clean) };
                     let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
                         Path::new(&check_path).symlink_metadata().is_ok_and(|m| m.is_dir())
                     } else {
@@ -1235,15 +1376,15 @@ impl Vfs {
                 let replaces_original = disposition == CREATE_ALWAYS
                     && !ov_entry
                     && in_orig
-                    && Path::new(&self.original_path(&rel)).is_file();
-                match self.prepare_write_staged_unlocked(&rel, keep) {
+                    && Path::new(&self.original_path(&clean)).is_file();
+                match self.prepare_write_staged_unlocked(&clean, keep) {
                     Ok((p, is_new)) if disposition == TRUNCATE_EXISTING && !ov_entry => {
-                        (Decision::UseWithDisposition(p, CREATE_ALWAYS), Some(OpenCommit { rel, is_new }))
+                        (Decision::UseWithDisposition(p, CREATE_ALWAYS), Some(OpenCommit { rel: clean, is_new }))
                     }
                     Ok((p, is_new)) if replaces_original => {
-                        (Decision::CreateOverOriginal(p), Some(OpenCommit { rel, is_new }))
+                        (Decision::CreateOverOriginal(p), Some(OpenCommit { rel: clean, is_new }))
                     }
-                    Ok((p, is_new)) => (Decision::Use(p), Some(OpenCommit { rel, is_new })),
+                    Ok((p, is_new)) => (Decision::Use(p), Some(OpenCommit { rel: clean, is_new })),
                     Err(e) => (Decision::Fail(e), None),
                 }
             }
@@ -1329,49 +1470,66 @@ impl Vfs {
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
         let _guard = self.write_lock.lock().unwrap();
+        // Upstream #1560: a traversal rel is FILE_NOT_FOUND before probing the host.
+        let Some(rel_clean) = clean_rel(rel) else {
+            return Err(ERROR_FILE_NOT_FOUND);
+        };
         #[cfg(windows)]
-        let ov = self.overlay_path(rel);
+        let ov = self.overlay_path(&rel_clean);
         #[cfg(not(windows))]
-        let ov = self.checked_overlay_path(rel)?;
+        let ov = self.checked_overlay_path(&rel_clean)?;
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
             if meta.is_dir() {
                 return Err(ERROR_ACCESS_DENIED);
             }
             std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
-            self.commit_overlay_removal_unlocked(rel);
+            self.commit_overlay_removal_unlocked(&rel_clean);
             return Ok(());
         }
-        if !self.visible_in_original(rel) {
+        if !self.visible_in_original(&rel_clean) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if Path::new(&self.original_path(rel)).is_dir() {
+        #[cfg(windows)]
+        let original_is_dir = Path::new(&self.original_path(&rel_clean)).is_dir();
+        #[cfg(not(windows))]
+        let original_is_dir = self
+            .checked_original_path(&rel_clean)
+            .is_ok_and(|path| Path::new(&path).is_dir());
+        if original_is_dir {
             return Err(ERROR_ACCESS_DENIED);
         }
-        self.add_whiteout(rel);
-        self.record_write(rel);
+        self.add_whiteout(&rel_clean);
+        self.record_write(&rel_clean);
         Ok(())
     }
 
     pub fn create_dir(&self, rel: &str) -> Result<(), u32> {
         let _guard = self.write_lock.lock().unwrap();
-        if self.visible_in_overlay(rel) || self.visible_in_original(rel) {
+        // Upstream #1560: a traversal rel is PATH_NOT_FOUND before probing the host.
+        let Some(rel_clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
+        if self.visible_in_overlay(&rel_clean) || self.visible_in_original(&rel_clean) {
             return Err(ERROR_ALREADY_EXISTS);
         }
         #[cfg(windows)]
-        let ov = self.overlay_path(rel);
+        let ov = self.overlay_path(&rel_clean);
         #[cfg(not(windows))]
-        let ov = self.checked_overlay_path(rel)?;
+        let ov = self.checked_overlay_path(&rel_clean)?;
         std::fs::create_dir_all(&ov).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         #[cfg(not(windows))]
-        self.checked_overlay_path(rel)?;
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        self.checked_overlay_path(&rel_clean)?;
+        self.remove_whiteout(&rel_clean);
+        self.record_write(&rel_clean);
         Ok(())
     }
 
     fn check_original_dir_empty(&self, rel: &str) -> Result<(), u32> {
-        let rel_clean = clean_rel(rel);
+        // Callers pass canonical rels; a traversal rel here is defensive-only.
+        let Some(rel_clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
         if self.is_whiteout(&rel_clean) {
             return Ok(());
         }
@@ -1397,7 +1555,10 @@ impl Vfs {
 
     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
         let _guard = self.write_lock.lock().unwrap();
-        let rel_clean = clean_rel(rel);
+        // Upstream #1560: a traversal rel is PATH_NOT_FOUND before probing the host.
+        let Some(rel_clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
         if rel_clean.is_empty() {
             return Err(ERROR_ACCESS_DENIED);
         }
@@ -1427,7 +1588,13 @@ impl Vfs {
         if !self.visible_in_original(&rel_clean) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if !Path::new(&self.original_path(&rel_clean)).is_dir() {
+        #[cfg(windows)]
+        let original_is_dir = Path::new(&self.original_path(&rel_clean)).is_dir();
+        #[cfg(not(windows))]
+        let original_is_dir = self
+            .checked_original_path(&rel_clean)
+            .is_ok_and(|path| Path::new(&path).is_dir());
+        if !original_is_dir {
             return Err(ERROR_DIRECTORY);
         }
         self.check_original_dir_empty(&rel_clean)?;
@@ -1438,13 +1605,16 @@ impl Vfs {
 
     /// Whether directory listings under `rel_dir` must merge overlay + original.
     pub fn needs_merge(&self, rel_dir: &str) -> bool {
+        let Some(clean) = clean_rel(rel_dir) else {
+            return false;
+        };
         #[cfg(windows)]
-        let overlay_is_dir = Path::new(&self.overlay_path(rel_dir)).is_dir();
+        let overlay_is_dir = Path::new(&self.overlay_path(&clean)).is_dir();
         #[cfg(not(windows))]
         let overlay_is_dir = self
-            .checked_overlay_path(rel_dir)
+            .checked_overlay_path(&clean)
             .is_ok_and(|path| Path::new(&path).is_dir());
-        overlay_is_dir || self.has_whiteouts_under(rel_dir)
+        overlay_is_dir || self.has_whiteouts_under(&clean)
     }
 
     pub fn unmapped_paths(&self) -> Vec<String> {
@@ -1614,7 +1784,10 @@ mod tests {
         );
         assert_eq!(std::fs::read(&outside).unwrap(), b"host secret");
         assert!(v.redirected_writes().is_empty());
-        assert_eq!(v.prepare_write("..\\outside.txt", false), Err(ERROR_ACCESS_DENIED));
+        // Upstream #1560 reconcile: a traversal rel fails with PATH_NOT_FOUND
+        // (the Win32 code for the operation) instead of the containment layer's
+        // ACCESS_DENIED — the symlink-escape Reject legs below are unchanged.
+        assert_eq!(v.prepare_write("..\\outside.txt", false), Err(ERROR_PATH_NOT_FOUND));
         assert_eq!(v.read_path_rel("..\\outside.txt"), None);
     }
 
@@ -2485,5 +2658,250 @@ mod tests {
             assert_eq!(v.classify(&abs), Target::Game { rel: "Data\\a.bin".into() });
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn clean_rel_resolves_dots_and_detects_boundary_traversal() {
+        // Upstream #1560 audit: `/` folds to `\`, leading/trailing/double
+        // separators collapse, `.` drops out, `..` pops inside the root and
+        // returns None past it (as do drive/UNC/device spellings).
+        assert_eq!(clean_rel("data/hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("data\\sub\\..\\hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("data\\.\\hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("/data/hello.txt/"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("data\\\\hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel(""), Some(String::new()));
+        assert_eq!(clean_rel("/"), Some(String::new()));
+        assert_eq!(clean_rel("\\"), Some(String::new()));
+        assert_eq!(clean_rel("."), Some(String::new()));
+        assert_eq!(clean_rel("./"), Some(String::new()));
+        assert_eq!(clean_rel(".\\"), Some(String::new()));
+
+        // Out-of-bounds directory traversal attempts return None.
+        assert_eq!(clean_rel(".."), None);
+        assert_eq!(clean_rel("..\\something"), None);
+        assert_eq!(clean_rel("data\\..\\..\\secret.txt"), None);
+        assert_eq!(clean_rel("a/b/../../../c"), None);
+
+        // Drive letters, UNC, and device paths return None.
+        assert_eq!(clean_rel("C:\\secret.txt"), None);
+        assert_eq!(clean_rel("\\\\server\\share"), None);
+        assert_eq!(clean_rel("data:stream"), None);
+    }
+
+    #[test]
+    fn case_insensitive_path_canonicalization_and_verbatim_unc() {
+        // Upstream #1560 audit: verbatim UNC prefixes strip case-insensitively,
+        // mount prefixes normalise `/`, and whiteouts stay slash-insensitive.
+        let f = Fixture::new("canon");
+        let v = &f.vfs;
+
+        // Verbatim UNC paths are case-insensitively stripped and classified as Pass.
+        assert_eq!(v.classify("\\\\?\\unc\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\\\?\\Unc\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\\\?\\UNC\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\??\\unc\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\??\\UNC\\server\\share\\file.txt"), Target::Pass);
+
+        // Verbatim DOS paths with \??\ prefix: `classify_host` strips the
+        // verbatim prefix first, so the spelled host file resolves on both
+        // platforms (Linux host-absolute, Windows drive-absolute).
+        let real_str = f.game().join("data").join("hello.txt").to_string_lossy().to_string();
+        let qmark = format!("\\??\\{real_str}");
+        assert_eq!(v.classify(&qmark), Target::Game { rel: "data\\hello.txt".into() });
+
+        // Forward slash mount definition normalization.
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_mount_slash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mnt_target = dir.join("target");
+        std::fs::create_dir_all(&mnt_target).unwrap();
+        let v_mnt = Vfs::new(
+            &f.game(),
+            &f.dir.join("xcldata"),
+            vec![("MNT/DIR:".to_string(), mnt_target.to_string_lossy().to_string())],
+        );
+        let mnt_res = v_mnt.classify("mnt/dir:/sub/file.txt");
+        #[cfg(windows)]
+        assert!(matches!(mnt_res, Target::Translated(ref p) if p.ends_with("sub\\file.txt")), "{mnt_res:?}");
+        #[cfg(not(windows))]
+        assert!(matches!(mnt_res, Target::Translated(ref p) if p.ends_with("sub/file.txt")), "{mnt_res:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whiteouts_case_insensitivity_and_traversal_equivalence() {
+        // Upstream #1560 audit: every spelling of a path (slashes, case, dots)
+        // names the same whiteout entry.
+        let f = Fixture::new("wo_canon");
+        let v = &f.vfs;
+
+        // Delete with forward slash or mixed case creates canonical whiteout.
+        assert_eq!(v.delete_file("data/gone.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert!(v.is_whiteout("data/gone.txt"));
+        assert!(v.is_whiteout("DATA/GONE.TXT"));
+        assert!(v.is_whiteout("data\\.\\gone.txt"));
+        assert!(v.is_whiteout("data\\sub\\..\\gone.txt"));
+        assert!(v.is_whiteout("\\data\\gone.txt\\"));
+        assert!(v.is_whiteout("data\\\\gone.txt"));
+
+        // Reads are properly hidden across all equivalent path forms.
+        assert_eq!(v.read_path_rel("data/gone.txt"), None);
+        assert_eq!(v.read_path_rel("DATA\\GONE.TXT"), None);
+        assert_eq!(v.read_path_rel("data\\.\\gone.txt"), None);
+
+        // Directory whiteout queries handle trailing and forward slashes.
+        assert!(v.has_whiteouts_under("data"));
+        assert!(v.has_whiteouts_under("data\\"));
+        assert!(v.has_whiteouts_under("data/"));
+        assert!(v.has_whiteouts_under("DATA"));
+        assert!(v.has_whiteouts_under("data/./"));
+        assert!(v.needs_merge("data"));
+        assert!(v.needs_merge("data\\"));
+        assert!(v.needs_merge("data/"));
+
+        // Recreating file via forward slash removes whiteout.
+        let Decision::Use(p) = v.open_decision("G:/data/gone.txt", GENERIC_WRITE, CREATE_ALWAYS, 0) else {
+            panic!("expected overlay path");
+        };
+        std::fs::write(&p, b"recreated").unwrap();
+        assert!(!v.is_whiteout("data\\gone.txt"));
+        assert!(!v.is_whiteout("data/gone.txt"));
+    }
+
+    #[test]
+    fn boundary_checks_reject_directory_traversal_escapes() {
+        // Upstream #1560 audit: rels that escape the root fail with safe
+        // codes (or None/false) without touching the host filesystem.
+        let f = Fixture::new("bounds");
+        let v = &f.vfs;
+
+        // Path operations attempting to escape root return safe error codes / None without touching filesystem.
+        assert_eq!(v.delete_file("..\\secret.txt"), Err(ERROR_FILE_NOT_FOUND));
+        assert_eq!(v.delete_file("data\\..\\..\\secret.txt"), Err(ERROR_FILE_NOT_FOUND));
+        assert_eq!(v.stage_write("..\\secret.txt"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.stage_write("data\\..\\..\\secret.txt"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.prepare_write("..\\secret.txt", true), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.create_dir("..\\escaped"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.remove_dir("..\\escaped"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.read_path_rel("..\\secret.txt"), None);
+        assert!(!v.is_whiteout("..\\secret.txt"));
+        assert!(!v.has_whiteouts_under("..\\escape"));
+        assert!(!v.exists("..\\secret.txt"));
+        assert!(!v.is_dir("..\\secret.txt"));
+        assert!(!v.visible_in_overlay("..\\secret.txt"));
+        assert!(!v.visible_in_original("..\\secret.txt"));
+
+        // Open decision for Target::Game with traversal rel fails safely.
+        assert_eq!(
+            v.open_decision_for(Target::Game { rel: "..\\secret.txt".into() }, 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_PATH_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn translated_mount_validates_path_against_mount_root_and_rejects_traversal() {
+        // Upstream #1560 audit: a mount-relative `..` must not escape the mount
+        // root to a host sibling. Windows rejects with the `..` sentinel
+        // (Game `..` -> PATH_NOT_FOUND); Linux keeps the #1170 clamp
+        // (below_mount + ensure_mount_contained), so the same inputs stay
+        // inside the mount. Both never touch the host sibling.
+        let f = Fixture::new("mnt_bounds");
+        let v = &f.vfs;
+
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_mnt_bounds_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mnt_root = dir.join("mount");
+        std::fs::create_dir_all(&mnt_root).unwrap();
+        let mnt_str = full_path(&mnt_root.to_string_lossy()).unwrap();
+
+        let v_mnt = Vfs::new(
+            &f.game(),
+            &f.dir.join("xcldata"),
+            vec![("MNT:".to_string(), mnt_str.clone()), ("G:".to_string(), mnt_str.clone())],
+        );
+
+        // Valid relative paths within translated mount are accepted.
+        let ok_res = v_mnt.classify("MNT:\\file.txt");
+        #[cfg(windows)]
+        assert!(matches!(ok_res, Target::Translated(ref p) if p.ends_with("mount\\file.txt")), "{ok_res:?}");
+        #[cfg(not(windows))]
+        assert!(matches!(ok_res, Target::Translated(ref p) if p.ends_with("mount/file.txt")), "{ok_res:?}");
+        let ok_nested = v_mnt.classify("MNT:\\sub\\..\\file.txt");
+        #[cfg(windows)]
+        assert!(matches!(ok_nested, Target::Translated(ref p) if p.ends_with("mount\\file.txt")), "{ok_nested:?}");
+        #[cfg(not(windows))]
+        assert!(matches!(ok_nested, Target::Translated(ref p) if p.ends_with("mount/file.txt")), "{ok_nested:?}");
+        #[cfg(windows)]
+        let want_use = format!("{mnt_str}\\file.txt");
+        #[cfg(not(windows))]
+        let want_use = format!("{mnt_str}/file.txt");
+        assert_eq!(
+            v_mnt.open_decision("MNT:\\file.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Use(want_use)
+        );
+
+        // Traversal escaping the mount root must not reach a host sibling.
+        #[cfg(windows)]
+        {
+            // Traversal escaping translated mount root is rejected.
+            assert_eq!(v_mnt.classify("MNT:\\..\\outside.txt"), Target::Game { rel: "..".into() });
+            assert_eq!(
+                v_mnt.open_decision("MNT:\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+                Decision::Fail(ERROR_PATH_NOT_FOUND)
+            );
+            assert_eq!(v_mnt.real_path_for_read("MNT:\\..\\outside.txt"), None);
+
+            // Traversal escaping translated G: mount rooted at non-game folder is rejected.
+            assert_eq!(v_mnt.classify("G:\\..\\outside.txt"), Target::Game { rel: "..".into() });
+            assert_eq!(
+                v_mnt.open_decision("G:\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+                Decision::Fail(ERROR_PATH_NOT_FOUND)
+            );
+            assert_eq!(v_mnt.real_path_for_read("G:\\..\\outside.txt"), None);
+
+            // Traversal escaping via multi-level subdirectories is rejected.
+            assert_eq!(v_mnt.classify("MNT:\\sub\\..\\..\\outside.txt"), Target::Game { rel: "..".into() });
+            assert_eq!(
+                v_mnt.open_decision("MNT:\\sub\\..\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+                Decision::Fail(ERROR_PATH_NOT_FOUND)
+            );
+            assert_eq!(v_mnt.real_path_for_read("MNT:\\sub\\..\\..\\outside.txt"), None);
+
+            // Traversal escaping game root via default G: mount is rejected.
+            assert_eq!(v.classify("G:\\..\\outside.txt"), Target::Game { rel: "..".into() });
+            assert_eq!(
+                v.open_decision("G:\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+                Decision::Fail(ERROR_PATH_NOT_FOUND)
+            );
+            assert_eq!(v.real_path_for_read("G:\\..\\outside.txt"), None);
+        }
+        #[cfg(not(windows))]
+        {
+            // Linux clamp: `..` past the root stays inside the mount, never the
+            // host sibling next to it.
+            for path in ["MNT:\\..\\outside.txt", "G:\\..\\outside.txt", "MNT:\\sub\\..\\..\\outside.txt"] {
+                let got = v_mnt.classify(path);
+                assert!(
+                    matches!(got, Target::Translated(ref p) if p.ends_with("mount/outside.txt")),
+                    "{path} -> {got:?}"
+                );
+                let want = format!("{mnt_str}/outside.txt");
+                assert_eq!(
+                    v_mnt.open_decision(path, 0x8000_0000, OPEN_EXISTING, 0),
+                    Decision::Use(want.clone()),
+                    "{path}"
+                );
+                assert_eq!(v_mnt.real_path_for_read(path), Some(want), "{path}");
+            }
+            // The default game mount clamps the same way (the dedicated
+            // `linux_mount_traversal_*` test pins the host sibling is untouched).
+            assert_eq!(
+                v.classify("G:\\..\\outside.txt"),
+                Target::Game { rel: "outside.txt".into() }
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
