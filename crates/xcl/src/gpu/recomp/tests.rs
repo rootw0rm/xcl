@@ -10282,3 +10282,26 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_v_dot8_u32_u4_clamped_overflow() {
+    const CASES: [(u32, u32); 4] = [
+        (0, 1800),
+        (0xFFFF_F8F7, u32::MAX),
+        (0xFFFF_F8F8, u32::MAX),
+        (u32::MAX, u32::MAX),
+    ];
+    let p = prog(&[("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None)]);
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (lane, r) in st.vgpr.iter_mut().enumerate() {
+            r[0] = u32::MAX;
+            r[1] = u32::MAX;
+            r[2] = CASES[lane % CASES.len()].0;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (lane, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[3], CASES[lane % CASES.len()].1, "wave{lanes} lane {lane}");
+        }
+    }
+}
