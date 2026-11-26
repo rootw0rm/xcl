@@ -113,3 +113,43 @@ newest at the bottom.
   first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS. Lock
   audit: 0 new `lock()` held across an `if let` body (named bindings
   + statement-local temporaries only); `diff --check` clean.
+
+## 2026-11-26 — step-116 (task-1795713518-79a3): scan found #2837, SKIP (Windows-only test CI fix on an aggregate fork stack)
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0 — ZERO sync fallout.
+- Per-PR sequential probe `refs/pull/$i/head` #2832..#2910 (widened past
+  the first gap per mem-1795712765-78dc): #2832 `e2ecdfa9` / #2833
+  `f5a352c3` / #2834 `653f8f13` / #2836 `43a4eb9d` (all pins match,
+  all four still OPEN — `merge-base --is-ancestor <head>
+  upstream/main` exit 1 each); #2835 MISSING; #2837 `9d967cf8` EXISTS
+  (OPEN, exit 1 — NEW since step-114, which spot-probed it MISSING);
+  #2838..#2910 ALL MISSING — scan complete.
+- #2837 = "Tests: sparse tests take CI's Basic Render Driver for a
+  software device" (DzXAnt22, tip `9d967cf8`). Verdict SKIP, two
+  independent reasons: (a) the tip commit itself is 3+/2- inside
+  `mod tests` in `hle/d3d12x/sparse.rs` (`software()` helper gains a
+  `(VendorId, DeviceId) == (0x1414, 0x8c)` clause for WARP/Basic Render
+  Driver) — Windows-only (`windows::Win32::Graphics::Dxgi`,
+  `ID3D12Device`), test-only, CI-only; `hle/d3d12x/*` never compiles
+  on Linux (Linux-live is `d3d12x_linux.rs` null/Vulkan), so there is
+  no Linux consumer and no Linux twin to mirror. Hunk context absent
+  in our tree: our `sparse.rs` (unified-memory sparse-windows design)
+  has `mod tests` at line 1865 but no `software()` fn and no
+  `0x1414`/Basic-Render-Driver refs (grep exit 1/0 hits for the
+  negative/positive halves). (b) The PR branch as a whole is an
+  88-file aggregate fork work stack (`8b957bec..9d967cf8`: +33541/-3546
+  across `wm17/prs` + `nvidia-dev` merges) — not one logical change,
+  so verbatim port is out; any portable pieces arrive as focused
+  upstream PRs and get triaged then. #2832 SKIP stands (still zero
+  `pso_async`/`need_by_submit` refs on the Linux path);
+  #2833/#2834 landed; #2836 adapted in `7645afeb`.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design, 24 `[FAIL]` lines = 12 unique, all `D3D12.X`,
+  0 non-GPU; retail fresh-root `XCL_DATA_ROOT=/tmp/xcl-step116-r`
+  exit 139 SIGSEGV `exe+0x2237320` fault `0x0` bytes `48 8b 03`
+  stubs 20 (all first_args) xgr exactly XAsync/XNetworking/XUser —
+  HOLDS (report.json verified, fresh root removed after). Lock audit:
+  0 new `lock()` (no code touched); `diff --check` clean.
