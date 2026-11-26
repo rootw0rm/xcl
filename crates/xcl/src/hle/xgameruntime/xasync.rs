@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::taskqueue::{self, Item, PORT_COMPLETION, PORT_WORK};
@@ -29,6 +29,7 @@ pub const OP_CANCEL: u32 = 3;
 pub const OP_CLEANUP: u32 = 4;
 
 pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000Eu32 as i32;
+const E_UNEXPECTED: HRESULT = 0x8000_FFFFu32 as i32;
 
 const BLOCK_MAGIC: u32 = 0x5841_5359; // "XASY"
 const FLAG_DONE: u8 = 1 << 0;
@@ -111,6 +112,7 @@ impl Inner {
 
 pub struct State {
     id: u64,
+    work_scheduled: AtomicBool,
     queue: Option<Arc<taskqueue::Queue>>,
     provider: usize,
     context: usize,
@@ -199,6 +201,8 @@ unsafe fn call_provider(s: &State, op: u32, b: *mut XAsyncBlock, buffer: *mut c_
 unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
     let b = ctx as *mut XAsyncBlock;
     let Lookup::Active(s) = lookup(b) else { return };
+    // A running provider may schedule its next work item (libHttpClient: WorkerCallback).
+    s.work_scheduled.store(false, Ordering::Release);
     if canceled {
         XAsyncComplete(b, E_ABORT, 0);
         return;
@@ -242,6 +246,7 @@ pub unsafe extern "system" fn XAsyncBegin(
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        work_scheduled: AtomicBool::new(false),
         queue: taskqueue::queue_from((*b).queue),
         provider,
         context: context as usize,
@@ -269,11 +274,16 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
         return f(o, b, delay_ms);
     }
     let Lookup::Active(s) = lookup(b) else { return E_INVALIDARG };
+    if s.work_scheduled.swap(true, Ordering::AcqRel) {
+        return E_UNEXPECTED;
+    }
     let Some(q) = &s.queue else {
+        s.work_scheduled.store(false, Ordering::Release);
         return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
     };
     // a terminated queue takes no new work (libHttpClient: XTaskQueueSubmitDelayedCallback)
     if !taskqueue::submit_delayed(q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
+        s.work_scheduled.store(false, Ordering::Release);
         return E_ABORT;
     }
     S_OK
@@ -497,6 +507,7 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        work_scheduled: AtomicBool::new(false),
         queue: taskqueue::queue_from((*b).queue),
         provider: 0,
         context: 0,
@@ -833,6 +844,126 @@ mod tests {
             assert!(dispatched);
             assert_eq!(status, 7);
             assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+
+    unsafe extern "system" fn count_pending_work(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+        if op == OP_DO_WORK {
+            let hits = &*((*data).context as *const AtomicU32);
+            hits.fetch_add(1, Ordering::SeqCst);
+            return E_PENDING;
+        }
+        S_OK
+    }
+
+    fn check_duplicate_schedule(delay: u32) {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            let hits = AtomicU32::new(0);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            assert_eq!(XAsyncBegin(&mut b, &hits as *const AtomicU32 as *mut c_void, std::ptr::null(), std::ptr::null(), count_pending_work as usize), S_OK);
+            let first = XAsyncSchedule(&mut b, delay);
+            let duplicate = XAsyncSchedule(&mut b, 0);
+            let dispatched = taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0);
+            let extra = taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0);
+            // Drain delayed work and retire the block before checking the negative control.
+            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            XAsyncComplete(&mut b, E_ABORT, 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+            assert_eq!(first, S_OK);
+            assert_eq!(duplicate, 0x8000_FFFFu32 as i32); // E_UNEXPECTED
+            assert_eq!(dispatched, delay == 0);
+            assert!(!extra, "only one work item may be queued for this operation");
+            assert_eq!(hits.load(Ordering::SeqCst), u32::from(delay == 0));
+        }
+    }
+
+    #[test]
+    fn async_schedule_rejects_duplicate_queued_work() {
+        check_duplicate_schedule(0);
+    }
+
+    #[test]
+    fn async_schedule_rejects_duplicate_delayed_work() {
+        check_duplicate_schedule(60_000);
+    }
+
+    #[test]
+    fn async_schedule_allows_rescheduling_from_do_work() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "system" fn reschedule(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_DO_WORK {
+                let d = &*data;
+                let (hits, scheduled) = &*(d.context as *const (AtomicU32, AtomicU32));
+                if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    scheduled.store(XAsyncSchedule(d.async_, 0) as u32, Ordering::SeqCst);
+                } else {
+                    XAsyncComplete(d.async_, S_OK, 0);
+                }
+                return E_PENDING;
+            }
+            S_OK
+        }
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            let state = (AtomicU32::new(0), AtomicU32::new(u32::MAX));
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            assert_eq!(XAsyncBegin(&mut b, &state as *const _ as *mut c_void, std::ptr::null(), std::ptr::null(), reschedule as usize), S_OK);
+            let scheduled = XAsyncSchedule(&mut b, 0);
+            let first = taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0);
+            let second = taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0);
+            let status = XAsyncGetStatus(&mut b, false);
+            XAsyncComplete(&mut b, E_ABORT, 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+            assert_eq!(scheduled, S_OK);
+            assert!(first && second);
+            assert_eq!(state.0.load(Ordering::SeqCst), 2);
+            assert_eq!(state.1.load(Ordering::SeqCst) as i32, S_OK);
+            assert_eq!(status, S_OK);
+        }
+    }
+
+    #[test]
+    fn async_schedule_rejected_submit_can_be_retried() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            let first = XAsyncSchedule(&mut b, 0);
+            let retry = XAsyncSchedule(&mut b, 0);
+            XAsyncComplete(&mut b, E_ABORT, 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+            assert_eq!((first, retry), (E_ABORT, E_ABORT));
+        }
+    }
+
+    #[test]
+    fn async_schedule_rejects_work_already_queued_by_run() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_MANUAL, &mut q), S_OK);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            assert_eq!(XAsyncRun(&mut b, run_work as usize), S_OK);
+            let duplicate = XAsyncSchedule(&mut b, 0);
+            let first = taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0);
+            let extra = taskqueue::XTaskQueueDispatch(q, PORT_WORK, 0);
+            let status = XAsyncGetStatus(&mut b, false);
+            taskqueue::XTaskQueueCloseHandle(q);
+            assert_eq!(duplicate, 0x8000_FFFFu32 as i32); // E_UNEXPECTED
+            assert!(first && !extra);
+            assert_eq!(status, 7);
         }
     }
 
