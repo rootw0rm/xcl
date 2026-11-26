@@ -280,12 +280,27 @@ fn test_title_runs_under_the_debug_layer_with_dred() {
     title_under_the_debug_layer(true);
 }
 
+fn debug_layer_skip_line(test: &str, dll: &str) -> String {
+    format!("SKIPPED {test}: no {dll}")
+}
+
+#[test]
+fn debug_layer_skip_line_matches_test_ps1_pattern() {
+    let line = debug_layer_skip_line("test_title_runs_under_the_debug_layer_with_dred", "d3d12SDKLayers.dll");
+    let rest = line.strip_prefix("SKIPPED ").expect("SKIPPED prefix");
+    let (test, reason) = rest.split_once(": ").expect("colon separator");
+    assert!(!test.is_empty() && !test.chars().any(char::is_whitespace), "test token must match \\S+: {line:?}");
+    assert_eq!(reason, "no d3d12SDKLayers.dll");
+}
+
 fn title_under_the_debug_layer(dred: bool) {
     let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
     for dll in ["d3d12SDKLayers.dll", "xgameruntime.dll"] {
         if !sys.join(dll).is_file() {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "SKIPPED the title under the debug layer (dred: {dred}): no {dll}");
+            let thread = std::thread::current();
+            let test = thread.name().unwrap_or("title_under_the_debug_layer");
+            let _ = writeln!(std::io::stderr(), "{}", debug_layer_skip_line(test, dll));
             return;
         }
     }
