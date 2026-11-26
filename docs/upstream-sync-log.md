@@ -989,3 +989,52 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-133 (task-1795725390-c461): #2875/#2877 triaged SKIP, probe past #2877
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2356 refs, in-range set exactly
+  #2830..#2877 minus the known gaps (showed #2875/#2877 that the
+  step-132 sequential scan missed) — sequential still ground truth.
+  Per-PR sequential probe #2830..#3200 (widened past the sixth gap per
+  mem-1795712765-78dc) found 37 PRESENT (#2830..#2877 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876 gaps),
+  matching pins on all 35 previously seen heads (no force-push, #2864
+  pin `723f5a19` holds); all 37 `merge-base --is-ancestor` exit 1
+  (all OPEN); #2878..#3200 ALL MISSING — scan complete, top is #2877.
+- Replication-lag note (per mem-1795714025-21a1, NOT builder fault): #2875
+  committed 20:32:00 UTC mid-window of the step-132 run (task created
+  20:16:04 UTC, scan to #3150) yet MISSING from it, and #2877 committed
+  18:26:34 UTC pre-task-creation yet MISSING from both the step-132
+  builder scan and the step-131 critic scan to #3130 — same handoff
+  treatment as #2873 in step-132. Triaged in-window now.
+- Triage (all SKIP with hunk evidence): #2875 `7876a7f6` SKIP,
+  single-commit on `8b957bec` (parent IS in main, exit 0), 1 file +7/-2
+  (`gpu/dxil/fuzz_tests.rs`): `run_seeds` keeps the `wave32` result and
+  reports `runner::skip_test("no wave32"/"no GPU")` instead of silently
+  skipping the GPU comparison — test-only reporting inside
+  `#[cfg(all(test, windows))] mod fuzz_tests` (`gpu/dxil/mod.rs:63`,
+  never compiled on Linux per the SPIR-V-backend LINUX-TODO above it).
+  #2877 `c1c22863` SKIP, single-commit on `8b957bec` (parent IS in main,
+  exit 0), 1 file +28/-2 (`hle/d3d12x/title_textures.rs`):
+  `title_bytes_read` (`Cow::Owned(read_committed(...))` via
+  `ReadProcessMemory`) for texture workers so a title-decommitted page
+  can't fault a borrow (#2841) + `windows_sys` VirtualAlloc regression
+  test — whole `hle`/`d3d12x` `cfg(windows)`, zero `title_bytes`/
+  `read_committed`/`title_textures` refs in Linux-compiled files (sole
+  hit is Windows-only `hle/kernelx.rs`). Earlier pins stand:
+  #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted
+  in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in
+  `aa59e8ac`; #2843-#2873 SKIP (minus #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step133r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
