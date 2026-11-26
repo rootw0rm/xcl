@@ -4232,6 +4232,53 @@ fn env_count(v: Option<&str>, default: usize, min: usize, max: usize) -> usize {
     v.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(default).clamp(min, max)
 }
 
+/// Console records whose compute pipeline is never handed to the driver (`XCL_REFUSE_CS`: record
+/// hashes in hex, comma-separated, as `driver compile start … record HASH` logs them): for a
+/// program whose driver compile does not end and takes the process's memory with it (#1035).
+/// Its dispatches are skipped, as for a program the driver refuses.
+fn refused_cs(record: u64) -> bool {
+    refused_cs_list().contains(&record)
+}
+
+/// Reads `XCL_REFUSE_CS` now: the host calls it before the VFS hooks, which would remap an
+/// `@path` on a host drive the title's mounts also name.
+pub(crate) fn load_refused_cs() {
+    refused_cs_list();
+}
+
+fn refused_cs_list() -> &'static [u64] {
+    static V: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let v = std::env::var("XCL_REFUSE_CS").ok();
+        // `@path`: the hashes are in that file (a list of a thousand programs does not fit a variable well)
+        match v.as_deref().and_then(|v| v.strip_prefix('@')) {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => record_hashes(Some(&text)),
+                Err(e) => {
+                    crate::xlog_warn!("D3D12.X: XCL_REFUSE_CS=@{path}: {e}: no program is refused");
+                    Vec::new()
+                }
+            },
+            None => record_hashes(v.as_deref()),
+        }
+    })
+}
+
+/// `a1b2,0xc3d4, …` (commas, spaces or lines; `#` starts a comment to the end of its line) -> the
+/// hashes; what does not read as hex is left out.
+fn record_hashes(v: Option<&str>) -> Vec<u64> {
+    v.map_or_else(Vec::new, |v| {
+        v.lines()
+            .map(|line| line.split('#').next().unwrap_or(""))
+            .flat_map(|line| line.split(|c: char| c == ',' || c.is_whitespace()))
+            .filter_map(|s| {
+                let s = s.trim();
+                u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok()
+            })
+            .collect()
+    })
+}
+
 /// A counting semaphore: background driver compiles of big programs at once (`most` 0: the
 /// `huge_pso_concurrency` of the environment; `wanted_most` 0: `huge_pso_wanted_concurrency`).
 struct Slots {
@@ -4447,6 +4494,22 @@ mod big_compile_tests {
     }
 
     #[test]
+    fn refused_record_hashes_parse() {
+        assert!(record_hashes(None).is_empty());
+        assert!(record_hashes(Some("")).is_empty());
+        assert_eq!(record_hashes(Some("95cc13288a27a96e")), vec![0x95cc13288a27a96e]);
+        assert_eq!(
+            record_hashes(Some(" 95cc13288a27a96e , 0x2E0055C25F49848A,not-hex,,")),
+            vec![0x95cc13288a27a96e, 0x2e0055c25f49848a]
+        );
+        // the `@path` file form: one per line, spaces, comments
+        assert_eq!(
+            record_hashes(Some("# never-ending compiles\n95cc13288a27a96e   # ActivateRays\r\n\n2e0055c25f49848a 0x12\n")),
+            vec![0x95cc13288a27a96e, 0x2e0055c25f49848a, 0x12]
+        );
+    }
+
+    #[test]
     fn env_counts_parse() {
         assert_eq!(env_count(None, 2, 1, 64), 2);
         assert_eq!(env_count(Some(" 4 "), 2, 1, 64), 4);
@@ -4583,6 +4646,12 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     let record = crate::gpu::shader::fnv64(cs);
+    // before every way to the driver: a warm whole, the split pieces and the whole build
+    if refused_cs(record) {
+        crate::xlog_warn!("D3D12.X: the compute PSO of record {record:016x} ({} B DXIL) is not built (XCL_REFUSE_CS): its dispatches are skipped", dxil.len());
+        note_translation_error(format!("the compute PSO of record {record:016x} is refused by XCL_REFUSE_CS"));
+        return Some(Err(()));
+    }
     let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
         let rs = abi_rs_for(this, &compiled.samplers)?;
         let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);

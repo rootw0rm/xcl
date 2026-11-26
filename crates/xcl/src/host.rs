@@ -145,6 +145,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             extra_own.push(dir);
         }
     }
+    crate::hle::d3d12x::real::load_refused_cs();
     crate::vfs::init(build_vfs(&boot, &crate::gpu::recomp::dxc::cache_dir(), &extra_own));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
