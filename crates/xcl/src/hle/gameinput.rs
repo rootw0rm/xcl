@@ -13,6 +13,9 @@
 //! (polled at 250 Hz). Methods not listed log their slot once and fail.
 //!
 //! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after start (tests).
+//! `XCL_STICK_AT=s:x/y,…` / `XCL_LOOK_AT=s:x/y,…`: hold the left / right stick at that deflection
+//! from that second until the next entry (`20:0.9/0.0,60:0.0/0.0` walks forward for 40 s) – the
+//! sticks a run drives without a person at the controls, for a title's movement and camera.
 
 #![allow(non_snake_case)]
 
@@ -263,6 +266,84 @@ fn scripted() -> u32 {
     at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
 }
 
+/// `XCL_STICK_AT=s:x/y,…` (the left stick) and `XCL_LOOK_AT=s:x/y,…` (the right): a deflection
+/// held from that second until the next entry, so `20:0.9/0.0,60:0.0/0.0` walks forward for 40 s
+/// and then stops. Coordinates are split with `/` to keep one entry one comma-separated item, as
+/// in `XCL_PRESS_AT`; out-of-range values clamp to the stick's own −1.0..1.0, and a `nan` or `inf`
+/// coordinate is refused like a garbled item rather than reaching the title.
+fn parse_stick_track(script: &str, what: &str) -> Vec<(f64, f32, f32)> {
+    let mut v: Vec<(f64, f32, f32)> = Vec::new();
+    for item in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let parsed = item
+            .split_once(':')
+            .and_then(|(s, c)| Some((s.trim().parse::<f64>().ok()?, c)))
+            .and_then(|(t, c)| c.split_once('/').map(|(x, y)| (t, x, y)))
+            .and_then(|(t, x, y)| {
+                // a deflection is a position on the stick, so `nan` and `inf` — which do parse as f32 —
+                // are not one, and are refused like a garbled item rather than clamped
+                let (x, y) = (x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?);
+                (t.is_finite() && x.is_finite() && y.is_finite()).then_some((t, x, y))
+            });
+        match parsed {
+            Some((t, x, y)) => v.push((t, x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0))),
+            None => crate::xlog_warn!("GameInput: {what} entry {item:?} not understood (seconds:x/y)"),
+        }
+    }
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v
+}
+
+/// The deflection a track holds at second `t`: the last entry that has started.
+fn stick_at(track: &[(f64, f32, f32)], t: f64) -> Option<(f32, f32)> {
+    track
+        .iter()
+        .take_while(|&&(s, _, _)| s <= t)
+        .last()
+        .map(|&(_, x, y)| (x, y))
+}
+
+/// Once per entry, a line naming the deflection and when it took hold: a long run can be read
+/// back against what the title did.
+fn log_stick_entry(seen: &AtomicU32, track: &[(f64, f32, f32)], t: f64, name: &str) {
+    let idx = track.iter().take_while(|&&(s, _, _)| s <= t).count();
+    if idx == 0 {
+        return;
+    }
+    if seen.swap(idx as u32, Ordering::Relaxed) != idx as u32 {
+        let (at, x, y) = track[idx - 1];
+        crate::xlog_info!("GameInput: scripted {name} {x:.2},{y:.2} held from {at:.1} s");
+    }
+}
+
+/// The scripted sticks, applied over `kbm`'s keyboard/mouse mapping: while a scripted deflection
+/// holds it wins, so a scripted drive is not fought by a key that happens to be down.
+fn scripted_sticks(s: &mut GamepadState) {
+    static TRACKS: OnceLock<(Vec<(f64, f32, f32)>, Vec<(f64, f32, f32)>)> = OnceLock::new();
+    let (left, look) = TRACKS.get_or_init(|| {
+        let var = |n: &str| std::env::var(n).unwrap_or_default();
+        (
+            parse_stick_track(&var("XCL_STICK_AT"), "XCL_STICK_AT"),
+            parse_stick_track(&var("XCL_LOOK_AT"), "XCL_LOOK_AT"),
+        )
+    });
+    if left.is_empty() && look.is_empty() {
+        return;
+    }
+    let t = crate::log::uptime();
+    static HELD_LEFT: AtomicU32 = AtomicU32::new(0);
+    static HELD_LOOK: AtomicU32 = AtomicU32::new(0);
+    if let Some((x, y)) = stick_at(left, t) {
+        s.left_x = x;
+        s.left_y = y;
+        log_stick_entry(&HELD_LEFT, left, t, "left stick");
+    }
+    if let Some((x, y)) = stick_at(look, t) {
+        s.right_x = x;
+        s.right_y = y;
+        log_stick_entry(&HELD_LOOK, look, t, "right stick");
+    }
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn GetAsyncKeyState(key: i32) -> i16;
@@ -313,6 +394,7 @@ pub fn poll() -> GamepadState {
         super::kbm::apply,
         scripted,
     );
+    scripted_sticks(&mut s);
     {
         // the first presses of each button: worth a line (is input arriving at all?)
         static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -1002,6 +1084,35 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stick_track_holds_until_the_next_entry() {
+        let t = parse_stick_track("20:0.9/0.0, 45:0.0/-0.5,70:0.0/0.0", "XCL_STICK_AT");
+        assert_eq!(t.len(), 3);
+        assert_eq!(stick_at(&t, 19.9), None, "nothing holds before the first entry");
+        assert_eq!(stick_at(&t, 20.0), Some((0.9, 0.0)));
+        assert_eq!(stick_at(&t, 44.9), Some((0.9, 0.0)), "an entry holds until the next one");
+        assert_eq!(stick_at(&t, 45.0), Some((0.0, -0.5)));
+        assert_eq!(stick_at(&t, 500.0), Some((0.0, 0.0)), "the last entry keeps holding");
+    }
+
+    #[test]
+    fn a_stick_track_is_ordered_and_clamped_to_the_stick() {
+        // out of range clamps; `nan` is refused; a garbled item is named and the rest of the track still parses
+        let t = parse_stick_track("30:2/-1,not a stick,10:-0.5/0.25,15:nan/0.5", "XCL_LOOK_AT");
+        assert_eq!(t, vec![(10.0, -0.5, 0.25), (30.0, 1.0, -1.0)]);
+        assert_eq!(stick_at(&t, 20.0), Some((-0.5, 0.25)));
+        assert_eq!(stick_at(&t, 31.0), Some((1.0, -1.0)));
+    }
+
+    #[test]
+    fn scripted_sticks_are_ignored_without_the_variables() {
+        // nothing set: the state the other inputs produced is left alone
+        let mut s = GamepadState { buttons: A, left_x: 0.4, right_y: -0.2, ..Default::default() };
+        scripted_sticks(&mut s);
+        assert_eq!(s.left_x, 0.4);
+        assert_eq!(s.right_y, -0.2);
+    }
 
     #[test]
     fn xinput_buttons_map_to_gameinput() {
