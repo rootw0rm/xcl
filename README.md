@@ -364,9 +364,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
 another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
-the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPPED <test>: <reason>`, and
-`scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
-those skips fail. Tests on real game data are opt-in through
+the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPPED <test>: <reason>`.
+`scripts/test.ps1` counts them at the end. For GPU tests that use `runner::skip_test`,
+`XCL_REQUIRE_GPU=wave64` allows only `no mesh shaders` skips, and `XCL_REQUIRE_GPU=mesh` allows
+only `no wave64` skips. `XCL_REQUIRE_GPU=wave64,mesh` turns every skip from that helper into a failure.
+Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
 `XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
 `XCL_SAMPLE_BCPACK` (a folder of BCPack streams `<name>.bc<mode>` with a reference decoder's blocks of each, `<name>.vic<mode>`), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
