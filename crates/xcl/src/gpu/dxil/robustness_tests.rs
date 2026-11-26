@@ -232,6 +232,22 @@ fn use_of_a_void_value_and_wrong_finish_are_errors() {
     assert!(m.try_to_bitcode("dxil-ms-dx", "").is_err());
 }
 
+/// `SKIPPED <test>: <reason>` straight to stderr: libtest captures `eprintln!`, so the
+/// line would show only with `--nocapture` and `scripts/test.ps1` would not count it
+/// (same contract as `e2e::debug_layer_skip_line`, K-TS-01).
+fn x64_masks_skip_line(test: &str) -> String {
+    format!("SKIPPED {test}: XCL_X64_ALL_MASKS set")
+}
+
+#[test]
+fn x64_masks_skip_line_matches_test_ps1_pattern() {
+    let line = x64_masks_skip_line("split_wave64_whole_live_elides_exchange_barriers_for_lane_local_masks");
+    let rest = line.strip_prefix("SKIPPED ").expect("SKIPPED prefix");
+    let (test, reason) = rest.split_once(": ").expect("colon separator");
+    assert!(!test.is_empty() && !test.chars().any(char::is_whitespace), "test token must match \\S+: {line:?}");
+    assert_eq!(reason, "XCL_X64_ALL_MASKS set");
+}
+
 #[test]
 fn split_wave64_whole_live_elides_exchange_barriers_for_lane_local_masks() {
     use super::bitreader_tests::parse;
@@ -242,7 +258,11 @@ fn split_wave64_whole_live_elides_exchange_barriers_for_lane_local_masks() {
     use super::module::{Block, InstInfo};
 
     if std::env::var_os("XCL_X64_ALL_MASKS").is_some() {
-        eprintln!("SKIPPED: XCL_X64_ALL_MASKS set");
+        // straight to stderr: libtest captures eprintln!, and scripts/test.ps1 counts this line
+        use std::io::Write;
+        let thread = std::thread::current();
+        let test = thread.name().unwrap_or("split_wave64_whole_live_elides_exchange_barriers_for_lane_local_masks");
+        let _ = writeln!(std::io::stderr(), "{}", x64_masks_skip_line(test));
         return;
     }
     let lower_cs = |code: &[u8], wave64: bool, split: bool| -> (Vec<u8>, u64, usize) {
