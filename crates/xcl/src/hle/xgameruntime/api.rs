@@ -1343,7 +1343,7 @@ fn package_languages() -> &'static [String] {
         .as_slice()
 }
 
-unsafe extern "system" fn XPackageGetUserLocale(size: usize, buf: *mut u8) -> HRESULT {
+pub unsafe extern "system" fn XPackageGetUserLocale(size: usize, buf: *mut u8) -> HRESULT {
     let mut w = [0u16; 85];
     let n = windows_sys::Win32::Globalization::GetUserDefaultLocaleName(w.as_mut_ptr(), w.len() as i32);
     let os_loc = if n > 1 { String::from_utf16_lossy(&w[..n as usize - 1]) } else { "en-US".into() };
@@ -1352,7 +1352,7 @@ unsafe extern "system" fn XPackageGetUserLocale(size: usize, buf: *mut u8) -> HR
 }
 
 /// every chunk is installed (XPackageChunkAvailability::Ready = 0)
-unsafe extern "system" fn XPackageFindChunkAvailability(_id: usize, _count: u32, _sel: usize, out: *mut u32) -> HRESULT {
+pub unsafe extern "system" fn XPackageFindChunkAvailability(_id: usize, _count: u32, _sel: usize, out: *mut u32) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -1360,7 +1360,7 @@ unsafe extern "system" fn XPackageFindChunkAvailability(_id: usize, _count: u32,
     S_OK
 }
 
-unsafe extern "system" fn XPackageEstimateDownloadSize(_id: usize, _count: u32, _sel: usize, size: *mut u64, confirm: *mut bool) -> HRESULT {
+pub unsafe extern "system" fn XPackageEstimateDownloadSize(_id: usize, _count: u32, _sel: usize, size: *mut u64, confirm: *mut bool) -> HRESULT {
     if !size.is_null() {
         *size = 0;
     }
@@ -1371,7 +1371,7 @@ unsafe extern "system" fn XPackageEstimateDownloadSize(_id: usize, _count: u32, 
 }
 
 /// XPackageWriteStats { interval, budget, elapsed, bytesWritten }: nothing measured
-unsafe extern "system" fn XPackageGetWriteStats(out: *mut [u64; 4]) -> HRESULT {
+pub unsafe extern "system" fn XPackageGetWriteStats(out: *mut [u64; 4]) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -1380,20 +1380,12 @@ unsafe extern "system" fn XPackageGetWriteStats(out: *mut [u64; 4]) -> HRESULT {
 }
 
 /// XPackageKind::Game
-unsafe extern "system" fn XPackageGetPackageKind(_id: usize, out: *mut u32) -> HRESULT {
+pub unsafe extern "system" fn XPackageGetPackageKind(_id: usize, out: *mut u32) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
     *out = 0;
     S_OK
-}
-
-/// A stable id per console and title.
-unsafe extern "system" fn XSystemGetAppSpecificDeviceId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str()).hash(&mut h);
-    crate::util::write_cstr_out(&format!("{:016X}", h.finish()), buf, size, used)
 }
 
 /// XUserFindUserByLocalId / XUserFindUserById (slots 10 / 12): the local user by either id.
@@ -1405,19 +1397,7 @@ unsafe extern "system" fn find_user(id: u64, out: *mut *mut c_void) -> HRESULT {
     XUserFindUserById(id, out)
 }
 
-/// The local user has every privilege (no Xbox Live to deny one).
-unsafe extern "system" fn XUserCheckPrivilege(_user: *mut c_void, _options: u32, _privilege: u32, has: *mut bool, reasons: *mut u32) -> HRESULT {
-    if has.is_null() {
-        return E_INVALIDARG;
-    }
-    *has = true;
-    if !reasons.is_null() {
-        *reasons = 0;
-    }
-    S_OK
-}
-
-unsafe extern "system" fn XGameSaveFilesGetRemainingQuota(_user: *mut c_void, _config: *const u8, quota: *mut i64) -> HRESULT {
+pub unsafe extern "system" fn XGameSaveFilesGetRemainingQuota(_user: *mut c_void, _config: *const u8, quota: *mut i64) -> HRESULT {
     if quota.is_null() {
         return E_INVALIDARG;
     }
@@ -1428,7 +1408,7 @@ unsafe extern "system" fn XGameSaveFilesGetRemainingQuota(_user: *mut c_void, _c
 /// The installation monitor of a fully installed package (XCL runs from an unpacked folder).
 static MONITOR: u64 = 0x4D4F_4E49;
 
-unsafe extern "system" fn XPackageCreateInstallationMonitor(_id: *const u8, _count: u32, _sel: *const c_void, _interval: u32, _queue: *mut c_void, out: *mut *const u64) -> HRESULT {
+pub unsafe extern "system" fn XPackageCreateInstallationMonitor(_id: *const u8, _count: u32, _sel: *const c_void, _interval: u32, _queue: *mut c_void, out: *mut *const u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -1438,7 +1418,7 @@ unsafe extern "system" fn XPackageCreateInstallationMonitor(_id: *const u8, _cou
 
 /// XPackageInstallationProgress { totalBytes, installedBytes, launchBytes, launchable,
 /// completed }: everything installed.
-unsafe extern "system" fn XPackageGetInstallationProgress(_monitor: *const u64, p: *mut u8) {
+pub unsafe extern "system" fn XPackageGetInstallationProgress(_monitor: *const u64, p: *mut u8) {
     if p.is_null() {
         return;
     }
@@ -1449,14 +1429,14 @@ unsafe extern "system" fn XPackageGetInstallationProgress(_monitor: *const u64, 
     *p.add(25) = 1;
 }
 
-unsafe extern "system" fn XPackageRegisterInstallationProgressChanged(_monitor: *const u64, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> HRESULT {
+pub unsafe extern "system" fn XPackageRegisterInstallationProgressChanged(_monitor: *const u64, _ctx: *mut c_void, _cb: usize, token: *mut u64) -> HRESULT {
     if !token.is_null() {
         *token = 1;
     }
     S_OK
 }
 
-unsafe extern "system" fn XPackageUnregisterInstallationProgressChanged(_monitor: *const u64, _token: u64, _wait: bool) -> bool {
+pub unsafe extern "system" fn XPackageUnregisterInstallationProgressChanged(_monitor: *const u64, _token: u64, _wait: bool) -> bool {
     true
 }
 
@@ -1477,7 +1457,7 @@ pub unsafe extern "system" fn XGameGetXboxTitleId(out: *mut u32) -> HRESULT {
     S_OK
 }
 
-unsafe extern "system" fn XLaunchNewGame(exe: *const u8, args: *const u8, _user: *mut c_void) {
+pub unsafe extern "system" fn XLaunchNewGame(exe: *const u8, args: *const u8, _user: *mut c_void) {
     crate::xlog_warn!(
         "XLaunchNewGame({}, {}) – ignored (XCL runs a single title)",
         crate::util::from_cstr_ptr(exe).unwrap_or_default(),
@@ -1485,7 +1465,7 @@ unsafe extern "system" fn XLaunchNewGame(exe: *const u8, args: *const u8, _user:
     );
 }
 
-unsafe extern "system" fn XLaunchRestartOnCrash(_args: *const u8, _reserved: u32) -> HRESULT {
+pub unsafe extern "system" fn XLaunchRestartOnCrash(_args: *const u8, _reserved: u32) -> HRESULT {
     S_OK
 }
 

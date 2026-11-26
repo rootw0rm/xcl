@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 mod gdk_table;
 
 use crate::hle::{xgameruntime_linux as xr, xtaskqueue_linux as xq, xuser_linux as xu};
-use crate::util::{write_cstr_out, E_INVALIDARG, HRESULT, S_OK};
+use crate::util::{write_cstr_out, E_INVALIDARG, E_NOT_SUFFICIENT_BUFFER, HRESULT, S_OK};
 use xu::XAsyncBlock;
 
 // ---------------------------------------------------------------------------------------
@@ -906,17 +906,37 @@ unsafe extern "win64" fn XPackageGetPackageKind(_id: usize, out: *mut u32) -> HR
     S_OK
 }
 
-/// A stable id per console and title.
+pub const XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES: usize = 45;
+
+/// An app-specific device ID derived deterministically from the console ID and title ID.
+/// GDK requirement: buffer size must be at least 45 bytes (44 hex chars + NUL).
 unsafe extern "win64" fn XSystemGetAppSpecificDeviceId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str()).hash(&mut h);
-    crate::util::write_cstr_out(&format!("{:016X}", h.finish()), buf, size, used)
+    if !used.is_null() {
+        *used = XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES;
+    }
+    if buf.is_null() {
+        return E_INVALIDARG;
+    }
+    if size < XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES {
+        return E_NOT_SUFFICIENT_BUFFER;
+    }
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    let mut h3 = std::collections::hash_map::DefaultHasher::new();
+    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str(), 1u32).hash(&mut h1);
+    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str(), 2u32).hash(&mut h2);
+    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str(), 3u32).hash(&mut h3);
+    let s = format!("{:016X}{:016X}{:012X}", h1.finish(), h2.finish(), h3.finish() & 0x0000_FFFF_FFFF_FFFF);
+    debug_assert_eq!(s.len(), 44);
+    std::ptr::copy_nonoverlapping(s.as_ptr(), buf, 44);
+    *buf.add(44) = 0;
+    S_OK
 }
 
-/// The local user has every privilege (no Xbox Live to deny one).
-unsafe extern "win64" fn XUserCheckPrivilege(_user: *mut c_void, _options: u32, _privilege: u32, has: *mut bool, reasons: *mut u32) -> HRESULT {
-    if has.is_null() {
+/// The local user has every privilege (offline: no Xbox Live to deny one).
+unsafe extern "win64" fn XUserCheckPrivilege(user: *mut c_void, _options: u32, _privilege: u32, has: *mut bool, reasons: *mut u32) -> HRESULT {
+    if !xu::valid_user(user) || has.is_null() {
         return E_INVALIDARG;
     }
     *has = true;
@@ -1342,7 +1362,7 @@ mod tests {
             let check: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut bool, *mut u32) -> HRESULT =
                 slot(u, slot_in_table("XUserCheckPrivilege").2);
             let (mut has, mut reasons) = (false, 0u32);
-            assert_eq!(check(u, std::ptr::null_mut(), 0, 220, &mut has, &mut reasons), S_OK);
+            assert_eq!(check(u, xu::user_ptr(), 0, 220, &mut has, &mut reasons), S_OK);
             assert!(has);
             // the gamertag interface has its own vtable; an unknown later XUser
             // interface falls back to the main one
@@ -1649,6 +1669,61 @@ mod tests {
             assert_eq!(got, std::ffi::CStr::from_bytes_until_nul(&want).unwrap().to_str().unwrap());
             XPackageCloseMountHandle(m);
             assert_eq!(LIVE_MOUNTS.load(Ordering::SeqCst), before);
+        }
+    }
+
+    #[test]
+    fn system_app_specific_device_id_is_44_hex_chars() {
+        // GDK requirement: the buffer must be at least 45 bytes (44 hex chars + NUL).
+        unsafe {
+            let mut used: usize = 0;
+            // null buffer
+            assert_eq!(XSystemGetAppSpecificDeviceId(0, std::ptr::null_mut(), &mut used), E_INVALIDARG);
+            assert_eq!(used, XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES);
+
+            // undersized buffer (< 45)
+            let mut small = [0u8; 44];
+            used = 0;
+            assert_eq!(XSystemGetAppSpecificDeviceId(small.len(), small.as_mut_ptr(), &mut used), E_NOT_SUFFICIENT_BUFFER);
+            assert_eq!(used, XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES);
+
+            // valid buffer (>= 45)
+            let mut buf = [0u8; 45];
+            used = 0;
+            assert_eq!(XSystemGetAppSpecificDeviceId(buf.len(), buf.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!(used, XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES);
+            assert_eq!(buf[44], 0);
+            let s = std::str::from_utf8(&buf[..44]).expect("valid utf-8");
+            assert_eq!(s.len(), 44);
+            assert!(s.chars().all(|c| c.is_ascii_hexdigit()), "app specific device id must be hex digits: {s}");
+        }
+    }
+
+    #[test]
+    fn user_check_privilege_validates_the_user() {
+        unsafe {
+            let mut has = false;
+            let mut reasons = 0xcccc_cccc;
+
+            // null user handle
+            assert_eq!(XUserCheckPrivilege(std::ptr::null_mut(), 0, 0, &mut has, &mut reasons), E_INVALIDARG);
+
+            // invalid user handle
+            let dummy = 0x1234usize as *mut c_void;
+            assert_eq!(XUserCheckPrivilege(dummy, 0, 0, &mut has, &mut reasons), E_INVALIDARG);
+
+            // valid user but null 'has' pointer
+            assert_eq!(XUserCheckPrivilege(xu::user_ptr(), 0, 0, std::ptr::null_mut(), &mut reasons), E_INVALIDARG);
+
+            // valid user and valid pointers
+            assert_eq!(XUserCheckPrivilege(xu::user_ptr(), 0, 0, &mut has, &mut reasons), S_OK);
+            assert!(has);
+            assert_eq!(reasons, 0);
+
+            // valid user with null reasons pointer (allowed by the GDK spec)
+            has = false;
+            assert_eq!(XUserCheckPrivilege(xu::user_ptr(), 0, 0, &mut has, std::ptr::null_mut()), S_OK);
+            assert!(has);
         }
     }
 }

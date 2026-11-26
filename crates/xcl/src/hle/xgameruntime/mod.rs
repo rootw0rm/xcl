@@ -21,7 +21,13 @@ use accessibility::*;
 use gamesave::*;
 use networking::*;
 use taskqueue::*;
-use api::{InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl, UninitializeApiImpl, XErrorReport};
+use api::{
+    InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl, UninitializeApiImpl, XErrorReport,
+    XGameGetXboxTitleId, XGameSaveFilesGetRemainingQuota, XLaunchNewGame, XLaunchRestartOnCrash,
+    XPackageCreateInstallationMonitor, XPackageEstimateDownloadSize, XPackageFindChunkAvailability,
+    XPackageGetInstallationProgress, XPackageGetPackageKind, XPackageGetUserLocale, XPackageGetWriteStats,
+    XPackageRegisterInstallationProgressChanged, XPackageUnregisterInstallationProgressChanged,
+};
 use xasync::*;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
@@ -93,6 +99,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XSystemGetConsoleId,
         XSystemGetAnalyticsInfo,
         XSystemGetXboxLiveSandboxId,
+        XSystemGetAppSpecificDeviceId,
         // package
         XPackageIsPackagedProcess,
         XPackageGetCurrentProcessPackageIdentifier,
@@ -102,6 +109,15 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XPackageGetMountPath,
         XPackageCloseMountHandle,
         XPackageEnumeratePackages,
+        XPackageGetPackageKind,
+        XPackageGetUserLocale,
+        XPackageGetWriteStats,
+        XPackageFindChunkAvailability,
+        XPackageEstimateDownloadSize,
+        XPackageCreateInstallationMonitor,
+        XPackageGetInstallationProgress,
+        XPackageRegisterInstallationProgressChanged,
+        XPackageUnregisterInstallationProgressChanged,
         // storage
         XPersistentLocalStorageGetPathSize,
         XPersistentLocalStorageGetPath,
@@ -109,6 +125,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XPersistentLocalStorageMountForPackage,
         XGameSaveFilesGetFolderWithUiAsync,
         XGameSaveFilesGetFolderWithUiResult,
+        XGameSaveFilesGetRemainingQuota,
         // game save containers
         XGameSaveInitializeProvider,
         XGameSaveInitializeProviderAsync,
@@ -163,6 +180,11 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XUserFindForDevice,
         XUserFindControllerForUserWithUiAsync,
         XUserFindControllerForUserWithUiResult,
+        XUserCheckPrivilege,
+        // title / launch
+        XGameGetXboxTitleId,
+        XLaunchNewGame,
+        XLaunchRestartOnCrash,
         // accessibility
         XClosedCaptionGetProperties,
         XClosedCaptionSetEnabled,
@@ -249,6 +271,34 @@ pub unsafe extern "system" fn XSystemGetConsoleId(size: usize, buf: *mut u8, use
 
 pub unsafe extern "system" fn XSystemGetXboxLiveSandboxId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
     write_cstr_out(&crate::state::config().sandbox_id, buf, size, used)
+}
+
+pub const XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES: usize = 45;
+
+/// An app-specific device ID derived deterministically from the console ID and title ID.
+/// GDK requirement: buffer size must be at least 45 bytes (44 hex chars + NUL).
+pub unsafe extern "system" fn XSystemGetAppSpecificDeviceId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
+    if !used.is_null() {
+        *used = XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES;
+    }
+    if buf.is_null() {
+        return E_INVALIDARG;
+    }
+    if size < XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES {
+        return E_NOT_SUFFICIENT_BUFFER;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    let mut h3 = std::collections::hash_map::DefaultHasher::new();
+    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str(), 1u32).hash(&mut h1);
+    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str(), 2u32).hash(&mut h2);
+    (crate::state::config().console_id.as_str(), crate::state::config().title_id.as_str(), 3u32).hash(&mut h3);
+    let s = format!("{:016X}{:016X}{:012X}", h1.finish(), h2.finish(), h3.finish() & 0x0000_FFFF_FFFF_FFFF);
+    debug_assert_eq!(s.len(), 44);
+    std::ptr::copy_nonoverlapping(s.as_ptr(), buf, 44);
+    *buf.add(44) = 0;
+    S_OK
 }
 
 #[repr(C)]
@@ -699,6 +749,18 @@ pub unsafe extern "system" fn XUserGetAgeGroup(h: *mut c_void, out: *mut u32) ->
         return E_INVALIDARG;
     }
     *out = 3; // Adult
+    S_OK
+}
+
+/// The local user has every privilege (offline: no Xbox Live to deny one).
+pub unsafe extern "system" fn XUserCheckPrivilege(user: *mut c_void, _options: u32, _privilege: u32, has: *mut bool, reasons: *mut u32) -> HRESULT {
+    if !valid_user(user) || has.is_null() {
+        return E_INVALIDARG;
+    }
+    *has = true;
+    if !reasons.is_null() {
+        *reasons = 0;
+    }
     S_OK
 }
 
@@ -1398,6 +1460,85 @@ mod tests {
             assert_eq!(XPackageGetMountPath(m, size, buf.as_mut_ptr()), S_OK);
             assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_str().unwrap(), pls_path());
             XPackageCloseMountHandle(m);
+        }
+    }
+
+    #[test]
+    fn gdk_exports_include_runtime_apis() {
+        let exp = exports();
+        let map: std::collections::HashMap<_, _> = exp.into_iter().collect();
+        for name in [
+            "XSystemGetAppSpecificDeviceId",
+            "XPackageGetPackageKind",
+            "XPackageGetUserLocale",
+            "XPackageGetWriteStats",
+            "XPackageFindChunkAvailability",
+            "XPackageEstimateDownloadSize",
+            "XPackageCreateInstallationMonitor",
+            "XPackageGetInstallationProgress",
+            "XPackageRegisterInstallationProgressChanged",
+            "XPackageUnregisterInstallationProgressChanged",
+            "XGameSaveFilesGetRemainingQuota",
+            "XUserCheckPrivilege",
+            "XGameGetXboxTitleId",
+            "XLaunchNewGame",
+            "XLaunchRestartOnCrash",
+        ] {
+            assert!(map.contains_key(name), "missing export: {name}");
+        }
+    }
+
+    #[test]
+    fn system_app_specific_device_id_buffer_validation() {
+        unsafe {
+            let mut used: usize = 0;
+            // null buffer
+            assert_eq!(XSystemGetAppSpecificDeviceId(0, std::ptr::null_mut(), &mut used), E_INVALIDARG);
+            assert_eq!(used, XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES);
+
+            // undersized buffer (< 45)
+            let mut small = [0u8; 44];
+            used = 0;
+            assert_eq!(XSystemGetAppSpecificDeviceId(small.len(), small.as_mut_ptr(), &mut used), E_NOT_SUFFICIENT_BUFFER);
+            assert_eq!(used, XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES);
+
+            // valid buffer (>= 45)
+            let mut buf = [0u8; 45];
+            used = 0;
+            assert_eq!(XSystemGetAppSpecificDeviceId(buf.len(), buf.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!(used, XSYSTEM_APP_SPECIFIC_DEVICE_ID_BYTES);
+            assert_eq!(buf[44], 0);
+            let s = std::str::from_utf8(&buf[..44]).expect("valid utf-8");
+            assert_eq!(s.len(), 44);
+            assert!(s.chars().all(|c| c.is_ascii_hexdigit()), "app specific device id must be hex digits: {s}");
+        }
+    }
+
+    #[test]
+    fn user_check_privilege_validation() {
+        unsafe {
+            let mut has = false;
+            let mut reasons = 0xcccc_cccc;
+
+            // null user handle
+            assert_eq!(XUserCheckPrivilege(std::ptr::null_mut(), 0, 0, &mut has, &mut reasons), E_INVALIDARG);
+
+            // invalid user handle
+            let dummy = 0x1234usize as *mut c_void;
+            assert_eq!(XUserCheckPrivilege(dummy, 0, 0, &mut has, &mut reasons), E_INVALIDARG);
+
+            // valid user but null 'has' pointer
+            assert_eq!(XUserCheckPrivilege(user_ptr(), 0, 0, std::ptr::null_mut(), &mut reasons), E_INVALIDARG);
+
+            // valid user and valid pointers
+            assert_eq!(XUserCheckPrivilege(user_ptr(), 0, 0, &mut has, &mut reasons), S_OK);
+            assert!(has);
+            assert_eq!(reasons, 0);
+
+            // valid user with null reasons pointer (allowed by GDK spec)
+            has = false;
+            assert_eq!(XUserCheckPrivilege(user_ptr(), 0, 0, &mut has, std::ptr::null_mut()), S_OK);
+            assert!(has);
         }
     }
 }

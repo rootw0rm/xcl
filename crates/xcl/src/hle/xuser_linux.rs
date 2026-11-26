@@ -531,11 +531,11 @@ static USER: User = User { magic: 0x5553_4552, refs: AtomicU32::new(1) };
 const LOCAL_ID: u64 = 1;
 static USER_ADD_IDENTITY: u8 = 0;
 
-fn user_ptr() -> *mut c_void {
+pub(crate) fn user_ptr() -> *mut c_void {
     &USER as *const User as *mut c_void
 }
 
-unsafe fn valid_user(h: *mut c_void) -> bool {
+pub(crate) unsafe fn valid_user(h: *mut c_void) -> bool {
     h == user_ptr()
 }
 
