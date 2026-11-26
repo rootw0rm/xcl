@@ -202,7 +202,15 @@ impl Lw {
             }
             match o.ty {
                 "OPR_SREG" | "OPR_VCC" if o.size == 64 => {
-                    let (l, h) = self.read64(d, o, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
+                    // wave32 lane masks (`v_cndmask_b32`, `v_*_co_ci_u32`, `v_div_fmas_f32`)
+                    // read one 32-bit scalar source (`m0`, `exec_hi`, `f32` inline constants),
+                    // never a 64-bit SGPR pair or `vcc_hi` / `exec_hi`
+                    let (l, h) = if self.wave64 {
+                        self.read64(d, o, false)
+                    } else {
+                        self.read(d, o, false).map(|l| (l, self.c(0)))
+                    }
+                    .ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
                     u.push(Src::Pair(l, h));
                 }
                 _ if o.size == 64 => return err(d, "operand 64-bit"),
@@ -1455,5 +1463,283 @@ impl Lw {
             let le = self.cmpc(Pred::ULe, l, 32);
             self.selc(le, 0, m)
         }
+    }
+}
+
+// LINUX-TODO Phase D: gated windows-only like the other dxil translation test
+// modules — `validate`/`runner` are Windows-only until the SPIR-V backend lands.
+#[cfg(all(test, windows))]
+mod wave32_mask_src_tests {
+    use std::collections::BTreeSet;
+
+    use super::Lw;
+    use crate::gpu::dxil::bitreader_tests;
+    use crate::gpu::dxil::kernel::{self, Entry, KernelOptions};
+    use crate::gpu::dxil::validate;
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::{self, runner};
+
+    const BLOCK_CONSTANTS: u32 = 11;
+    const BLOCK_FUNCTION: u32 = 12;
+    const CST_CODE_INTEGER: u32 = 4;
+    const FUNC_CODE_INST_CALL: u32 = 34;
+
+    fn asm(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in list {
+            code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}/{enc}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn touched_for(code: &[u8], wave64: bool) -> BTreeSet<u32> {
+        let insts = [rdna2::decode(code, 0).expect("decode mask consumer")];
+        let leaders: BTreeSet<u64> = [0].into_iter().collect();
+        let ko = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&insts, &leaders, ko, &Entry::Kernel);
+        lw.setup_lanes();
+        lw.init.vgpr_base = Some(lw.c(0));
+        lw.init.touched.clear();
+        lw.inst(&insts[0]).expect("lower single mask consumer");
+        lw.init.touched
+    }
+
+    fn dxil_bitcode(container: &[u8]) -> &[u8] {
+        let n = u32::from_le_bytes(container[28..32].try_into().unwrap()) as usize;
+        for i in 0..n {
+            let off = u32::from_le_bytes(container[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
+            if &container[off..off + 4] == b"DXIL" {
+                let len = u32::from_le_bytes(container[off + 4..off + 8].try_into().unwrap()) as usize;
+                let bc = &container[off + 8 + 24..off + 8 + len];
+                assert_eq!(&bc[..4], b"BC\xC0\xDE");
+                return bc;
+            }
+        }
+        panic!("missing DXIL part");
+    }
+
+    fn call_count(container: &[u8]) -> usize {
+        let root = bitreader_tests::parse(dxil_bitcode(container));
+        root.find(BLOCK_FUNCTION).expect("function block").records_with(FUNC_CODE_INST_CALL).len()
+    }
+
+    fn has_i32_const(container: &[u8], val: u32) -> bool {
+        let root = bitreader_tests::parse(dxil_bitcode(container));
+        let enc = (val as u64) << 1;
+        root.find(BLOCK_CONSTANTS)
+            .expect("constants block")
+            .records_with(CST_CODE_INTEGER)
+            .iter()
+            .any(|r| **r == [enc])
+    }
+
+    /// Wave32 VALU lane-mask sources (`v_cndmask_b32`, `v_add_co_ci_u32`, `v_sub_co_ci_u32`,
+    /// `v_subrev_co_ci_u32`) must accept 32-bit-only scalar codes `m0` (124) and `exec_hi` (127)
+    /// across kernel and compute Direct DXIL entrypoints, while Wave64 still rejects both.
+    #[test]
+    fn direct_wave32_valu_mask_32bit_only_sources_translate() {
+        let ko32 = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let ko64 = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let cs = recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+
+        for src2 in [124u64, 127] {
+            let ops: [(&str, &str, &[(&str, u64)]); 4] = [
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", src2)]),
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 0), ("SRC0", 256), ("SRC1", 257), ("SRC2", src2)]),
+                ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 0), ("SRC0", 256), ("SRC1", 257), ("SRC2", src2)]),
+                ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 0), ("SRC0", 256), ("SRC1", 257), ("SRC2", src2)]),
+            ];
+            for (name, enc, fields) in ops {
+                let code = asm(&[(name, enc, fields)]);
+                let dxil = kernel::translate(&code, ko32).unwrap_or_else(|e| panic!("wave32 {name} src2={src2}: {e}"));
+                assert!(bitreader_tests::parse(dxil_bitcode(&dxil)).find(BLOCK_FUNCTION).is_some());
+                if validate::validator_supported() {
+                    validate::validate(&dxil).unwrap_or_else(|e| panic!("validate wave32 {name} src2={src2}: {e}"));
+                }
+                assert!(kernel::translate(&code, ko64).is_err(), "wave64 {name} src2={src2} must reject non-pair code");
+
+                let cs_code = asm(&[
+                    ("S_MOV_B32", "ENC_SOP1", &[("SDST", src2), ("SSRC0", 0)]),
+                    (name, enc, fields),
+                    ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 0), ("SOFFSET", 128)]),
+                ]);
+                let comp = kernel::translate_compute(&cs_code, ko32, &cs)
+                    .unwrap_or_else(|e| panic!("compute wave32 {name} src2={src2}: {e}"));
+                if validate::validator_supported() {
+                    validate::validate(&comp.dxil).unwrap_or_else(|e| panic!("validate compute {name} src2={src2}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Wave32 `OPR_VCC` and `OPR_SREG` mask consumers read only the low 32-bit register (`vcc_lo`
+    /// or `src2`), never touching or loading `vcc_hi` (107), `exec_hi` (127), `s[n+1]`, or bogus
+    /// `s108`, whereas Wave64 still reads both halves of the 64-bit mask pair.
+    #[test]
+    fn direct_wave32_valu_mask_sources_skip_hi_sgpr_touches_and_loads() {
+        let ko32 = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let ko64 = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+        let vcc_ops: &[(&str, &str, &[(&str, u64)])] = &[
+            ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)]),
+            (
+                "V_CNDMASK_B32",
+                "VOP2_VOP_SDWA",
+                &[("VDST", 2), ("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6)],
+            ),
+            (
+                "V_CNDMASK_B32",
+                "VOP2_VOP_DPP16",
+                &[
+                    ("VDST", 2),
+                    ("SRC0", 0xFA),
+                    ("VSRC0", 0),
+                    ("VSRC1", 1),
+                    ("DPP_CTRL", 0x141),
+                    ("ROW_MASK", 0xF),
+                    ("BANK_MASK", 0xF),
+                    ("BOUND_CTRL", 1),
+                ],
+            ),
+            ("V_ADD_CO_CI_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)]),
+            ("V_SUB_CO_CI_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)]),
+            ("V_SUBREV_CO_CI_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)]),
+            ("V_DIV_FMAS_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 258)]),
+        ];
+        for &(name, enc, fields) in vcc_ops {
+            let code = asm(&[(name, enc, fields)]);
+            let touched = touched_for(&code, false);
+            assert!(touched.contains(&106), "{name}/{enc} wave32 must read vcc_lo: {touched:?}");
+            assert!(!touched.contains(&107), "{name}/{enc} wave32 must not touch vcc_hi (s107): {touched:?}");
+            assert!(!touched.contains(&127), "{name}/{enc} wave32 must not touch exec_hi (s127): {touched:?}");
+        }
+
+        for src2 in [10u64, 105, 106, 107, 126] {
+            for (name, enc, fields) in [
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2u64), ("SRC0", 256), ("SRC1", 257), ("SRC2", src2)][..]),
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 0), ("SRC0", 256), ("SRC1", 257), ("SRC2", src2)][..]),
+            ] {
+                let code = asm(&[(name, enc, fields)]);
+                let touched = touched_for(&code, false);
+                let lo = src2 as u32;
+                assert!(touched.contains(&lo), "{name} src2={src2} wave32 must touch s{lo}: {touched:?}");
+                assert!(!touched.contains(&(lo + 1)), "{name} src2={src2} wave32 must not touch s{}: {touched:?}", lo + 1);
+            }
+        }
+
+        // Control: Wave64 still reads both halves (`vcc_lo` + `vcc_hi`, and `s10` + `s11`).
+        let vop2_cnd = asm(&[("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)])]);
+        let t64_vcc = touched_for(&vop2_cnd, true);
+        assert!(t64_vcc.contains(&106) && t64_vcc.contains(&107), "wave64 ENC_VOP2 must touch vcc_lo+vcc_hi: {t64_vcc:?}");
+        let vop3_s10 = asm(&[("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 10)])]);
+        let t64_s10 = touched_for(&vop3_s10, true);
+        assert!(t64_s10.contains(&10) && t64_s10.contains(&11), "wave64 ENC_VOP3 s10 must touch s10+s11: {t64_s10:?}");
+
+        // Bitcode check on shipping `translate_compute`: with `user_sgprs = 12` and `SRC2 = s10`,
+        // Wave32 emits a `rawBufferLoad` at `s10`'s `io` byte offset (`40`) and never `s11`'s
+        // (`44`), whereas Wave64 loads both `s10` (`40`) and `s11` (`44`).
+        let cs32 = recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 12, tgid: [false; 3], tg_size: false, tid_components: 2 };
+        let cs64 = recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 12, tgid: [false; 3], tg_size: false, tid_components: 2 };
+        let cs_s10 = asm(&[
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 10)]),
+            ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 0), ("SOFFSET", 128)]),
+        ]);
+        let comp32 = kernel::translate_compute(&cs_s10, ko32, &cs32).expect("compute wave32 s10").dxil;
+        let comp64 = kernel::translate_compute(&cs_s10, ko64, &cs64).expect("compute wave64 s10").dxil;
+        assert!(has_i32_const(&comp32, 10 * 4), "compute wave32 must load s10 at io offset 40");
+        assert!(!has_i32_const(&comp32, 11 * 4), "compute wave32 must not load s11 at io offset 44");
+        assert!(has_i32_const(&comp64, 11 * 4), "compute wave64 must load s11 at io offset 44");
+        assert_eq!(call_count(&comp32) + 1, call_count(&comp64), "compute wave32 skips bogus s11 rawBufferLoad");
+    }
+
+    /// Wave32 inline float constants (`0.5` = 240, `inv_2pi` = 248) on scalar mask operands emit
+    /// their 32-bit IEEE-754 `f32` bit patterns rather than `code64`'s `f64` low dword.
+    #[test]
+    fn direct_wave32_valu_mask_inline_float_consts_use_f32_bits() {
+        let ko32 = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+
+        let f05 = asm(&[("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 240)])]);
+        let f05_dxil = kernel::translate(&f05, ko32).expect("wave32 inline 0.5 mask");
+        assert!(has_i32_const(&f05_dxil, 0.5f32.to_bits()), "wave32 inline 0.5 mask must emit 0x3F000000");
+
+        let inv2pi = asm(&[("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 248)])]);
+        let inv2pi_dxil = kernel::translate(&inv2pi, ko32).expect("wave32 inline inv_2pi mask");
+        assert!(has_i32_const(&inv2pi_dxil, 0x3E22_F983), "wave32 inline inv_2pi mask must emit f32 0x3E22F983");
+        assert!(!has_i32_const(&inv2pi_dxil, 0x6DC9_C882), "wave32 inline inv_2pi mask must not emit f64 low bits");
+    }
+
+    /// Wave32 Direct DXIL GPU execution of `v_cndmask_b32` (with `VCC`, `m0`, `exec_hi`, `s10`,
+    /// and inline `0.5`) and `v_add_co_ci_u32` / `v_sub_co_ci_u32` / `v_subrev_co_ci_u32` (with
+    /// `m0`), verifying lane results and confirming adjacent high SGPRs (`s11`, `vcc_hi`, `s3`,
+    /// `s5`, `s7`) remain untouched.
+    #[test]
+    fn gpu_direct_wave32_valu_mask_sources() {
+        match runner::wave32_supported() {
+            Ok(true) => {}
+            Ok(false) => return runner::skip_test("no wave32"),
+            Err(e) => return runner::skip_test(&e),
+        }
+        let code = asm(&[
+            ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 256), ("SRC1", 257), ("SRC2", 124)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 256), ("SRC1", 257), ("SRC2", 127)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 256), ("SRC1", 257), ("SRC2", 10)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 256), ("SRC1", 257), ("SRC2", 240)]),
+            ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 7), ("SDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 124)]),
+            ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 8), ("SDST", 4), ("SRC0", 256), ("SRC1", 257), ("SRC2", 124)]),
+            ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 9), ("SDST", 6), ("SRC0", 256), ("SRC1", 257), ("SRC2", 124)]),
+        ]);
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("direct wave32 translate");
+        let mut st = runner::KernelState::default();
+        let (vcc_mask, m0_mask, exechi_mask, s10_mask, f05_mask) =
+            (0xA5A5_5A5Au32, 0x0F0F_F0F0u32, 0x33CC_AA55u32, 0xFFFF_0000u32, 0.5f32.to_bits());
+        st.sgpr[106] = vcc_mask;
+        st.sgpr[107] = 0xCAFE_BABE;
+        st.sgpr[124] = m0_mask;
+        st.sgpr[126] = u32::MAX;
+        st.sgpr[127] = exechi_mask;
+        st.sgpr[10] = s10_mask;
+        st.sgpr[11] = 0xDEAD_BEEF;
+        st.sgpr[3] = 0x1111_2222;
+        st.sgpr[5] = 0x3333_4444;
+        st.sgpr[7] = 0x5555_6666;
+        for l in 0..32usize {
+            st.vgpr[l][0] = if l % 2 == 0 { u32::MAX } else { 100 + l as u32 };
+            st.vgpr[l][1] = (l as u32) + 1;
+        }
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run");
+        let (mut want_add_c, mut want_sub_b, mut want_subrev_b) = (0u32, 0u32, 0u32);
+        for l in 0..32usize {
+            let (a, b) = (st.vgpr[l][0], st.vgpr[l][1]);
+            let bit = |m: u32| (m >> l) & 1 == 1;
+            assert_eq!(r.vgpr[l][2], if bit(vcc_mask) { b } else { a }, "lane {l}: vcc cndmask");
+            assert_eq!(r.vgpr[l][3], if bit(m0_mask) { b } else { a }, "lane {l}: m0 cndmask");
+            assert_eq!(r.vgpr[l][4], if bit(exechi_mask) { b } else { a }, "lane {l}: exec_hi cndmask");
+            assert_eq!(r.vgpr[l][5], if bit(s10_mask) { b } else { a }, "lane {l}: s10 cndmask");
+            assert_eq!(r.vgpr[l][6], if bit(f05_mask) { b } else { a }, "lane {l}: 0.5 cndmask");
+
+            let c = bit(m0_mask) as u64;
+            let add64 = a as u64 + b as u64 + c;
+            assert_eq!(r.vgpr[l][7], add64 as u32, "lane {l}: add_co_ci");
+            want_add_c |= (((add64 >> 32) != 0) as u32) << l;
+
+            let sub64 = (a as u64).wrapping_sub(b as u64).wrapping_sub(c);
+            assert_eq!(r.vgpr[l][8], sub64 as u32, "lane {l}: sub_co_ci");
+            want_sub_b |= (((sub64 >> 32) != 0) as u32) << l;
+
+            let subrev64 = (b as u64).wrapping_sub(a as u64).wrapping_sub(c);
+            assert_eq!(r.vgpr[l][9], subrev64 as u32, "lane {l}: subrev_co_ci");
+            want_subrev_b |= (((subrev64 >> 32) != 0) as u32) << l;
+        }
+        assert_eq!(r.sgpr[2], want_add_c, "add_co_ci carry-out");
+        assert_eq!(r.sgpr[4], want_sub_b, "sub_co_ci borrow-out");
+        assert_eq!(r.sgpr[6], want_subrev_b, "subrev_co_ci borrow-out");
+        assert_eq!(r.sgpr[3], 0x1111_2222, "s3 must remain untouched");
+        assert_eq!(r.sgpr[5], 0x3333_4444, "s5 must remain untouched");
+        assert_eq!(r.sgpr[7], 0x5555_6666, "s7 must remain untouched");
+        assert_eq!(r.sgpr[11], 0xDEAD_BEEF, "s11 must remain untouched");
+        assert_eq!(r.sgpr[107], 0xCAFE_BABE, "vcc_hi must remain untouched");
     }
 }

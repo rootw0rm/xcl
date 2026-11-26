@@ -479,6 +479,13 @@ impl<'a, I: Ir> Lower<'a, I> {
             193 => Ok(self.ir.boolean(true)),
             129..=192 => Ok(bit_of_const(self, (code - 128) as u32, false)),
             194..=208 => Ok(bit_of_const(self, (-((code - 192) as i32)) as u32, true)),
+            253 => {
+                let s = self.read_scc(b);
+                let lane = self.lane();
+                let z = self.ir.int(0);
+                let l0 = self.ir.icmp(Cmp::Eq, lane, z);
+                Ok(self.ir.bin(Bin::And, s, l0))
+            }
             255 => Ok(bit_of_const(self, d.literal.ok_or("missing literal")?, false)),
             _ => Err(format!("mask source code {code}")),
         }
@@ -789,6 +796,10 @@ impl<'a, I: Ir> Lower<'a, I> {
             125 => (self.ir.int(0), self.ir.int(0)),
             128..=192 => (self.ir.int((code - 128) as u32), self.ir.int(0)),
             193..=208 => (self.ir.int((-((code - 192) as i32)) as u32), self.ir.int(u32::MAX)),
+            253 => {
+                let s = self.read_scc(b);
+                (self.ir.zext(s), self.ir.int(0))
+            }
             255 => (self.ir.int(d.literal.ok_or("missing literal")?), self.ir.int(0)),
             _ => return Err(format!("64-bit source code {code}")),
         })
@@ -1187,11 +1198,7 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, ir: I) -> R<(I, V
 /// from instruction `i` can read SCC before an unconditional scalar instruction overwrites it.
 fn compute_scc_liveness(insts: &[Decoded], sum: &Summary) -> Vec<bool> {
     let reads_scc = |d: &Decoded| -> bool {
-        matches!(d.inst.name, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1")
-            || d.ienc.operands.iter().any(|o| o.input && o.ty == "OPR_SSRC_SPECIAL_SCC")
-            || ["SSRC0", "SSRC1", "SRC0", "SRC1", "SRC2", "SOFFSET"]
-                .iter()
-                .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(253))
+        matches!(d.inst.name, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") || lane_masks::reads_scc(d)
     };
     let writes_scc = |d: &Decoded| -> bool {
         d.inst.name.starts_with("S_")
@@ -1810,7 +1817,7 @@ impl<I: Ir> Lower<'_, I> {
                 }
             }
         }
-        if operand(true, "OPR_SSRC_SPECIAL_SCC") {
+        if lane_masks::reads_scc(d) {
             let s = self.read_scc(b);
             let s = self.ir.zext(s);
             inputs.push((Var::Scc, s));
@@ -3526,6 +3533,167 @@ pub(crate) mod tests {
         assert_eq!((s[1], s[2], s[5]), (0, 1, 0xFFFF_FFFF));
         // 0 - 1 = 0xFFFFFFFF borrow 1; 5 - 1 - 1 = 3; 5 - 1 - 0 = 4
         assert_eq!((s[3], s[4], s[6]), (0xFFFF_FFFF, 3, 4));
+    }
+
+    #[test]
+    fn explicit_src_scc_in_salu_valu_bridge_and_wave_liveness() {
+        // 1. Native 64-bit SALU (`src64`) and per-lane mask (`src_bit`) operands with `SRC_SCC` (253):
+        //    `src_scc` is zero-extended `(zext(scc), 0)`, so as a mask only lane 0 holds `scc`.
+        let native_lines: &[I] = &[
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 0)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 253)]),
+            ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 253), ("SSRC1", 193)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 138), ("SRC1", 148), ("SRC2", 253)]),
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 126), ("SSRC1", 253)]),
+            ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 0)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 253)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 138), ("SRC1", 148), ("SRC2", 253)]),
+            ENDPGM,
+        ];
+        let (s, v) = state(64);
+        let (s, v) = run(native_lines, true, &s, &v);
+        assert_eq!((s[2], s[3], s[4], s[5]), (1, 0, 1, 0));
+        assert_eq!((s[6], s[7], s[8], s[9]), (1, 0, 0, 0));
+        for (l, regs) in v.iter().enumerate() {
+            assert_eq!(regs[1], if l == 0 { 20 } else { 10 }, "lane {l} scc=1");
+            assert_eq!(regs[2], 10, "lane {l} scc=0");
+        }
+
+        // 2. Bridged instructions encoding explicit `SRC_SCC` (253) — including SDWA `S0`/`S1` —
+        //    must pass `Var::Scc` into `Ir::foreign`, track `lane_uses` for `stale`, and keep
+        //    `scc_live_after` live across split-wave64 `mask_nonzero_scc`.
+        #[derive(Default)]
+        struct BridgeSccIr {
+            inner: Interp,
+            compute_zero_scc: bool,
+            split_exchange: bool,
+            ballots: usize,
+            foreign_scc: Vec<Option<u32>>,
+            block_scc: HashMap<usize, u32>,
+        }
+        impl Sink for BridgeSccIr {
+            type V = u32;
+            fn phi(&mut self, b: usize, v: Var) -> u32 { self.inner.phi(b, v) }
+            fn incoming(&mut self, p: u32, v: u32, pred: usize) { self.inner.incoming(p, v, pred); }
+            fn replace(&mut self, old: u32, new: u32) { self.inner.replace(old, new); }
+            fn undef(&mut self, v: Var) -> u32 { self.inner.undef(v) }
+        }
+        impl Ir for BridgeSccIr {
+            fn new_block(&mut self) -> usize { self.inner.new_block() }
+            fn at(&mut self, b: usize) { self.inner.at(b); }
+            fn int(&mut self, v: u32) -> u32 { self.inner.int(v) }
+            fn boolean(&mut self, v: bool) -> u32 { self.inner.boolean(v) }
+            fn bin(&mut self, op: Bin, a: u32, b: u32) -> u32 { self.inner.bin(op, a, b) }
+            fn icmp(&mut self, c: Cmp, a: u32, b: u32) -> u32 { self.inner.icmp(c, a, b) }
+            fn select(&mut self, c: u32, a: u32, b: u32) -> u32 { self.inner.select(c, a, b) }
+            fn zext(&mut self, b: u32) -> u32 { self.inner.zext(b) }
+            fn lane(&mut self) -> u32 { self.inner.lane() }
+            fn group_id(&mut self, k: u32) -> u32 { self.inner.group_id(k) }
+            fn compute_ids(&mut self, t: [u32; 3]) -> (u32, [u32; 3]) { self.inner.compute_ids(t) }
+            fn whole_needs_exchange(&self) -> bool { self.split_exchange }
+            fn can_wave_branch(&self) -> bool { true }
+            fn ballot(&mut self, c: u32) -> [u32; 2] {
+                self.ballots += 1;
+                self.inner.ballot(c)
+            }
+            fn ballot_half(&mut self, c: u32) -> [u32; 2] { self.inner.ballot_half(c) }
+            fn read_lane(&mut self, v: u32, l: u32) -> u32 { self.inner.read_lane(v, l) }
+            fn read_lane_half(&mut self, v: u32, l: u32) -> u32 { self.inner.read_lane_half(v, l) }
+            fn count_bits(&mut self, v: u32) -> u32 { self.inner.count_bits(v) }
+            fn foreign(&mut self, _d: &Decoded, guard: u32, inputs: &[(Var, u32)], outputs: &[Var]) -> R<Vec<u32>> {
+                let scc_in = inputs.iter().find_map(|&(v, x)| (v == Var::Scc).then_some(x));
+                self.foreign_scc.push(scc_in);
+                let scc_val = match scc_in {
+                    Some(x) => {
+                        self.block_scc.insert(self.inner.cur, x);
+                        x
+                    }
+                    None if self.compute_zero_scc => {
+                        let z = self.inner.int(0);
+                        *self.block_scc.get(&self.inner.cur).unwrap_or(&z)
+                    }
+                    None => match self.block_scc.get(&self.inner.cur).copied() {
+                        Some(x) => x,
+                        None => return Err("it reads register 125 the per-lane form did not pass".into()),
+                    },
+                };
+                Ok(outputs
+                    .iter()
+                    .map(|&v| {
+                        let prev = inputs.iter().find_map(|&(iv, ix)| (iv == v).then_some(ix)).unwrap_or_else(|| self.inner.int(0));
+                        let out = self.inner.select(guard, scc_val, prev);
+                        if v == Var::Scc {
+                            self.block_scc.insert(self.inner.cur, out);
+                        }
+                        out
+                    })
+                    .collect())
+            }
+            fn io_load(&mut self, d: u32) -> u32 { self.inner.io_load(d) }
+            fn res_store(&mut self, d: u32, v: u32) { self.inner.res_store(d, v); }
+            fn mem_load(&mut self, a: u32) -> u32 { self.inner.mem_load(a) }
+            fn mem_store(&mut self, a: u32, v: u32) { self.inner.mem_store(a, v); }
+            fn br(&mut self, t: usize) { self.inner.br(t); }
+            fn br_if(&mut self, c: u32, t: usize, f: usize) { self.inner.br_if(c, t, f); }
+            fn ret(&mut self) { self.inner.ret(); }
+            fn graphics_start(&mut self, v: &[u16]) -> Option<GraphicsStart<u32>> { self.inner.graphics_start(v) }
+        }
+
+        let bridged = decode(&[
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 0)]),
+            ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 253)]),
+            ("S_BFE_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 253)]),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 0)]),
+            ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 253)]),
+            ENDPGM,
+        ]);
+        let (k_ir, _) = lower_kernel(&bridged, false, BridgeSccIr::default()).unwrap();
+        assert!(k_ir.foreign_scc.iter().all(|s| s.is_some()));
+        let mut io = vec![0u32; KERNEL_SGPRS + 32 * KERNEL_VGPRS];
+        io[126] = u32::MAX;
+        let mut res = io.clone();
+        k_ir.inner.run(32, &io, &mut res, &mut []);
+        assert_eq!(res[2], 1, "S_BFE_U32 saw live SCC = 1");
+        for l in 0..32 {
+            assert_eq!(res[KERNEL_SGPRS + l * KERNEL_VGPRS + 1], 1, "lane {l} v1");
+            assert_eq!(res[KERNEL_SGPRS + l * KERNEL_VGPRS + 2], 1, "lane {l} v2 refreshed after S_BFE_U32");
+        }
+
+        // Stale SCC from a skipped arm read via bridged `SRC_SCC` after reconvergence must be refused.
+        let stale_bridged = decode(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+            ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 253)]),
+            ENDPGM,
+        ]);
+        let err = lower_kernel(&stale_bridged, false, BridgeSccIr::default()).err().expect("stale SCC refused");
+        assert!(err.contains("some lanes were elsewhere"), "{err}");
+
+        // Split-wave64 compute: `S_AND_SAVEEXEC_B64` (lanes 32..63 active) followed by SDWA `S0=1, VSRC0=253`
+        // must keep SCC live (`ballots == 1`) and pass `SCC = 1` across all 64 lanes.
+        let cs = compute_cs();
+        let split_sdwa = decode(&[
+            ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)]),
+            (
+                "V_ADD_NC_U32",
+                "VOP2_VOP_SDWA",
+                &[("VDST", 1), ("SRC0", 0xF9), ("VSRC1", 0), ("VSRC0", 253), ("S0", 1), ("DST_SEL", 6), ("SRC0_SEL", 6), ("SRC1_SEL", 6)],
+            ),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ]);
+        let probe = BridgeSccIr { compute_zero_scc: true, split_exchange: true, ..Default::default() };
+        let c_ir = lower_compute(&split_sdwa, &cs, true, probe).unwrap();
+        assert_eq!(c_ir.ballots, 1, "live SDWA SRC_SCC must preserve whole-wave SCC ballot");
+        let mut mem = vec![0u32; 64];
+        c_ir.inner.run_with(64, 0, [0; 3], &[0; KERNEL_SGPRS], &mut [], &mut mem);
+        assert_eq!(&mem[..], &[1u32; 64], "every split-wave64 lane must observe whole-wave SCC = 1");
     }
 
     /// A far jump (`s_getpc_b64`, a constant added, `s_setpc_b64`, as a retail program jumps

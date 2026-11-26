@@ -278,17 +278,36 @@ pub struct Summary {
 }
 
 /// Whether `d` reads SCC as a non-branch input (either implicitly via `OPR_SSRC_SPECIAL_SCC`
-/// or explicitly via source encoding 253 / `SRC_SCC`).
-fn reads_scc(d: &Decoded) -> bool {
+/// or explicitly via scalar source encoding 253 / `SRC_SCC`, including SDWA `S0` / `S1`).
+pub(super) fn reads_scc(d: &Decoded) -> bool {
     if matches!(d.inst.name, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") {
         return false;
     }
     if d.ienc.operands.iter().any(|o| o.input && o.ty == "OPR_SSRC_SPECIAL_SCC") {
         return true;
     }
-    ["SSRC0", "SSRC1", "SRC0", "SRC1", "SRC2", "SOFFSET"]
-        .iter()
-        .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(253))
+    let has_in = |name: &str| d.ienc.operands.iter().any(|o| o.input && !o.implicit && o.field == Some(name));
+    if d.variant == rdna2::Variant::Sdwa {
+        let Some(e) = super::emit::ext_encoding(d) else { return true };
+        let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
+        if (has_in("SRC0") && fv("S0") == 1 && fv("VSRC0") == 253)
+            || (has_in("VSRC1") && fv("S1") == 1 && fv("VSRC1") == 253)
+        {
+            return true;
+        }
+    }
+    let movrels = matches!(d.inst.name, "S_MOVRELS_B32" | "S_MOVRELS_B64" | "S_MOVRELSD_2_B32");
+    d.ienc.operands.iter().any(|o| {
+        if !o.input || o.implicit || matches!(o.ty, "OPR_ATTR" | "OPR_PARAM") {
+            return false;
+        }
+        let Some(f) = o.field else { return false };
+        if (f == "SRC0" && d.variant != rdna2::Variant::Plain) || (movrels && f == "SSRC0") {
+            return false;
+        }
+        matches!(f, "SSRC0" | "SSRC1" | "SRC0" | "SRC1" | "SRC2" | "SOFFSET")
+            && rdna2::field_value(d.enc, &d.words, f) == Some(253)
+    })
 }
 
 /// Executed with the lane's EXEC bit (VOPC and the lane reads / writes are mask producers).
@@ -1169,6 +1188,54 @@ mod tests {
         // the quads of any other mask are not followed
         let s = run_launch(&[CMP, ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 106)]), MOV2, ENDPGM], LaunchExec::All).unwrap();
         assert_eq!((s.guarded, s.wqm_all), (vec![8], vec![]));
+    }
+
+    #[test]
+    fn sdwa_and_vop3_src_scc_reads_are_classified_accurately() {
+        let decode_all = |lines: &[I]| -> Vec<Decoded> {
+            let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+            let mut insts = Vec::new();
+            let mut off = 0usize;
+            while off < bytes.len() {
+                let d = rdna2::decode(&bytes[off..], off as u64).unwrap();
+                off += d.len;
+                insts.push(d);
+            }
+            rdna2::resolve_far_jumps(&mut insts);
+            insts
+        };
+        let and_mask: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 106), ("SSRC1", 126)]);
+        let save_and: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+        let sdwa_s0: I = (
+            "V_ADD_NC_U32",
+            "VOP2_VOP_SDWA",
+            &[("VDST", 2), ("SRC0", 0xF9), ("VSRC1", 1), ("VSRC0", 253), ("S0", 1), ("DST_SEL", 6), ("SRC0_SEL", 6), ("SRC1_SEL", 6)],
+        );
+        let sdwa_s1: I = (
+            "V_ADD_NC_U32",
+            "VOP2_VOP_SDWA",
+            &[("VDST", 2), ("SRC0", 0xF9), ("VSRC1", 253), ("VSRC0", 1), ("S1", 1), ("DST_SEL", 6), ("SRC0_SEL", 6), ("SRC1_SEL", 6)],
+        );
+        let sdwa_vgpr_253: I = (
+            "V_ADD_NC_U32",
+            "VOP2_VOP_SDWA",
+            &[("VDST", 2), ("SRC0", 0xF9), ("VSRC1", 253), ("VSRC0", 253), ("DST_SEL", 6), ("SRC0_SEL", 6), ("SRC1_SEL", 6)],
+        );
+        let vop3_unused_src2: I = ("V_MOV_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 128), ("SRC2", 253)]);
+
+        assert_eq!(
+            analyze(&decode_all(&[CMP, and_mask, sdwa_s0, ENDPGM]), true).err(),
+            Some("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit")
+        );
+        assert_eq!(
+            analyze(&decode_all(&[CMP, and_mask, sdwa_s1, ENDPGM]), true).err(),
+            Some("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit")
+        );
+        // S0=0 / S1=0 reads v253, not SRC_SCC; S_AND_SAVEEXEC makes active-lane SCC uniform;
+        // unused SRC2=253 on a 1-source VOP3 op is not an SCC read.
+        assert!(analyze(&decode_all(&[CMP, and_mask, sdwa_vgpr_253, ENDPGM]), true).is_ok());
+        assert!(analyze(&decode_all(&[CMP, save_and, sdwa_s0, ENDPGM]), true).is_ok());
+        assert!(analyze(&decode_all(&[CMP, and_mask, vop3_unused_src2, ENDPGM]), true).is_ok());
     }
 
     #[test]
