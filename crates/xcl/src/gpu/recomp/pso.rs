@@ -300,7 +300,10 @@ mod translated {
     }
 
     pub(super) fn load_in(path: &Path, ident: u64, blob: &[u8]) -> Option<Compiled> {
-        let b = std::fs::read(path).ok()?;
+        decode_entry(std::fs::read(path).ok()?, ident, blob)
+    }
+
+    pub(super) fn decode_entry(mut b: Vec<u8>, ident: u64, blob: &[u8]) -> Option<Compiled> {
         let head = header(ident, blob);
         let mut r = b.strip_prefix(head.as_slice())?;
         let u32_ = |r: &mut &[u8]| -> Option<u32> {
@@ -324,7 +327,12 @@ mod translated {
         let (whole, mut rest) = r.split_at_checked(len)?;
         if !super::dxc::valid_dxil_container(whole) { return None; }
         let dispatch_chain = if rest.is_empty() {
-            None
+            // Keep the file allocation instead of allocating a second payload-sized buffer.
+            // Split entries still copy below, so the whole shader does not retain all pieces.
+            let start = b.len() - len;
+            b.copy_within(start.., 0);
+            b.truncate(len);
+            return Some(Compiled { dxil: b, samplers, dispatch_chain: None });
         } else {
             let dwords_per_group = u32_(&mut rest)?;
             let count = u32_(&mut rest)?;
@@ -1761,6 +1769,71 @@ mod shader_cache_tests {
             dxil: synthetic_dxil(marker),
             samplers: vec![([marker as u32; 4], false)],
         }
+    }
+
+    #[test]
+    fn translated_cache_reuses_unsplit_read_buffer() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-buffer-{}", std::process::id()));
+        let path = dir.join("entry");
+        let blob = b"console-buffer";
+        for count in [0, 1, 65] {
+            let mut expected = compiled(7);
+            expected.samplers = (0..count).map(|i| ([i, i + 1, i + 2, i + 3], i % 2 != 0)).collect();
+            translated::store_in(&path, 42, blob, &expected);
+            let raw = std::fs::read(&path).unwrap();
+            let (ptr, capacity) = (raw.as_ptr(), raw.capacity());
+            let actual = translated::decode_entry(raw, 42, blob).unwrap();
+            assert_eq!(actual.dxil, expected.dxil);
+            assert_eq!(actual.samplers, expected.samplers);
+            assert!(actual.dispatch_chain.is_none());
+            assert_eq!(actual.dxil.as_ptr(), ptr, "reuse the file allocation");
+            assert_eq!(actual.dxil.capacity(), capacity);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn translated_cache_buffer_decode_preserves_validation_and_split_entries() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-decode-{}", std::process::id()));
+        let path = dir.join("entry");
+        let blob = b"console-decode";
+        let mut expected = compiled(9);
+        translated::store_in(&path, 42, blob, &expected);
+        let raw = std::fs::read(&path).unwrap();
+        for len in 0..raw.len() {
+            assert!(translated::decode_entry(raw[..len].to_vec(), 42, blob).is_none(), "truncated at {len}");
+        }
+        for count in 1..=16 {
+            let mut trailing = raw.clone();
+            trailing.resize(raw.len() + count, 0);
+            assert!(translated::decode_entry(trailing, 42, blob).is_none(), "{count} trailing bytes");
+        }
+
+        let chain = Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+            dwords_per_group: 8,
+            pieces: vec![synthetic_dxil(2), synthetic_dxil(3)],
+        });
+        expected.dispatch_chain = Some(chain.clone());
+        translated::store_in(&path, 42, blob, &expected);
+        let split = std::fs::read(&path).unwrap();
+        let actual = translated::load_in(&path, 42, blob).unwrap();
+        assert_eq!(actual.dxil, expected.dxil);
+        assert_eq!(actual.samplers, expected.samplers);
+        let actual_chain = actual.dispatch_chain.unwrap();
+        assert_eq!(actual_chain.dwords_per_group, chain.dwords_per_group);
+        assert_eq!(actual_chain.pieces, chain.pieces);
+        for len in raw.len() + 1..split.len() {
+            assert!(translated::decode_entry(split[..len].to_vec(), 42, blob).is_none(), "split truncated at {len}");
+        }
+        for offset in [0, 4, 8, 12] {
+            let mut corrupt = split.clone();
+            corrupt[raw.len() + offset..raw.len() + offset + 4].fill(0);
+            assert!(translated::decode_entry(corrupt, 42, blob).is_none(), "invalid split field at {offset}");
+        }
+        let mut trailing = split;
+        trailing.push(0);
+        assert!(translated::decode_entry(trailing, 42, blob).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
