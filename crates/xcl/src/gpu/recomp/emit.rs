@@ -5944,6 +5944,15 @@ fn d16_merge(v: &str, raw: &str, n: u32, signed: bool, half: u32) -> String {
     }
 }
 
+/// The fraction bits of 2/pi that `v_trig_preop_f64` reads, b1200 (the first after the point)
+/// down to b17, most significant first. The gfx1036 returns zeros for b16..b0.
+pub(crate) const TRIG_PREOP_2_OVER_PI: [u32; 37] = [
+    0xA2F9836E, 0x4E441529, 0xFC2757D1, 0xF534DDC0, 0xDB629599, 0x3C439041, 0xFE5163AB, 0xDEBBC561, 0xB7246E3A, 0x424DD2E0,
+    0x06492EEA, 0x09D1921C, 0xFE1DEB1C, 0xB129A73E, 0xE88235F5, 0x2EBB4484, 0xE99C7026, 0xB45F7E41, 0x3991D639, 0x835339F4,
+    0x9C845F8B, 0xBDF9283B, 0x1FF897FF, 0xDE05980F, 0xEF2F118B, 0x5A0A6D1F, 0x6D367ECF, 0x27CB09B7, 0x4F463F66, 0x9E5FEA2D,
+    0x7527BAC7, 0xEBE5F17B, 0x3D0739F7, 0x8A5292EA, 0x6BFB5FB1, 0x1F8D5D08, 0x56033046,
+];
+
 /// Per-lane private memory of scratch_* (static = thread-private in HLSL; 4 KB per lane).
 const PRELUDE_SCRATCH: &str = r#"
 static uint xcl_scratch[1024];
