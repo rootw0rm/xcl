@@ -151,26 +151,30 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
-fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+/// A unique sibling temp file of `dest` (`blobs_of` skips what a crash leaves behind).
+fn temp_path(dest: &Path) -> std::io::Result<PathBuf> {
     let parent = dest
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory"))?;
     let id = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!("{TMP_PREFIX}{}.{id}", std::process::id()));
+    Ok(parent.join(format!("{TMP_PREFIX}{}.{id}", std::process::id())))
+}
+
+/// Write `data` to a unique sibling temp file of `dest`, flushed to disk, for the caller to
+/// move into place (`replace_file`); nothing is left behind when the write fails.
+fn write_temp(dest: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let tmp = temp_path(dest)?;
     let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
-        f.sync_all()?;
-        drop(f);
-        replace_file(&tmp, dest)?;
-        Ok(())
+        f.sync_all()
     })();
-    if res.is_err() {
+    if let Err(e) = res {
         let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    res
+    Ok(tmp)
 }
 
 unsafe fn provider<'a>(p: *mut Provider) -> Option<&'a Provider> {
@@ -265,7 +269,8 @@ unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRES
     std::path::absolute(pr.root.join(enc(&name))).map_err(|_| E_FAIL)
 }
 
-// A queued delete must not remove a container partway through a blob update.
+// A queued delete must not remove a container partway through a blob update, and a read must not
+// see part of an update or keep open a file it replaces.
 static SAVE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn delete_container(dir: &Path) {
@@ -413,6 +418,7 @@ pub unsafe extern "system" fn XGameSaveEnumerateBlobInfoByName(c: *mut Container
 /// Blobs `names` (all when empty) laid out as the API returns them: `Blob` array, then the
 /// names and data; pointers stored as offsets from the start (fixed up by the caller).
 fn read_layout(dir: &Path, names: &[String]) -> Result<(Vec<u8>, u32), HRESULT> {
+    let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let all = blobs_of(dir);
     let picked: Vec<(String, PathBuf)> = if names.is_empty() {
         all.into_iter().map(|b| (b.0, b.1)).collect()
@@ -574,24 +580,60 @@ fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
     }
-    if let Some(d) = display {
-        if write_atomic(&dir.join("display"), d.as_bytes()).is_err() {
-            return crate::util::E_FAIL;
+    // All or nothing (#324): every write goes to a temp file first; then the files the update
+    // replaces or deletes are moved aside and the temps moved into place. A failure anywhere
+    // puts the files moved aside back and removes the temps, so the container stays as it was.
+    let mut writes: Vec<(PathBuf, PathBuf)> = Vec::new(); // (temp, destination)
+    let mut deletes: Vec<PathBuf> = Vec::new();
+    let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new(); // (where it went, where it was)
+    let mut placed = 0;
+    let done = (|| -> std::io::Result<()> {
+        if let Some(d) = display {
+            let dest = dir.join("display");
+            writes.push((write_temp(&dest, d.as_bytes())?, dest));
         }
+        // the last op on a blob is the one that counts, as when they ran in order (names
+        // compare without case: one file on NTFS)
+        let mut seen: Vec<&str> = Vec::new();
+        let last: Vec<&(String, Option<Vec<u8>>)> =
+            ops.iter().rev().filter(|(name, _)| !seen.iter().any(|s| s.eq_ignore_ascii_case(name)) && { seen.push(name); true }).collect();
+        for (name, data) in last.into_iter().rev() {
+            let path = blobs.join(enc(name));
+            match data {
+                Some(d) => writes.push((write_temp(&path, d)?, path)),
+                None => deletes.push(path),
+            }
+        }
+        for dest in writes.iter().map(|(_, dest)| dest).chain(&deletes) {
+            if dest.is_file() {
+                let away = temp_path(dest)?;
+                replace_file(dest, &away)?;
+                aside.push((away, dest.clone()));
+            }
+        }
+        for (tmp, dest) in &writes {
+            replace_file(tmp, dest)?;
+            placed += 1;
+        }
+        Ok(())
+    })();
+    if done.is_err() {
+        for (tmp, dest) in &writes {
+            let _ = std::fs::remove_file(tmp);
+            if placed > 0 {
+                let _ = std::fs::remove_file(dest);
+                placed -= 1;
+            }
+        }
+        for (away, dest) in &aside {
+            if let Err(e) = replace_file(away, dest) {
+                crate::xlog_warn!("XGameSave: a failed update could not put {} back from {}: {e}", dest.display(), away.display());
+            }
+        }
+        return crate::util::E_FAIL;
     }
-    for (name, data) in ops {
-        let path = blobs.join(enc(name));
-        match data {
-            Some(d) => {
-                // write to a unique sibling temp file, sync, then replace atomically
-                if write_atomic(&path, d).is_err() {
-                    return crate::util::E_FAIL;
-                }
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+    for (away, _) in &aside {
+        let _ = std::fs::remove_file(away);
     }
     S_OK
 }
@@ -933,6 +975,64 @@ mod tests {
         }
     }
 
+    /// An update is all or nothing (#324): when one of its blobs cannot be written, the blobs
+    /// and the display name it wrote before stay as they were, and no temp file is left.
+    #[test]
+    fn a_failed_update_leaves_the_container_as_it_was() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-324-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slot/324\0".as_ptr(), &mut c), S_OK);
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"Old\0".as_ptr(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"a\0".as_ptr(), b"old".as_ptr(), 3), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+            // the second blob of the next update cannot be written: a folder is in its place
+            let dir = (*p).root.join(enc("slot/324"));
+            std::fs::create_dir_all(dir.join("b").join(enc("b"))).unwrap();
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"New\0".as_ptr(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"a\0".as_ptr(), b"new".as_ptr(), 3), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"b\0".as_ptr(), b"x".as_ptr(), 1), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), crate::util::E_FAIL);
+            XGameSaveCloseUpdate(u);
+            assert_eq!(std::fs::read(dir.join("b").join(enc("a"))).unwrap(), b"old");
+            assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Old");
+            let temps: Vec<String> = [dir.clone(), dir.join("b")]
+                .iter()
+                .flat_map(|d| std::fs::read_dir(d).unwrap().flatten())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(TMP_PREFIX))
+                .collect();
+            assert!(temps.is_empty(), "temp files left behind: {temps:?}");
+            // ops on one blob count in their order: write then delete, delete then write
+            std::fs::remove_dir(dir.join("b").join(enc("b"))).unwrap();
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"b\0".as_ptr(), b"x".as_ptr(), 1), S_OK);
+            assert_eq!(XGameSaveSubmitBlobDelete(u, b"b\0".as_ptr()), S_OK);
+            assert_eq!(XGameSaveSubmitBlobDelete(u, b"a\0".as_ptr()), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"a\0".as_ptr(), b"z".as_ptr(), 1), S_OK);
+            // one file on NTFS whatever the case, so the delete of META is the last op on Meta
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"Meta\0".as_ptr(), b"m".as_ptr(), 1), S_OK);
+            assert_eq!(XGameSaveSubmitBlobDelete(u, b"META\0".as_ptr()), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+            assert!(!dir.join("b").join(enc("b")).exists());
+            assert!(!dir.join("b").join(enc("Meta")).exists());
+            assert_eq!(std::fs::read(dir.join("b").join(enc("a"))).unwrap(), b"z");
+            assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Old");
+            XGameSaveCloseContainer(c);
+            let root = (*p).root.clone();
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     #[test]
     fn atomic_writes_preserve_xcltmp_blobs_and_skip_leftover_temps() {
         let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -994,7 +1094,8 @@ mod tests {
             let _ = std::fs::remove_file(&leftover);
             let blocker = blobs_dir.join("dir_blocker");
             std::fs::create_dir_all(&blocker).unwrap();
-            assert!(write_atomic(&blocker, b"cannot-replace-dir").is_err());
+            let ops = [("dir_blocker".to_string(), Some(b"cannot-replace-dir".to_vec()))];
+            assert_eq!(apply(blobs_dir.parent().unwrap(), None, &ops), crate::util::E_FAIL);
             let remaining_tmps: Vec<_> = std::fs::read_dir(&blobs_dir)
                 .unwrap()
                 .flatten()
@@ -1185,6 +1286,46 @@ mod tests {
         let (reads, mixed) = reader.join().unwrap();
         assert!(reads > 0, "the reader never enumerated blobs");
         assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
+    }
+
+    /// An update replaces its blobs one file at a time: a read in between must not return some of
+    /// them from before the update and some from after it, nor make the update fail by having one
+    /// of the files open.
+    #[test]
+    fn reads_during_an_update_see_all_of_it_or_none() {
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-read-update-{}", std::process::id()));
+        let dir = root.join("slot");
+        let names = ["head".to_string(), "tail".to_string()];
+        let write = |v: u8| {
+            let ops: Vec<_> = names.iter().map(|n| (n.clone(), Some(vec![v; 4096]))).collect();
+            apply(&dir, None, &ops)
+        };
+        assert_eq!(write(0), S_OK);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (failed_updates, (reads, mixed, failed_reads)) = std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let (mut reads, mut mixed, mut failed) = (0u32, 0u32, 0u32);
+                loop {
+                    reads += 1;
+                    match read_layout(&dir, &names) {
+                        Ok((bytes, 2)) => {
+                            let data_at = |k: usize| k * std::mem::size_of::<Blob>() + std::mem::offset_of!(Blob, data);
+                            let first = |k: usize| bytes[u64::from_le_bytes(bytes[data_at(k)..data_at(k) + 8].try_into().unwrap()) as usize];
+                            mixed += (first(0) != first(1)) as u32;
+                        }
+                        _ => failed += 1,
+                    }
+                    if done.load(Ordering::Relaxed) {
+                        return (reads, mixed, failed);
+                    }
+                }
+            });
+            let failed = (1..=30u8).filter(|&v| write(v) != S_OK).count();
+            done.store(true, Ordering::Relaxed);
+            (failed, reader.join().unwrap())
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!((failed_updates, mixed, failed_reads), (0, 0, 0), "failed updates, mixed reads, failed reads of {reads}");
     }
 
     #[test]
