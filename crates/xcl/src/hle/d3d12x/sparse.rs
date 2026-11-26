@@ -1645,16 +1645,51 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = lock_state();
-    let s = g.as_mut()?;
+    place_buffer_in(
+        &STATE,
+        &FORGOTTEN,
+        va,
+        desc,
+        state,
+        |d| {
+            let hr = super::real::dev_create_reserved_resource(this, d as *const _ as usize, state as usize, 0, riid, ppv);
+            if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+                None
+            } else {
+                Some((hr, *ppv))
+            }
+        },
+        |raw| {
+            if !ppv.is_null() && *ppv == raw {
+                *ppv = std::ptr::null_mut();
+            }
+            drop(ID3D12Resource::from_raw(raw));
+        },
+    )
+}
+
+unsafe fn place_buffer_in(
+    state_lock: &Mutex<Option<State>>,
+    forgotten: &Mutex<Vec<usize>>,
+    va: usize,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    create: impl FnOnce(&D3D12_RESOURCE_DESC) -> Option<(crate::util::HRESULT, *mut c_void)>,
+    on_abort: impl FnOnce(*mut c_void),
+) -> Option<(crate::util::HRESULT, usize)> {
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
     if bytes == 0 {
         return None;
     }
-    s.window_index(start)?;
-    s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
+    let end = va.checked_add(bytes)?.checked_sub(1)?;
+    {
+        let g = lock_state_in(state_lock, forgotten);
+        let s = g.as_ref()?;
+        s.window_index(start)?;
+        s.window_index(end)?;
+    }
     let mut d = *desc;
     d.Width = (delta + bytes) as u64;
     d.Alignment = 0;
@@ -1664,17 +1699,25 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32) != 0 {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
-    let hr = super::real::dev_create_reserved_resource(this, &d as *const _ as usize, state as usize, 0, riid, ppv);
-    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+    // Create the reserved resource without holding `STATE`, then re-lock via `lock_state_in`
+    // so any deferred `FORGOTTEN` release of a reused pointer is drained before registering `raw`.
+    let (hr, raw) = create(&d)?;
+    let mut g = lock_state_in(state_lock, forgotten);
+    let valid = g.as_ref().is_some_and(|s| s.window_index(start).is_some() && s.window_index(end).is_some());
+    let Some(res) = valid.then(|| ID3D12Resource::from_raw_borrowed(&raw).cloned()).flatten() else {
+        drop(g);
+        on_abort(raw);
         return None;
-    }
+    };
+    let s = g.as_mut()?;
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
     s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
     let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
-    let raw = *ppv;
-    let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
     s.map_tiles(&res, start, &tiles);
+    if s.buffers.contains_key(&(raw as usize)) {
+        forget_in(s, raw as usize);
+    }
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
@@ -1683,19 +1726,44 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     Some((hr, delta))
 }
 
+/// The tiles a new placed buffer at `raw` pins. A buffer released while the state was held
+/// (`place_buffer` holds it across `CreateReservedResource`) is let go first: its address can be
+/// `raw`, and letting it go later would let the new buffer go with it (#2457).
+/// (Test helper: production `place_buffer_in` drains via `lock_state_in` at its re-lock.)
+#[cfg(test)]
+fn record_buffer(g: &mut Option<State>, raw: usize, tiles: Vec<(u32, u32)>) {
+    forget_released(g);
+    let Some(s) = g.as_mut() else { return };
+    for &tile in &tiles {
+        *s.pinned.entry(tile).or_default() += 1;
+    }
+    s.buffers.insert(raw, tiles);
+}
+
+/// Drain of buffers released while `STATE` was held, for the next `lock_state`.
+/// (Test helper: production paths drain via `lock_state_in`.)
+#[cfg(test)]
+fn forget_released(g: &mut Option<State>) {
+    forget_released_in(g, &FORGOTTEN)
+}
+
 /// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
 /// to push or take, never across a call out.
 static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// `STATE`, with the buffers released while it was held let go first.
 fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
-    let mut g = STATE.lock().unwrap();
-    forget_released(&mut g);
+    lock_state_in(&STATE, &FORGOTTEN)
+}
+
+fn lock_state_in<'a>(state: &'a Mutex<Option<State>>, forgotten: &Mutex<Vec<usize>>) -> std::sync::MutexGuard<'a, Option<State>> {
+    let mut g = state.lock().unwrap();
+    forget_released_in(&mut g, forgotten);
     g
 }
 
-fn forget_released(g: &mut Option<State>) {
-    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
+fn forget_released_in(g: &mut Option<State>, forgotten: &Mutex<Vec<usize>>) {
+    let gone = std::mem::take(&mut *forgotten.lock().unwrap());
     let Some(s) = g.as_mut() else { return };
     for res in gone {
         forget_in(s, res);
@@ -1708,9 +1776,13 @@ fn forget_released(g: &mut Option<State>) {
 /// here deadlocked the two threads. So it does not wait: with `STATE` held, the holder's next
 /// `lock_state` lets the buffer go.
 pub fn forget_buffer(res: usize) {
-    FORGOTTEN.lock().unwrap().push(res);
-    match STATE.try_lock() {
-        Ok(mut g) => forget_released(&mut g),
+    forget_buffer_in(&STATE, &FORGOTTEN, res);
+}
+
+fn forget_buffer_in(state: &Mutex<Option<State>>, forgotten: &Mutex<Vec<usize>>, res: usize) {
+    forgotten.lock().unwrap().push(res);
+    match state.try_lock() {
+        Ok(mut g) => forget_released_in(&mut g, forgotten),
         Err(std::sync::TryLockError::WouldBlock) => {}
         Err(e) => panic!("sparse state: {e}"),
     }
@@ -1807,6 +1879,81 @@ mod tests {
         assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
         drop(lock_state());
         assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
+    }
+
+    /// A placed buffer released while `place_buffer` held the state (inside its
+    /// `CreateReservedResource`) can leave its address to the new buffer: it is let go before
+    /// the new one is recorded, so the next `lock_state` does not let the new one go (#2457).
+    #[test]
+    fn a_buffer_released_during_a_placement_does_not_take_the_new_one_with_it() {
+        const RES: usize = 0x7ff0_beef_0000;
+        let (old, new) = ((7, 1), (7, 2));
+        let mut g = Some(unsafe { test_state() });
+        record_buffer(&mut g, RES, vec![old]);
+        // the old buffer's last Release while the state was held, then the new one at its address
+        FORGOTTEN.lock().unwrap().push(RES);
+        record_buffer(&mut g, RES, vec![new]);
+        // the next `lock_state`
+        forget_released(&mut g);
+        let s = g.as_ref().unwrap();
+        assert_eq!(s.buffers.get(&RES), Some(&vec![new]), "the new buffer was let go");
+        assert_eq!(s.pinned.get(&new), Some(&1));
+        assert!(!s.pinned.contains_key(&old), "the old buffer's tile is still pinned");
+    }
+
+    /// A state over a D3D12 device (WARP when there is no GPU), with no windows or pools.
+    unsafe fn test_state() -> State {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+        }
+        let dev = dev.expect("D3D12 device");
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+        let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+        let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+        rb_list.Close().expect("rb_list close");
+        State {
+            dev,
+            queue,
+            fence,
+            value: 0,
+            event,
+            rb_fence,
+            rb_value: 0,
+            windows: Vec::new(),
+            pools: Vec::new(),
+            free: Vec::new(),
+            retired: Vec::new(),
+            parked: FxHashMap::default(),
+            mapped: FxHashMap::default(),
+            pinned: FxHashMap::default(),
+            quarantined: VecDeque::new(),
+            queue_fences: FxHashMap::default(),
+            buffers: FxHashMap::default(),
+            to_zero: Vec::new(),
+            staging: None,
+            ring_write: 0,
+            ring_submitted: 0,
+            ring_free: 0,
+            inflight: VecDeque::new(),
+            zero_buf: None,
+            slots: Vec::new(),
+            next_slot: 0,
+            readback: None,
+            rb_alloc,
+            rb_list,
+            rb_last_fence: 0,
+            waited: FxHashMap::default(),
+            runs: None,
+            scratch_runs: Vec::new(),
+        }
     }
 
 
@@ -2531,6 +2678,140 @@ mod tests {
         early_add(&mut early, a, a + 4 * TILE);
         early_remove(&mut early, a + TILE, a + 2 * TILE);
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    #[test]
+    fn place_buffer_drains_forgotten_and_does_not_hold_state_across_create() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+
+            let base = 0x10_0000_0000usize;
+            let mut win_res: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc((4 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut win_res)
+                .expect("window reserved resource");
+            let mut s = State {
+                dev: dev.clone(),
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: vec![(base, win_res.unwrap())],
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                parked: FxHashMap::default(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                quarantined: VecDeque::new(),
+                queue_fences: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let (old_tile, _) = s.take_tile().expect("old tile");
+            let (new_tile, _) = s.take_tile().expect("new tile");
+            s.mapped.insert(base, TileEntry::with_holes(old_tile, 0));
+            s.mapped.insert(base + TILE, TileEntry::with_holes(new_tile, 0));
+
+            let mut placed_res: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut placed_res)
+                .expect("placed reserved resource");
+            let placed_res = placed_res.unwrap();
+            let raw = placed_res.as_raw();
+            let ptr = raw as usize;
+
+            // Old sparse buffer at address `ptr` pinned `old_tile`.
+            s.buffers.insert(ptr, vec![old_tile]);
+            s.pinned.insert(old_tile, 1);
+
+            let local_state = Mutex::new(Some(s));
+            let local_forgotten = Mutex::new(Vec::new());
+            let mut desc = buffer_desc(TILE as u64);
+            desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+            let mut state_unlocked_during_create = false;
+            let placed = place_buffer_in(
+                &local_state,
+                &local_forgotten,
+                base + TILE,
+                &desc,
+                0,
+                |_| {
+                    state_unlocked_during_create = local_state.try_lock().is_ok();
+                    // Simulate another thread releasing the old buffer at `ptr` while
+                    // `create` is in flight (either immediately if unlocked, or queued
+                    // into `FORGOTTEN` if another thread briefly held the lock).
+                    forget_buffer_in(&local_state, &local_forgotten, ptr);
+                    // Also simulate a deferred `FORGOTTEN` entry queued for `ptr` right
+                    // before `create` returned the reused pointer.
+                    local_forgotten.lock().unwrap().push(ptr);
+                    Some((0, raw))
+                },
+                |_| panic!("unexpected abort"),
+            );
+            assert_eq!(placed, Some((0, 0)));
+            assert!(state_unlocked_during_create, "STATE must not be held across dev_create_reserved_resource");
+
+            // The very next `lock_state` must NOT delete the newly placed buffer at `ptr`
+            // or unpin `new_tile`, and `old_tile` must no longer be pinned.
+            let g = lock_state_in(&local_state, &local_forgotten);
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.buffers.get(&ptr), Some(&vec![new_tile]), "stale FORGOTTEN entry deleted live reused buffer");
+            assert_eq!(s.pinned.get(&old_tile), None, "old buffer tile pin leaked on pointer reuse");
+            assert_eq!(s.pinned.get(&new_tile), Some(&1), "new buffer tile pin must stay active");
+            assert!(local_forgotten.lock().unwrap().is_empty());
+            drop(g);
+
+            // If STATE is torn down while unlocked during `create`, `on_abort` runs and None is returned.
+            let mut aborted = None;
+            let res2 = place_buffer_in(
+                &local_state,
+                &local_forgotten,
+                base + TILE,
+                &desc,
+                0,
+                |_| {
+                    *local_state.lock().unwrap() = None;
+                    Some((0, raw))
+                },
+                |p| aborted = Some(p as usize),
+            );
+            assert_eq!(res2, None);
+            assert_eq!(aborted, Some(ptr));
+        }
     }
 
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
