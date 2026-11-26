@@ -419,3 +419,58 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-123 (task-1795717751-4372): #2849 triaged SKIP, all pins re-verified
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) tops out at #2848 (`88e56f93`) — NOTHING past
+  #2848 in the batched listing (older #2826–#2829 refs present below
+  the window). Per-PR sequential probe #2830..#2900 (widened past the
+  third gap per mem-1795712765-78dc) finds #2849 `4e93173` PRESENT —
+  the sequential scan again catches what the batched listing missed
+  (same shape as step-122, where sequential caught #2846–#2848 after
+  batched topped out at #2845): #2830 `069292ca` / #2831 `965806a0` /
+  #2832 `e2ecdfa9` / #2833 `f5a352c3` / #2834 `653f8f13` /
+  #2836 `43a4eb9d` / #2837 `9d967cf8` / #2838 `ef36b7df` /
+  #2842 `344ce7b5` / #2843 `932e689c` / #2844 `25dfc2c0` /
+  #2845 `76b17593` / #2846 `a4421e06` / #2847 `4b1780e8` /
+  #2848 `88e56f93` / #2849 `4e93173` (all pins match batched +
+  sequential, `merge-base --is-ancestor` exit 1 each — all still OPEN,
+  unmerged); #2835, #2839..#2841, #2850..#2900 ALL MISSING — scan
+  complete. #2849 is NEW since step-122: single commit parented on
+  `upstream/main` `8b957bec`, head stamped 15:31:38 -0300 (= 18:31
+  UTC, minutes into this scan window) — a fresh PR that appeared
+  mid-window, not a push-race on an older ref.
+- Triage: nothing portable. #2849 SKIP ("D3D12.X: copy title bytes
+  instead of borrowing in texture workers", 1 file
+  `hle/d3d12x/title_textures.rs` +7/-3): `title_bytes` borrows only
+  inside a UMA committed window now
+  (`crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at,
+  len))`, replacing the `readable(at, len)` borrow gate; everything
+  else copies page-by-page via `read_committed`) plus the matching
+  test flip (a plain committed page is now `Owned`, not `Borrowed`).
+  The whole `hle` module is `#[cfg(windows)]` (`lib.rs` swaps in
+  `hle_linux.rs` on Linux: null `d3d12x_linux` + Vulkan), so
+  `hle/d3d12x/*` never compiles on Linux; the Linux `gpu::uma` shim
+  is constants-only (`MAX_WINDOWS`/`MAX_HEAP_WINDOWS`, no `get()` /
+  `in_committed_window`) and zero `title_bytes` refs exist in the
+  Linux shims — the borrowed-view race on worker threads has no
+  Linux consumer. Our base shape matches (`title_bytes` at
+  `title_textures.rs:1819`, `readable` gate, `Borrowed` test at
+  `:2738`). The `(#2841)` cite in the new comment is an issue ref —
+  `refs/pull/2841/head` stays MISSING. Earlier pins stand:
+  #2830/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted in
+  `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in `aa59e8ac`;
+  #2843/#2844/#2845/#2846/#2847/#2848 SKIP.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step123r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
