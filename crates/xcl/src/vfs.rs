@@ -1224,6 +1224,37 @@ impl Vfs {
     /// without removing whiteouts or recording the write yet. Call
     /// `commit_open(rel, is_new)` only after the underlying file operation succeeds
     /// so a failed open cannot resurrect a whited-out original.
+    /// Upstream #618: a file parent anywhere above `rel` refuses the write
+    /// before overlay parents are created, so the failure cannot hide that file.
+    fn check_parent_types(&self, rel: &str) -> Result<(), u32> {
+        for (end, _) in rel.match_indices('\\') {
+            let parent = &rel[..end];
+            if self.exists(parent) && !self.is_dir(parent) {
+                return Err(ERROR_PATH_NOT_FOUND);
+            }
+            // Linux keeps #1259's anti-resurrection for removed directories
+            // (strictly stronger than upstream, which does not cover this):
+            // a whited-out original *directory* still blocks creation below it
+            // — recreate it with `create_dir` first — while a whited-out file
+            // does not (per #618 it may be replaced by a directory). An overlay
+            // directory already on disk needs no conjuring, so the failed-host-
+            // open path (`failed_host_open_restores_an_ancestor_whiteout`) still
+            // reaches the host and reports its error.
+            #[cfg(not(windows))]
+            if self.is_whiteout(parent)
+                && self
+                    .checked_original_path(parent)
+                    .is_ok_and(|p| Path::new(&p).is_dir())
+                && !self
+                    .checked_overlay_path(parent)
+                    .is_ok_and(|p| Path::new(&p).is_dir())
+            {
+                return Err(ERROR_PATH_NOT_FOUND);
+            }
+        }
+        Ok(())
+    }
+
     pub fn prepare_write_staged(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
         let _guard = self.write_lock.lock().unwrap();
         let (ov, _) = self.prepare_write_staged_unlocked(rel, keep_content)?;
@@ -1242,13 +1273,10 @@ impl Vfs {
         // parent check below can shadow it as PATH_NOT_FOUND.
         #[cfg(not(windows))]
         Self::checked_rel(&rel_clean)?;
-        // Win32 fails a create-write with ERROR_PATH_NOT_FOUND when the parent folder
-        // does not exist; do not conjure missing parents (same check as `stage_write`).
-        if let Some((parent_rel, _)) = rel_clean.rsplit_once('\\') {
-            if !self.is_dir(parent_rel) {
-                return Err(ERROR_PATH_NOT_FOUND);
-            }
-        }
+        // Upstream #618 (reconciled with #1259): only a *file* parent fails here;
+        // missing parents are still auto-created below, and a traversal rel already
+        // failed above. `stage_write` keeps the strict immediate-parent check.
+        self.check_parent_types(&rel_clean)?;
         #[cfg(windows)]
         let ov = self.overlay_path(&rel_clean);
         #[cfg(not(windows))]
@@ -1412,10 +1440,28 @@ impl Vfs {
                     }
                 }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
-                let replaces_original = disposition == CREATE_ALWAYS
-                    && !ov_entry
-                    && in_orig
-                    && Path::new(&self.original_path(&clean)).is_file();
+                // Upstream #644: CREATE_ALWAYS on an original directory is refused
+                // before staging (native codes: 5, `FILE_FLAG_BACKUP_SEMANTICS` -> 80).
+                let replaces_original = if disposition == CREATE_ALWAYS && !ov_entry && in_orig {
+                    let original = self.original_path(&clean);
+                    let original = Path::new(&original);
+                    let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
+                        original.symlink_metadata().is_ok_and(|m| m.is_dir())
+                    } else {
+                        original.is_dir()
+                    };
+                    if is_dir {
+                        let err = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 {
+                            ERROR_FILE_EXISTS
+                        } else {
+                            ERROR_ACCESS_DENIED
+                        };
+                        return (Decision::Fail(err), None);
+                    }
+                    original.is_file()
+                } else {
+                    false
+                };
                 match self.prepare_write_staged_unlocked(&clean, keep) {
                     Ok((p, is_new)) if disposition == TRUNCATE_EXISTING && !ov_entry => {
                         (Decision::UseWithDisposition(p, CREATE_ALWAYS), Some(OpenCommit { rel: clean, is_new }))
@@ -1549,6 +1595,8 @@ impl Vfs {
         let Some(rel_clean) = clean_rel(rel) else {
             return Err(ERROR_PATH_NOT_FOUND);
         };
+        // Upstream #618: a file parent refuses before anything is created.
+        self.check_parent_types(&rel_clean)?;
         if self.visible_in_overlay(&rel_clean) || self.visible_in_original(&rel_clean) {
             return Err(ERROR_ALREADY_EXISTS);
         }
@@ -2467,6 +2515,159 @@ mod tests {
     }
 
     #[test]
+    fn create_always_rejects_unoverlaid_game_directory() {
+        // Upstream #644: CREATE_ALWAYS on an original directory is refused before
+        // staging (native codes: 5, `FILE_FLAG_BACKUP_SEMANTICS` -> 80).
+        for (flags, expected) in [(0, ERROR_ACCESS_DENIED), (FILE_FLAG_BACKUP_SEMANTICS, ERROR_FILE_EXISTS)] {
+            let f = Fixture::new("create_always_directory");
+            let v = &f.vfs;
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
+                use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+                let original_w = crate::util::wide(&f.game().join("data").to_string_lossy());
+                let open = |disposition| unsafe {
+                    CreateFileW(original_w.as_ptr(), GENERIC_WRITE, 7, std::ptr::null(), disposition, flags, std::ptr::null_mut())
+                };
+                if !crate::util::under_wine() {
+                    let handle = open(CREATE_ALWAYS);
+                    let error = unsafe { GetLastError() };
+                    if handle != INVALID_HANDLE_VALUE {
+                        unsafe { CloseHandle(handle) };
+                    }
+                    assert_eq!(handle, INVALID_HANDLE_VALUE, "native CreateFileW with flags {flags:#x}");
+                    assert_eq!(error, expected, "native CreateFileW with flags {flags:#x}");
+                }
+            }
+            assert_eq!(
+                v.open_decision("G:\\data", GENERIC_WRITE, CREATE_ALWAYS, flags),
+                Decision::Fail(expected),
+                "flags {flags:#x}"
+            );
+            assert!(!v.visible_in_overlay("data"));
+            assert!(v.is_dir("data"));
+            assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+            assert_eq!(std::fs::read(f.game().join("data").join("gone.txt")).unwrap(), b"bye");
+            assert_eq!(v.read_path_rel("data\\hello.txt").as_deref().map(|_| ()).is_some(), true);
+        }
+    }
+
+    #[test]
+    fn creating_files_below_virtual_files_is_rejected() {
+        // Upstream #618: creating below an existing virtual file fails with
+        // PATH_NOT_FOUND before overlay parents are created.
+        for overlaid in [false, true] {
+            let f = Fixture::new(if overlaid { "file_parent_ov" } else { "file_parent_orig" });
+            let v = &f.vfs;
+            if overlaid {
+                let ov = v.prepare_write("data\\hello.txt", true).unwrap();
+                std::fs::write(ov, b"overlay").unwrap();
+            }
+            for suffix in ["child.bin", "missing\\child.bin"] {
+                let rel = format!("data\\hello.txt\\{suffix}");
+                // The rel-level gate (shared `check_parent_types`) fails with
+                // PATH_NOT_FOUND on both platforms.
+                assert_eq!(
+                    v.prepare_write(&rel, false),
+                    Err(ERROR_PATH_NOT_FOUND),
+                    "overlaid={overlaid}, {rel}"
+                );
+                #[cfg(windows)]
+                {
+                    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
+                    use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+                    let native = crate::util::wide(&f.game().join(&rel).to_string_lossy());
+                    for disposition in [CREATE_NEW, CREATE_ALWAYS, OPEN_ALWAYS] {
+                        let h = unsafe {
+                            CreateFileW(native.as_ptr(), GENERIC_WRITE, 7, std::ptr::null(),
+                                disposition, 0, std::ptr::null_mut())
+                        };
+                        let error = unsafe { GetLastError() };
+                        if h != INVALID_HANDLE_VALUE { unsafe { CloseHandle(h); } }
+                        assert_eq!(h, INVALID_HANDLE_VALUE);
+                        assert_eq!(error, ERROR_PATH_NOT_FOUND);
+                    }
+                }
+                // Through a console path Linux containment (`ensure_mount_contained`,
+                // ENOTDIR on the on-disk file) refuses first with ACCESS_DENIED,
+                // while Windows reaches the VFS gate above (PATH_NOT_FOUND).
+                for disposition in [CREATE_NEW, CREATE_ALWAYS, OPEN_ALWAYS] {
+                    #[cfg(windows)]
+                    let expected = ERROR_PATH_NOT_FOUND;
+                    #[cfg(not(windows))]
+                    let expected = ERROR_ACCESS_DENIED;
+                    assert_eq!(
+                        v.open_decision(&format!("G:\\{rel}"), GENERIC_WRITE, disposition, 0),
+                        Decision::Fail(expected),
+                        "overlaid={overlaid}, disposition={disposition}, {rel}"
+                    );
+                }
+            }
+            assert!(!v.is_dir("data\\hello.txt"));
+            assert_eq!(v.visible_in_overlay("data\\hello.txt"), overlaid);
+            assert_eq!(std::fs::read(v.read_path_rel("data\\hello.txt").unwrap()).unwrap(),
+                if overlaid { b"overlay".as_slice() } else { b"original".as_slice() });
+            assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn creating_directories_below_virtual_files_is_rejected() {
+        // Upstream #618 companion: directories below a virtual file fail the same way.
+        for overlaid in [false, true] {
+            let f = Fixture::new(if overlaid { "dir_parent_ov" } else { "dir_parent_orig" });
+            let v = &f.vfs;
+            if overlaid { v.prepare_write("data\\hello.txt", true).unwrap(); }
+            for suffix in ["child", "missing\\child"] {
+                let rel = format!("data\\hello.txt\\{suffix}");
+                #[cfg(windows)]
+                {
+                    use windows_sys::Win32::Foundation::GetLastError;
+                    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+                    let native = crate::util::wide(&f.game().join(&rel).to_string_lossy());
+                    let result = unsafe { CreateDirectoryW(native.as_ptr(), std::ptr::null()) };
+                    let error = unsafe { GetLastError() };
+                    assert_eq!(result, 0);
+                    assert_eq!(error, ERROR_PATH_NOT_FOUND);
+                }
+                assert_eq!(v.create_dir(&rel), Err(ERROR_PATH_NOT_FOUND), "overlaid={overlaid}, {rel}");
+            }
+            assert!(!v.is_dir("data\\hello.txt"));
+            assert_eq!(v.visible_in_overlay("data\\hello.txt"), overlaid);
+            assert_eq!(std::fs::read(v.read_path_rel("data\\hello.txt").unwrap()).unwrap(), b"original");
+            assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn missing_or_hidden_file_parents_can_be_recreated() {
+        // Upstream #618: missing parents are still auto-created, and a deleted
+        // original file no longer blocks a directory in its place.
+        let f = Fixture::new("missing_parent");
+        let v = &f.vfs;
+        assert_eq!(v.create_dir("saves\\slot1"), Ok(()));
+        let Decision::Use(p) = v.open_decision("G:\\new\\nested\\save.bin", GENERIC_WRITE, CREATE_ALWAYS, 0)
+            else { panic!("missing parents should still be created") };
+        std::fs::write(p, b"save").unwrap();
+        assert!(v.visible_in_overlay("new\\nested\\save.bin"));
+        // A deleted original file is no longer a visible parent and may be replaced by a directory.
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(v.create_dir("data\\gone.txt\\child"), Ok(()));
+        assert!(v.is_dir("data\\gone.txt"));
+        assert_eq!(std::fs::read(f.game().join("data").join("gone.txt")).unwrap(), b"bye");
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        // A hidden file no longer blocks a new parent at the VFS-rel level.
+        // (Through a `G:\` console path Linux containment still sees the on-disk
+        // file — ENOTDIR — and refuses with ACCESS_DENIED before the VFS gate,
+        // so exercise the rel-level `prepare_write` here, as above.)
+        let p = v.prepare_write("data\\hello.txt\\child.bin", false)
+            .expect("a hidden file should not block a new parent");
+        std::fs::write(p, b"child").unwrap();
+        assert!(v.is_dir("data\\hello.txt"));
+        assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+    }
+
+    #[test]
     fn delete_file_rejects_directories_and_remove_dir_rejects_files() {
         let f = Fixture::new("type_checks");
         let v = &f.vfs;
@@ -2572,10 +2773,15 @@ mod tests {
     fn write_below_a_missing_parent_fails_without_creating_it() {
         let f = Fixture::new("noparent");
         let v = &f.vfs;
-        // Win32: CreateFileW CREATE_ALWAYS under a folder that exists in neither layer
-        // fails with ERROR_PATH_NOT_FOUND (3); it does not conjure the folder.
-        assert_eq!(v.prepare_write("nodir\\f.bin", true), Err(ERROR_PATH_NOT_FOUND));
-        assert!(!Path::new(&v.overlay_path("nodir")).exists());
+        // Upstream #618 reconciles #1259: the file-creation path (`prepare_write`
+        // via `open_decision`) auto-creates missing parents, while the copy/move
+        // staging path (`stage_write`) keeps #1259's strict immediate-parent check.
+        let p = v.prepare_write("nodir\\f.bin", true).expect("missing parents auto-create per #618");
+        assert!(Path::new(&p).parent().is_some_and(|par| par.exists()));
+        let _ = std::fs::remove_dir_all(f.dir.join("xcldata").join("overlay").join("nodir"));
+        // `stage_write` still refuses below a missing parent without creating anything.
+        assert_eq!(v.stage_write("nodir2\\f.bin"), Err(ERROR_PATH_NOT_FOUND));
+        assert!(!Path::new(&v.overlay_path("nodir2")).exists());
     }
 
     #[test]
