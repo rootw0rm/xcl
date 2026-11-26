@@ -703,6 +703,57 @@ impl Agg {
     }
 }
 
+/// Opt-in boundaries for diagnosing a precompile that stalls before its progress counter.
+struct ShaderPhase {
+    id: u64,
+    name: &'static str,
+    record: Option<u64>,
+    bytes: usize,
+    start: std::time::Instant,
+}
+
+impl ShaderPhase {
+    fn enabled() -> bool {
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TRACE.get_or_init(|| std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    fn start(name: &'static str, record: Option<u64>, bytes: usize) -> Option<Self> {
+        if !Self::enabled() { return None; }
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let phase = Self { id, name, record, bytes, start: std::time::Instant::now() };
+        phase.log("start");
+        Some(phase)
+    }
+
+    fn log(&self, boundary: &str) {
+        #[cfg(windows)]
+        let private = {
+            use windows_sys::Win32::System::{ProcessStatus, Threading};
+            let mut memory: ProcessStatus::PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            memory.cb = std::mem::size_of_val(&memory) as u32;
+            let sampled = unsafe {
+                ProcessStatus::K32GetProcessMemoryInfo(Threading::GetCurrentProcess(), (&mut memory as *mut ProcessStatus::PROCESS_MEMORY_COUNTERS_EX).cast(), memory.cb)
+            } != 0;
+            if sampled { (memory.PrivateUsage >> 20).to_string() } else { "-".to_string() }
+        };
+        // Linux has no `K32GetProcessMemoryInfo`: `/proc/self/status`, else `-`.
+        #[cfg(not(windows))]
+        let private = match crate::platform::process_private_bytes() >> 20 {
+            0 => "-".to_string(),
+            mib => mib.to_string(),
+        };
+        let record = self.record.map_or_else(|| "-".to_string(), |hash| format!("{hash:016x}"));
+        eprintln!("shader phase {boundary} {} span={} record={record} bytes={} elapsed_ms={} private_mib={private}",
+            self.name, self.id, self.bytes, self.start.elapsed().as_millis());
+    }
+}
+
+impl Drop for ShaderPhase {
+    fn drop(&mut self) { self.log("end"); }
+}
+
 enum Input {
     Pack { data: Vec<u8>, records: Vec<pack::Record> },
     Files(Vec<PathBuf>),
@@ -941,7 +992,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let n = files.len();
         (Input::Files(files), format!("folder, {n} files"))
     } else {
-        let data = match std::fs::read(path) {
+        let data = match {
+            let _phase = ShaderPhase::start("input-read", None, 0);
+            std::fs::read(path)
+        } {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("xcl shaders: {}: {e}", path.display());
@@ -949,7 +1003,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             }
         };
         if data.starts_with(pack::RPF9_MAGIC) {
-            let records = pack::scan(&data, 0x40);
+            let records = {
+                let _phase = ShaderPhase::start("pack-scan", None, data.len());
+                pack::scan(&data, 0x40)
+            };
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
         } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
@@ -1073,7 +1130,10 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
             continue;
         }
         matched = true;
-        let hlsl = match recomp::pso::console_hlsl(&blob, recomp::pso::Stage::Compute, windows, split) {
+        let hlsl = match {
+            let _phase = ShaderPhase::start("export-translate", Some(hash), blob.len());
+            recomp::pso::console_hlsl(&blob, recomp::pso::Stage::Compute, windows, split)
+        } {
             Ok((hlsl, _)) => hlsl,
             Err(e) => {
                 failures += 1;
@@ -1307,7 +1367,7 @@ mod pipeline_cap_tests {
 
         pipelines.max_dxil = dxil.len() - 1;
         let start = Instant::now();
-        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()));
+        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()), None);
         let elapsed = start.elapsed();
         let capped = pipelines.capped.load(Ordering::Relaxed);
         let made = pipelines.made.load(Ordering::Relaxed);
@@ -1394,7 +1454,7 @@ mod pipeline_cap_tests {
         };
 
         pipelines.max_dxil = max_piece;
-        pipelines.make(&compiled);
+        pipelines.make(&compiled, None);
         let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
         let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
         let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
@@ -1409,7 +1469,7 @@ mod pipeline_cap_tests {
         assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
 
         // Second pass reuses both cached piece blobs.
-        pipelines.make(&compiled);
+        pipelines.make(&compiled, None);
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2);
         assert_eq!(pipelines.made.load(Ordering::Relaxed), 4);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
@@ -1435,7 +1495,7 @@ mod pipeline_cap_tests {
         std::fs::write(&p1_path, b"corrupt chain blob").expect("corrupt piece1 blob");
         pipelines.max_dxil = piece1.len() - 1;
         let reused_before = pipelines.reused.load(Ordering::Relaxed);
-        pipelines.make(&compiled);
+        pipelines.make(&compiled, None);
         assert!(!p1_path.exists(), "rejected over-cap .chain.pso should be removed");
         assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
         if piece0.len() <= pipelines.max_dxil {
@@ -1483,11 +1543,12 @@ impl Pipelines {
     /// into a dispatch chain of at least two pieces, each piece is built and cached under the
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
     /// instead of the unsplit whole container.
-    fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
+    fn make(&self, c: &recomp::pso::Compiled, record: Option<u64>) {
+        let _phase = ShaderPhase::start("precompile-pipeline", record, c.dxil.len());
+        self.make_with_cache_path(c, None, record);
     }
 
-    fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+    fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>, record: Option<u64>) {
         if path_override.is_none() {
             if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
                 self.split_programs.fetch_add(1, Ordering::Relaxed);
@@ -1495,7 +1556,7 @@ impl Pipelines {
                 let workers = chain.pieces.len().min(self.most);
                 if workers <= 1 {
                     for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
+                        self.make_one(piece, &c.samplers, true, None, record);
                     }
                 } else {
                     let next = AtomicUsize::new(0);
@@ -1504,7 +1565,7 @@ impl Pipelines {
                             s.spawn(|| loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
+                                self.make_one(piece, &c.samplers, true, None, record);
                             });
                         }
                     });
@@ -1512,10 +1573,10 @@ impl Pipelines {
                 return;
             }
         }
-        self.make_one(&c.dxil, &c.samplers, false, path_override);
+        self.make_one(&c.dxil, &c.samplers, false, path_override, record);
     }
 
-    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>, record: Option<u64>) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
@@ -1554,7 +1615,10 @@ impl Pipelines {
             }
             driver_cache::path_for(dxil, desc.Flags.0, chained)
         });
-        let cached = path.as_deref().and_then(driver_cache::load);
+        let cached = {
+            let _phase = ShaderPhase::start("pipeline-cache-read", record, dxil.len());
+            path.as_deref().and_then(driver_cache::load)
+        };
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
@@ -1566,6 +1630,7 @@ impl Pipelines {
             return;
         }
         {
+            let _phase = ShaderPhase::start("pipeline-slot", record, dxil.len());
             let mut n = self.running.0.lock().unwrap();
             while *n >= self.most {
                 n = self.running.1.wait(n).unwrap();
@@ -1576,8 +1641,11 @@ impl Pipelines {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
             // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
-                .ok()
+            let pso = {
+                let _phase = ShaderPhase::start("pipeline-create-with-blob", record, dxil.len());
+                unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+            };
+            pso.ok()
                 .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
         });
         // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
@@ -1598,7 +1666,10 @@ impl Pipelines {
             Ok(pso)
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            let pso = {
+                let _phase = ShaderPhase::start("pipeline-create-without-blob", record, dxil.len());
+                unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+            };
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
@@ -1632,6 +1703,7 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
 
 #[cfg(windows)]
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
+    let adapter_init = ShaderPhase::start("precompile-init", None, 0);
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1660,6 +1732,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     // `--split` sets both
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
+    drop(adapter_init);
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
@@ -1690,10 +1763,15 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         done.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                    let record = ShaderPhase::enabled().then(|| shader::fnv64(&blob));
+                    let translated = {
+                        let _phase = ShaderPhase::start("precompile-translate", record, blob.len());
+                        recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows)
+                    };
+                    match translated {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                p.make(&c, record);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }

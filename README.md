@@ -332,6 +332,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- For `xcl shaders --precompile` and shader exports, `XCL_PSO_TRACE=1` also logs phase
+  boundaries, elapsed time, and process private memory. Match start and end by
+  `span`; per-record lines also include the shader hash.
+  Offline pipeline traces distinguish cache reads, waiting for a worker slot, and
+  D3D12 pipeline creation with or without a cached blob.
 - To investigate a world-load pause, save a run's `xcl.log` with `XCL_ACTIVITY=1` (set by
   `scripts/smoke.ps1`) and `XCL_PSO_TRACE=1` for full driver compile tracing. Run
   `python scripts/world_load_stall.py path/to/xcl.log` on the saved file. It finds the final
