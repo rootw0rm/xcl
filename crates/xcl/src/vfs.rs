@@ -1879,6 +1879,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mount_prefixes_accept_either_separator() {
+        // Upstream #1234: separators inside configured prefixes are normalised
+        // before matching, so `GAME:/data` does not fall through to `GAME:`.
+        // The `logical` fold in `Vfs::new` already normalises `/` inside
+        // prefixes (step-39); this pins the behaviour. Linux joins translated
+        // host paths with `/` (Windows `\`); the console spelling keeps `\`.
+        let f = Fixture::new("prefix_slashes");
+        let game = f.game();
+        let target = f.dir.join("redirect").to_string_lossy().into_owned();
+        let hello = format!("{target}{}hello.txt", std::path::MAIN_SEPARATOR);
+        for prefix in ["GAME:\\data", "GAME:/data", "GaMe:\\data/", "game:/data/"] {
+            let v = Vfs::new(
+                &game,
+                &f.dir.join("xcldata"),
+                vec![("GAME:".into(), game.to_string_lossy().into_owned()), (prefix.into(), target.clone())],
+            );
+            for path in ["GAME:\\data\\hello.txt", "game:/data/hello.txt"] {
+                assert_eq!(v.classify(path), Target::Translated(hello.clone()), "{prefix}");
+            }
+            assert_eq!(v.classify("GAME:\\data"), Target::Translated(target.clone()), "{prefix}");
+            assert_eq!(
+                v.classify("GAME:\\database\\hello.txt"),
+                Target::Game { rel: "database\\hello.txt".into() },
+                "{prefix}"
+            );
+        }
+    }
+
     /// The console's "D:" mount on a PC whose game and XCL data are on its D: drive: paths
     /// already inside those folders are the PC's, everything else on the drive is the console's.
     #[cfg(windows)]

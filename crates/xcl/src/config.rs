@@ -139,6 +139,7 @@ impl Config {
     /// the drive-letter mount onto `{data}\pls`. None when the mounts have no such drive.
     pub fn pls_drive(&self) -> Option<String> {
         self.mounts.iter().find_map(|(prefix, target)| {
+            let prefix = prefix.trim_end_matches(['\\', '/']);
             let b = prefix.as_bytes();
             let target = target.replace('/', "\\");
             let is_drive = b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
@@ -210,7 +211,9 @@ impl Config {
                 let mut c: Config = toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
                 // default mounts added since the file was written
                 for (k, v) in Config::default().mounts {
-                    c.mounts.entry(k).or_insert(v);
+                    if !c.mounts.keys().any(|prefix| prefix.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(&k)) {
+                        c.mounts.insert(k, v);
+                    }
                 }
                 // the old default console id, written into every xcl.toml created before
                 if c.console_id == OLD_CONSOLE_ID {
@@ -298,14 +301,95 @@ impl Boot {
         self.logs_dir().join("report.json")
     }
     pub fn expand(&self, s: &str) -> String {
-        s.replace("{game}", &self.game_root.to_string_lossy())
-            .replace("{data}", &self.data_dir.to_string_lossy())
+        let game = self.game_root.to_string_lossy();
+        let data = self.data_dir.to_string_lossy();
+        // Scan only the template: directory names may themselves contain placeholders.
+        let parts = s.split_inclusive('}').map(|part| {
+            if let Some(prefix) = part.strip_suffix("{game}") {
+                (prefix, game.as_ref())
+            } else if let Some(prefix) = part.strip_suffix("{data}") {
+                (prefix, data.as_ref())
+            } else {
+                (part, "")
+            }
+        });
+        let capacity = parts.clone().map(|(prefix, value)| prefix.len() + value.len()).sum();
+        let mut expanded = String::with_capacity(capacity);
+        for (prefix, value) in parts {
+            expanded.push_str(prefix);
+            expanded.push_str(value);
+        }
+        expanded
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_mounts_do_not_shadow_equivalent_user_prefixes() {
+        // Upstream #1222: a user prefix equivalent to a default (ASCII case,
+        // trailing separators) shadows it instead of coexisting with it.
+        use crate::vfs::{Target, Vfs};
+
+        let dir = std::env::temp_dir().join(format!("xcl_cfg_mount_overrides_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("xcl.toml");
+        // Windows spells the folders literally, as upstream does; Linux needs
+        // host folders under the temp dir (a `C:\` root would cwd-join through
+        // `host_path_string` instead of naming the custom target).
+        #[cfg(windows)]
+        let (game_root, custom) = (PathBuf::from("C:\\game"), "C:\\custom".to_string());
+        #[cfg(not(windows))]
+        let (game_root, custom) = (dir.join("game"), dir.join("custom").to_string_lossy().into_owned());
+        let custom_asset = format!("{custom}{}asset.bin", std::path::MAIN_SEPARATOR);
+        for prefix in ["G:", "g:", "G:\\", "g:/", "GaMe:"] {
+            std::fs::write(&path, format!("[mounts]\n'{prefix}' = '{custom}'\n")).unwrap();
+            let boot = Boot {
+                title: "MountOverride".into(),
+                exe_path: game_root.join("game.exe"),
+                game_root: game_root.clone(),
+                data_dir: dir.clone(),
+                config: Config::load_or_create(&path).unwrap(),
+            };
+            let mounts = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
+            let vfs = Vfs::new(&boot.game_root, &boot.data_dir, mounts);
+            let input = format!("{}\\asset.bin", prefix.trim_end_matches(['\\', '/']));
+            assert_eq!(
+                vfs.classify_with(&input, |p| Some(p.to_string())),
+                Target::Translated(custom_asset.clone()),
+                "{prefix}"
+            );
+            assert_eq!(
+                vfs.classify_with("D:\\asset.bin", |p| Some(p.to_string())),
+                Target::Game { rel: "asset.bin".into() }
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn mount_expansion_keeps_placeholders_in_directory_names_literal() {
+        // Upstream #1204: expansion scans only the template, so a literal
+        // `{data}` inside the game directory name stays literal.
+        let boot = Boot {
+            title: "Title".into(),
+            exe_path: PathBuf::from("C:\\games\\{data}\\Title\\game.exe"),
+            game_root: PathBuf::from("C:\\games\\{data}\\Title"),
+            data_dir: PathBuf::from("C:\\saves\\{game}\\Title"),
+            config: Config::default(),
+        };
+        assert_eq!(boot.expand("{game}\\Content"), "C:\\games\\{data}\\Title\\Content");
+        assert_eq!(boot.expand("{data}\\pls"), "C:\\saves\\{game}\\Title\\pls");
+        assert_eq!(
+            boot.expand("{game}/{data}/{game}/{unknown}"),
+            "C:\\games\\{data}\\Title/C:\\saves\\{game}\\Title/C:\\games\\{data}\\Title/{unknown}"
+        );
+        assert_eq!(boot.expand("C:\\literal\\folder"), "C:\\literal\\folder");
+        assert_eq!(boot.expand(""), "");
+    }
 
     #[test]
     fn default_roundtrips_through_toml() {
@@ -346,10 +430,12 @@ mod tests {
         // a user-moved drive (any spelling of the target) is followed
         c.mounts.remove("S:");
         assert_eq!(c.pls_drive(), None);
-        c.mounts.insert("p:".into(), "{data}/PLS\\".into());
-        assert_eq!(c.pls_drive().as_deref(), Some("P:\\"));
+        for prefix in ["p:", "P:\\", "p:/"] {
+            c.mounts.insert(prefix.into(), "{data}/PLS\\".into());
+            assert_eq!(c.pls_drive().as_deref(), Some("P:\\"));
+            c.mounts.remove(prefix);
+        }
         // directory-style prefixes are not drives
-        c.mounts.remove("p:");
         c.mounts.insert("PLS:".into(), PLS_MOUNT_TARGET.into());
         assert_eq!(c.pls_drive(), None);
     }
