@@ -831,7 +831,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             .collect()
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
-    upload_all(todo);
+    upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -1091,8 +1091,84 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
             && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
 }
 
+struct QueueUploads {
+    fence: ID3D12Fence,
+    value: u64,
+    in_flight: std::collections::VecDeque<(u64, texture::InFlight)>,
+    bytes: u64,
+}
+
+unsafe impl Send for QueueUploads {}
+
+static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
+
+const IN_FLIGHT_BYTES: u64 = 512 << 20;
+
+unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
+    let q = title?;
+    if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return None;
+    }
+    let mut qd: Option<ID3D12Device> = None;
+    q.GetDevice(&mut qd).ok()?;
+    (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
+}
+
+unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
+    let done = q.fence.GetCompletedValue();
+    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+    }
+    while q.bytes > cap {
+        let Some(&(v, _)) = q.in_flight.front() else { break };
+        if crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err() {
+            break;
+        }
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+    }
+}
+
+unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    // The textures' tile mappings made since the title queue last waited for them (a texture
+    // made on another thread after `refresh_once`'s wait, or its levels mapped just now by
+    // `map_levels_with_texels`): a copy into a tile still unmapped is a copy-engine page fault
+    // on NVIDIA (`DmaPageFaultWrite`), as the upload queue's own path already waits for.
+    super::vram::before_execute(queue);
+    let (failed, f) = texture::submit_batch(dev, queue, batch)?;
+    let Some(f) = f else { return Ok(failed) };
+    let mut g = ON_QUEUE.lock().unwrap();
+    let key = queue.as_raw() as usize;
+    if !g.contains_key(&key) {
+        match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+            Ok(fence) => {
+                g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+            }
+            Err(e) => {
+                texture::wait(dev, queue)?;
+                drop(f);
+                return Err(e.to_string());
+            }
+        }
+    }
+    let q = g.get_mut(&key).unwrap();
+    q.value += 1;
+    if let Err(e) = queue.Signal(&q.fence, q.value) {
+        q.value -= 1;
+        texture::wait(dev, queue)?;
+        drop(f);
+        return Err(e.to_string());
+    }
+    q.bytes += f.bytes;
+    let v = q.value;
+    q.in_flight.push_back((v, f));
+    reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    Ok(failed)
+}
+
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1124,6 +1200,26 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         |device, bytes, picked| {
             let d = device as *mut c_void;
             let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Ok((0, Vec::new())) };
+            if let Some(tq) = title_queue_for(dev, title) {
+                match own_work(|| submit_on_title_queue(dev, &tq, &batch)) {
+                    Ok(failed) => {
+                        let mut failed_keys = Vec::with_capacity(failed.len());
+                        for (idx, e) in failed {
+                            warn(&e);
+                            if let Some((r, _, _)) = batch.get(idx) {
+                                failed_keys.push(r.as_raw() as usize);
+                            }
+                        }
+                        failed_keys.sort_unstable();
+                        failed_keys.dedup();
+                        return Ok((batch.len(), failed_keys));
+                    }
+                    Err(e) => {
+                        warn(&e);
+                        return Err(batch.into_iter().map(|(r, _, _)| r).collect());
+                    }
+                }
+            }
             let queue = match upload_queue(dev, device) {
                 Ok(q) => q,
                 Err(e) => {
@@ -1137,9 +1233,10 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 if super::present::trace_frame() {
                     note_content(va, &r, &subs);
                 }
-                if super::vram::level_pages() {
-                    // (the queue waits for these mappings before the copies: `vram::before_execute` below)
-                    map_levels_with_texels(&r, &subs);
+                if super::vram::level_pages() && !map_levels_with_texels(&r, &subs) {
+                    // The copies into unmapped tiles will be dropped. Upload the backed levels,
+                    // and let the next refresh that selects this texture retry the same bytes.
+                    LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
                 }
                 batch.push((r, subs, states));
             }
@@ -1257,14 +1354,15 @@ fn run_upload_batches<T, R>(
 /// placed with lazy levels; any other: nothing to do. A level of zeros has no texels: a streamed
 /// texture's larger levels before the title has memory behind them (read as zeros,
 /// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
-/// to tiles that are not mapped, which drops it (tiled resources tier 2).
-unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
+/// to tiles that are not mapped, which drops it (tiled resources tier 2). Returns whether all
+/// levels with texels have pages. The upload queue waits for their mappings in `before_execute`.
+unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> bool {
     if !super::vram::has_lazy_levels(r.as_raw() as usize) {
-        return;
+        return true;
     }
     // (one slice: its subresources are its levels)
     let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
-    super::vram::map_levels(r, Some(&present));
+    super::vram::map_levels(r, Some(&present))
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
@@ -1573,6 +1671,113 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     out
 }
 
+/// Write `subs` (every subresource, D3D12 order, as `subresources` gives them) into the title's
+/// memory at `va` in the console layout of `tex`: the reverse of `subresources`. Only the 4 KiB
+/// pages whose bytes change are written, and of them only the committed, writable ones.
+/// Returns the bytes written.
+unsafe fn write_subresources(va: usize, tex: &xg::Texture, subs: &[Subresource]) -> Result<usize, String> {
+    let Some(t) = tex.texels() else { return Err("a texture without texels".into()) };
+    let c = &t.chain;
+    let bpe = t.bpe as usize;
+    let volume = t.depth > 0;
+    let slices = if volume { 1 } else { t.array as usize };
+    if subs.len() != slices * c.levels.len() {
+        return Err(format!("{} subresources, the console layout has {}", subs.len(), slices * c.levels.len()));
+    }
+    for (k, s) in subs.iter().enumerate() {
+        let l = &c.levels[k % c.levels.len()];
+        let depth = if volume { l.depth } else { 1 };
+        if (s.row_bytes, s.rows, s.depth) != (l.width * bpe, l.height, depth) || s.data.len() < s.row_bytes * s.rows * s.depth {
+            return Err(format!("subresource {k} is {}x{}x{} B, the console layout's {}x{}x{} B", s.row_bytes, s.rows, s.depth, l.width * bpe, l.height, depth));
+        }
+    }
+    let len = if volume { tex.size() as usize } else { slices * c.slice_bytes };
+    let old = title_bytes(va, len);
+    let mut mem = old.to_vec();
+    if volume {
+        for (i, s) in subs.iter().enumerate() {
+            c.tile_volume(&mut mem, i, &s.data);
+        }
+    } else {
+        for (s, slice) in mem.chunks_exact_mut(c.slice_bytes).enumerate() {
+            for (i, sub) in subs[s * c.levels.len()..][..c.levels.len()].iter().enumerate() {
+                c.tile_level(slice, i, s, &sub.data);
+            }
+        }
+    }
+    // the pages that change, as runs
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut p = va;
+    while p < va + len {
+        let end = ((p & !0xFFF) + 0x1000).min(va + len);
+        if old[p - va..end - va] != mem[p - va..end - va] {
+            match runs.last_mut() {
+                Some(r) if r.1 == p => r.1 = end,
+                _ => runs.push((p, end)),
+            }
+        }
+        p = end;
+    }
+    drop(old);
+    let mut written = 0;
+    for (a, b) in runs {
+        written += write_writable(a, &mem[a - va..b - va]);
+    }
+    Ok(written)
+}
+
+/// `bytes` into the title's memory at `at`, on its committed, writable pages (the others are
+/// left as they are). Returns the bytes written.
+unsafe fn write_writable(at: usize, bytes: &[u8]) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let limit = at + bytes.len();
+    let mut written = 0;
+    let mut p = at;
+    while p < limit {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
+            break;
+        }
+        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
+        // RW / WC / X-RW / X-WC, no guard (a read-only page is not written: WriteProcessMemory
+        // would make it writable)
+        if m.State == MEM_COMMIT && m.Protect & 0xCC != 0 && m.Protect & 0x100 == 0 {
+            let mut n = 0usize;
+            // (another thread may unmap the pages meanwhile: WriteProcessMemory fails then
+            // instead of faulting)
+            WriteProcessMemory(GetCurrentProcess(), p as *const c_void, bytes[p - at..].as_ptr() as *const c_void, end - p, &mut n);
+            written += n;
+        }
+        p = end;
+    }
+    written
+}
+
+/// Copy what the GPU holds in title texture `res` back into the title's memory (where its bytes
+/// are read, `Entry::src`) in the console's layout, for a title that reads on the CPU what its GPU
+/// work wrote there (#2663). That work must be done. Returns the bytes written.
+#[allow(dead_code)] // called once CPU reads of GPU-written textures are noticed (#2663)
+pub(super) unsafe fn read_back(res: usize) -> Result<usize, String> {
+    let (device, src, tex, states, r) = {
+        let t = TEXTURES.lock().unwrap();
+        let e = t.by_res.get(&res).ok_or("not a title texture")?;
+        let p = res as *mut c_void;
+        // (a reference of our own while it is copied, as the uploads hold one)
+        let r = ID3D12Resource::from_raw_borrowed(&p).cloned().ok_or("no resource")?;
+        (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), r)
+    };
+    let d = device as *mut c_void;
+    let dev = ID3D12Device::from_raw_borrowed(&d).ok_or("no device")?;
+    let subs = own_work(|| -> Result<Vec<Subresource>, String> {
+        let queue = upload_queue(dev, device)?;
+        super::vram::before_execute(&queue);
+        texture::download(dev, &queue, &r, &states)
+    })?;
+    write_subresources(src, &tex, &subs)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1605,6 +1810,181 @@ mod tests {
         assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
+    }
+
+    unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
+        own_work(|| {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0;
+            dev.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+            let mut readback = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback,
+            ).unwrap();
+            let readback: ID3D12Resource = readback.unwrap();
+            let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let barrier = |before, after| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(texture), Subresource: 0, StateBefore: before, StateAfter: after }) },
+                ..Default::default()
+            };
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, dev, None, 5_000).unwrap();
+            let mut data = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let mut out = Vec::with_capacity(64 * 64);
+            for y in 0..64 {
+                out.extend_from_slice(std::slice::from_raw_parts((data as *const u8).add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize), 64));
+            }
+            readback.Unmap(0, None);
+            out
+        })
+    }
+
+    #[test]
+    fn gpu_uploads_on_the_title_queue_run_before_its_later_work_and_are_released() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let compute: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            assert!(title_queue_for(dev, Some(&queue)).is_some());
+            assert!(title_queue_for(dev, Some(&compute)).is_none());
+            assert!(title_queue_for(dev, None).is_none());
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = queue.as_raw() as usize;
+            let upload = |value: u8| {
+                let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![value; 64 * 64] }];
+                own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            };
+            for value in [0x21, 0xC4] {
+                upload(value);
+                assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "the title queue's next work sees the upload");
+            }
+            upload(0x5E);
+            {
+                let mut g = ON_QUEUE.lock().unwrap();
+                let q = g.get_mut(&key).unwrap();
+                assert_eq!(q.value, 3);
+                reclaim(dev, q, 0, 10_000);
+                assert!(q.in_flight.is_empty() && q.bytes == 0, "over the cap the oldest uploads are waited for and released");
+                assert!(q.fence.GetCompletedValue() >= 3);
+            }
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x5E; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
+    /// An upload on the title's queue waits there for the texture page mappings made before it,
+    /// as one on XCL's upload queue does: without the wait its copy can run into tiles whose
+    /// mapping has not run yet (a copy-engine write page fault on NVIDIA).
+    #[test]
+    fn gpu_a_title_queue_upload_waits_for_the_page_mappings_before_it() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(mapped) = super::super::vram::note_mapping_for_test(dev) else {
+                crate::gpu::recomp::runner::skip_test("no texture pages on this device");
+                return;
+            };
+            let key = queue.as_raw() as usize;
+            assert!(super::super::vram::waited_for_test(raw_device as usize, key) < mapped);
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x3C; 64 * 64] }];
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            assert_eq!(
+                super::super::vram::waited_for_test(raw_device as usize, key),
+                mapped,
+                "the title queue's upload must wait for the page mappings made before it"
+            );
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x3C; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
+    #[test]
+    fn gpu_an_upload_still_running_is_kept_when_its_wait_times_out() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = queue.as_raw() as usize;
+            let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x77; 64 * 64] }];
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            {
+                let mut g = ON_QUEUE.lock().unwrap();
+                let q = g.get_mut(&key).unwrap();
+                reclaim(dev, q, 0, 50);
+                assert_eq!(q.in_flight.len(), 1, "a batch the GPU has not run stays in flight when its wait times out");
+                assert!(q.bytes > 0);
+            }
+            gate.Signal(1).unwrap();
+            {
+                let mut g = ON_QUEUE.lock().unwrap();
+                let q = g.get_mut(&key).unwrap();
+                reclaim(dev, q, 0, 10_000);
+                assert!(q.in_flight.is_empty() && q.bytes == 0);
+            }
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x77; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
@@ -1654,45 +2034,6 @@ mod tests {
             assert!(!crate::gpu::uma::get().unwrap().contains(at), "exercise the Windows fallback");
             assert!(kernelx::in_graphics_reservation(at), "fallback must be write-watched");
             reservation
-        }
-        unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
-            own_work(|| {
-                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-                let mut total = 0;
-                dev.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
-                let mut readback = None;
-                dev.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
-                    D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback,
-                ).unwrap();
-                let readback: ID3D12Resource = readback.unwrap();
-                let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
-                let barrier = |before, after| D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(texture), Subresource: 0, StateBefore: before, StateAfter: after }) },
-                    ..Default::default()
-                };
-                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
-                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
-                list.Close().unwrap();
-                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-                queue.Signal(&fence, 1).unwrap();
-                crate::gpu::fence::wait(&fence, 1, dev, None, 5_000).unwrap();
-                let mut data = std::ptr::null_mut();
-                readback.Map(0, None, Some(&mut data)).unwrap();
-                let mut out = Vec::with_capacity(64 * 64);
-                for y in 0..64 {
-                    out.extend_from_slice(std::slice::from_raw_parts((data as *const u8).add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize), 64));
-                }
-                readback.Unmap(0, None);
-                out
-            })
         }
         unsafe {
             let raw_device = super::super::real::device_raw();
@@ -1967,6 +2308,129 @@ mod tests {
             for threads in [2, 3, 8] {
                 assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
             }
+        }
+    }
+
+    /// `write_subresources` is the reverse of `subresources`: what it writes reads back as the
+    /// same subresources, bytes past the texture stay as they were, and with nothing changed it
+    /// writes nothing (2D with mips and slices, 3D, BC7, a tiny one).
+    #[test]
+    fn written_subresources_read_back_as_the_same_texels() {
+        let descs = [
+            console_desc(3, 64, 64, 2, 3, 28, 0x105),
+            console_desc(3, 200, 72, 1, 5, 28, 0x105),
+            console_desc(4, 40, 24, 6, 3, 28, 0x105),
+            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
+            console_desc(3, 4, 4, 1, 1, 28, 0x105),
+        ];
+        for d in &descs {
+            let tex = xg::Texture::new(d).unwrap();
+            assert_ne!(tex.texels().unwrap().chain.layout.mode, 0, "{d:02x?}: a tiled layout");
+            let size = tex.size() as usize;
+            let want_mem: Vec<u8> = (0..size).map(|i| (i * 7 + i / 4096) as u8).collect();
+            unsafe {
+                let want = subresources(want_mem.as_ptr() as usize, &tex);
+                assert!(!want.is_empty());
+                // the title's memory: other bytes there, and a page after the texture
+                let mut title = vec![0x5Au8; size + 4096];
+                let at = title.as_mut_ptr() as usize;
+                let n = write_subresources(at, &tex, &want).unwrap();
+                assert!(n > 0, "{d:02x?}: nothing written");
+                assert!(subresources(at, &tex) == want, "{d:02x?}: the written memory reads back as other texels");
+                assert!(title[size..].iter().all(|&b| b == 0x5A), "{d:02x?}: bytes past the texture written");
+                assert_eq!(write_subresources(at, &tex, &want).unwrap(), 0, "{d:02x?}: unchanged pages written again");
+                // a subresource of another size is refused, and nothing is written
+                let mut wrong = want.clone();
+                wrong[0].rows += 1;
+                assert!(write_subresources(at, &tex, &wrong).is_err());
+                assert!(write_subresources(at, &tex, &want[1..]).is_err());
+            }
+        }
+    }
+
+    /// What the GPU wrote into a title texture reaches the title's memory in the console's layout
+    /// (`read_back`), and pages the title cannot write are left alone.
+    #[test]
+    fn read_back_writes_what_the_gpu_holds_into_the_title_memory() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory as mem;
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        // (the texture and its title memory)
+        struct Registered(usize, usize);
+        impl Drop for Registered {
+            fn drop(&mut self) {
+                forget(self.0);
+                unsafe { mem::VirtualFree(self.1 as *mut c_void, 0, mem::MEM_RELEASE) };
+            }
+        }
+        // (console description, D3D12 dimension, width, height, depth or slices, mips, format)
+        let cases = [
+            (console_desc(3, 64, 64, 2, 3, 28, 0x105), D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64u64, 64u32, 2u16, 3u16, 28),
+            (console_desc(4, 40, 24, 6, 3, 28, 0x105), D3D12_RESOURCE_DIMENSION_TEXTURE3D, 40, 24, 6, 3, 28),
+            (console_desc(3, 256, 256, 1, 9, 98, 0x10A), D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, 1, 9, 98),
+        ];
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            for (console, dim, w, h, n, mips, format) in cases {
+                let tex = xg::Texture::new(&console).unwrap();
+                let size = tex.size() as usize;
+                let pages = size.div_ceil(4096) + 1;
+                let va = mem::VirtualAlloc(std::ptr::null(), pages * 4096, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+                assert_ne!(va, 0);
+                std::ptr::write_bytes(va as *mut u8, 0x5A, pages * 4096);
+                // the texels the GPU holds: another texture's memory, detiled
+                let gpu_mem: Vec<u8> = (0..size).map(|i| (i * 13 + i / 4096 + 1) as u8).collect();
+                let want = subresources(gpu_mem.as_ptr() as usize, &tex);
+                let mut texture: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Dimension: dim, Width: w, Height: h, DepthOrArraySize: n, MipLevels: mips, Format: DXGI_FORMAT(format), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                    D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+                ).unwrap();
+                let texture = texture.unwrap();
+                let key = texture.as_raw() as usize;
+                register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+                let _registered = Registered(key, va);
+                // the GPU writes it (a copy into it, as the title's CopyTextureRegion) …
+                texture::upload(dev, &queue, &texture, &want, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON).unwrap();
+                note_gpu_write(key);
+                assert!(subresources(va, &tex) != want, "the title's memory starts out different");
+                // … and it is read back into the title's memory, in the console layout
+                let written = read_back(key).unwrap();
+                assert!(written > 0 && written <= size, "{written} of {size} bytes written");
+                assert!(subresources(va, &tex) == want, "dimension {} format {format}: the title's memory holds other texels", dim.0);
+                assert!(std::slice::from_raw_parts((va + size) as *const u8, pages * 4096 - size).iter().all(|&b| b == 0x5A), "bytes past the texture written");
+                assert_eq!(read_back(key).unwrap(), 0, "nothing changed: nothing written");
+                // a read-only page of the title's memory is left as it is, the others written
+                std::ptr::write_bytes(va as *mut u8, 0x5A, size);
+                let mut old = 0;
+                assert_ne!(mem::VirtualProtect(va as *const c_void, 4096, mem::PAGE_READONLY, &mut old), 0);
+                let written = read_back(key).unwrap();
+                assert!(std::slice::from_raw_parts(va as *const u8, 4096).iter().all(|&b| b == 0x5A), "a read-only page written");
+                if size > 4096 {
+                    assert!(written > 0, "the writable pages not written");
+                }
+                assert_ne!(mem::VirtualProtect(va as *const c_void, 4096, mem::PAGE_READWRITE, &mut old), 0);
+                dev.GetDeviceRemovedReason().unwrap();
+            }
+            // a format of two planes (depth and stencil) is refused, not read back as plane 0 alone
+            let mut depth: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default() },
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut depth,
+            ).unwrap();
+            let e = texture::download(dev, &queue, &depth.unwrap(), &[D3D12_RESOURCE_STATE_DEPTH_WRITE]).unwrap_err();
+            assert!(e.contains("2 planes"), "{e}");
+            dev.GetDeviceRemovedReason().unwrap();
         }
     }
 
@@ -2494,7 +2958,8 @@ mod tests {
     /// first upload, then pages for those levels only and their texels right, zeros where there
     /// are none. With memory under the largest level too, a texture placed there again (as a
     /// title does) takes that level's pages - the others are shared - and holds all of it. A
-    /// texture the GPU writes gets the pages of all its levels.
+    /// texture the GPU writes gets the pages of all its levels. If a level cannot get pages,
+    /// its texels can still be uploaded when the same source is selected again.
     #[test]
     fn a_placed_texture_gets_the_pages_of_a_level_with_its_texels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
@@ -2610,8 +3075,23 @@ mod tests {
             assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
             std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
             let full = place_tex(at);
+            let full_key = full.as_raw() as usize;
+            super::super::vram::FAIL_LEVEL_BIND_FOR_TEST.with(|failure| failure.set(Some((full_key, 0))));
             refresh(queue.as_raw());
-            assert_eq!(dev_pages() - p0, (all as usize) << 16, "mip 0's pages come with its texels; the other levels' are shared");
+            assert_eq!(dev_pages() - p0, ((all - top_tiles) as usize) << 16, "the failed mapping left mip 0 without pages");
+            assert!(read_sub(&full, 0).iter().all(|&b| b == 0), "the failed mip still reads as zeros");
+            assert!(read_sub(&full, 1) == want[1].data, "the other mips still upload");
+
+            // Offer the texture again without changing any of its source bytes.
+            {
+                let mut textures = TEXTURES.lock().unwrap();
+                let entry = textures.by_res.get_mut(&full_key).unwrap();
+                assert!(!entry.pending);
+                entry.pending = true;
+                adjust_pending(1);
+            }
+            refresh(queue.as_raw());
+            assert_eq!(dev_pages() - p0, (all as usize) << 16, "retry maps mip 0 with the same source bytes; the other levels are shared");
             for sub in 0..11u32 {
                 assert!(read_sub(&full, sub) == want[sub as usize].data, "level {sub} once all of it is there");
             }

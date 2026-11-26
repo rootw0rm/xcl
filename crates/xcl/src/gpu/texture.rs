@@ -185,6 +185,91 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     r
 }
 
+/// Every subresource (D3D12 order) of `res` as linear rows, copied out on `queue` (the
+/// reverse of `upload`, waited for): `res` is in `states` (one for all subresources, or one per
+/// subresource) and is left in them. The work that wrote it must be done, or ordered before
+/// `queue`'s.
+pub unsafe fn download(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D12Resource, states: &[D3D12_RESOURCE_STATES]) -> Result<Vec<Subresource>, String> {
+    let rd = res.GetDesc();
+    let arrays = match rd.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D => rd.DepthOrArraySize as usize,
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => 1,
+        _ => return Err("texture download requires a texture resource".into()),
+    };
+    // (a format of several planes – depth and stencil, video – has a set of subresources per plane:
+    // not copied here, rather than giving back plane 0 alone)
+    let mut info = D3D12_FEATURE_DATA_FORMAT_INFO { Format: rd.Format, PlaneCount: 0 };
+    dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &mut info as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&info) as u32).map_err(err)?;
+    if info.PlaneCount != 1 {
+        return Err(format!("texture download of a format with {} planes", info.PlaneCount));
+    }
+    let n = rd.MipLevels as usize * arrays;
+    if states.len() != 1 && states.len() != n {
+        return Err(format!("{} subresource states for {n} subresources", states.len()));
+    }
+    let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+    let mut rows = vec![0u32; n];
+    let mut row_bytes = vec![0u64; n];
+    let mut total = 0u64;
+    dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+    let rb_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: total.max(256),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut rb: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb)
+        .map_err(|x| format!("texture readback buffer: {x}"))?;
+    let rb = rb.ok_or("texture readback buffer")?;
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    let to_copy = transitions(res, states, &[D3D12_RESOURCE_STATE_COPY_SOURCE], n);
+    if !to_copy.is_empty() {
+        list.ResourceBarrier(&to_copy);
+    }
+    for (k, fp) in fps.iter().enumerate() {
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+    }
+    let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_SOURCE], states, n);
+    if !back.is_empty() {
+        list.ResourceBarrier(&back);
+    }
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    if let Err(e) = wait(dev, queue) {
+        // the copy is queued and may still run (a stalled queue can go on after the wait gave
+        // up): what it uses is kept rather than released under it
+        std::mem::forget((rb, alloc, list, res.clone()));
+        return Err(e);
+    }
+    let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+    rb.Map(0, None, Some(&mut p)).map_err(err)?;
+    let out = fps
+        .iter()
+        .zip(rows.iter().zip(&row_bytes))
+        .map(|(fp, (&nrows, &nbytes))| {
+            let (nrows, nbytes, depth, pitch) = (nrows as usize, nbytes as usize, fp.Footprint.Depth as usize, fp.Footprint.RowPitch as usize);
+            let mut data = Vec::with_capacity(depth * nrows * nbytes);
+            // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
+            for z in 0..depth {
+                for y in 0..nrows {
+                    data.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + (z * nrows + y) * pitch), nbytes));
+                }
+            }
+            Subresource { rows: nrows, row_bytes: nbytes, depth, data }
+        })
+        .collect();
+    rb.Unmap(0, None);
+    Ok(out)
+}
+
 /// What `upload_batch` keeps for a queue between batches: its allocator and list, a fence, and
 /// one persistently mapped upload buffer the batches' texels go through. Making them for every
 /// batch – an upload buffer per texture, an allocator, a list and a fence per batch – cost a
@@ -262,19 +347,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         None => Uploader::new(dev)?,
     };
     // where each texture's texels go in the upload buffer
-    let mut failed = Vec::new();
-    let mut planned = Vec::with_capacity(items.len());
-    let mut total = 0u64;
-    for (k, (res, subs, states)) in items.iter().enumerate() {
-        match layout(dev, res, subs, states, states) {
-            Ok(l) => {
-                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
-                total = base + l.total;
-                planned.push((k, l, base));
-            }
-            Err(e) => failed.push((k, e)),
-        }
-    }
+    let (failed, planned, total) = plan_batch(dev, items);
     if planned.is_empty() {
         put_back(key, up);
         return Ok(failed);
@@ -299,6 +372,50 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     }
     put_back(key, up);
     Ok(failed)
+}
+
+unsafe fn plan_batch(dev: &ID3D12Device, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> (Vec<(usize, String)>, Vec<(usize, Layout, u64)>, u64) {
+    let mut failed = Vec::new();
+    let mut planned = Vec::with_capacity(items.len());
+    let mut total = 0u64;
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        match layout(dev, res, subs, states, states) {
+            Ok(l) => {
+                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                total = base + l.total;
+                planned.push((k, l, base));
+            }
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    (failed, planned, total)
+}
+
+pub struct InFlight {
+    _alloc: ID3D12CommandAllocator,
+    _list: ID3D12GraphicsCommandList,
+    _staging: ID3D12Resource,
+    pub bytes: u64,
+}
+
+pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<(Vec<(usize, String)>, Option<InFlight>), String> {
+    let (failed, planned, bytes) = plan_batch(dev, items);
+    if planned.is_empty() {
+        return Ok((failed, None));
+    }
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    let staging = buffer(dev, bytes)?;
+    let mut mapped = std::ptr::null_mut();
+    staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
+    for (k, layout, base) in &planned {
+        let (res, subs, states) = &items[*k];
+        record_into(&list, res, subs, layout, states, states, &staging, mapped as *mut u8, *base);
+    }
+    staging.Unmap(0, None);
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    Ok((failed, Some(InFlight { _alloc: alloc, _list: list, _staging: staging, bytes })))
 }
 
 fn put_back(key: usize, up: Uploader) {

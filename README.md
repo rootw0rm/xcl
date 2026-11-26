@@ -396,6 +396,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
+- `XCL_TEXTURE_LEVEL_PAGES=1` gives eligible single-slice sampled textures video memory for each
+  mip when an upload has texels for it. If a mip cannot get pages, XCL retries it the next time
+  the texture is selected for upload, even when its source bytes are unchanged.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   If a mid-run `xcl.log` write or flush fails, XCL reports the first failure once on stderr and

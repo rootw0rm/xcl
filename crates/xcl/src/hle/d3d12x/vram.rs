@@ -489,6 +489,11 @@ pub(super) fn level_pages() -> bool {
 #[cfg(test)]
 pub(super) static LEVEL_PAGES_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_LEVEL_BIND_FOR_TEST: std::cell::Cell<Option<(usize, u32)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Of the textures with lazy levels there are now: how many, the tiles they stand for, and the
 /// tiles of them that have pages; and the level groups given pages so far.
 static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
@@ -1341,6 +1346,16 @@ impl Pages {
     /// groups stay unmapped (`None`) and retry once pools free up.
     #[allow(clippy::too_many_arguments)]
     unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, skip: &[bool]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        #[cfg(test)]
+        if FAIL_LEVEL_BIND_FOR_TEST.with(|failure| {
+            if failure.get() != Some((res.as_raw() as usize, sub)) {
+                return false;
+            }
+            failure.take();
+            true
+        }) {
+            return None;
+        }
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -2081,6 +2096,25 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// A tile mapping on `dev`'s page queue, as `map` leaves it (the fence advanced and signalled
+/// there): the value a queue must wait for before work that uses the pages. None: no pages on
+/// this device (no tiled resources).
+#[cfg(test)]
+pub(super) unsafe fn note_mapping_for_test(dev: &ID3D12Device) -> Option<u64> {
+    let mut g = PAGES.lock().unwrap();
+    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
+    pages.value += 1;
+    pages.queue.Signal(&pages.fence, pages.value).ok()?;
+    Some(pages.value)
+}
+
+/// The page mapping value `queue` was last made to wait for on `dev` (`before_execute`).
+#[cfg(test)]
+pub(super) fn waited_for_test(dev: usize, queue: usize) -> u64 {
+    let g = PAGES.lock().unwrap();
+    g.get(&dev).and_then(|p| p.as_ref()).and_then(|p| p.waited.get(&queue).copied()).unwrap_or(0)
+}
+
 /// Tile identities of one mapped resource: title pages, then extra pages.
 /// A device-wide byte count also falls when unrelated idle pages are swept.
 #[cfg(test)]
@@ -2163,17 +2197,22 @@ pub unsafe fn place_pages(
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 
-/// The levels `levels` of `res` (None: all of them) get their pages if they have none yet: a
-/// texture placed with lazy levels (any other: nothing to do). Returns the levels that got pages
-/// by this call - the queue the texture is used on next has to wait for that (`before_execute`),
-/// and what the pages held before is another texture's.
-pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) -> Vec<u32> {
+/// Give the requested levels of a lazy texture pages (None: all levels). Returns whether every
+/// requested level has pages. Other textures have nothing to map. The queue that uses the
+/// texture waits for the mappings in `before_execute`.
+pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) -> bool {
+    if levels.is_some_and(|levels| levels.is_empty()) {
+        return true;
+    }
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     for (&dev_key, pages) in g.iter_mut() {
         let Some(pages) = pages.as_mut() else { continue };
         let Some(t) = pages.targets.get(&key) else { continue };
-        let Some(lv) = t.levels.as_ref().filter(|_| t.mapped) else { return Vec::new() };
+        let Some(lv) = t.levels.as_ref() else { return true };
+        if !t.mapped {
+            return false;
+        }
         let mut wanted: Vec<usize> = match levels {
             Some(l) => l.iter().map(|&x| lv.group_of(x)).collect(),
             None => (0..lv.groups.len()).collect(),
@@ -2183,15 +2222,18 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let todo: Vec<(usize, u32, u32, u32, std::ops::Range<u32>)> =
             groups_to_map(lv, wanted, t.skip_mips).into_iter().map(|k| (k, lv.groups[k].0, lv.groups[k].1, lv.groups[k].2, lv.levels_of(k))).collect();
         if todo.is_empty() {
-            return Vec::new();
+            return true;
         }
         let (va, console_bytes, total) = (t.va, t.console_bytes, t.total);
         let d = dev_key as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
-        let mut fresh = Vec::new();
-        for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, &[]) else { continue };
-            let Some(t) = pages.targets.get_mut(&key) else { return fresh };
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return false };
+        let mut complete = true;
+        for (k, sub, first, n, _) in todo {
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, &[]) else {
+                complete = false;
+                continue;
+            };
+            let Some(t) = pages.targets.get_mut(&key) else { return false };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
             if let Some(l) = t.levels.as_mut() {
@@ -2203,11 +2245,10 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
                 let (textures, stand, mapped, _) = level_stats();
                 crate::xlog_info!("D3D12.X: level pages: {textures} textures standing for {} MB have pages for {} MB ({groups} levels given pages so far)", stand >> 4, mapped >> 4);
             }
-            fresh.extend(levels);
         }
-        return fresh;
+        return complete;
     }
-    Vec::new()
+    true
 }
 
 /// Of the level groups `wanted`, those to give pages now: not mapped yet, and not of the
