@@ -135,51 +135,56 @@ pub unsafe extern "system" fn D3D12GetDebugInterface(riid: *const c_void, ppv: *
     forward!("D3D12GetDebugInterface", unsafe extern "system" fn(*const c_void, *mut *mut c_void) -> HRESULT, null::D3D12GetDebugInterface, (riid, ppv))
 }
 
-pub unsafe extern "system" fn D3D12SerializeRootSignature(d: *const c_void, v: u32, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
-    forward!(
-        "D3D12SerializeRootSignature",
-        unsafe extern "system" fn(*const c_void, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT,
-        null::D3D12SerializeRootSignature,
-        (d, v, blob, err)
-    )
-}
+// console-only root signature flags (seen: 0x3000000 from XboxBvhBuilder.dll) – Windows
+// rejects unknown bits; flags sit at +32 in 40-byte 1.0 desc and +40 in 48-byte versioned desc
+const PC_FLAGS: u32 = 0xFFF;
 
-pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(d: *const c_void, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
+unsafe fn serialize_root_sig<const QWORDS: usize>(
+    name: &str, d: *const c_void, flags_off: usize, err: *mut *mut c_void,
+    meta: impl FnOnce(*const u8) -> (u32, u32, u32, u32),
+    call: impl FnOnce(*const c_void, *mut *mut c_void) -> HRESULT,
+) -> HRESULT {
     let mut own_err: *mut c_void = std::ptr::null_mut();
-    let e = if err.is_null() { &mut own_err as *mut _ } else { err };
-    // console-only root signature flags (seen: 0x3000000 from XboxBvhBuilder.dll) – Windows
-    // rejects unknown bits; the flags sit at +40 in every version of the desc (48 bytes)
-    const PC_FLAGS: u32 = 0xFFF;
-    let mut copy = [0u8; 48];
+    let e = if err.is_null() { &mut own_err as *mut _ } else { *err = std::ptr::null_mut(); err };
+    let mut copy = [0u64; QWORDS];
     let mut d = d;
-    if !d.is_null() && *(d as *const u8).add(40).cast::<u32>() & !PC_FLAGS != 0 {
-        std::ptr::copy_nonoverlapping(d as *const u8, copy.as_mut_ptr(), 48);
-        let f = copy.as_mut_ptr().add(40).cast::<u32>();
-        crate::xlog_info!("D3D12SerializeVersionedRootSignature: console flags {:#x} dropped", *f & !PC_FLAGS);
+    if !d.is_null() && (d as *const u8).add(flags_off).cast::<u32>().read_unaligned() & !PC_FLAGS != 0 {
+        let dst = copy.as_mut_ptr().cast::<u8>();
+        std::ptr::copy_nonoverlapping(d.cast::<u8>(), dst, QWORDS * 8);
+        let f = dst.add(flags_off).cast::<u32>();
+        crate::xlog_info!("{name}: console flags {:#x} dropped", *f & !PC_FLAGS);
         *f &= PC_FLAGS;
-        d = copy.as_ptr() as *const c_void;
+        d = dst.cast::<c_void>();
     }
-    type Serialize = unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
-    let hr = match sys("D3D12SerializeVersionedRootSignature").filter(|_| backend() == Backend::Real) {
-        Some(f) => std::mem::transmute::<_, Serialize>(f)(d, blob, e),
-        None => null::D3D12SerializeVersionedRootSignature(d, blob, e),
-    };
+    let hr = call(d, e);
     if hr < 0 && !d.is_null() {
-        // D3D12_VERSIONED_ROOT_SIGNATURE_DESC: version, then (1.1 / 1.2) parameters, samplers, flags
-        let w = |o: usize| *(d as *const u8).add(o).cast::<u32>();
-        let text = blob_text(*e);
-        crate::xlog_warn!(
-            "D3D12SerializeVersionedRootSignature: {hr:#x} (version {}, parameters {}, samplers {}, flags {:#x}): {text}",
-            w(0),
-            w(8),
-            w(24),
-            w(40)
-        );
+        let (ver, params, samplers, flags) = meta(d.cast::<u8>());
+        crate::xlog_warn!("{name}: {hr:#x} (version {ver}, parameters {params}, samplers {samplers}, flags {flags:#x}): {}", blob_text(*e));
     }
     if err.is_null() && !own_err.is_null() {
         blob_release(own_err);
     }
     hr
+}
+
+pub unsafe extern "system" fn D3D12SerializeRootSignature(d: *const c_void, v: u32, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
+    type Serialize = unsafe extern "system" fn(*const c_void, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    serialize_root_sig::<5>("D3D12SerializeRootSignature", d, 32, err, |p| (v, p.cast::<u32>().read_unaligned(), p.add(16).cast::<u32>().read_unaligned(), p.add(32).cast::<u32>().read_unaligned()), |d, e| {
+        match sys("D3D12SerializeRootSignature").filter(|_| backend() == Backend::Real) {
+            Some(f) => std::mem::transmute::<_, Serialize>(f)(d, v, blob, e),
+            None => null::D3D12SerializeRootSignature(d, v, blob, e),
+        }
+    })
+}
+
+pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(d: *const c_void, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
+    type Serialize = unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    serialize_root_sig::<6>("D3D12SerializeVersionedRootSignature", d, 40, err, |p| (p.cast::<u32>().read_unaligned(), p.add(8).cast::<u32>().read_unaligned(), p.add(24).cast::<u32>().read_unaligned(), p.add(40).cast::<u32>().read_unaligned()), |d, e| {
+        match sys("D3D12SerializeVersionedRootSignature").filter(|_| backend() == Backend::Real) {
+            Some(f) => std::mem::transmute::<_, Serialize>(f)(d, blob, e),
+            None => null::D3D12SerializeVersionedRootSignature(d, blob, e),
+        }
+    })
 }
 
 /// text of an ID3DBlob (error messages)
@@ -255,3 +260,69 @@ pub unsafe extern "system" fn D3D12ConfigureVirtualMemoryX(config: *const c_void
 }
 
 pub(crate) mod host_bvh;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAGS, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS, D3D12_VERSIONED_ROOT_SIGNATURE_DESC,
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0, D3D_ROOT_SIGNATURE_VERSION_1_0, ID3D12RootSignatureDeserializer,
+    };
+
+    #[test]
+    fn serialize_root_signature_strips_console_flags_and_preserves_pc_flags() {
+        assert_eq!((std::mem::size_of::<D3D12_ROOT_SIGNATURE_DESC>(), std::mem::offset_of!(D3D12_ROOT_SIGNATURE_DESC, Flags)), (40, 32));
+        assert_eq!((std::mem::size_of::<D3D12_VERSIONED_ROOT_SIGNATURE_DESC>(), std::mem::offset_of!(D3D12_VERSIONED_ROOT_SIGNATURE_DESC, Anonymous) + std::mem::offset_of!(D3D12_ROOT_SIGNATURE_DESC, Flags)), (48, 40));
+        unsafe {
+            let deser_flags = |blob_raw: *mut c_void| -> D3D12_ROOT_SIGNATURE_FLAGS {
+                let blob = ID3DBlob::from_raw(blob_raw);
+                let mut deser_raw = std::ptr::null_mut();
+                assert_eq!(D3D12CreateRootSignatureDeserializer(blob.GetBufferPointer(), blob.GetBufferSize(), (&ID3D12RootSignatureDeserializer::IID as *const windows::core::GUID).cast(), &mut deser_raw), S_OK);
+                (*ID3D12RootSignatureDeserializer::from_raw(deser_raw).GetRootSignatureDesc()).Flags
+            };
+            let pc_flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+            let raw_flags = D3D12_ROOT_SIGNATURE_FLAGS(pc_flags.0 | 0x0300_0000);
+            let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: raw_flags, ..Default::default() };
+            let (mut blob_raw, mut vblob_raw) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(D3D12SerializeRootSignature(&desc as *const _ as *const c_void, D3D_ROOT_SIGNATURE_VERSION_1_0.0 as u32, &mut blob_raw, std::ptr::null_mut()), S_OK);
+            assert_eq!(desc.Flags, raw_flags, "caller descriptor must not be mutated");
+            assert_eq!(deser_flags(blob_raw), pc_flags);
+
+            let vdesc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC { Version: D3D_ROOT_SIGNATURE_VERSION_1_0, Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 { Desc_1_0: desc } };
+            assert_eq!(D3D12SerializeVersionedRootSignature(&vdesc as *const _ as *const c_void, &mut vblob_raw, std::ptr::null_mut()), S_OK);
+            assert_eq!(deser_flags(vblob_raw), pc_flags);
+
+            let (mut out, mut err_out) = (std::ptr::null_mut(), 1usize as *mut c_void);
+            assert!(D3D12SerializeRootSignature(&desc as *const _ as *const c_void, 99, &mut out, std::ptr::null_mut()) < 0);
+            assert!(D3D12SerializeRootSignature(&desc as *const _ as *const c_void, 99, &mut out, &mut err_out) < 0);
+            assert_ne!(err_out, 1usize as *mut c_void, "caller error pointer must be initialized");
+            // In-box Windows 10 d3d12.dll (without Agility SDK) leaves the error blob null/empty for unknown versions.
+            if !err_out.is_null() {
+                let text = blob_text(err_out);
+                assert!(text.is_empty() || text.contains("version"), "unexpected error blob text: {text}");
+                blob_release(err_out);
+            }
+            err_out = 1usize as *mut c_void;
+            assert!(D3D12SerializeRootSignature(std::ptr::null(), D3D_ROOT_SIGNATURE_VERSION_1_0.0 as u32, &mut out, &mut err_out) < 0);
+            assert!(err_out.is_null());
+
+            // Runtime-independent error-blob forwarding and internal release checks.
+            #[repr(C)]
+            struct FakeBlob { vt: *const [usize; 5], releases: u32 }
+            unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 { (*(this as *mut FakeBlob)).releases += 1; 0 }
+            unsafe extern "system" fn fake_ptr(_: *mut c_void) -> *const u8 { b"bad root sig\0".as_ptr() }
+            unsafe extern "system" fn fake_len(_: *mut c_void) -> usize { 13 }
+            let vt = [0, 0, fake_release as *const () as usize, fake_ptr as *const () as usize, fake_len as *const () as usize];
+            let mut fake = FakeBlob { vt: &vt, releases: 0 };
+            let fake_p = &mut fake as *mut FakeBlob as *mut c_void;
+            err_out = 1usize as *mut c_void;
+            assert_eq!(serialize_root_sig::<5>("test", &desc as *const _ as *const c_void, 32, &mut err_out, |_| (99, 0, 0, 0), |_, e| { assert!((*e).is_null()); *e = fake_p; -2147024809 }), -2147024809);
+            assert_eq!((err_out, fake.releases), (fake_p, 0));
+            assert_eq!(serialize_root_sig::<5>("test", &desc as *const _ as *const c_void, 32, std::ptr::null_mut(), |_| (99, 0, 0, 0), |_, e| { *e = fake_p; -2147024809 }), -2147024809);
+            assert_eq!(fake.releases, 1);
+        }
+    }
+}
