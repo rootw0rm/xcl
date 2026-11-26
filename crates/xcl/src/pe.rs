@@ -419,7 +419,10 @@ impl<'a> Pe<'a> {
             } else {
                 let hn = (v & 0x7FFF_FFFF) as u32;
                 let hint = self.u16_at(hn).ok_or(PeError::BadRva(hn))?;
-                let name = self.cstr_at(hn.wrapping_add(2)).ok_or(PeError::BadRva(hn))?;
+                // wrapping_add would turn a hint at the top of the address space into RVA 0
+                // and read the DOS header as the import name
+                let name_rva = hn.checked_add(2).ok_or(PeError::BadRva(hn))?;
+                let name = self.cstr_at(name_rva).ok_or(PeError::BadRva(hn))?;
                 ImportName::Name { hint, name }
             };
             out.push(ImportEntry { iat_rva: iat_rva.checked_add(i * 8).ok_or(PeError::BadRva(iat_rva))?, what });
@@ -587,8 +590,9 @@ impl<'a> Pe<'a> {
     }
 
     /// Resolve an export to an RVA or a forwarder string ("DLL.Func" / "DLL.#12").
+    /// An unreadable forwarder is not an export address.
     pub fn export_target(&self, ex: &Exports, rva: u32) -> Option<ExportTarget> {
-        let fwd = if ex.is_forwarder_rva(rva) { self.cstr_at(rva) } else { None };
+        let fwd = if ex.is_forwarder_rva(rva) { Some(self.cstr_at(rva)?) } else { None };
         ex.target(rva, fwd)
     }
 }
@@ -606,8 +610,10 @@ impl OwnedExports {
         let mut out = OwnedExports::default();
         if let Some(ex) = pe.exports()? {
             for (i, &rva) in ex.functions.iter().enumerate() {
+                // the base comes from the file: an entry past u32::MAX has no ordinal
+                let Some(ordinal) = ex.ordinal_base.checked_add(i as u32) else { break };
                 if let Some(t) = pe.export_target(&ex, rva) {
-                    out.by_ordinal.insert(ex.ordinal_base + i as u32, t);
+                    out.by_ordinal.insert(ordinal, t);
                 }
             }
             for (name, idx) in &ex.names {
@@ -666,6 +672,78 @@ mod tests {
         data[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes());
         data[0x200..].copy_from_slice(payload);
         data
+    }
+
+    #[test]
+    fn import_name_at_the_top_of_the_address_space_is_error() {
+        // Hint/name RVA 0xFFFFFFFE is inside a section there; +2 must not wrap to RVA 0
+        // (the DOS header) and be accepted as the import name.
+        let base = 0xFFFF_FF00u32;
+        let mut payload = vec![0u8; 0x100];
+        let int_rva = base + 0x40;
+        let dll_rva = base + 0x50;
+        payload[0..4].copy_from_slice(&int_rva.to_le_bytes());
+        payload[12..16].copy_from_slice(&dll_rva.to_le_bytes());
+        payload[16..20].copy_from_slice(&int_rva.to_le_bytes());
+        payload[0x40..0x48].copy_from_slice(&0xFFFF_FFFEu64.to_le_bytes());
+        payload[0x50..0x52].copy_from_slice(b"k\0");
+        payload[0xFE..0x100].copy_from_slice(&1u16.to_le_bytes());
+        let data = directory_at_rva(DIR_IMPORT, base, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.u16_at(0xFFFF_FFFE), Some(1));
+        assert!(matches!(pe.imports(), Err(PeError::BadRva(_))));
+    }
+
+    #[test]
+    fn unterminated_forwarders_are_not_export_addresses() {
+        for terminated in [true, false] {
+            let mut payload = vec![0u8; 60];
+            payload[16..20].copy_from_slice(&1u32.to_le_bytes()); // ordinal base
+            payload[20..24].copy_from_slice(&1u32.to_le_bytes()); // functions
+            payload[24..28].copy_from_slice(&1u32.to_le_bytes()); // names
+            payload[28..32].copy_from_slice(&0x1028u32.to_le_bytes()); // function table
+            payload[32..36].copy_from_slice(&0x102Cu32.to_le_bytes()); // name table
+            payload[36..40].copy_from_slice(&0x1030u32.to_le_bytes()); // ordinal table
+            payload[40..44].copy_from_slice(&0x103Cu32.to_le_bytes()); // forwarder
+            payload[44..48].copy_from_slice(&0x1032u32.to_le_bytes()); // export name
+            payload[50..60].copy_from_slice(b"Forwarded\0");
+            payload.extend_from_slice(b"other.Real");
+            if terminated {
+                payload.push(0);
+            }
+            let file = directory_at_rva(DIR_EXPORT, 0x1000, &payload);
+            let mut mapped = vec![0; 0x1000 + payload.len()];
+            mapped[..0x200].copy_from_slice(&file[..0x200]);
+            mapped[0x1000..].copy_from_slice(&payload);
+            let expected = terminated.then(|| ExportTarget::Forwarder("other.Real".into()));
+            for (data, layout) in [(&file[..], Layout::File), (&mapped[..], Layout::Mapped)] {
+                let pe = Pe::parse(data, layout).unwrap();
+                let exports = pe.exports().unwrap().unwrap();
+                assert_eq!(pe.export_target(&exports, 0x103C), expected, "{layout:?}, terminated={terminated}");
+                let owned = OwnedExports::from_pe(&pe).unwrap();
+                assert_eq!(owned.by_name.get("Forwarded"), expected.as_ref());
+                assert_eq!(owned.by_ordinal.get(&1), expected.as_ref());
+            }
+        }
+    }
+
+    /// The ordinal base comes from the file: an export past u32::MAX is no ordinal and is skipped
+    /// (it panicked on overflow in debug builds and wrapped to ordinal 0 in release ones).
+    #[test]
+    fn export_ordinals_past_u32_max_are_skipped() {
+        let rva = 0x1000u32;
+        let mut payload = vec![0u8; 48];
+        payload[16..20].copy_from_slice(&u32::MAX.to_le_bytes()); // Base
+        payload[20..24].copy_from_slice(&2u32.to_le_bytes()); // NumberOfFunctions
+        payload[28..32].copy_from_slice(&(rva + 40).to_le_bytes()); // AddressOfFunctions
+        payload[40..44].copy_from_slice(&0x2000u32.to_le_bytes());
+        payload[44..48].copy_from_slice(&0x2004u32.to_le_bytes());
+        let data = directory_at_rva(DIR_EXPORT, rva, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        let ex = OwnedExports::from_pe(&pe).unwrap();
+        assert_eq!(ex.by_ordinal.len(), 1);
+        assert_eq!(ex.by_ordinal.get(&u32::MAX), Some(&ExportTarget::Rva(0x2000)));
+        assert!(!ex.by_ordinal.contains_key(&0));
     }
 
     #[test]
