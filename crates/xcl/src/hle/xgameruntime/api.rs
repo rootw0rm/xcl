@@ -156,7 +156,40 @@ fn pc() -> Option<&'static Pc> {
     .as_ref()
 }
 
+/// Set when the system runtime is there but refused to initialise (e.g. 0x80073cfc without a working
+/// Gaming Services): its objects then fail fast on first use, so XCL's own fallbacks are used instead.
+static PC_INIT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tests: the result the system runtime's `InitializeApiImpl*` are taken to return instead of
+/// calling them (0: they are called), so a refusing runtime can be tested on a PC whose runtime
+/// initialises.
+#[cfg(test)]
+static FORCED_INIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn forced_init_result() -> Option<HRESULT> {
+    #[cfg(test)]
+    {
+        let hr = FORCED_INIT.load(Ordering::Acquire);
+        if hr != 0 {
+            return Some(hr);
+        }
+    }
+    None
+}
+
+/// Why XCL's own object stands in for a family the system runtime would give.
+fn fallback_reason() -> &'static str {
+    if PC_INIT_FAILED.load(Ordering::Acquire) {
+        "the system xgameruntime.dll refused to initialise"
+    } else {
+        "no system xgameruntime.dll"
+    }
+}
+
 unsafe fn pc_object(c: &Guid, i: &Guid) -> Option<usize> {
+    if PC_INIT_FAILED.load(Ordering::Acquire) {
+        return None;
+    }
     let mut o: *mut c_void = std::ptr::null_mut();
     ((pc()?.query)(c, i, &mut o) >= 0 && !o.is_null()).then_some(o as usize)
 }
@@ -182,15 +215,16 @@ pub unsafe extern "system" fn InitializeApiImplEx2(gdk: u64, os: u64, flags: u64
 /// (newer GDK) fall back to the older entry points.
 unsafe fn pc_init(gdk: u64, os: u64, flags: u64, options: *mut c_void) {
     let Some(p) = pc() else { return };
-    let mut hr = p.init_ex2.map(|f| f(gdk, os, flags, options)).unwrap_or(-1);
-    if hr < 0 {
+    let mut hr = forced_init_result().unwrap_or_else(|| p.init_ex2.map(|f| f(gdk, os, flags, options)).unwrap_or(-1));
+    if hr < 0 && forced_init_result().is_none() {
         hr = p.init_ex.map(|f| f(gdk, os, flags)).unwrap_or(-1);
     }
-    if hr < 0 {
+    if hr < 0 && forced_init_result().is_none() {
         hr = p.init.map(|f| f(gdk >> 32, gdk & 0xFFFF_FFFF)).unwrap_or(-1);
     }
     if hr < 0 {
-        crate::xlog_warn!("XGameRuntime PC: initialization → {:#x}", hr as u32);
+        crate::xlog_warn!("XGameRuntime PC: initialization → {:#x} – using XCL's own XAsync / fallbacks", hr as u32);
+        PC_INIT_FAILED.store(true, Ordering::Release);
     }
     start_pc_async();
 }
@@ -302,12 +336,12 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
             S_OK
         }
         None if c == XASYNC => {
-            note(c, i, "XAsync: XCL (fallback – no system xgameruntime.dll)".into());
+            note(c, i, format!("XAsync: XCL (fallback – {})", fallback_reason()));
             *out = xcl_xasync_object() as *const Obj as *mut c_void;
             S_OK
         }
         None if c == XACCESSIBILITY => {
-            note(c, i, "XAccessibility: XCL (fallback – no system xgameruntime.dll)".into());
+            note(c, i, format!("XAccessibility: XCL (fallback – {})", fallback_reason()));
             *out = xcl_xaccessibility_object() as *const Obj as *mut c_void;
             S_OK
         }
@@ -658,13 +692,20 @@ fn mute_tts() -> bool {
 /// Built-in XAccessibility COM object used as a fallback when Gaming Services
 /// (`System32\xgameruntime.dll`) is not installed on the host, or when `XCL_MUTE_TTS=1`
 /// silences Windows speech synthesis.
+unsafe extern "system" fn speech_to_text_set_position_hint(_this: *mut c_void, _position: u32) -> HRESULT {
+    S_OK
+}
+
 fn xcl_xaccessibility_object() -> &'static Obj {
     static O: OnceLock<&'static Obj> = OnceLock::new();
     O.get_or_init(|| {
         let mut ifaces = layout(Class {
             name: "XAccessibility",
             clsid: XACCESSIBILITY,
-            impls: named![XClosedCaptionGetProperties, XClosedCaptionSetEnabled, XHighContrastGetMode],
+            impls: named![XClosedCaptionGetProperties, XClosedCaptionSetEnabled, XHighContrastGetMode]
+                .into_iter()
+                .chain([("XSpeechToTextSetPositionHint", speech_to_text_set_position_hint as usize)])
+                .collect(),
             forward: &[],
         });
         object(ifaces.remove(0))
@@ -1539,6 +1580,36 @@ mod tests {
         }
     }
 
+    /// A system runtime that refuses to initialise (0x80073cfc on a PC whose Gaming Services do
+    /// not run) is not used: XAsync and XAccessibility are XCL's, as on a PC without the DLL. The
+    /// refusal is forced (`FORCED_INIT`): the runtime on the test machine initialises.
+    #[test]
+    fn a_system_runtime_that_refuses_to_initialise_is_not_used() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if pc().is_none() {
+            println!("no system xgameruntime.dll – skipping");
+            return;
+        }
+        // the other tests in this process see an initialised runtime again
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORCED_INIT.store(0, Ordering::Release);
+                PC_INIT_FAILED.store(false, Ordering::Release);
+            }
+        }
+        let _r = Restore;
+        unsafe {
+            FORCED_INIT.store(0x80073cfcu32 as i32, Ordering::Release);
+            assert_eq!(InitializeApiImplEx2(0x6336_0000_2712, 0x65f4_0000_1edd, 2, std::ptr::null_mut()), S_OK);
+            let (hr, xa) = query(XASYNC, XASYNC);
+            assert_eq!((hr, xa as usize), (S_OK, xcl_xasync_object() as *const Obj as usize), "XAsync is XCL's");
+            let (hr, acc) = query(XACCESSIBILITY, XACCESSIBILITY);
+            assert_eq!((hr, acc as usize), (S_OK, xcl_xaccessibility_object() as *const Obj as usize), "XAccessibility is XCL's");
+            assert_eq!(fallback_reason(), "the system xgameruntime.dll refused to initialise");
+        }
+    }
+
     /// The thunk protocol end to end on the PC runtime: XUser and XGameSave are XCL's objects,
     /// their async calls complete on the PC runtime's task queues; XStore is refused; XAsync
     /// comes from the PC runtime.
@@ -2051,7 +2122,7 @@ mod tests {
         let _g = accessibility::ACCESSIBILITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let iid = g(0xd722b373_8c4d_4692_9e51_d6ad9b37aa7d);
         unsafe {
-            // Built-in fallback object serves slots 3..=5 and stubs speech slots as E_NOTIMPL.
+            // Built-in fallback object serves slots 3..=5, accepts position hints, and stubs other speech slots.
             let acc = xcl_xaccessibility_object() as *const Obj as *mut c_void;
             let get_props: unsafe extern "system" fn(*mut c_void, *mut accessibility::XClosedCaptionProperties) -> HRESULT = slot(acc, 3);
             let set_enabled: unsafe extern "system" fn(*mut c_void, u8) -> HRESULT = slot(acc, 4);
@@ -2071,7 +2142,7 @@ mod tests {
             assert_eq!(get_hc(acc, &mut hc), S_OK);
             assert!(hc <= accessibility::XHIGH_CONTRAST_MODE_OTHER);
 
-            assert_eq!(speech_pos(acc, 0), E_NOTIMPL);
+            assert_eq!(speech_pos(acc, 0), S_OK);
 
             // QueryApiImpl succeeds whether backed by host System32\xgameruntime.dll or XCL fallback.
             let (hr, queried) = query(XACCESSIBILITY, iid);
