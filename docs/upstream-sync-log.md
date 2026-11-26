@@ -831,3 +831,58 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-130 (task-1795722019-4a48): #2861/#2862/#2864 triaged SKIP, probe past #2864
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) flaky again: full listing topped at #2822
+  (truncated fetch, 2347 refs) — sequential is ground truth, same
+  lesson as step-128/129. Per-PR sequential probe #2830..#3060
+  (widened past the sixth gap per mem-1795712765-78dc) found 29
+  PRESENT (#2830..#2864 minus #2835/#2839-#2841/#2857/#2863 gaps);
+  all pins match prior steps (no force-push), all 29 `merge-base
+  --is-ancestor` exit 1 (all OPEN); #2865..#3060 ALL MISSING — scan
+  complete, top is #2864.
+- Replication-lag handoff (per mem-1795714025-21a1, NOT builder
+  fault): #2862 committed 19:40:07 UTC (12s before task creation
+  19:40:19 UTC) and #2864 committed 19:31:59 UTC both predate the
+  window yet were MISSING from the step-129 critic scan to #3060 —
+  same lag shape as step-128's batch-miss. Triaged in-window now.
+- Triage (all SKIP with hunk evidence): #2861 `a3b9394e` SKIP,
+  single commit on `8b957bec` (parent IS in main, exit 0), 1 file
+  `hle/d3d12x/real.rs` +156/-2 (CreateCommandList-behind-standin:
+  `dev_create_command_list_driver` rename + `pso_async::resolve`
+  wrap incl. `create_raw_pc_command_list` path + 147-line standin
+  test module); whole `hle` `cfg(windows)`, zero
+  `pso_async`/`standin`/`dev_create_command_list` refs in the Linux
+  shims (sole `d3d12x_linux.rs` hit is an unrelated fence-wait
+  comment). #2862 `3f0ed9b8` SKIP, single commit on `8b957bec`,
+  2 files +54/-3 (`gpu/texture.rs` staging-capacity counters +
+  `Drop` bucket + `host.rs` +5 periodic log line);
+  `gpu::texture` is `#[cfg(windows)]` (`windows::Win32` throughout),
+  `host.rs` is `cfg(windows)` with a `host_linux.rs` twin holding
+  zero staging refs. #2864 `aea330e1` SKIP, single commit on
+  `8b957bec`, 3 files +566/-5 (README `XCL_DSTORAGE_CACHE` docs +
+  `hle/dstorage.rs` opt-in unpack-cache hooks + new 482-line
+  `dstorage/unpack_cache.rs`: Adler-checked on-disk store, 32 GiB
+  cap, own writer thread); whole `hle` `cfg(windows)`
+  (`std::os::windows`, `windows_sys` in the diff), and the Linux
+  twin `dstorage_linux.rs` is a headless synchronous subset that
+  fails closed on zlib/BCPack (`E_DECOMPRESSION`) with zero
+  unpack/cache refs — decoded-request caching has no Linux
+  consumer; opt-in perf env, not correctness. Earlier pins stand:
+  #2830-new-head/#2831/#2832 SKIP; #2833/#2834 landed; #2836 adapted
+  in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim in
+  `aa59e8ac`; #2843-#2860 SKIP (minus #2857 gap).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step130r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
