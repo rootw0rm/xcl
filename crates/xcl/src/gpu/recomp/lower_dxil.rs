@@ -511,6 +511,99 @@ mod tests {
         }
     }
 
+    /// A bridged non-CMPX `V_CMP_*` (e.g. `V_CMP_LT_F32` in VOPC or VOP3) must clear its
+    /// destination bit in lanes outside EXEC, matching RDNA2 hardware and the HLSL path (#2458's
+    /// lowering ran with the guard `true`, so its result is the compare alone)
+    #[cfg(windows)]
+    #[test]
+    fn a_bridged_v_cmp_clears_inactive_lanes_outside_exec() {
+        const F15: u64 = 15.0f32.to_bits() as u64;
+        const F31: u64 = 31.0f32.to_bits() as u64;
+        const F7: u64 = 7.0f32.to_bits() as u64;
+        // Kernel wave32: EXEC = lanes 0..15, then bridged VOPC and VOP3 float compares whose
+        // predicate holds in inactive lanes 16..31 (and for VOP3 also in active lanes 8..15).
+        let kernel_lines: &[I] = &[
+            ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]),
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 1), ("LITERAL", F15)]),
+            ("V_CMP_LT_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 255), ("SRC1", V + 1), ("LITERAL", F7)]),
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            ENDPGM,
+        ];
+        // Compute wave_branches (wave32 and split wave64): narrowed EXEC + bridged `V_CMP_LT_F32`
+        // false in all active lanes and true in all inactive lanes -> `S_CBRANCH_VCCZ` must be taken.
+        let branch_prog = |w64: bool| -> Vec<I> {
+            let (cut_cmp, fcmp, save, restore): (I, &str, &str) = if w64 {
+                (
+                    ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)]),
+                    ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 1), ("LITERAL", F31)]),
+                    "S_AND_SAVEEXEC_B64",
+                    "S_OR_B64",
+                )
+            } else {
+                (
+                    ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+                    ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 1), ("LITERAL", F15)]),
+                    "S_AND_SAVEEXEC_B32",
+                    "S_OR_B32",
+                )
+            };
+            vec![
+                ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 129)]),
+                cut_cmp,
+                (save, "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+                fcmp,
+                ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 137)]),
+                (restore, "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+                ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 0)]),
+                ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 3), ("DATA", 2), ("SADDR", 125)]),
+                ENDPGM,
+            ]
+        };
+
+        let (k_dxil, _) = super::kernel(&decode(kernel_lines), false).unwrap_or_else(|e| panic!("{e}"));
+        let mut cs32 = compute_cs();
+        cs32.threads = [32, 1, 1];
+        let b32_lines = branch_prog(false);
+        let b32_dxil = super::compute(&decode(&b32_lines), &cs32, false).unwrap_or_else(|e| panic!("{e}"));
+        let mut cs64 = compute_cs();
+        cs64.threads = [64, 1, 1];
+        let b64_lines = branch_prog(true);
+        let b64_dxil = super::compute_split(&decode(&b64_lines), &cs64).unwrap_or_else(|e| panic!("{e}"));
+        if crate::gpu::dxil::validate::validator_supported() {
+            crate::gpu::dxil::validate::validate(&k_dxil).unwrap();
+            crate::gpu::dxil::validate::validate(&b32_dxil).unwrap();
+            crate::gpu::dxil::validate::validate(&b64_dxil).unwrap();
+        }
+        if !gpu() {
+            return;
+        }
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let direct = runner::run(&k_dxil, &st, &[]).unwrap();
+        assert_eq!(direct.sgpr[106], 0x0000_0000, "vcc must clear inactive lanes 16..31");
+        assert_eq!(direct.sgpr[4], 0x0000_FF00, "VOP3 s4 must clear inactive lanes 16..31");
+        assert_eq!(direct.sgpr[126], u32::MAX, "exec restored");
+        if dxc::location().is_ok() {
+            let bytes: Vec<u8> = kernel_lines.iter().flat_map(encode_line).collect();
+            let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+            assert_eq!((direct.sgpr[106], direct.sgpr[4], direct.sgpr[126]), (hlsl.sgpr[106], hlsl.sgpr[4], hlsl.sgpr[126]));
+        }
+        let out32 = runner::dispatch(&b32_dxil, [1, 1, 1], &[], &[0; 32]).unwrap();
+        assert_eq!(&out32[..32], &[1; 32], "wave32 s_cbranch_vccz must be taken when only inactive lanes match");
+        let out64 = runner::dispatch(&b64_dxil, [1, 1, 1], &[], &[0; 64]).unwrap();
+        assert_eq!(&out64[..64], &[1; 64], "split wave64 s_cbranch_vccz must be taken when only inactive lanes match");
+    }
+
     #[cfg(windows)]
     #[test]
     fn gpu_frexp_exp_f32_denorm_per_lane() {
