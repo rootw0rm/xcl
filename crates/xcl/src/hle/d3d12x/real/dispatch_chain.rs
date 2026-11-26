@@ -9,9 +9,16 @@ static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 /// slabs dispatched (`pso::dispatch_slabs`)
 static SLABS: AtomicU64 = AtomicU64::new(0);
-/// scratch alive now, the most there was, and the most a dispatch would have needed at once (bytes)
-static LIVE: AtomicU64 = AtomicU64::new(0);
-static PEAK: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct ScratchUsage {
+    /// Buffers held by recordings, plus driver allocations still in progress.
+    charged: u64,
+    live: u64,
+    peak: u64,
+}
+
+static SCRATCH: Mutex<ScratchUsage> = Mutex::new(ScratchUsage { charged: 0, live: 0, peak: 0 });
+/// Most scratch a dispatch would have needed in a single slab (bytes).
 static WANTED: AtomicU64 = AtomicU64::new(0);
 /// ExecuteIndirects run as chains, those of them that ran the whole form instead (more slabs than
 /// rounds), and the slabs lost when there was no whole form yet
@@ -22,10 +29,13 @@ static INDIRECT_LOST: AtomicU64 = AtomicU64::new(0);
 static WHOLE_INDIRECT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
-    let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
     let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let (live, peak) = {
+        let usage = SCRATCH.lock().unwrap();
+        (usage.live, usage.peak)
+    };
     crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); ExecuteIndirect: {} chained ({} of them whole, {} slabs lost), {} whole",
-        n(&PROGRAMS), n(&PIECES), n(&DISPATCHES), n(&SLABS), mib(&LIVE), mib(&PEAK), mib(&WANTED),
+        n(&PROGRAMS), n(&PIECES), n(&DISPATCHES), n(&SLABS), live >> 20, peak >> 20, n(&WANTED),
         n(&INDIRECT), n(&INDIRECT_WHOLE), n(&INDIRECT_LOST), n(&WHOLE_INDIRECT));
 }
 
@@ -47,12 +57,12 @@ struct PipelineBuilder {
 }
 
 impl PipelineBuilder {
-    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
+    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Result<ID3D12PipelineState, HRESULT> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
             dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
-        (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
+        if hr >= 0 && !raw.is_null() { Ok(ID3D12PipelineState::from_raw(raw)) } else { Err(hr) }
     }
 }
 
@@ -61,8 +71,10 @@ struct Chain {
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
+    whole: OnceLock<Option<ID3D12PipelineState>>,
     build_whole: Mutex<()>,
+    /// after a whole build that ran out of memory: when it may be tried, once more
+    retry_at: Mutex<Option<std::time::Instant>>,
     /// threads other than `want_whole`'s waiting for the whole form
     waiting: std::sync::atomic::AtomicUsize,
     /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
@@ -79,7 +91,7 @@ struct Chain {
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        if let Some(p) = self.whole.get() { return p.clone().ok_or_else(|| "whole compute pipeline".into()); }
         // `want_whole`'s build may hold `build_whole` while it waits for its turn
         // (`big_compile_turn`): while this thread waits, that build is one the title waits for
         self.waiting.fetch_add(1, Ordering::AcqRel);
@@ -90,10 +102,24 @@ impl Chain {
 
     unsafe fn build_whole_form(&self) -> Result<ID3D12PipelineState, String> {
         let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+        if let Some(p) = self.whole.get() { return p.clone().ok_or_else(|| "whole compute pipeline".into()); }
+        let mut retry_at = self.retry_at.lock().unwrap();
+        if let Some(p) = self.whole.get() { return p.clone().ok_or_else(|| "whole compute pipeline".into()); }
+        if retry_at.is_some_and(|t| std::time::Instant::now() < t) { return Err("whole compute pipeline: out of memory".into()); }
+        match self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)) {
+            Ok(p) => {
+                let _ = self.whole.set(Some(p.clone()));
+                Ok(p)
+            }
+            Err(hr) if hr == crate::util::E_OUTOFMEMORY && retry_at.is_none() => {
+                *retry_at = Some(std::time::Instant::now() + WHOLE_RETRY);
+                Err("whole compute pipeline: out of memory".into())
+            }
+            Err(_) => {
+                let _ = self.whole.set(None);
+                Err("whole compute pipeline".into())
+            }
+        }
     }
 
     /// The whole form built on another thread, for a later ExecuteIndirect with more slabs than rounds
@@ -116,6 +142,9 @@ impl Chain {
 fn whole_thread() -> std::thread::Builder {
     std::thread::Builder::new().name("xcl-pso-chain-whole".into())
 }
+
+/// How long a split program's whole form waits after a build that ran out of memory, before its last try
+const WHOLE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
@@ -141,7 +170,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(),
-        slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+        slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default(), retry_at: Mutex::new(None) });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -169,7 +198,7 @@ pub(in crate::hle::d3d12x) fn resolve_allocator_for_test(list: usize, allocator:
 
 pub(in crate::hle::d3d12x) unsafe fn whole(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize) -> Result<Option<ID3D12PipelineState>, String> {
     let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(None) };
-    if chain.is_some() { WHOLE_INDIRECT.fetch_add(1, Ordering::Relaxed); }
+    WHOLE_INDIRECT.fetch_add(1, Ordering::Relaxed);
     let whole = chain.whole()?;
     retain_whole(resolve_allocator(list.as_raw() as usize, allocator), chain);
     Ok(Some(whole))
@@ -177,12 +206,39 @@ pub(in crate::hle::d3d12x) unsafe fn whole(list: &ID3D12GraphicsCommandList, pso
 
 struct Scratch {
     buffer: ID3D12Resource,
-    bytes: u64,
+    reservation: ScratchReservation<'static>,
 }
 
-impl Drop for Scratch {
+struct ScratchReservation<'a> {
+    usage: &'a Mutex<ScratchUsage>,
+    bytes: u64,
+    live: bool,
+}
+
+impl<'a> ScratchReservation<'a> {
+    fn reserve(usage: &'a Mutex<ScratchUsage>, needed: u64, group: u64, budget: u64, had: Option<u64>, total: u64) -> Option<Self> {
+        let mut counts = usage.lock().unwrap();
+        let (bytes, make) = scratch_bytes(needed, group, budget, had, counts.charged, total);
+        if !make { return None; }
+        counts.charged += bytes;
+        Some(Self { usage, bytes, live: false })
+    }
+
+    fn allocated(&mut self) {
+        let mut counts = self.usage.lock().unwrap();
+        counts.live += self.bytes;
+        counts.peak = counts.peak.max(counts.live);
+        self.live = true;
+    }
+}
+
+impl Drop for ScratchReservation<'_> {
     fn drop(&mut self) {
-        LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+        let mut counts = self.usage.lock().unwrap();
+        counts.charged -= self.bytes;
+        if self.live {
+            counts.live -= self.bytes;
+        }
     }
 }
 
@@ -281,9 +337,9 @@ const LEAST: u64 = 2 << 20;
 /// How much scratch a dispatch of `needed` bytes (`group` for one group) runs with at once: the
 /// list's own buffer (`had` bytes) when that is enough or no more may be made, else a new one of
 /// the bytes given (second: make one).
-fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, live: u64, total: u64) -> (u64, bool) {
+fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, charged: u64, total: u64) -> (u64, bool) {
     let want = needed.min(budget).max(group);
-    let room = total.saturating_sub(live);
+    let room = total.saturating_sub(charged);
     match had {
         Some(h) if h >= want || (room < want && h >= group) => (h, false),
         _ => (want.min(room.max(LEAST)).max(group), true),
@@ -294,13 +350,13 @@ fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, live: u
 /// chain before it on the list used it.
 unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed: u64, group: u64) -> Option<(Arc<Scratch>, bool)> {
     let had = SHARED.lock().unwrap().get(&list).filter(|s| s.0 == allocator).and_then(|s| s.1.upgrade());
-    let (bytes, make) = scratch_bytes(needed, group, scratch_budget(), had.as_ref().map(|s| s.bytes), LIVE.load(Ordering::Relaxed), scratch_total());
-    if !make {
+    let capacity = had.as_ref().map(|s| s.reservation.bytes);
+    let Some(mut reservation) = ScratchReservation::reserve(&SCRATCH, needed, group, scratch_budget(), capacity, scratch_total()) else {
         return had.map(|s| (s, true));
-    }
-    let s = Arc::new(Scratch { buffer: scratch_buffer(dev, bytes)?, bytes });
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
+    };
+    let buffer = scratch_buffer(dev, reservation.bytes)?;
+    reservation.allocated();
+    let s = Arc::new(Scratch { buffer, reservation });
     SHARED.lock().unwrap().insert(list, (allocator, Arc::downgrade(&s)));
     Some((s, false))
 }
@@ -311,11 +367,21 @@ fn retain_whole(allocator: usize, chain: Arc<Chain>) {
         let mut map = RECORDINGS.lock().unwrap();
         let entries = map.entry(allocator).or_default();
         if !entries.iter().any(|r| Arc::ptr_eq(&r.chain, &chain)) {
-            entries.push(Arc::new(Recording { scratch: None, first: None, chain }));
+            entries.push(Arc::new(Recording { scratch: None, first: None, chain, indirect: None }));
             return;
         }
     }
     drop(chain); // outside RECORDINGS.lock()
+}
+
+fn select_scratch<T>(
+    (bytes, make): (u64, bool), had: Option<(u64, T)>, group: u64, allocate: impl FnOnce(u64) -> Option<T>,
+) -> Option<(T, bool)> {
+    if make {
+        if let Some(s) = allocate(bytes) { return Some((s, false)); }
+    }
+    // A smaller buffer can still run the chain in slabs. Reuse needs a UAV barrier.
+    had.filter(|(capacity, _)| *capacity >= group).map(|(_, s)| (s, true))
 }
 
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
@@ -361,7 +427,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     WANTED.fetch_max(needed, Ordering::Relaxed);
     let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
         .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
-    let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
+    let most = scratch.as_ref().map_or(1, |(s, _)| (s.reservation.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
         let whole = chain.whole()?;
@@ -426,12 +492,12 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     let dev = &chain.builder.device;
     let group = u64::from(chain.words) * 4;
     let Some((scratch, _)) = scratch_for(dev, list.as_raw() as usize, allocator, scratch_budget(), group) else { return Ok(false) };
-    let most = (scratch.bytes / group).max(1);
+    let most = (scratch.reservation.bytes / group).max(1);
     let sig = match chain.signature.get() {
         Some(s) => s.clone(),
         None => { let s = pso::chain_command_signature(dev, &chain.builder.signature)?; chain.signature.get_or_init(|| s).clone() }
     };
-    let full = chain.whole.get().cloned().map(|p| pso::dispatch_command_signature(dev).map(|s| (p, s))).transpose()?;
+    let full = chain.whole.get().cloned().flatten().map(|p| pso::dispatch_command_signature(dev).map(|s| (p, s))).transpose()?;
     let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.slabs.load(Ordering::Relaxed), chain.last.load(Ordering::Relaxed));
     let rounds = indirect_rounds(seen, most, before, most_rounds());
     let pieces = chain.tail.len() as u32 + 1;
@@ -466,9 +532,32 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
 
 #[cfg(test)]
 mod tests {
+    use super::{scratch_bytes, select_scratch, LEAST};
     use super::*;
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn failed_scratch_growth_reuses_a_buffer_that_fits_a_group() {
+        let group = 64 << 10;
+        let select = |had: Option<(u64, &'static str)>| {
+            let plan = scratch_bytes(8 * MB, group, 256 * MB, had.map(|(bytes, _)| bytes), 2 * MB, 384 * MB);
+            let mut attempted = false;
+            let result = select_scratch(plan, had, group, |bytes| {
+                assert_eq!(bytes, 8 * MB);
+                attempted = true;
+                None
+            });
+            assert!(attempted);
+            result
+        };
+        assert_eq!(select(Some((2 * MB, "old"))), Some(("old", true)));
+        assert_eq!(select(Some((group, "old"))), Some(("old", true)));
+        assert_eq!(select(Some((group - 1, "old"))), None);
+        assert_eq!(select(None), None);
+        assert_eq!(select_scratch((8 * MB, true), Some((2 * MB, "old")), group, |_| Some("new")), Some(("new", false)));
+        assert_eq!(select_scratch((2 * MB, false), Some((2 * MB, "old")), group, |_| panic!("unneeded allocation")), Some(("old", true)));
+    }
 
     #[test]
     fn a_list_recorded_after_another_goes_on_in_its_scratch() {
@@ -575,7 +664,7 @@ mod tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default(), retry_at: Mutex::new(None) }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
@@ -685,7 +774,7 @@ mod tests {
             bundle.SetComputeRootSignature(&rs);
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
-            let mk = |words| Arc::new(Chain { builder: Arc::new(PipelineBuilder { device: dev.clone(), create: unused_pso_fn, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 }), tail: Vec::new(), words, whole_code: Vec::new(), whole: OnceLock::from(whole_pso.clone()), build_whole: Mutex::new(()) });
+            let mk = |words| Arc::new(Chain { builder: Arc::new(PipelineBuilder { device: dev.clone(), create: unused_pso_fn, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 }), tail: Vec::new(), words, whole_code: Vec::new(), whole: OnceLock::from(Some(whole_pso.clone())), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default(), retry_at: Mutex::new(None) });
             let (c1, c2) = (mk(4), mk(4));
             let (w1, w2) = (Arc::downgrade(&c1), Arc::downgrade(&c2));
             let (p1, a1, p2, a2) = (0x7D00_0001usize, 0x7D00_A001usize, 0x7D00_0002usize, 0x7D00_A002usize);
@@ -704,5 +793,170 @@ mod tests {
             bundle.Close().unwrap();
             list.Close().unwrap();
         }
+    }
+
+    #[test]
+    fn a_whole_form_that_fails_to_build_is_not_built_again() {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn refused(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_FAIL
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let chain = Chain { builder, tail: Vec::new(), words: 4, whole_code: vec![0; 16], whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default(), retry_at: Mutex::new(None) };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn a_whole_form_that_ran_out_of_memory_is_tried_once_more_after_a_pause() {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn out_of_memory(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_OUTOFMEMORY
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev, create: out_of_memory, signature, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let chain = Chain { builder, tail: Vec::new(), words: 4, whole_code: vec![0; 16], whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default(), retry_at: Mutex::new(None) };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+            *chain.retry_at.lock().unwrap() = Some(std::time::Instant::now());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+            *chain.retry_at.lock().unwrap() = Some(std::time::Instant::now());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn list_lifecycle_transitions_clear_shared_scratch() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12CommandAllocator, ID3D12Device, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_TYPE_DIRECT};
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) };
+            if warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) }).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+        }
+        let dev = dev.unwrap();
+        let (a, b, c, alloc_id) = (0x7E57_6C01usize, 0x7E57_6C02usize, 0x7E57_6C03usize, 0x7E57_6CA0usize);
+
+        // 1. `list_x::on_release` drops `SHARED[list]` so a recreated list at the same address
+        //    cannot reuse the in-flight recording's scratch on the same allocator.
+        let (sa1, used) = unsafe { super::scratch_for(&dev, a, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used);
+        super::super::super::list_x::on_release(a);
+        let (sa2, used) = unsafe { super::scratch_for(&dev, a, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sa1, &sa2), "on_release must clear shared dispatch scratch");
+
+        // 2. `list_x::on_create` clears any stale `SHARED[list]` entry on address reuse.
+        let (sb1, used) = unsafe { super::scratch_for(&dev, b, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used);
+        unsafe { super::super::super::list_x::on_create(b as *mut std::ffi::c_void, alloc_id, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        let (sb2, used) = unsafe { super::scratch_for(&dev, b, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sb1, &sb2), "on_create must clear shared dispatch scratch");
+        super::super::super::list_x::on_release(b);
+
+        // 3. `list_x::clear_segment_state` clears `SHARED[list]` when a split segment returns to spare pool.
+        let (sc1, used) = unsafe { super::scratch_for(&dev, c, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used);
+        super::super::super::list_x::clear_segment_state(c);
+        let (sc2, used) = unsafe { super::scratch_for(&dev, c, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sc1, &sc2), "clear_segment_state must clear shared dispatch scratch");
+
+        // 4. `console_list` Reset and Release clear `SHARED[pc_list]`.
+        let ca: ID3D12CommandAllocator = unsafe { dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+        let cl: ID3D12GraphicsCommandList = unsafe { dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &ca, None) }.unwrap();
+        unsafe { cl.Close() }.unwrap();
+        let pc_ptr = cl.as_raw() as usize;
+        let ca_ptr = ca.as_raw() as usize;
+        let cl_obj = unsafe { super::super::super::console_list::create_with_allocator(cl.into_raw(), ca.as_raw()) };
+        let (sd1, used) = unsafe { super::scratch_for(&dev, pc_ptr, ca_ptr, MB, 4096) }.unwrap();
+        assert!(!used);
+        // Call console_list vtable Reset (slot 10)
+        unsafe {
+            let vt = *(cl_obj as *const *const usize);
+            let reset_fn: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32 = std::mem::transmute(*vt.add(10));
+            assert_eq!(reset_fn(cl_obj, ca.as_raw(), std::ptr::null_mut()), 0);
+        }
+        let (sd2, used) = unsafe { super::scratch_for(&dev, pc_ptr, ca_ptr, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sd1, &sd2), "console_list Reset must clear shared dispatch scratch");
+        // Call console_list vtable Release (slot 2)
+        unsafe {
+            let vt = *(cl_obj as *const *const usize);
+            let release_fn: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            assert_eq!(release_fn(cl_obj), 0);
+        }
+        let (sd3, used) = unsafe { super::scratch_for(&dev, pc_ptr, ca_ptr, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sd2, &sd3), "console_list Release must clear shared dispatch scratch");
+
+        for list in [a, b, c, pc_ptr] {
+            super::list_reset(list);
+        }
+    }
+
+    #[test]
+    fn simultaneous_scratch_allocations_share_the_total() {
+        use super::{ScratchReservation, ScratchUsage};
+        use std::sync::{Barrier, Mutex};
+        let usage = Mutex::new(ScratchUsage::default());
+        let both_reserved = Barrier::new(2);
+        let allocations = std::thread::scope(|scope| {
+            let allocate = || {
+                let mut reservation = ScratchReservation::reserve(&usage, 256 * MB, 4096, 256 * MB, None, 384 * MB).unwrap();
+                // Both recordings have chosen their allocation before either driver call returns.
+                both_reserved.wait();
+                reservation.allocated();
+                reservation
+            };
+            let first = scope.spawn(allocate);
+            [allocate(), first.join().unwrap()]
+        });
+        let mut sizes = allocations.each_ref().map(|r| r.bytes / MB);
+        sizes.sort();
+        assert_eq!(sizes, [128, 256]);
+        assert_eq!(usage.lock().unwrap().live, 384 * MB);
+        drop(allocations);
+        let counts = usage.lock().unwrap();
+        assert_eq!((counts.charged, counts.live, counts.peak), (0, 0, 384 * MB));
+    }
+
+    #[test]
+    fn pending_scratch_releases_its_charge_on_allocation_failure() {
+        use super::{ScratchReservation, ScratchUsage};
+        use std::sync::Mutex;
+        let usage = Mutex::new(ScratchUsage::default());
+        let reserve = |group, had| ScratchReservation::reserve(&usage, 16 * MB, group, 16 * MB, had, 16 * MB);
+        let counts = || {
+            let state = usage.lock().unwrap();
+            (state.charged, state.live, state.peak)
+        };
+        let pending = reserve(4096, None).unwrap();
+        assert_eq!(counts(), (16 * MB, 0, 0));
+        assert!(reserve(4096, Some(4 * MB)).is_none(), "reuse the recording's scratch while growth has no room");
+        assert_eq!(reserve(4096, None).unwrap().bytes, LEAST);
+        assert_eq!(reserve(5 * MB, None).unwrap().bytes, 5 * MB);
+        drop(pending); // CreateCommittedResource returned no buffer.
+        let next = reserve(4096, None).unwrap();
+        assert_eq!(next.bytes, 16 * MB);
+        drop(next);
+        assert_eq!(counts(), (0, 0, 0));
     }
 }

@@ -393,6 +393,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     if left == 0 {
         let dead = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj));
         if let Some(st) = dead {
+            super::real::dispatch_chain::list_reset(st.pc);
             free_uma(&st.uma);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
             release(st.pc);
@@ -443,6 +444,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
     }
     with_list(obj, |st| new_chunk(obj, st));
+    super::real::dispatch_chain::list_reset(pc);
     let init_pso = super::pso_async::resolve_for_bind_retained(pc_pso(pso) as usize);
     let init_ptr = init_pso.ptr();
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
@@ -636,6 +638,7 @@ pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> 
     };
     new_chunk(obj, &mut st);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
+    super::real::dispatch_chain::list_reset(pc as usize);
     obj as *mut c_void
 }
 
@@ -776,6 +779,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     // the whole recording is replayed into the PC list here: its transitions of textures kept
     // in step are these
     super::title_textures::list_reset(st.pc);
+    super::real::dispatch_chain::list_reset(st.pc);
     super::dred::reset(st.pc as *mut c_void);
     let windows = super::real::uma_window_vas();
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);

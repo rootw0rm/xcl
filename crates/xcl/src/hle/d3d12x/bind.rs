@@ -450,7 +450,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     Ok(Some(whole)) => list.SetPipelineState(&whole),
                     Ok(None) => {}
                     Err(e) => {
-                        crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
+                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                            crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
+                        }
                         count(DISPATCHES_SKIPPED);
                         return;
                     }

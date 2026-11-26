@@ -318,13 +318,18 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
-  Loading a cached shader without split pieces reuses the file buffer, avoiding a second
+- Command lists recording split compute dispatches share a scratch budget
+  (`XCL_SPLIT_SCRATCH_TOTAL_MB`, default 384 MiB). Each list reserves its share while its
+  buffer is being created. When the budget is full, a new buffer can still take up to
+  2 MiB, or the space for one thread group if larger.
+- Loading a cached shader without split pieces reuses the file buffer, avoiding a second
   payload-sized allocation.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
-  dispatches use the whole pipeline.
+  dispatches use the whole pipeline. If a larger scratch buffer cannot be allocated, the
+  dispatch runs in smaller slabs using the recording's existing buffer when it fits at least one thread group.
 - If the host refuses a shader cache session, XCL's in-memory fallback limits stored keys and
   values to 32 MiB per store. Writes that exceed that limit return `DXGI_ERROR_CACHE_FULL`
   before copying the inputs and leave existing entries intact.
