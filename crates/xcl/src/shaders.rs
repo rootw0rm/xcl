@@ -2448,6 +2448,31 @@ mod tests {
         sample(5, &[compute])
     }
 
+    /// A worker that panics is a panic in the sweep, not a timeout; one that is still working
+    /// when the time is up is a timeout (#2387).
+    #[test]
+    fn sweep_result_tells_a_panicked_worker_from_a_timeout() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let (tx, rx) = channel::<Result<u32, String>>();
+        tx.send(Ok(7)).unwrap();
+        assert_eq!(sweep_result(&rx, Duration::from_secs(1)), Ok(7));
+
+        let (tx, rx) = channel::<Result<u32, String>>();
+        let _ = std::thread::spawn(move || {
+            let _tx = tx;
+            panic!("translator bug");
+        })
+        .join();
+        let e = sweep_result(&rx, Duration::from_secs(60)).unwrap_err();
+        assert!(e.starts_with("panic:"), "{e}");
+
+        let (_tx, rx) = channel::<Result<u32, String>>();
+        let e = sweep_result(&rx, Duration::from_millis(10)).unwrap_err();
+        assert!(e.starts_with("timeout:"), "{e}");
+    }
+
     /// A signature part (v1): (name, system value, register, mask) per element, floats.
     fn signature(elements: &[(&str, u32, u32, u8)]) -> Vec<u8> {
         let mut d = Vec::new();
@@ -2793,7 +2818,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                             std::thread::spawn(move || {
                                 let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
                             });
-                            rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
+                            sweep_result(&rx, timeout)
                         };
                         let time = t.elapsed();
                         if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
@@ -2804,7 +2829,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                             std::thread::spawn(move || {
                                 let _ = tx.send(recomp::lower_dxil::compute_with(&c, &csc, o));
                             });
-                            match rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs()))) {
+                            match sweep_result(&rx, timeout) {
                                 Ok(k) => {
                                     lanes_ok.fetch_add(1, Ordering::Relaxed);
                                     lanes_bytes.fetch_add(k.dxil.len(), Ordering::Relaxed);
@@ -2871,6 +2896,17 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
     0
+}
+
+/// What a sweep worker sent within `timeout`. A worker that panics drops its sender without
+/// sending, so the channel is disconnected at once: that is reported as a panic, not as a
+/// timeout (#2387).
+fn sweep_result<T>(rx: &std::sync::mpsc::Receiver<Result<T, String>>, timeout: std::time::Duration) -> Result<T, String> {
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!("timeout: over {} s", timeout.as_secs())),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("panic: the translator thread ended without a result".to_string()),
+    }
 }
 
 /// A survey reason without its program's numbers: registers as `sN`, other numbers as `N`
