@@ -10,6 +10,17 @@
 //! closed (`E_DECOMPRESSION`/`E_SOURCE_TYPE`); fences signal through the
 //! `d3d12x_linux` null-device fence object (same `Signal` slot the Windows path
 //! uses). Nothing is rendered; this only moves the title's bytes.
+//!
+//! Step-89 M1 content hypothesis (H-DLC-mount, FALSIFIED 2026-11-26, doc-only):
+//! the missing key-0 insert into `0x14aad3d68` (which would let
+//! `0x1406BD160`->`0x140A34890`->`0x1408EC200` succeed and unstick retail
+//! `exe+0x2237320`) was tried as a DLC-pack record (layout chunks 3000-3008
+//! -> the 9 present `pack/<name>/*.rpf`, incl. `core_licenses_data.rpf`);
+//! consumer is the `FC2492`->`FC2540`->`0x141FB2600` mount/pack chain
+//! (`abort-2237179.md` §§15-17). Falsified: `MicrosoftGame.Config` declares
+//! no DLC set, all 9 packs present, live retail shows `xgr.apis` exactly
+//! XAsync/XNetworking/XUser + `vfs.unmapped []` + 20 non-storage stubs, so
+//! the game never requests DLC content before `FC2540`. No family.
 
 #![allow(non_snake_case)]
 
