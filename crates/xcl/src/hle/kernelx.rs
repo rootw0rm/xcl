@@ -407,7 +407,7 @@ fn gpu_visible_fallback(addr: *const c_void, t: u32, p: u32) -> bool {
 /// Plain memory for GPU-visible title memory, write-watched and recorded with the graphics
 /// reservations (whose ranges `title_textures` watches; `VirtualFree` forgets it). Null if
 /// Windows refuses it.
-unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
+pub(crate) unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
     let q = mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
     if !q.is_null() {
         GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
