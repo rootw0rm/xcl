@@ -1445,3 +1445,39 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (fresh-root `report.json` verified before removal).
   Lock audit: 0 new `lock()` (doc-only change); `diff --check` clean.
+
+## 2026-11-26 — step-142 (task-1795732268-943c): scan empty, top still #2905, probe past #2905
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2377 refs (+0 vs step-141), in-range set exactly
+  #2830..#2905 minus the known gaps — no refs >=2906 in batched;
+  sequential still ground truth. Per-PR sequential probe #2830..#3600
+  (widened past #2905 per mem-1795712765-78dc; foreground 2906..2960 +
+  background 2961..3200 / 3201..3600, no tail left open) found
+  58 PRESENT (same set as step-141: #2830..#2905 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880/#2883-#2885/#2899/#2900/#2903
+  gaps), all 21 pins re-verified match (no force-push, #2872 pin `3893df0a` +
+  #2879 pin `63197e31` + #2881 pin `2c50cc71` + #2882 pin `3e8e2c43` +
+  #2886 pin `237b7181` + #2887 pin `128ee21f` + #2888 pin `5fefeb15` +
+  #2889 pin `ca3eb153` + #2890 pin `c6c14a15` + #2891 pin `0246ae43` +
+  #2892 pin `f9362ed3` + #2893 pin `20e38b05` + #2894 pin `7716b4cf` +
+  #2895 pin `f3cd0a5b` + #2896 pin `33c18faf` + #2897 pin `d24b4250` +
+  #2898 pin `8cf249e5` + #2901 pin `2902398f` + #2902 pin `8e16f9ca` +
+  #2904 pin `059f4eca` + #2905 pin `d900644d`); #2906..#3600 ALL MISSING —
+  scan complete, top is still #2905, nothing new since step-141.
+- Triage: no new PRs — all pins stand: #2830-new-head/#2831/#2832 SKIP;
+  #2833/#2834 landed; #2836 adapted in `7645afeb`; #2837/#2842 SKIP;
+  #2838 landed verbatim in `aa59e8ac`; #2843-#2905 SKIP (minus gaps,
+  #2890 PORTED in `1efa5ac0`).
+- Gates (doc-only, tree CLEAN throughout): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step142r` SIGSEGV (core dumped)
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (fresh-root `report.json` verified before removal).
+  Lock audit: 0 new `lock()` (doc-only change); `diff --check` clean.
