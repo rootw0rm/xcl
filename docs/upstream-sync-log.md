@@ -507,3 +507,76 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-125 (task-1795718722-3f65): #2830-new-head + #2844-new-head + #2850 + #2851 triaged, all SKIP, probe past #2851
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18) tops out at #2851 (`7e6e2f09`) — NOTHING past
+  #2851 in the batched listing. Per-PR sequential probe #2830..#2960
+  (widened past the fifth gap per mem-1795712765-78dc): #2830 `d6cf64c1` /
+  #2831 `965806a0` / #2832 `e2ecdfa9` / #2833 `f5a352c3` /
+  #2834 `653f8f13` / #2836 `43a4eb9d` / #2837 `9d967cf8` /
+  #2838 `ef36b7df` / #2842 `344ce7b5` / #2843 `932e689c` /
+  #2844 `fc007a96` / #2845 `76b17593` / #2846 `a4421e06` /
+  #2847 `4b1780e8` / #2848 `88e56f93` / #2849 `4e93173` /
+  #2850 `cdff8f72` / #2851 `7e6e2f09` (all pins match batched +
+  sequential, `merge-base --is-ancestor` exit 1 each — all still OPEN,
+  unmerged); #2835, #2839..#2841, #2852..#2960 ALL MISSING — scan
+  complete. Batched and sequential agree this time (no mid-window
+  arrivals after the batched fetch).
+- Push-race note (per mem-1795714025-21a1): step-124 critic handed off
+  #2830-new-head + #2850 + #2851; all three pins match the handoff
+  hashes. #2844 was force-pushed since step-123 (`25dfc2c0` →
+  `fc007a96`, same 2-commit stack over `b84e0378`, reworked tip:
+  `25dfc2c0..fc007a96` = uma.rs ±15, title_textures −58, uma_driver
+  +67) — triaged below at the NEW head, not the stale pin.
+- Triage (all SKIP, hunk evidence):
+  - #2830 `d6cf64c1` (shaders.rs +204/−13 startup-preparation
+    cancellation): entire diff lives under `#[cfg(windows)]` —
+    `Pipelines` struct/impl (`shaders.rs:1302/1516`), incl.
+    `make_with_cache_path_cancel` / `make_one` (windows
+    `ID3D12Device::*` body) and the `#[cfg(windows)] precompile`
+    (`:1794`); the `#[cfg(not(windows))] precompile` (`:2046`) stays a
+    no-op stub. Only shared-file touches are the `AtomicBool` import
+    (covered by `:9 cfg_attr(not(windows), allow(unused_imports))`) and
+    the `is_cancelled` helper (dead-code-allowed on Linux, zero Linux
+    callers). SKIP — no Linux consumer (no DXC/D3D12 device on Linux).
+  - #2844 `fc007a96` (coherent UMA driver heaps on NVIDIA, 5 files):
+    shared-file hunk is `gpu/uma.rs` +14 (`driver: AtomicU32`,
+    `set/is_driver_window`) only; every producer/consumer sits in
+    `hle/d3d12x` (`uma_driver.rs` new 249 lines, `real.rs` open_uma +
+    `sanitize_coherent_buffer`, `title_textures.rs`
+    `with_title_bytes`/`read_committed_into`) which never compiles on
+    Linux (`lib.rs` swaps in `hle_linux`). Zero `uma_driver` /
+    `set_driver_window` / `is_driver_window` / `title_bytes` refs in
+    `hle_linux.rs` / `d3d12x_linux.rs`; our `uma.rs` stays driver-free
+    (`grep driver` empty). `driver == 0` makes the `real.rs` branch a
+    no-op. SKIP — base shapes match.
+  - #2850 `cdff8f72` (vfs.rs +1: `WRITE_ACCESS` gains `0x0200_0000`
+    MAXIMUM_ALLOWED): ALREADY IN TREE — `91e37a87` (port of upstream
+    #2694) added the identical bit as named const `MAXIMUM_ALLOWED`
+    (`vfs.rs:73/76`, same `0x0200_0000` value) with the
+    overlay-routing test (`:2247-2264`, `MAXIMUM_ALLOWED +
+    OPEN_EXISTING must be a write open`). SKIP — duplicate of landed
+    semantics, nothing to port.
+  - #2851 `7e6e2f09` (eh.rs +9/−4 unwind-while-suspended): moves
+    `unwind()` inside the `SuspendThread`/`GetThreadContext` window;
+    all three are windows-crate/windows-sys-only (`eh.rs:13+`,
+    `#2689`/`#106` cites). `eh_linux.rs` is a separate
+    copy-then-unwind implementation with no consumer of this change.
+    SKIP — Windows-only.
+  Earlier pins stand: #2830old/#2831/#2832 SKIP; #2833/#2834 landed;
+  #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed verbatim
+  in `aa59e8ac`; #2843/#2845/#2846/#2847/#2848/#2849 SKIP.
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step125r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
