@@ -325,6 +325,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
   dispatches use the whole pipeline.
+- If the host refuses a shader cache session, XCL's in-memory fallback limits stored keys and
+  values to 32 MiB per store. Writes that exceed that limit return `DXGI_ERROR_CACHE_FULL`
+  before copying the inputs and leave existing entries intact.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so

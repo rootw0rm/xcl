@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::util::{E_INVALIDARG, E_NOINTERFACE, E_NOT_SUFFICIENT_BUFFER, E_POINTER, HRESULT, S_FALSE, S_OK};
 
 const DXGI_ERROR_NOT_FOUND: HRESULT = 0x887A_0002u32 as i32;
+const DXGI_ERROR_CACHE_FULL: HRESULT = 0x887A_0034u32 as i32;
 /// Cap per fallback session store so an unbounded stream of blobs cannot exhaust RAM.
 const MAX_STORE_BYTES: usize = 32 << 20;
 
@@ -26,16 +27,17 @@ impl Store {
         Self { entries: HashMap::new(), bytes: 0 }
     }
 
-    fn insert(&mut self, key: Vec<u8>, val: Vec<u8>) {
-        if let Some(old) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(key.len() + old.len());
-        }
+    fn insert(&mut self, key: &[u8], val: &[u8]) -> HRESULT {
+        let replaced = self.entries.get(key).map_or(0, |old| key.len() + old.len());
         let cost = key.len().saturating_add(val.len());
-        if self.bytes.saturating_add(cost) > MAX_STORE_BYTES {
-            return;
+        let bytes = (self.bytes - replaced).saturating_add(cost);
+        if bytes > MAX_STORE_BYTES {
+            return DXGI_ERROR_CACHE_FULL;
         }
-        self.bytes += cost;
-        self.entries.insert(key, val);
+        // Check capacity before copying either input or changing an existing entry.
+        self.entries.insert(key.to_vec(), val.to_vec());
+        self.bytes = bytes;
+        S_OK
     }
 
     fn clear(&mut self) {
@@ -238,14 +240,16 @@ unsafe extern "system" fn store_value(
     if key.is_null() || key_size == 0 || (val.is_null() && val_size > 0) {
         return E_INVALIDARG;
     }
-    let k = std::slice::from_raw_parts(key as *const u8, key_size as usize).to_vec();
+    if (key_size as usize).saturating_add(val_size as usize) > MAX_STORE_BYTES {
+        return DXGI_ERROR_CACHE_FULL;
+    }
+    let k = std::slice::from_raw_parts(key as *const u8, key_size as usize);
     let v = if val_size == 0 {
-        Vec::new()
+        &[]
     } else {
-        std::slice::from_raw_parts(val as *const u8, val_size as usize).to_vec()
+        std::slice::from_raw_parts(val as *const u8, val_size as usize)
     };
-    (*this).store.lock().unwrap().insert(k, v);
-    S_OK
+    (*this).store.lock().unwrap().insert(k, v)
 }
 
 unsafe extern "system" fn set_delete_on_destroy(this: *mut Session) {
@@ -266,6 +270,74 @@ unsafe extern "system" fn get_desc(
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    fn memory_session() -> Session {
+        Session {
+            vtbl: vtbl(), refs: AtomicU32::new(1), device: std::ptr::null_mut(),
+            desc: D3D12_SHADER_CACHE_SESSION_DESC::default(),
+            store: Arc::new(Mutex::new(Store::new())), shared_key: None,
+            delete_on_destroy: AtomicBool::new(false),
+        }
+    }
+
+    unsafe fn put(session: &mut Session, key: &[u8], value: &[u8]) -> HRESULT {
+        store_value(session, key.as_ptr().cast(), key.len() as u32, value.as_ptr().cast(), value.len() as u32)
+    }
+
+    #[test]
+    fn cache_capacity_rejects_an_oversized_entry() {
+        let mut session = memory_session();
+        let value = vec![7; MAX_STORE_BYTES];
+        assert_eq!(unsafe { put(&mut session, b"k", &value) }, 0x887A_0034u32 as i32);
+        let store = session.store.lock().unwrap();
+        assert_eq!(store.bytes, 0);
+        assert!(store.entries.is_empty());
+    }
+
+    #[test]
+    fn cache_capacity_accepts_exact_limit_and_rejects_another_key() {
+        let mut session = memory_session();
+        let value = vec![7; MAX_STORE_BYTES - 1];
+        assert_eq!(unsafe { put(&mut session, b"k", &value) }, S_OK);
+        assert_eq!(unsafe { put(&mut session, b"j", b"") }, 0x887A_0034u32 as i32);
+        let store = session.store.lock().unwrap();
+        assert_eq!(store.bytes, MAX_STORE_BYTES);
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.entries.get(b"k".as_slice()).unwrap(), &value);
+    }
+
+    #[test]
+    fn cache_capacity_failed_replacement_preserves_the_previous_value() {
+        let mut session = memory_session();
+        assert_eq!(unsafe { put(&mut session, b"k", b"old") }, S_OK);
+        let value = vec![7; MAX_STORE_BYTES];
+        assert_eq!(unsafe { put(&mut session, b"k", &value) }, 0x887A_0034u32 as i32);
+        let store = session.store.lock().unwrap();
+        assert_eq!(store.bytes, 4);
+        assert_eq!(store.entries.get(b"k".as_slice()).unwrap(), b"old");
+    }
+
+    #[test]
+    fn cache_capacity_accounts_for_replacements_in_a_full_store() {
+        let mut session = memory_session();
+        assert_eq!(unsafe { put(&mut session, b"k", b"old") }, S_OK);
+        let value = vec![7; MAX_STORE_BYTES - 5];
+        assert_eq!(unsafe { put(&mut session, b"j", &value) }, S_OK);
+        assert_eq!(unsafe { put(&mut session, b"k", b"grow") }, DXGI_ERROR_CACHE_FULL);
+        {
+            let store = session.store.lock().unwrap();
+            assert_eq!(store.bytes, MAX_STORE_BYTES);
+            assert_eq!(store.entries.get(b"k".as_slice()).unwrap(), b"old");
+        }
+        assert_eq!(unsafe { put(&mut session, b"k", b"new") }, S_OK);
+        assert_eq!(unsafe { put(&mut session, b"k", b"") }, S_OK);
+        assert_eq!(unsafe { put(&mut session, b"x", b"yz") }, S_OK);
+        let store = session.store.lock().unwrap();
+        assert_eq!(store.bytes, MAX_STORE_BYTES);
+        assert_eq!(store.entries.len(), 3);
+        assert!(store.entries.get(b"k".as_slice()).unwrap().is_empty());
+        assert_eq!(store.entries.get(b"x".as_slice()).unwrap(), b"yz");
+    }
 
     #[test]
     fn rejected_create_shader_cache_session_falls_back_to_working_in_memory_session() {
