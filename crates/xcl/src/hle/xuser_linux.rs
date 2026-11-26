@@ -245,7 +245,8 @@ pub unsafe extern "win64" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) 
 }
 
 pub unsafe extern "win64" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
-    if result == E_PENDING {
+    // E_PENDING is not a completion: the provider still has work to do (libHttpClient).
+    if b.is_null() || result == E_PENDING {
         return;
     }
     let Lookup::Active(s) = lookup(b) else { return };
@@ -284,6 +285,9 @@ pub unsafe extern "win64" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT
 }
 
 pub unsafe extern "win64" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
     match lookup(b) {
         Lookup::Active(s) => {
             let mut g = s.inner.lock().unwrap();
@@ -300,6 +304,9 @@ pub unsafe extern "win64" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) ->
 }
 
 pub unsafe extern "win64" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT {
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
     // libHttpClient always writes `*bufferSize` before returning, including E_PENDING (0).
     match lookup(b) {
         Lookup::Active(s) => {
@@ -332,6 +339,9 @@ pub unsafe extern "win64" fn XAsyncGetResult(
     buffer: *mut c_void,
     used: *mut usize,
 ) -> HRESULT {
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
     // libHttpClient writes `*bufferUsed` (0) before returning E_PENDING / failure HRESULTs.
     match lookup(b) {
         Lookup::Invalid => E_INVALIDARG,
@@ -402,6 +412,9 @@ pub unsafe extern "win64" fn XAsyncGetResult(
 }
 
 pub unsafe extern "win64" fn XAsyncCancel(b: *mut XAsyncBlock) {
+    if b.is_null() {
+        return;
+    }
     let Lookup::Active(s) = lookup(b) else { return };
     if s.inner.lock().unwrap().phase != Phase::Pending {
         return;
@@ -1617,6 +1630,50 @@ mod tests {
                 E_INVALIDARG
             );
             assert_eq!(token16_ptr, std::ptr::null_mut());
+        }
+    }
+
+    /// Null `XAsyncBlock` inputs must be rejected before any state lookup: returning
+    /// `E_INVALIDARG` (or a silent no-op for the void returns) instead of touching the
+    /// `ACTIVE` map or dereferencing the block. Linux twin of the upstream null-reject
+    /// pins (same contract, `win64` ABI, no PC-runtime forwarding on this twin).
+    #[test]
+    fn xasync_entry_points_reject_null_block() {
+        unsafe {
+            assert_eq!(
+                XAsyncBegin(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0x1234),
+                E_INVALIDARG
+            );
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(
+                XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0),
+                E_INVALIDARG
+            );
+            assert_eq!(XAsyncSchedule(std::ptr::null_mut(), 0), E_INVALIDARG);
+            // Void returns: must be silent no-ops, not traps.
+            XAsyncComplete(std::ptr::null_mut(), S_OK, 0);
+            XAsyncComplete(&mut b, E_PENDING, 0);
+            assert_eq!(XAsyncGetStatus(std::ptr::null_mut(), false), E_INVALIDARG);
+            let mut size = 0usize;
+            assert_eq!(XAsyncGetResultSize(std::ptr::null_mut(), &mut size), E_INVALIDARG);
+            let mut buf = [0u8; 4];
+            let mut used = 0usize;
+            assert_eq!(
+                XAsyncGetResult(std::ptr::null_mut(), std::ptr::null(), 4, buf.as_mut_ptr() as _, &mut used),
+                E_INVALIDARG
+            );
+            XAsyncCancel(std::ptr::null_mut());
+            assert_eq!(XAsyncRun(std::ptr::null_mut(), 0x1234), E_INVALIDARG);
+            assert_eq!(XAsyncRun(&mut b, 0), E_INVALIDARG);
+
+            // begin_with_fixups returns E_INVALIDARG on null b and cleans up its Payload without leak.
+            assert_eq!(
+                begin_with_fixups(std::ptr::null_mut(), 0x5678, || Ok(PayloadBuf { bytes: vec![1, 2, 3], fixups: Vec::new() })),
+                E_INVALIDARG
+            );
+            // No null call may have registered state for the null address or the stack block.
+            assert!(!active_map().lock().unwrap().contains_key(&(std::ptr::null_mut::<XAsyncBlock>() as usize)));
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b as *mut XAsyncBlock as usize)));
         }
     }
 }
