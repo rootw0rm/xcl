@@ -7148,6 +7148,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
                 0 => put(&mut c.pRootSignature, p),
                 6 => put(&mut c.CS, p),
                 18 => put(&mut c.NodeMask, p),
+                20 => put(&mut c.Flags, p),
                 _ => {}
             }
         }
@@ -9115,6 +9116,49 @@ mod map_tests {
         // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
         assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
         assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
+    }
+
+    /// A console compute stream's FLAGS subobject reaches the projected descriptor:
+    /// `dev_create_compute_pso` uses it for the driver's own cache key the same way a
+    /// legacy desc's flags are used (#2607).
+    #[test]
+    fn a_compute_stream_keeps_its_flags_subobject() {
+        let console_cs = crate::gpu::xbox::tests::sample(
+            1,
+            &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])],
+        );
+        let parse = |flags: Option<u32>| -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            let mut stream = Vec::new();
+            let mut cs_bc = [0u8; 16];
+            cs_bc[0..8].copy_from_slice(&(console_cs.as_ptr() as usize).to_le_bytes());
+            cs_bc[8..16].copy_from_slice(&console_cs.len().to_le_bytes());
+            stream.extend_from_slice(&6u32.to_le_bytes());
+            stream.extend_from_slice(&0u32.to_le_bytes());
+            stream.extend_from_slice(&cs_bc);
+            while stream.len() % 8 != 0 {
+                stream.push(0);
+            }
+            if let Some(f) = flags {
+                stream.extend_from_slice(&20u32.to_le_bytes());
+                stream.extend_from_slice(&f.to_le_bytes());
+                while stream.len() % 8 != 0 {
+                    stream.push(0);
+                }
+            }
+            #[repr(C)]
+            struct StreamDesc {
+                size: usize,
+                ptr: usize,
+            }
+            let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
+            match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
+                StreamPipeline::Compute(c) => *c,
+                _ => panic!("expected compute stream pipeline"),
+            }
+        };
+        assert_eq!(parse(None).Flags.0, 0);
+        assert_eq!(parse(Some(1)).Flags.0, 1, "the FLAGS subobject must reach the projected compute desc");
+        assert_eq!(parse(Some(3)).Flags.0, 3);
     }
 }
 
