@@ -1284,3 +1284,61 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-139 (task-1795729800-2f4f): #2890 ported, #2888/#2889/#2891 SKIP, probe past #2887
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2365 refs (+3 vs step-138), in-range set exactly
+  #2830..#2891 minus the known gaps — no refs >=2892 in batched;
+  sequential still ground truth. Per-PR sequential probe #2830..#3450
+  (widened past #2887 per mem-1795712765-78dc; foreground 2830..3000 +
+  background 3001..3200 + background 3201..3450, no tail left open)
+  found 47 PRESENT (#2830..#2891 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876/#2880/#2883-#2885/#2892+
+  gaps), all 43 prior pins match (no force-push, #2872 pin `3893df0a` +
+  #2879 pin `63197e31` + #2881 pin `2c50cc71` + #2882 pin `3e8e2c43` +
+  #2886 pin `237b7181` + #2887 pin `128ee21f` hold, all OPEN
+  merge-base exit 1); #2892..#3450 ALL MISSING — scan complete,
+  top is #2891.
+- Triage: #2890 `c6c14a15` PORTED verbatim in `1efa5ac0` (single-commit
+  on `8b957bec`, parent IS in main, OPEN; 1 file
+  `crates/xcl/tests/e2e.rs` +24/-4): `title_under_the_debug_layer`
+  gains a `TAIL = 40` + `tail()` helper and prints the last 40 lines of
+  `xcl.log` in its three assertion messages, tolerating a missing log
+  (`unwrap_or_default`). Cross-platform test diagnostics, applies
+  cleanly (only context offset is the linux-only
+  `debug_layer_skip_line` helper); hunk bodies identical to upstream.
+  #2888 `5fefeb15` SKIP — 6-commit stack off `upstream/main`
+  (merge-base `8b957bec`; tip parent `128ee21f` = #2887 tip), whole-stack
+  5 files +741 (`README.md`, `perf-run.ps1`, `perf-compare.ps1` new +
+  tests), tip-only 3 files +285 (`perf-compare.ps1` + tests, README):
+  zero Rust, Windows-only PowerShell absent from the `linux` tree.
+  #2889 `ca3eb153` SKIP — single-commit on `8b957bec`, OPEN, 1 file
+  `crates/xcl/tests/tiling_parity.rs` +286 new (reserved-resource
+  tiling parity vs the host D3D12 driver, issue #480): imports the
+  `windows` crate (a `cfg(windows)`-only dep) and `xcl::hle::d3d12x`
+  (`hle` is `#[cfg(windows)]` in `lib.rs`), yet carries ZERO
+  `#![cfg(windows)]` gates (count 0; all 20+ sibling `d3d12_*.rs` tests
+  are gated line 1) — a verbatim port would break Linux
+  `cargo check --tests`; held until upstream gates it or the Vulkan
+  backend covers the surface. #2891 `0246ae43` SKIP — dev-stack tip on
+  `71b8e6e0` (NOT in main; merge-base vs upstream/main empty; stack
+  244 files +85951/-46522), tip-only 1 file +507/-17
+  `hle/d3d12x/title_textures.rs` (write-watch Hot/Cold tiering):
+  whole-stack port out of hourly-sync scope, tip file Windows-only.
+  Earlier pins stand: #2830-new-head/#2831/#2832 SKIP; #2833/#2834
+  landed; #2836 adapted in `7645afeb`; #2837/#2842 SKIP; #2838 landed
+  verbatim in `aa59e8ac`; #2843-#2887 SKIP (minus #2857/#2863 gaps).
+- Gates (1 code port + doc): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step139r2` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (fresh-root `report.json` verified before removal; first fresh-root
+  run's report was deleted unverified and re-run).
+  Lock audit: 0 new `lock()` (test-only change); `diff --check` clean.
