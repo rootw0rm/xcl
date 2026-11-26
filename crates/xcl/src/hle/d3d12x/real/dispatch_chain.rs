@@ -236,6 +236,7 @@ impl Drop for Recording {
     fn drop(&mut self) {
         self.read_back();
     }
+}
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
 /// list → the allocator it records on and the scratch its chains share: they are dispatched one
