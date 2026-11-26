@@ -231,7 +231,11 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
-        s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        // the same root signature again keeps the bound arguments (D3D12: only a different
+        // one invalidates them)
+        if !console_list::same_layout(&s.layout_gfx, &layout) {
+            s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        }
         s.layout_gfx = layout;
         s.rs_gfx = rs as usize;
     });
@@ -281,8 +285,15 @@ fn note_address(va: u64) {
 /// command signatures that change root arguments (they need the title's root signature)
 static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
-pub(super) fn note_root_changing_signature(sig: usize) {
-    ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
+/// noted at every creation, so a signature made at a freed one's address does not keep its kind
+pub(super) fn note_root_changing_signature(sig: usize, changes: bool) {
+    let mut s = ROOT_SIGNATURES.lock().unwrap();
+    let s = s.get_or_insert_with(Default::default);
+    if changes {
+        s.insert(sig);
+    } else {
+        s.remove(&sig);
+    }
 }
 
 /// command signatures with a Dispatch argument (noted at every creation, so a signature made
@@ -983,7 +994,9 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
-        s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        if !console_list::same_layout(&s.layout, &layout) {
+            s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        }
         s.layout = layout;
     });
 }
@@ -1518,6 +1531,50 @@ void main(uint t : SV_GroupIndex) {
         forget(list);
     }
 
+    #[test]
+    fn the_same_root_signature_again_keeps_the_root_arguments() {
+        let list = 0x7100_0301usize as *mut c_void;
+        let (rs_a, rs_b) = (0x7100_0310usize, 0x7100_0320usize);
+        console_list::note_root_signature(rs_a, &test_rts0_blob());
+        console_list::note_root_signature(rs_b, &test_rts0_blob());
+        let set = |gfx: bool, rs: usize| unsafe {
+            if gfx { set_graphics_root_signature(list, rs as *mut c_void) } else { set_compute_root_signature(list, rs as *mut c_void) }
+        };
+        let args = |gfx: bool| with(list, |s| if gfx { s.args_gfx.clone() } else { s.args.clone() });
+        reset(list, 0x7100_0330, 0);
+        set(false, rs_a);
+        set(true, rs_a);
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        assert!(args(false).iter().any(|b| *b != 0));
+        assert!(args(true).iter().all(|b| *b == 0), "compute and graphics arguments are separate");
+        // the same signature again: the arguments stay
+        set(false, rs_a);
+        assert_eq!(&args(false)[..4], &0xABCDu32.to_le_bytes());
+        // graphics is independent: a different one there leaves compute alone
+        unsafe { set_graphics_root_constant(list, 0, 0x1234, 0) };
+        set(true, rs_b);
+        assert!(args(true).iter().all(|b| *b == 0));
+        assert_eq!(&args(false)[..4], &0xABCDu32.to_le_bytes());
+        // a different signature clears
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        // a signature re-made at the same address is a different one
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        console_list::note_root_signature(rs_b, &test_rts0_blob());
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        // Reset and ClearState clear, so the signature set again afterwards starts empty
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        clear_state(list, 0);
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        reset(list, 0x7100_0330, 0);
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        forget(list);
+    }
+
     #[repr(C)]
     struct FakeAdoptedList {
         vt: *const usize,
@@ -1599,7 +1656,7 @@ void main(uint t : SV_GroupIndex) {
         let standin_ok = 0x7200_0001usize;
         let real_ok = 0x7200_0002usize;
         let sig_root_changing = 0x7200_00F0usize;
-        note_root_changing_signature(sig_root_changing);
+        note_root_changing_signature(sig_root_changing, true);
 
         pso_async::submit(
             standin_ok,
@@ -1698,6 +1755,17 @@ void main(uint t : SV_GroupIndex) {
     }
 
     #[test]
+    fn a_command_signature_made_at_a_freed_ones_address_does_not_keep_its_kind() {
+        let sig = 0x7230_00F0usize;
+        let changing = |s: usize| ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|set| set.contains(&s));
+        note_root_changing_signature(sig, true);
+        assert!(changing(sig));
+        // the signature is freed; a simple one is made at its address
+        note_root_changing_signature(sig, false);
+        assert!(!changing(sig));
+    }
+
+    #[test]
     fn execute_indirect_skips_failed_shared_console_compute_standin() {
         let mut orig_vt = [0usize; 64];
         orig_vt[1] = fake_add_ref as usize;
@@ -1733,7 +1801,7 @@ void main(uint t : SV_GroupIndex) {
         let sig_dispatch = 0x7210_00F8usize;
         let sig_root_changing = 0x7210_00F0usize;
         note_signature_dispatches(sig_dispatch, true);
-        note_root_changing_signature(sig_root_changing);
+        note_root_changing_signature(sig_root_changing, true);
 
         pso_async::submit_lazy(shell_fail, true, Box::new(|| 0), 0);
         pso_async::shared(shell_fail, shared_driver);
