@@ -11824,4 +11824,144 @@ mod tests {
             assert_eq!(VirtualFree(m1b as *mut c_void, 0, 0x8000), 1);
         }
     }
+
+    #[test]
+    fn map_pages_gap_overrun_is_refused() {
+        // Upstream #1635, gap half: a range holding a page number from no live
+        // allocation is refused with ERROR_INVALID_PARAMETER however it is
+        // mapped (NULL address or an explicit graphics VA). Only own pages and
+        // VAs are asserted, so other tests may run alongside.
+        unsafe {
+            let (mut n, mut pages) = (1usize, [0u64; 1]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            let live = pages[0] as usize;
+            // A page number far past every live block: never allocated, so it
+            // has no home whatever other tests allocate concurrently.
+            let dead = live + FRAMES * 1024;
+            assert!(page_home(dead).is_none());
+
+            let mut overrun = [pages[0], dead as u64];
+            set_error(0);
+            assert!(XMemMapPhysicalPages(std::ptr::null_mut(), 2, overrun.as_mut_ptr()).is_null());
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            // An explicit graphics VA refuses the same range before touching memory.
+            let at = XMemMapPhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr());
+            assert!(!at.is_null());
+            set_error(0);
+            assert_eq!(
+                XMemMapPhysicalPages(at, 2, overrun.as_mut_ptr()),
+                std::ptr::null_mut()
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            // The failed call left the live mapping alone.
+            assert_eq!(XMemMapPhysicalPages(at, 1, pages.as_mut_ptr()) as usize, at as usize);
+
+            assert_eq!(XMemFreePhysicalPages(1, pages.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(at, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn cross_allocation_live_span_splits_with_per_page_contents() {
+        // Upstream #1635, live-span half, DELIBERATE divergence: consecutive page
+        // numbers spanning two live allocations refuse upstream
+        // (ERROR_INVALID_PARAMETER) but split-map here — the NULL-address fast
+        // path only fires for one live block (`contiguous_home`), everything else
+        // falls through to the per-page loop, so no cross-block home is ever
+        // returned over unrelated memory. No `page_block` refactor: the split is
+        // the fix, pinned for both the NULL and the explicit-VA paths.
+        unsafe {
+            let page = 0x1_0000usize;
+            let (mut na, mut pa) = (1usize, [0u64; 1]);
+            let (mut nb, mut pb) = (1usize, [0u64; 1]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut na, pa.as_mut_ptr()), 1);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut nb, pb.as_mut_ptr()), 1);
+            let (a, b) = (pa[0] as usize, pb[0] as usize);
+            if b != a + FRAMES {
+                // Another test allocated between the two calls: not one
+                // consecutive span (the quad case in
+                // `cross_allocation_pages_map_split_and_unmap_preserves_neighbors`
+                // covers the non-consecutive layout instead).
+                assert_eq!(XMemFreePhysicalPages(1, pa.as_mut_ptr()), 1);
+                assert_eq!(XMemFreePhysicalPages(1, pb.as_mut_ptr()), 1);
+                return;
+            }
+            assert_eq!(contiguous_home(&[a, b]), None, "two allocations never share one home");
+            assert!(write_physical_pages(&[a], 0, &0xD0u32.to_ne_bytes()));
+            assert!(write_physical_pages(&[b], 0, &0xD1u32.to_ne_bytes()));
+
+            // NULL address: succeeds, each page keeps its own contents.
+            let mut pair = [pa[0], pb[0]];
+            let m = XMemMapPhysicalPages(std::ptr::null_mut(), 2, pair.as_mut_ptr()) as *mut u32;
+            assert!(!m.is_null());
+            assert_eq!(*m.add(page / 4 * 0), 0xD0);
+            assert_eq!(*m.add(page / 4 * 1), 0xD1);
+
+            // Explicit address: the same span re-maps per page, contents intact.
+            let mut pair2 = [pa[0], pb[0]];
+            assert_eq!(
+                XMemMapPhysicalPages(m as *mut c_void, 2, pair2.as_mut_ptr()) as usize,
+                m as usize
+            );
+            assert_eq!(*m.add(page / 4 * 0), 0xD0);
+            assert_eq!(*m.add(page / 4 * 1), 0xD1);
+
+            assert_eq!(XMemFreePhysicalPages(1, pa.as_mut_ptr()), 1);
+            assert_eq!(XMemFreePhysicalPages(1, pb.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(m as *mut c_void, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn remap_at_current_mapping_preserves_contents() {
+        // Linux twin of upstream #1143's
+        // `mapping_page_at_its_own_home_in_mixed_call_keeps_it_committed`. The
+        // upstream `home == at` arm has no Linux counterpart: homes are private
+        // `malloc` memory while mapping targets always come from the graphics
+        // pool, so a home address can never equal an explicit VA (the
+        // `gfx_contains` gate rejects anything else). Re-mapping a page at the
+        // VA it already occupies therefore goes through the ordinary move path
+        // and stays AWAY-recorded by design — no copy-onto-itself decommit, no
+        // lost contents. Only own pages and VAs are asserted.
+        unsafe {
+            let page = 0x1_0000usize;
+            let (mut n2, mut blk) = (2usize, [0u64; 2]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n2, blk.as_mut_ptr()), 1);
+            let (mut n1, mut other) = (1usize, [0u64; 1]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n1, other.as_mut_ptr()), 1);
+            let (b0, o) = (blk[0] as usize, other[0] as usize);
+
+            let h0 = XMemMapPhysicalPages(std::ptr::null_mut(), 1, blk.as_mut_ptr()) as usize;
+            let h_other =
+                XMemMapPhysicalPages(std::ptr::null_mut(), 1, other.as_mut_ptr()) as usize;
+            assert_ne!(h0, 0);
+            assert_ne!(h_other, 0);
+            *(h0 as *mut u32) = 0x1122_3344;
+            *(h_other as *mut u32) = 0x5566_7788;
+
+            // Map [blk[0], other] at h0: blk[0] already occupies h0, other moves
+            // to h0 + PHYS_PAGE. Both keep their contents.
+            let mut mixed = [blk[0], other[0]];
+            assert_eq!(
+                XMemMapPhysicalPages(h0 as *mut c_void, 2, mixed.as_mut_ptr()) as usize,
+                h0
+            );
+            assert_eq!(*(h0 as *const u32), 0x1122_3344);
+            assert_eq!(*((h0 + page) as *const u32), 0x5566_7788);
+            // Linux bookkeeping (differs from upstream on purpose): the mapping
+            // stays AWAY-recorded instead of becoming home-resident.
+            let guard = away().lock().unwrap();
+            let recorded = guard
+                .as_ref()
+                .is_some_and(|st| st.page.get(&b0) == Some(&h0) && st.page.get(&o) == Some(&(h0 + page)));
+            drop(guard);
+            assert!(recorded, "re-mapped pages stay AWAY-recorded on Linux");
+
+            assert_eq!(XMemFreePhysicalPages(2, blk.as_mut_ptr()), 1);
+            assert_eq!(XMemFreePhysicalPages(1, other.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(h0 as *mut c_void, 0, 0x8000), 1);
+            assert_eq!(VirtualFree(h_other as *mut c_void, 0, 0x8000), 1);
+        }
+    }
 }
