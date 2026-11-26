@@ -66,6 +66,7 @@ pub mod spirv;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod partition;
+pub mod ps_masks;
 pub mod x64_masks;
 #[cfg(windows)]
 pub mod pso;
