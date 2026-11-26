@@ -111,6 +111,7 @@ impl Inner {
 
 pub struct State {
     id: u64,
+    queue: Option<Arc<taskqueue::Queue>>,
     provider: usize,
     context: usize,
     identity: usize,
@@ -241,6 +242,7 @@ pub unsafe extern "system" fn XAsyncBegin(
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        queue: taskqueue::queue_from((*b).queue),
         provider,
         context: context as usize,
         identity: identity as usize,
@@ -266,11 +268,12 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     if b.is_null() {
         return E_INVALIDARG;
     }
-    let Some(q) = taskqueue::queue_from((*b).queue) else {
+    let Lookup::Active(s) = lookup(b) else { return E_INVALIDARG };
+    let Some(q) = &s.queue else {
         return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
     };
     // a terminated queue takes no new work (libHttpClient: XTaskQueueSubmitDelayedCallback)
-    if !taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
+    if !taskqueue::submit_delayed(q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
         return E_ABORT;
     }
     S_OK
@@ -300,9 +303,8 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         g.result_size = if status >= 0 { required } else { 0 };
         cleanup_now = g.result_size == 0;
     }
-    // Snapshot callback/queue before publishing completion so a waiter woken from
-    // `XAsyncGetStatus(b, true)` can safely destroy a stack-allocated `XAsyncBlock`.
-    let (cb, queue_ptr) = ((*b).callback, (*b).queue);
+    // Snapshot the callback before publishing completion; the queue is retained in `s`.
+    let cb = (*b).callback;
     if cleanup_now {
         call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
     }
@@ -320,8 +322,8 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
     }
     s.cv.notify_all();
     if cb != 0 {
-        if let Some(q) = taskqueue::queue_from(queue_ptr) {
-            let _ = taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
+        if let Some(q) = &s.queue {
+            let _ = taskqueue::submit_now(q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
 }
@@ -483,6 +485,7 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        queue: taskqueue::queue_from((*b).queue),
         provider: 0,
         context: 0,
         identity: 0,
@@ -745,6 +748,80 @@ mod tests {
     }
     unsafe extern "system" fn begins_without_work(_op: u32, _data: *const XAsyncProviderData) -> HRESULT {
         S_OK
+    }
+
+    unsafe extern "system" fn count_block_completion(b: *mut XAsyncBlock) {
+        let count = &*((*b).context as *const AtomicU32);
+        count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn async_complete_after_queue_handle_close_delivers_callback() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+            let queue = Arc::downgrade(&taskqueue::queue_from(q).unwrap());
+            let count = AtomicU32::new(0);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            b.context = &count as *const AtomicU32 as *mut c_void;
+            b.callback = count_block_completion as usize;
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            taskqueue::XTaskQueueCloseHandle(q);
+            XAsyncComplete(&mut b, S_OK, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, false), S_OK);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(queue.upgrade().is_none(), "completed operation must release its queue");
+        }
+    }
+
+    #[test]
+    fn async_schedule_after_queue_handle_close_uses_begins_queue() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_IMMEDIATE, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+            let count = AtomicU32::new(0);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            b.context = &count as *const AtomicU32 as *mut c_void;
+            b.callback = count_block_completion as usize;
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            taskqueue::XTaskQueueCloseHandle(q);
+            let scheduled = XAsyncSchedule(&mut b, 0);
+            let status = XAsyncGetStatus(&mut b, false);
+            // Keep the negative control from leaving a pending state pointing at this stack block.
+            if status == E_PENDING { XAsyncComplete(&mut b, E_ABORT, 0); }
+            assert_eq!(scheduled, S_OK);
+            assert_eq!(status, S_OK);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn async_run_after_queue_handle_close_delivers_callback() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+            let mut dispatch_handle = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueDuplicateHandle(q, &mut dispatch_handle), S_OK);
+            let count = AtomicU32::new(0);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            b.context = &count as *const AtomicU32 as *mut c_void;
+            b.callback = count_block_completion as usize;
+            assert_eq!(XAsyncRun(&mut b, run_work as usize), S_OK);
+            taskqueue::XTaskQueueCloseHandle(q);
+            let dispatched = taskqueue::XTaskQueueDispatch(dispatch_handle, PORT_WORK, 0);
+            let status = XAsyncGetStatus(&mut b, false);
+            taskqueue::XTaskQueueCloseHandle(dispatch_handle);
+            if status == E_PENDING { XAsyncComplete(&mut b, E_ABORT, 0); }
+            assert!(dispatched);
+            assert_eq!(status, 7);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
