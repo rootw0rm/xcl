@@ -61,7 +61,10 @@ fn main() {
             _ => {}
         }
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // the tree this run builds, read at run time: `env!` would keep the tree that compiled this
+    // script, and worktrees sharing a target dir share its binary (then their source ids hash
+    // the first tree's files)
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set for build scripts"));
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     add(&mut h, b"xcl-translator-source-v1\0");
     add(&mut h, TRANSLATION_GLUE_REVISION.as_bytes());
@@ -90,7 +93,7 @@ fn main() {
     sources.sort();
     let mut d = 0xcbf2_9ce4_8422_2325u64;
     for path in &sources {
-        add(&mut d, path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/").as_bytes());
+        add(&mut d, path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/").as_bytes());
         add(&mut d, &[0]);
         add_source(&mut d, &std::fs::read(path).expect("read direct DXIL source"));
         add(&mut d, &[0]);

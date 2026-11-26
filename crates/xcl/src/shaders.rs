@@ -1775,6 +1775,20 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
+// The worker-process preparation (`prepare_workers` over `host::system_commit`) stays
+// Windows-only until the Phase-D Linux preparation; the sizing itself is shared and tested.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn workers_for(cores: usize, free_mb: u64) -> usize {
+    cores.saturating_sub(4).min(32).min((free_mb / 3072) as usize).max(1)
+}
+
+/// The workers for `cores` logical processors and the system's commit charge `used` and its
+/// `limit`, both in bytes as `host::system_commit` gives them.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn workers_for_commit(cores: usize, used: u64, limit: u64) -> usize {
+    workers_for(cores, limit.saturating_sub(used) >> 20)
+}
+
 // Windows-only (Pipelines/DXC/D3D12); see the Linux stub below.
 #[cfg(windows)]
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
@@ -1834,14 +1848,19 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 };
-                let Some(sh) = xbox::parse(&blob) else {
-                    if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
-                        failed.fetch_add(1, Ordering::Relaxed);
+                let shader = xbox::parse(&blob);
+                let stage = match &shader {
+                    Some(sh) => sh.stage.as_str(),
+                    None if recomp::pso::fspx(&blob).is_some() => "CS",
+                    None => {
+                        if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        record_done();
+                        continue;
                     }
-                    record_done();
-                    continue;
                 };
-                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                if only.is_some_and(|o| !stage.eq_ignore_ascii_case(o)) {
                     record_done();
                     continue;
                 }
@@ -1852,7 +1871,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again; an MS
                 // as the compute pass of its two-pass pipelines (`pso::console_mesh_in`)
-                let compute = sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_))));
+                // An admitted shader without XDAT is the FSPX compute case above.
+                let compute = shader.as_ref().is_none_or(|sh| sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, sh, f), Some(recomp::Mode::Compute(_)))));
                 let mesh = !compute && two_pass_mesh(&blob, &sh);
                 if compute || mesh {
                     // a mesh pipeline's key has its PS too: `--used-only` passes the MSs over
@@ -1886,6 +1906,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
+                let Some(sh) = shader else { continue };
                 let (mut warmed_vs, mut warmed_ps) = (false, false);
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
@@ -2407,6 +2428,17 @@ mod tests {
 
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
+
+    /// The commit figures come in bytes: 6 GiB left on 16 logical processors is room for two
+    /// workers, not twelve; a commit that is not known (0, 0) gives one.
+    #[test]
+    fn preparation_workers_take_the_commit_left_in_bytes() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(workers_for_commit(16, 10 * GIB, 16 * GIB), 2);
+        assert_eq!(workers_for_commit(16, 0, 64 * GIB), 12);
+        assert_eq!(workers_for_commit(16, 0, 0), 1);
+        assert_eq!(workers_for_commit(16, 20 * GIB, 16 * GIB), 1);
+    }
 
     fn compute_sample() -> Vec<u8> {
         let mut compute = fssm(&CODE, &[(6, 3)]);

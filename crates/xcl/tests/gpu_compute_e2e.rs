@@ -74,17 +74,80 @@ fn console_cs_flags(code: &[u8], rsrc2: u32, threads: [u32; 3], flags: u32) -> V
     let dwords = (d.len() / 4) as u32;
     d[4..8].copy_from_slice(&dwords.to_le_bytes());
     d[16..20].copy_from_slice(&((nobc - 8) as u32).to_le_bytes());
+    shader_container(b"DXIL", &d)
+}
+
+fn shader_container(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut v = vec![0u8; 36];
     v[0..4].copy_from_slice(b"DXBC");
     v[20..24].copy_from_slice(&1u32.to_le_bytes());
     v[28..32].copy_from_slice(&1u32.to_le_bytes());
     v[32..36].copy_from_slice(&36u32.to_le_bytes());
-    v.extend_from_slice(b"DXIL");
-    le(&mut v, d.len() as u32);
-    v.extend_from_slice(&d);
+    v.extend_from_slice(tag);
+    le(&mut v, data.len() as u32);
+    v.extend_from_slice(data);
     let total = v.len() as u32;
     v[24..28].copy_from_slice(&total.to_le_bytes());
     v
+}
+
+#[test]
+fn folder_precompile_includes_fspx_only_compute() {
+    use std::{fs, path::PathBuf, process::Command};
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mut part = Vec::from(*b"FSPX");
+    // Two directory entries: type 0 is the compute header, type 6 is the code.
+    for word in [1, 2, 0x74, 0, 0x30, 0x1c, 0, 6, 0x4c, 0x28, 0] {
+        le(&mut part, word);
+    }
+    part.resize(0x74, 0);
+    part[0x3c..0x42].copy_from_slice(&[1, 0, 1, 0, 1, 0]); // numthreads(1, 1, 1)
+    part[0x70..].copy_from_slice(&0xbf81_0000u32.to_le_bytes()); // s_endpgm
+    let blob = shader_container(b"ACCC", &part);
+    assert!(xcl::gpu::xbox::parse(&blob).is_none());
+    assert!(xcl::gpu::recomp::pso::fspx(&blob).is_some());
+
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("xcl-fspx-precompile-{}-{nonce}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let dir = Directory(root);
+    let input = dir.0.join("input");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("compute.bin"), blob).unwrap();
+    let precompile = |only, cache, extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders").arg(&input)
+            .args(["--precompile", "--only", only, "--split", "1"])
+            .args(extra)
+            .env("XCL_DXIL_CACHE", dir.0.join(cache))
+            .env("XCL_DXC_THREADS", "1")
+            .env("XCL_DIRECT_DXIL", "0")
+            .env("XCL_PSO_DISK_CACHE", "1")
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "{text}\n{}", String::from_utf8_lossy(&output.stderr));
+        println!("FSPX precompile --only {only} {extra:?}\n{text}");
+        text
+    };
+    let ps = precompile("ps", "pixel-cache", &[]);
+    assert!(ps.contains("compiled 0, already cached 0, errors 0"), "{ps}");
+    let cs = precompile("cs", "compute-cache", &[]);
+    assert!(cs.contains("compiled 1, already cached 0, errors 0"), "{cs}");
+
+    if !runner::wave32_supported().unwrap_or(false) {
+        return runner::skip_test("no wave32 GPU for the native pipeline check");
+    }
+    let native = precompile("cs", "native-cache", &["--pipelines"]);
+    assert!(native.contains("pipelines made on the GPU 1, refused 0"), "{native}");
+    let mut files = fs::read_dir(dir.0.join("native-cache/driver")).unwrap();
+    let blob = files.next().unwrap().unwrap().path();
+    assert!(files.next().is_none() && blob.metadata().unwrap().len() > 0);
 }
 
 const V: u64 = 256; // VALU source code of v0
