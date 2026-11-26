@@ -324,6 +324,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   2 MiB, or the space for one thread group if larger.
 - Loading a cached shader without split pieces reuses the file buffer, avoiding a second
   payload-sized allocation.
+- XCL saves the driver's compiled blob for later runs when an eligible compute or graphics
+  pipeline takes at least 250 ms to build, even after the in-memory cache fills.
+  Set `XCL_PSO_DISK_CACHE=0` to disable these files.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the

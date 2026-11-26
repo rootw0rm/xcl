@@ -1621,10 +1621,11 @@ impl Pipelines {
             }
             driver_cache::path_for(dxil, desc.Flags.0, chained)
         });
-        let cached = {
+        let mut loaded = {
             let _phase = ShaderPhase::start("pipeline-cache-read", record, dxil.len());
             path.as_deref().and_then(driver_cache::load)
         };
+        let cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
@@ -1657,8 +1658,8 @@ impl Pipelines {
         // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
         // size cap and start the expensive uncached driver compile.
         if cached.is_some() && from_cache.is_none() && over_cap {
-            if let Some(path) = path.as_deref() {
-                let _ = std::fs::remove_file(path);
+            if let Some(loaded) = loaded.take() {
+                let _ = loaded.invalidate();
             }
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
