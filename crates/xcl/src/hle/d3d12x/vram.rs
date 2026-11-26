@@ -580,6 +580,17 @@ fn keep_spare_pools() -> usize {
 }
 
 /// The title's pages of video memory for tiled textures (see the module's comment).
+/// A superseded texture's NULL mapping, held until every queue has finished the work submitted
+/// before it (`unmap_superseded`). The texture keeps its tiles until then.
+struct HeldUnmap {
+    res: ID3D12Resource,
+    total: u32,
+    used: Vec<usize>,
+    used_extra: Vec<(usize, usize)>,
+    /// (a queue's mark fence, the value that follows that work)
+    marks: Vec<(ID3D12Fence, u64)>,
+}
+
 struct Pages {
     queue: ID3D12CommandQueue,
     /// signalled after each mapping; title queues wait for it before their next work
@@ -600,6 +611,11 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// queue → a fence signalled on it when a texture is superseded, and its last value
+    /// (`unmap_superseded`)
+    marks: std::collections::HashMap<usize, (ID3D12Fence, u64)>,
+    /// unmaps of superseded textures held until the work submitted before them is done
+    held: Vec<HeldUnmap>,
     /// cached `reservable()` answers for `(DXGI_FORMAT, SampleCount)` on this device
     reservable_cache: std::collections::HashMap<(i32, u32), bool>,
     /// reusable scratch buffers for `map()`
@@ -640,6 +656,8 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            marks: std::collections::HashMap::new(),
+            held: Vec::new(),
             reservable_cache: std::collections::HashMap::new(),
             scratch_heaps: Vec::new(),
             scratch_flags: Vec::new(),
@@ -745,6 +763,48 @@ impl Pages {
         );
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
+    /// A mark on each of `queues` (of this device) after the work submitted to it so far: (fence,
+    /// value). None when one cannot be made: the caller keeps the texture mapped.
+    unsafe fn mark(&mut self, dev: &ID3D12Device, queues: &[ID3D12CommandQueue]) -> Option<Vec<(ID3D12Fence, u64)>> {
+        let mut marks = Vec::with_capacity(queues.len());
+        for q in queues {
+            let mut qd: Option<ID3D12Device> = None;
+            if q.GetDevice(&mut qd).is_err() || qd.as_ref().map(|d| d.as_raw()) != Some(dev.as_raw()) {
+                continue;
+            }
+            let key = q.as_raw() as usize;
+            if !self.marks.contains_key(&key) {
+                let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                self.marks.insert(key, (f, 0));
+            }
+            let (f, v) = self.marks.get_mut(&key)?;
+            *v += 1;
+            q.Signal(&*f, *v).ok()?;
+            marks.push((f.clone(), *v));
+        }
+        Some(marks)
+    }
+
+    /// The held unmaps whose work is done: NULL-mapped now, their tiles back in the pool. Returns
+    /// their textures, to be let go of after `PAGES` is unlocked (the last reference's release
+    /// comes back to `forget_pages`).
+    unsafe fn release_held(&mut self, now: std::time::Instant) -> Vec<ID3D12Resource> {
+        let mut done = Vec::new();
+        if self.held.is_empty() {
+            return done;
+        }
+        for h in std::mem::take(&mut self.held) {
+            if h.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v) {
+                self.unmap(&h.res, h.total);
+                self.release_tiles(h.used, h.used_extra, now, true);
+                done.push(h.res);
+            } else {
+                self.held.push(h);
+            }
+        }
+        done
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1032,28 +1092,49 @@ unsafe fn place_on_pages(
 }
 
 /// Unmap a placed texture superseded by a placement with a different address range, returning its
-/// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
+/// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool.
+///
+/// Not at once: work already submitted may still copy to or sample the texture, and changing its
+/// tile mappings under that work removes the device on NVIDIA Ampere and Blackwell GPUs
+/// (`0x887a0006`, a copy whose tiles go NULL while it runs). A mark goes on every queue the title
+/// and the uploads use, and the unmap is made by `before_execute` once every mark is done: by the
+/// CPU, so the mapping queue never waits for a title queue (which could wait for work submitted
+/// later, behind the mapping queue).
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
+    let mut dev: Option<ID3D12Device> = None;
+    if res.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    // the queues before PAGES: their own locks never wait for it
+    let mut queues: Vec<ID3D12CommandQueue> = super::present::known_queues()
+        .into_iter()
+        .filter_map(|q| {
+            let raw = q as *mut c_void;
+            ID3D12CommandQueue::from_raw_borrowed(&raw).cloned()
+        })
+        .collect();
+    queues.extend(super::title_textures::upload_queues());
     let key = res.as_raw() as usize;
-    let mut g = PAGES.lock().unwrap();
-    let now = std::time::Instant::now();
-    for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.get_mut(&key) else { continue };
-        if !t.mapped {
+    let done = {
+        let mut g = PAGES.lock().unwrap();
+        let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
+        if !pages.targets.get(&key).is_some_and(|t| t.mapped) {
             return;
         }
-        let total = t.total;
-        let used = std::mem::take(&mut t.used);
-        let used_extra = std::mem::take(&mut t.used_extra);
+        // no mark, no unmap: the texture keeps its tiles
+        let Some(marks) = pages.mark(&dev, &queues) else { return };
+        let Some(t) = pages.targets.get_mut(&key) else { return };
+        let (total, used, used_extra) = (t.total, std::mem::take(&mut t.used), std::mem::take(&mut t.used_extra));
         t.mapped = false;
         if let Some(l) = t.levels.as_mut() {
             LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
             l.groups.iter_mut().for_each(|g| g.3 = false);
         }
-        pages.unmap(res, total);
-        pages.release_tiles(used, used_extra, now, true);
-        return;
-    }
+        pages.held.push(HeldUnmap { res: res.clone(), total, used, used_extra, marks });
+        pages.release_held(std::time::Instant::now())
+    };
+    drop(done);
 }
 
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
@@ -1070,6 +1151,17 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         return false;
     };
     if mapped {
+        return true;
+    }
+    // an unmap still held: the texture never lost its tiles
+    if let Some(i) = pages.held.iter().position(|h| h.res.as_raw() as usize == key) {
+        let h = pages.held.swap_remove(i);
+        if let Some(t) = pages.targets.get_mut(&key) {
+            (t.used, t.used_extra, t.mapped) = (h.used, h.used_extra, true);
+        }
+        // the caller holds `res`: not its last reference
+        drop(g);
+        drop(h.res);
         return true;
     }
     // (lazy levels: they get their pages again with their next texels)
@@ -1203,9 +1295,11 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    let mut held_done = Vec::new();
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            held_done = pages.release_held(now);
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
                 let _ = queue.Wait(&pages.fence, pages.value);
@@ -1228,6 +1322,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
     }
+    drop(held_done);
 }
 
 #[cfg(test)]
@@ -1254,6 +1349,13 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let Some(Some(p)) = g.get(&device) else { return (0, 0) };
     ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
 }
+
+#[cfg(test)]
+fn held_unmaps(device: usize) -> usize {
+    let g = PAGES.lock().unwrap();
+    g.get(&device).and_then(|p| p.as_ref()).map_or(0, |p| p.held.len())
+}
+
 
 /// Pool/tile identities used by one mapped resource: title pages, then extra pages.
 /// Unlike device-wide byte counts, these cannot shrink when unrelated idle targets expire.
@@ -1960,6 +2062,76 @@ mod tests {
     /// On the GPU: D32S8 targets 256 MiB apart take their own size of video memory, not an arena
     /// of 256 MiB each; depth and stencil survive a clear, CopyResource and a read of both planes;
     /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
+    #[test]
+    fn a_superseded_texture_keeps_its_tiles_until_the_work_before_it_is_done() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let key = dev.as_raw() as usize;
+            // a title queue whose submitted work cannot finish until `gate` is signalled
+            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            super::super::present::note_execute(title.as_raw(), &[]);
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            title.Wait(&gate, 1).unwrap();
+            let other: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+            };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut p);
+                assert!(hr.is_some_and(|hr| hr >= 0) && !p.is_null(), "texture at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let (a, b) = (0x7_1000_0000usize, 0x7_2000_0000usize);
+            let old = place_at(a);
+            let (bytes, _) = page_bytes_for(key);
+            assert!(bytes >= 16 * PAGE, "512 x 512 x 4 bytes on pages");
+
+            unmap_superseded(&old);
+            before_execute(&other);
+            assert_eq!(held_unmaps(key), 1, "the work submitted before it is not done: no unmap yet");
+            assert_eq!(page_bytes_for(key).0, bytes, "the texture keeps its tiles meanwhile");
+
+            gate.Signal(1).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            title.Signal(&done, 1).unwrap();
+            let t0 = std::time::Instant::now();
+            while done.GetCompletedValue() < 1 && t0.elapsed().as_secs() < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            before_execute(&other);
+            assert_eq!(held_unmaps(key), 0, "unmapped once that work is done");
+            assert!(page_bytes_for(key).0 < bytes, "its tiles went back to the pool");
+
+            // a texture mapped again before its unmap was made keeps the tiles it had
+            let again = place_at(b);
+            let with_again = page_bytes_for(key).0;
+            title.Wait(&gate, 2).unwrap();
+            unmap_superseded(&again);
+            assert_eq!(held_unmaps(key), 1);
+            assert!(remap_if_unmapped(&again));
+            assert_eq!(held_unmaps(key), 0, "the held unmap is dropped");
+            assert_eq!(page_bytes_for(key).0, with_again, "no tiles were taken or given back");
+            gate.Signal(2).unwrap();
+            drop((old, again));
+        }
+    }
+
     #[test]
     fn d32s8_targets_take_their_own_size_of_video_memory() {
         let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
