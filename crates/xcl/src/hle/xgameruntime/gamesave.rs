@@ -20,7 +20,6 @@ pub const E_GS_UPDATE_TOO_BIG: HRESULT = 0x8083_0005u32 as i32;
 pub const E_GS_QUOTA_EXCEEDED: HRESULT = 0x8083_0006u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
 pub const E_GS_BLOB_NOT_FOUND: HRESULT = 0x8083_0008u32 as i32;
-pub const E_GS_CONTAINER_NOT_FOUND: HRESULT = 0x8083_0010u32 as i32;
 
 pub const GS_MAX_BLOB_NAME_SIZE: usize = 1024;
 pub const GS_MAX_BLOB_SIZE: usize = 16 << 20; // 16 MiB
@@ -129,19 +128,50 @@ fn dec(file: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
-    let mut v: Vec<(String, PathBuf, u64)> = std::fs::read_dir(dir.join("b"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_type().is_ok_and(|t| t.is_file())
-                && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
-        })
-        .map(|e| (dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)))
-        .collect();
+fn try_blobs_of(dir: &Path) -> std::io::Result<Vec<(String, PathBuf, u64)>> {
+    let rd = match std::fs::read_dir(dir.join("b")) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut v = Vec::new();
+    for entry in rd {
+        let e = entry?;
+        if e.file_type().is_ok_and(|t| t.is_file())
+            && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
+        {
+            v.push((dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)));
+        }
+    }
     v.sort();
-    v
+    Ok(v)
+}
+
+fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
+    try_blobs_of(dir).unwrap_or_default()
+}
+
+fn mtime_secs(p: &Path) -> i64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The container folder's own mtime only moves when `b\` or `display` first appear;
+/// titles read `lastModifiedTime` as the last submitted update (#1041), so report
+/// the newest mtime among the container, `b\`, `display` and the blobs.
+fn container_modified(dir: &Path, blobs: &[(String, PathBuf, u64)]) -> i64 {
+    let mut newest = mtime_secs(dir);
+    for p in [dir.join("b"), dir.join("display")] {
+        newest = newest.max(mtime_secs(&p));
+    }
+    for (_, p, _) in blobs {
+        newest = newest.max(mtime_secs(p));
+    }
+    newest
 }
 
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
@@ -150,13 +180,34 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
+#[cfg(windows)]
+fn move_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    // Resolve normal Win32 path components before adding an extended-length prefix.
+    let absolute = std::path::absolute(path)?;
+    let (prefix, skip) = match absolute.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(_) => (r"\\?\", 0),
+            Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+            _ => ("", 0),
+        },
+        _ => ("", 0),
+    };
+    Ok(prefix
+        .encode_utf16()
+        .chain(absolute.as_os_str().encode_wide().skip(skip))
+        .chain(std::iter::once(0))
+        .collect())
+}
+
 fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let src = move_path(tmp)?;
+        let dst = move_path(dest)?;
         // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
         let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
         if ok != 0 {
@@ -350,8 +401,19 @@ pub unsafe extern "system" fn XGameSaveCloseContainer(c: *mut Container) {
 }
 
 /// Call `cb` for every stored container whose name starts with `prefix`.
-unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_void, cb: ContainerCb) -> usize {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&pr.root).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect();
+unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_void, cb: ContainerCb) -> Result<usize, HRESULT> {
+    let rd = match std::fs::read_dir(&pr.root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Err(E_FAIL),
+    };
+    let mut dirs = Vec::new();
+    for entry in rd {
+        let e = entry.map_err(|_| E_FAIL)?;
+        if e.path().is_dir() {
+            dirs.push(e.path());
+        }
+    }
     dirs.sort();
     let mut n = 0;
     for d in dirs {
@@ -363,17 +425,12 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
         } else if !starts_with_ignore_ascii_case(&name, prefix) {
             continue;
         }
-        let blobs = blobs_of(&d);
+        let blobs = try_blobs_of(&d).map_err(|_| E_FAIL)?;
         if blobs.is_empty() && !d.join("display").exists() {
             continue; // created but never written
         }
         let display = std::fs::read_to_string(d.join("display")).unwrap_or_else(|_| name.clone());
-        let modified = std::fs::metadata(&d)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|t| t.as_secs() as i64)
-            .unwrap_or(0);
+        let modified = container_modified(&d, &blobs);
         let (cn, cd) = (CString::new(name).unwrap_or_default(), CString::new(display).unwrap_or_default());
         let info = ContainerInfo {
             name: cn.as_ptr() as *const u8,
@@ -388,27 +445,26 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
             break;
         }
     }
-    n
+    Ok(n)
 }
 
 pub unsafe extern "system" fn XGameSaveGetContainerInfo(p: *mut Provider, name: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(n), Some(cb)) = (provider(p), from_cstr_ptr(name), cb) else { return E_INVALIDARG };
-    if each_container(pr, &n, true, ctx, cb) == 0 {
-        return E_GS_CONTAINER_NOT_FOUND;
+    if !valid_container_name_length(&n) {
+        return E_GS_INVALID_CONTAINER_NAME;
     }
-    S_OK
+    // A container that is not stored yet is not an error: the callback is just not called.
+    each_container(pr, &n, true, ctx, cb).map(|_| S_OK).unwrap_or_else(|hr| hr)
 }
 
 pub unsafe extern "system" fn XGameSaveEnumerateContainerInfo(p: *mut Provider, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(cb)) = (provider(p), cb) else { return E_INVALIDARG };
-    each_container(pr, "", false, ctx, cb);
-    S_OK
+    each_container(pr, "", false, ctx, cb).map(|_| S_OK).unwrap_or_else(|hr| hr)
 }
 
 pub unsafe extern "system" fn XGameSaveEnumerateContainerInfoByName(p: *mut Provider, prefix: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(cb)) = (provider(p), cb) else { return E_INVALIDARG };
-    each_container(pr, &from_cstr_ptr(prefix).unwrap_or_default(), false, ctx, cb);
-    S_OK
+    each_container(pr, &from_cstr_ptr(prefix).unwrap_or_default(), false, ctx, cb).map(|_| S_OK).unwrap_or_else(|hr| hr)
 }
 
 unsafe fn each_blob(c: &Container, prefix: &str, ctx: *mut c_void, cb: BlobCb) {
@@ -1101,7 +1157,9 @@ mod tests {
             assert_eq!(q, QUOTA - 5);
             XGameSaveCloseContainer(c);
             assert_eq!(XGameSaveDeleteContainer(p, b"slot/1\0".as_ptr()), S_OK);
-            assert_eq!(XGameSaveGetContainerInfo(p, b"slot/1\0".as_ptr(), std::ptr::null_mut(), Some(count_containers)), E_GS_CONTAINER_NOT_FOUND);
+            let mut gone: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveGetContainerInfo(p, b"slot/1\0".as_ptr(), &mut gone as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(gone.is_empty(), "{gone:?}");
             let root = (*p).root.clone();
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
@@ -1604,6 +1662,141 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// A container with no saved data is not an error: the call succeeds and the callback
+    /// is not called, as on the console (first launch).
+    #[test]
+    fn get_container_info_of_a_container_without_saved_data_succeeds_without_a_result() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-info-missing-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut info: Vec<(String, String, u32, u64)> = Vec::new();
+            let ctx = &mut info as *mut _ as *mut c_void;
+
+            // Never created.
+            assert_eq!(XGameSaveGetContainerInfo(p, b"missing\0".as_ptr(), ctx, Some(count_containers)), S_OK);
+            let longest = format!("{}\0", "a".repeat(256));
+            assert_eq!(XGameSaveGetContainerInfo(p, longest.as_ptr(), ctx, Some(count_containers)), S_OK);
+            assert!(info.is_empty(), "{info:?}");
+
+            // Created, but no update was ever submitted.
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"fresh\0".as_ptr(), &mut c), S_OK);
+            assert_eq!(XGameSaveGetContainerInfo(p, b"fresh\0".as_ptr(), ctx, Some(count_containers)), S_OK);
+            assert!(info.is_empty(), "{info:?}");
+            XGameSaveCloseContainer(c);
+
+            // A name XGameSaveCreateContainer rejects is rejected here with the same error.
+            let overlong = format!("{}\0", "a".repeat(257));
+            assert_eq!(XGameSaveGetContainerInfo(p, b"\0".as_ptr(), ctx, Some(count_containers)), E_GS_INVALID_CONTAINER_NAME);
+            assert_eq!(XGameSaveGetContainerInfo(p, overlong.as_ptr(), ctx, Some(count_containers)), E_GS_INVALID_CONTAINER_NAME);
+            assert!(info.is_empty(), "{info:?}");
+
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn get_container_info_reports_storage_errors() {
+        unsafe {
+            let mut info: Vec<(String, String, u32, u64)> = Vec::new();
+            let ctx = &mut info as *mut _ as *mut c_void;
+
+            // Provider root is a file, not a directory.
+            let mut pr = Provider { magic: MAGIC_PROVIDER, root: std::env::current_exe().unwrap() };
+            let r = XGameSaveGetContainerInfo(&mut pr, b"slot\0".as_ptr(), ctx, Some(count_containers));
+            assert_eq!(r, E_FAIL);
+            assert!(info.is_empty(), "{info:?}");
+
+            // Container's `b` entry is a file instead of a directory.
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("xcl-gamesave-err-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(root.join("slot")).unwrap();
+            std::fs::write(root.join("slot").join("b"), b"not a directory").unwrap();
+            let mut pr = Provider { magic: MAGIC_PROVIDER, root: root.clone() };
+            let r = XGameSaveGetContainerInfo(&mut pr, b"slot\0".as_ptr(), ctx, Some(count_containers));
+            let _ = std::fs::remove_dir_all(&root);
+            assert_eq!(r, E_FAIL);
+            assert!(info.is_empty(), "{info:?}");
+        }
+    }
+
+    #[test]
+    fn container_modified_reports_the_newest_blob_not_the_folder() {
+        // The container folder's own mtime stops at the first save (#1041): titles
+        // read lastModifiedTime as the last update, so a blob or display write must
+        // move the reported time even when the folder's did not.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-mtime-{}-{nonce}", std::process::id()));
+        let dir = root.join("slot1");
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let blob = dir.join("b").join("data");
+        std::fs::write(&blob, b"v1").unwrap();
+        let display = dir.join("display");
+        std::fs::write(&display, b"Save 1").unwrap();
+
+        // Future times: the freshly made folders' own mtimes are "now", so the
+        // artificial ones must be later to prove they win the max.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let t = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::File::options().write(true).open(&blob).unwrap().set_modified(t(now + 100)).unwrap();
+        std::fs::File::options().write(true).open(&display).unwrap().set_modified(t(now + 200)).unwrap();
+        assert_eq!(container_modified(&dir, &blobs_of(&dir)), (now + 200) as i64);
+
+        std::fs::File::options().write(true).open(&blob).unwrap().set_modified(t(now + 300)).unwrap();
+        assert_eq!(container_modified(&dir, &blobs_of(&dir)), (now + 300) as i64);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn move_paths_preserve_windows_path_forms() {
+        for (path, expected) in [
+            (r"C:\saves/backup\..\slot.dat", r"\\?\C:\saves\slot.dat"),
+            (r"\\server\share\saves\slot.dat", r"\\?\UNC\server\share\saves\slot.dat"),
+            (r"\\?\UNC\server\share\saves\slot.dat", r"\\?\UNC\server\share\saves\slot.dat"),
+        ] {
+            let expected: Vec<_> = expected.encode_utf16().chain(std::iter::once(0)).collect();
+            assert_eq!(move_path(Path::new(path)).unwrap(), expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_save_creates_and_replaces_a_blob_past_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-long-path-{}", std::process::id()));
+        let dir = root.join("a".repeat(96)).join("b".repeat(96)).join("c".repeat(96));
+        let blob = dir.join("b").join("save.dat");
+        assert!(blob.as_os_str().encode_wide().count() >= 260);
+        std::fs::create_dir(&root).unwrap();
+
+        let create = apply(&dir, None, &[("save.dat".to_string(), Some(b"original".to_vec()))]);
+        let original = std::fs::read(&blob);
+        let replace = apply(&dir, None, &[("save.dat".to_string(), Some(b"updated".to_vec()))]);
+        let updated = std::fs::read(&blob);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(create, S_OK);
+        assert_eq!(original.unwrap(), b"original");
+        assert_eq!(replace, S_OK);
+        assert_eq!(updated.unwrap(), b"updated");
     }
 
 }
