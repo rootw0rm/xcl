@@ -1038,3 +1038,47 @@ newest at the bottom.
   (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
   (report.json verified, fresh root removed after).
   Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
+
+## 2026-11-26 — step-134 (task-1795725971-11a3): #2878 triaged SKIP, probe past #2878
+
+- `upstream/main` = `8b957bec`, `merge-base --is-ancestor upstream/main HEAD`
+  exit 0, HEAD-ancestor-of-upstream exit 1 — ZERO sync fallout.
+- Batched `git ls-remote upstream 'refs/pull/*/head'` cross-check (per
+  mem-1795715658-5c18): 2357 refs, in-range set exactly
+  #2830..#2878 minus the known gaps — this round it showed #2878 that
+  no prior sequential scan had reached; sequential still ground truth.
+  Per-PR sequential probe #2830..#3230 (widened past the sixth gap per
+  mem-1795712765-78dc) found 38 PRESENT (#2830..#2878 minus
+  #2835/#2839-#2841/#2857/#2863/#2866/#2867/#2869/#2874/#2876 gaps),
+  matching pins on all 37 previously seen heads (no force-push, #2875
+  pin `7876a7f6` and #2877 pin `c1c22863` hold); all 38
+  `merge-base --is-ancestor` exit 1 (all OPEN); #2879..#3230 ALL
+  MISSING — scan complete, top is #2878.
+- Replication-lag note (per mem-1795714025-21a1, NOT builder fault): #2878
+  committed 20:43 UTC pre-task-creation (task created 20:46:11 UTC) yet
+  MISSING from the step-133 builder scan to #3200 — same handoff
+  treatment as #2873/#2875/#2877 in steps 132–133. Triaged in-window now.
+- Triage (SKIP with hunk evidence): #2878 `c1a8ecc7` SKIP,
+  single-commit on `8b957bec` (parent IS in main, exit 0), 1 file +58/-3
+  (`hle/d3d12x/shader_cache_session.rs`): fallback shader-cache
+  sessions now share the store for `D3D12_SHADER_CACHE_MODE_MEMORY`
+  (new `memory_stores()` registry mirroring `disk_stores()`, refcounted
+  last-release eviction) + `memory_sessions_share_entries_until_the_
+  last_release` regression test — whole `hle` is `cfg(windows)`
+  (`lib.rs`: Linux compiles `hle_linux.rs` instead), zero
+  `shader_cache` refs in `hle_linux.rs`/`d3d12x_linux.rs`/
+  `host_linux.rs` (all count 0), test uses `windows::` types never
+  compiled on Linux. Earlier pins stand: #2830-new-head/#2831/#2832
+  SKIP; #2833/#2834 landed; #2836 adapted in `7645afeb`; #2837/#2842
+  SKIP; #2838 landed verbatim in `aa59e8ac`; #2843-#2877 SKIP (minus
+  #2857/#2863 gaps).
+- Gates (doc-only change, no code touched): both `cargo check`s 0 errors
+  (22 lib + 28 lib-test pre-existing warnings); lib 783 passed /
+  0 failed / 1 ignored (`--test-threads=4`); title e2e 4 passed /
+  1 failed by design (`test_title_runs_and_game_folder_is_untouched`),
+  24 `[FAIL]` lines, all `D3D12.X`, 0 non-GPU; retail fresh-root
+  `XCL_DATA_ROOT=/tmp/xcl-step134r` exit 139 SIGSEGV
+  `exe+0x2237320` fault `0x0` bytes `48 8b 03` stubs 20
+  (all first_args) xgr exactly XAsync/XNetworking/XUser — HOLDS
+  (report.json verified, fresh root removed after).
+  Lock audit: 0 new `lock()` (no code touched); `diff --check` clean.
