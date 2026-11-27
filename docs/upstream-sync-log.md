@@ -1989,3 +1989,64 @@ newest at the bottom.
 - Gates: no tree changes → checks/lib/e2e/retail not re-run
   (tip `030f0a1b` holders stand: lib 820/0/1, Vulkan e2e 5/0,
   retail HOLDS).
+
+## 2026-11-27 — step-33 (task-1795820809-5d63): upstream `2c717a04` `pso-precompile` NOT ported (no Linux shader disk cache)
+
+- `upstream/main` = `2c717a04` (PR #3043 tip). `git diff 81693f02
+  2c717a04` is 4 files, +272/−27, after 239 rewritten commits: the
+  net delta is triaged, not the commit list.
+- Net-delta split (verified in this tree):
+  - `gpu/shader.rs` +1/−1 (`detect_wave64(code)` → `fssm_wave64(f, code)`)
+    and the `RecompAgg::add(…, wave64, …)` hunks of `shaders.rs` are
+    **ported** at `8676b135` (step-32), pinned by
+    `shaders.rs:2541` `recomp_counts_the_wave_size_from_the_fssm_header`.
+  - **NOT ported**: `main.rs` +7 (`xcl pso-precompile` usage row +
+    dispatch), `shaders.rs` +237/−26 (`PSO_PRECOMPILE_HELP`,
+    `pso_precompile`, `shader_package`, `--records`/`--used` selection,
+    used-first/largest-first `PipelineJob` ordering, `pipeline_key`),
+    `tests/shaders_e2e.rs` +27 (`pso-precompile --help`,
+    `--records` operand). Verified absent in the tree:
+    `PSO_PRECOMPILE_HELP` / `pso_precompile` / `shader_package` /
+    `pipeline_key` / `default_pipeline_threads` have no hits in
+    `crates/xcl/src/`, and `main.rs:102-110` `USAGES` plus the match
+    arms have no `pso-precompile` entry.
+- Reason — the command exists only to fill two Windows caches:
+  - `gpu/recomp/mod.rs:56-75` gates the whole machinery:
+    `#[cfg(windows)]` on `dxc` (:56-57), `dxil` (:58-59), `pso`
+    (:71-72), `runner` (:74-75). `dxc::cache_dir()`
+    (`gpu/recomp/dxc.rs:704-712`, `XCL_DXIL_CACHE`) and the
+    translated-pipeline disk cache (`gpu/recomp/pso.rs`, `translated`
+    at :191) therefore do not exist on Linux.
+  - `hle/d3d12x/pso_async.rs:576-579` `earlier_used_keys` reads
+    `dxc::cache_dir()/used-pipelines.txt`; `hle::d3d12x` is only
+    compiled on Windows (`lib.rs:30-34` selects `hle` vs
+    `hle_linux`, and `hle_linux.rs:38-41` has `d3d12x_linux` but no
+    `pso_async`). The Linux `--used-only` arm already stubs the key
+    set to `None` (`shaders.rs:1117-1122`).
+  - `shaders.rs:1881-1882` `precompile` is `#[cfg(windows)]` and owns
+    `Pipelines` (`:1381-1382`, live D3D12 device + driver-blob cache).
+    Linux's twin is the honest `#[cfg(not(windows))]` stub at
+    `shaders.rs:2134-2136`: `xcl shaders --precompile: DXC is
+    Windows-only; not supported on Linux yet (Phase D)`.
+  - `host_linux.rs:43-47`: "Linux has no out-of-data shader disk cache
+    (no DXC/D3D12: the SPIR-V path keeps no disk cache)".
+  - PROMPT.md's "Linux has its own shader disk cache keyed on
+    translator-source hash" is false: `build.rs:82` compiles the hash
+    (`XCL_TRANSLATOR_SOURCE_ID`) on both platforms, but its only
+    consumers are `gpu/recomp/pso.rs:265`/`:1652`, inside the Windows
+    module. Linux has no cache it keys.
+- Pin (existing, no new wording test): `tests/shaders_e2e.rs:257-283`
+  `shaders_single_file_runs_the_requested_sweep_modes` asserts the
+  Linux `--precompile` path exits 2 with `--precompile` and
+  "DXC is Windows-only" (:268-281); `tests/shaders_e2e.rs:126-137`
+  pins the same refusal for `--compile 1`. `xcl pso-precompile` is not
+  advertised and falls to the unknown-command help with exit 2 — no
+  inert command, no false driver/cache success.
+- Not ported either half of the portable split: the `--records`
+  selection only feeds the unported `Pipelines` flow, and the SPIR-V
+  path has no disk cache to fill. A Linux offline shader cache is M4
+  scope, not first-frame work.
+- Gates: docs-only. `cargo check --workspace` exit 0; `cargo test -p
+  xcl --test shaders_e2e` 14 passed / 0 failed (Linux refusal pins
+  stand); fresh-root retail unchanged (exit 139,
+  `game_scarlett_master.exe+0x2237320`, 2 called stubs).
