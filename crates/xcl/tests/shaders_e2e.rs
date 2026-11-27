@@ -310,6 +310,76 @@ fn shaders_rejects_two_exclusive_modes() {
     assert!(String::from_utf8_lossy(&one.stdout).contains("direct DXIL coverage"), "{one:?}");
 }
 
+/// An option read only inside one mode is a request that mode; given without it, the run would
+/// parse the value and silently drop it.
+#[test]
+fn shaders_mode_options_require_their_mode() {
+    let dir = TempDir::new("mode-options");
+    let file = dir.path().join("ps.bin");
+    std::fs::write(&file, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    let dump = dir.path().join("dump");
+    let dump_arg = dump.to_str().unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["--count", "2"], "--count requires --export-hlsl"),
+        (&["--min-kb", "1"], "--min-kb requires --export-hlsl"),
+        (&["--record-hash", "1"], "--record-hash requires --export-hlsl"),
+        (&["--repeat", "3"], "--repeat requires --measure-pso"),
+        (&["--limit", "1"], "--limit requires --precompile"),
+        (&["--only", "cs"], "--only requires --precompile"),
+        (&["--pipelines"], "--pipelines requires --precompile"),
+        (&["--used-only"], "--used-only requires --precompile"),
+        (&["--sample", "1"], "--sample requires one of --record-vs, --direct"),
+        (&["--seed", "2"], "--seed requires one of --record-vs, --direct"),
+        (&["--threads", "2"], "--threads requires one of --record-vs, --direct"),
+        (&["--trace"], "--trace requires one of --record-vs, --direct"),
+        (&["--validate"], "--validate requires --direct"),
+        (&["--compare"], "--compare requires --direct"),
+        (&["--max-bytes", "16"], "--max-bytes requires --direct"),
+        (&["--timeout", "2"], "--timeout requires --direct"),
+        (&["--lanes"], "--lanes requires --direct"),
+        (&["--hash", "1"], "--hash requires --direct"),
+        (&["--dump", dump_arg], "--dump requires --direct"),
+        (&["--split", "1"], "--split requires one of --export-hlsl, --measure-pso, --precompile, --direct"),
+        (&["--windows", "2"], "--windows requires one of --export-hlsl, --measure-pso, --precompile, --direct"),
+    ];
+    for (args, expected) in cases {
+        let out = run_shaders(&file, args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("xcl shaders:"), "args {args:?}: {stderr}");
+        assert!(stderr.contains(expected), "args {args:?}: expected {expected:?} in {stderr:?}");
+    }
+    assert!(!dump.exists(), "a rejected --dump must not create {}", dump.display());
+
+    // With its mode each option reaches that mode: no `requires` error, the mode's own outcome.
+    let direct = run_shaders(&file, &["--direct", "--sample", "1", "--seed", "2", "--threads", "1", "--dump", dump_arg]);
+    assert!(direct.status.success(), "{direct:?}");
+    assert!(String::from_utf8_lossy(&direct.stdout).contains("direct DXIL coverage"), "{direct:?}");
+
+    let record_vs = run_shaders(&file, &["--record-vs", "--sample", "1"]);
+    assert!(record_vs.status.success(), "{record_vs:?}");
+    assert!(String::from_utf8_lossy(&record_vs.stdout).contains("records from"), "{record_vs:?}");
+
+    // On Linux these modes refuse by name (DXC/Phase D): the option's mode was found, so the
+    // run must get past the scope check, not stop at it.
+    let cases: &[(&[&str], &str)] = &[
+        (&["--precompile", "--limit", "1", "--only", "cs", "--pipelines", "--used-only"], "--precompile"),
+        (&["--measure-pso", "1", "--repeat", "2"], "--measure-pso"),
+        (&["--export-hlsl", dump_arg, "--min-kb", "1", "--count", "2"], "--export-hlsl"),
+        (&["--direct", "--validate", "--compare"], "--direct"),
+    ];
+    for (args, mode) in cases {
+        let out = run_shaders(&file, args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains(" requires "), "args {args:?}: unexpected scope error {stderr:?}");
+        assert!(stderr.contains(mode), "args {args:?}: expected the {mode} refusal in {stderr:?}");
+        assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
+    }
+}
+
 #[test]
 fn shaders_direct_reports_an_unusable_dump_directory() {
     let dir = TempDir::new("dump-fail");

@@ -884,6 +884,34 @@ struct ShadersOptions {
 }
 
 fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
+    // Each of these options is read only inside the modes listed for it (`run`'s mode branches
+    // and the sweeps). Given without one, `run` would parse the value and drop it: reject the
+    // request instead of running less than was asked. `cli::Parser::value` refuses values that
+    // start with `--`, so an arg matching a name here is an option, never an option's value.
+    const MODE_OPTIONS: &[(&str, &[&str])] = &[
+        ("--count", &["--export-hlsl"]),
+        ("--min-kb", &["--export-hlsl"]),
+        ("--record-hash", &["--export-hlsl"]),
+        ("--repeat", &["--measure-pso"]),
+        ("--limit", &["--precompile"]),
+        ("--only", &["--precompile"]),
+        ("--pipelines", &["--precompile"]),
+        ("--used-only", &["--precompile"]),
+        ("--sample", &["--record-vs", "--direct"]),
+        ("--seed", &["--record-vs", "--direct"]),
+        ("--threads", &["--record-vs", "--direct"]),
+        ("--trace", &["--record-vs", "--direct"]),
+        ("--validate", &["--direct"]),
+        ("--compare", &["--direct"]),
+        ("--max-bytes", &["--direct"]),
+        ("--timeout", &["--direct"]),
+        ("--lanes", &["--direct"]),
+        ("--hash", &["--direct"]),
+        ("--dump", &["--direct"]),
+        ("--split", &["--export-hlsl", "--measure-pso", "--precompile", "--direct"]),
+        ("--windows", &["--export-hlsl", "--measure-pso", "--precompile", "--direct"]),
+    ];
+    let given: Vec<(&str, &[&str])> = args.iter().filter_map(|a| MODE_OPTIONS.iter().find(|(name, _)| *name == a.as_str()).copied()).collect();
     let mut opts = ShadersOptions {
         top: 60,
         json: false,
@@ -974,6 +1002,16 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
     .collect();
     if let [first, second, ..] = modes.as_slice() {
         return Err(format!("{first} and {second} are exclusive modes; run one mode per invocation"));
+    }
+    for (opt, required) in given {
+        if required.iter().any(|m| modes.contains(m)) {
+            continue;
+        }
+        return Err(if required.len() == 1 {
+            format!("{opt} requires {}", required[0])
+        } else {
+            format!("{opt} requires one of {}", required.join(", "))
+        });
     }
     Ok(opts)
 }
