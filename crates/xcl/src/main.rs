@@ -21,25 +21,39 @@ unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mu
 #[link_section = ".CRT$XLY"]
 static XCL_TLS_CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
 
-const HELP: &str = "\
+const HELP_HEADER: &str = "\
 XCL – Xbox Series X|S → Windows compatibility layer
 
 Usage:
-  xcl run <game folder | file.exe> [-- game arguments]
+";
+
+// One block per command. `xcl --help` prints all of them and `xcl <command> --help|-h`
+// prints exactly the command's block: the usage text has a single definition.
+const RUN_USAGE: &str = "  xcl run <game folder | file.exe> [-- game arguments]
       Runs the game. The game folder is only read; writes, game saves and logs go to
       %LOCALAPPDATA%\\XCL\\<title>\\ on Windows or $XDG_DATA_HOME/XCL/<title>/ on Linux
       (%XCL_DATA_ROOT%\\<title>\\ overrides the root).
-  xcl inspect <file.exe|file.dll> [--json]
+";
+
+const INSPECT_USAGE: &str = "  xcl inspect <file.exe|file.dll> [--json]
       Analysis without running: imports and what XCL has for them (HLE / Windows / stub).
-  xcl preflight [gpu]
+";
+
+const PREFLIGHT_USAGE: &str = "  xcl preflight [gpu]
       Checks the PC against what a run needs (DXC, the system XGameRuntime, Shader Model 6.6,
       mesh shaders, wave width) without starting a game: a missing piece shows up now rather
       than after the world load. The same checks `xcl run` prints, without the load. `gpu` is a
       d3d12_adapter value (default: auto). Exit code 1 if any check is an Error, else 0.
-  xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
+";
+
+const DISASM_USAGE: &str =
+    "  xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
       Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
       Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
-  xcl shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
+";
+
+const SHADERS_USAGE: &str =
+    "  xcl shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
       Shader corpus statistics: formats, stages, RDNA2 instruction histogram (priorities
       for the recompiler). RPF9 packages are scanned for shader records.
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
@@ -57,19 +71,33 @@ Usage:
       --record-vs [--sample N] [--seed S] [--top N] [--threads N] [--json]: classifies
           records as console VS (S1 interface + S2/S3 SPIR-V) and counts what the
           bring-up backend rejects or cannot translate; no device, no DXC.
-  xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
+";
+
+const RPF_USAGE: &str = "  xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
-  xcl replay <capture folder> [--timeout S] [--repeat N] [--out NAME] [--debug] [--no-run]
+";
+
+const REPLAY_USAGE: &str =
+    "  xcl replay <capture folder> [--timeout S] [--repeat N] [--out NAME] [--debug] [--no-run]
              [--sub FROM=>TO||…] [--profile ps_6_7] [--split 0|1] [--loops]
       Runs one draw / dispatch captured with XCL_CAPTURE_DRAW alone on a device of its own:
       its GPU time, and PNG / raw files of what it wrote in the folder replay_<NAME> of the
       capture. --timeout: seconds the call may take (15); --no-run: translate and compile
       only; --debug: with the D3D12 debug layer. --sub: text substitutions in the translated
       HLSL; --loops: the passes of each loop of the pixel shader, per lane.
-  xcl --version
 ";
+
+const USAGES: &[(&str, &str)] = &[
+    ("run", RUN_USAGE),
+    ("inspect", INSPECT_USAGE),
+    ("preflight", PREFLIGHT_USAGE),
+    ("disasm", DISASM_USAGE),
+    ("shaders", SHADERS_USAGE),
+    ("rpf", RPF_USAGE),
+    ("replay", REPLAY_USAGE),
+];
 
 fn main() {
     // keep the TLS callback from being discarded by the linker
@@ -85,6 +113,10 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(usage) = subcommand_help(&args) {
+        print!("Usage:\n{usage}");
+        std::process::exit(0);
+    }
     let code = match args.first().map(String::as_str) {
         Some("run") if args.len() >= 2 => {
             let rest: Vec<String> = match args.iter().position(|a| a == "--") {
@@ -118,8 +150,26 @@ fn main() {
     std::process::exit(code);
 }
 
+/// `xcl <command> --help|-h`: that command's block from the table the top-level help prints.
+/// Only the first argument after the command counts, so `xcl run <game> -- --help` still
+/// passes `--help` to the game.
+fn subcommand_help(args: &[String]) -> Option<&'static str> {
+    let command = args.first()?.as_str();
+    if !matches!(args.get(1).map(String::as_str), Some("--help") | Some("-h")) {
+        return None;
+    }
+    USAGES
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map(|(_, usage)| *usage)
+}
+
 fn help(args: &[String]) -> i32 {
-    print!("{HELP}");
+    print!("{HELP_HEADER}");
+    for (_, usage) in USAGES {
+        print!("{usage}");
+    }
+    println!("  xcl --version");
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         0
     } else {
