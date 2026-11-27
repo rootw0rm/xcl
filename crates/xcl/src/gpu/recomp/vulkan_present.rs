@@ -866,6 +866,340 @@ pub fn present_triangle_windowed(
     }
 }
 
+/// Present arbitrary host RGBA bytes through a real window + swapchain (1d(ii):
+/// the queue-#30 `PresentX` entry for title frames). Staging-buffer upload —
+/// no shaders, no pipeline — then one `queue_present`; BGRA surfaces get a
+/// host swizzle. Fail-closed `"no ..."` (headless: skipped, title runs on);
+/// other failures are hard errors. Never spawns a process.
+pub fn present_rgba_image(width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    if width == 0 || height == 0 || width > 4096 || height > 4096 || rgba.len() != (width * height * 4) as usize {
+        return Err("bad present image (dims/bytes)".into());
+    }
+    unsafe {
+        // The window must outlive the surface; destroyed after the instance below.
+        let window = XWindow::open()?;
+        let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
+        // Same no-probe shape as the triangle present: extensions enabled
+        // unconditionally, absence fails closed at `create_instance`.
+        let surface_fn = CString::new("VK_KHR_surface").unwrap();
+        let xlib_fn = CString::new("VK_KHR_xlib_surface").unwrap();
+        let exts = [surface_fn.as_ptr(), xlib_fn.as_ptr()];
+        let app = CString::new("xcl").unwrap();
+        let app_info = ash::vk::ApplicationInfo::default()
+            .application_name(&app)
+            .api_version(ash::vk::make_api_version(0, 1, 3, 0));
+        let create = ash::vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&exts);
+        let instance = entry.create_instance(&create, None).map_err(|e| {
+            if e == ash::vk::Result::ERROR_EXTENSION_NOT_PRESENT {
+                format!("no WSI: surface/xlib extension missing ({e:?})")
+            } else {
+                format!("no Vulkan: create_instance: {e}")
+            }
+        })?;
+        let surface_ext = ash::khr::surface::Instance::new(&entry, &instance);
+        let xlib_ext = ash::khr::xlib_surface::Instance::new(&entry, &instance);
+        let out = (|| -> Result<(), String> {
+            let (phys, gqfi, _, _) = pick_graphics_device(&instance)?;
+            let si = ash::vk::XlibSurfaceCreateInfoKHR::default().dpy(window.dpy).window(window.win);
+            let surface = xlib_ext
+                .create_xlib_surface(&si, None)
+                .map_err(|e| format!("no WSI: create_xlib_surface: {e:?}"))?;
+            let _guard = SurfaceGuard { ext: &surface_ext, surface: Some(surface) };
+            let qfi = pick_present_queue(&instance, &surface_ext, phys, surface, gqfi)?;
+            let prio = [1.0f32];
+            let qi = ash::vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(qfi)
+                .queue_priorities(&prio);
+            let swap_fn = CString::new("VK_KHR_swapchain").unwrap();
+            let swap_exts = [swap_fn.as_ptr()];
+            let di = ash::vk::DeviceCreateInfo::default()
+                .queue_create_infos(std::slice::from_ref(&qi))
+                .enabled_extension_names(&swap_exts);
+            let device = instance.create_device(phys, &di, None).map_err(|e| {
+                if e == ash::vk::Result::ERROR_EXTENSION_NOT_PRESENT {
+                    format!("no WSI: VK_KHR_swapchain missing ({e:?})")
+                } else {
+                    format!("create_device: {e:?}")
+                }
+            })?;
+            let queue = device.get_device_queue(qfi, 0);
+            let swap_ext = ash::khr::swapchain::Device::new(&instance, &device);
+            let drawn = (|| -> Result<(), String> {
+                let formats = surface_ext
+                    .get_physical_device_surface_formats(phys, surface)
+                    .map_err(|e| format!("no WSI: surface formats: {e:?}"))?;
+                let format = pick_surface_format(&formats)
+                    .ok_or_else(|| "no WSI: surface offers no formats".to_string())?;
+                let caps = surface_ext
+                    .get_physical_device_surface_capabilities(phys, surface)
+                    .map_err(|e| format!("no WSI: surface caps: {e:?}"))?;
+                let extent = if caps.current_extent.width != u32::MAX {
+                    caps.current_extent
+                } else {
+                    ash::vk::Extent2D {
+                        width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+                        height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+                    }
+                };
+                if extent.width == 0 || extent.height == 0 {
+                    return Err("no WSI: empty surface extent".into());
+                }
+                if !caps.supported_usage_flags.contains(ash::vk::ImageUsageFlags::TRANSFER_DST) {
+                    return Err("no WSI: surface image is no transfer dst".into());
+                }
+                let alpha = pick_composite_alpha(caps.supported_composite_alpha)
+                    .ok_or_else(|| "no WSI: no composite alpha".to_string())?;
+                // Scale the frame to the surface extent (nearest; exact when equal).
+                let (ew, eh) = (extent.width, extent.height);
+                let mut frame = vec![0u8; (ew * eh * 4) as usize];
+                for y in 0..eh {
+                    for x in 0..ew {
+                        let (sx, sy) = (x * width / ew, y * height / eh);
+                        let (s, d) = ((sy * width + sx) as usize * 4, (y * ew + x) as usize * 4);
+                        frame[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
+                    }
+                }
+                match format.format {
+                    ash::vk::Format::R8G8B8A8_UNORM | ash::vk::Format::R8G8B8A8_SRGB => {}
+                    ash::vk::Format::B8G8R8A8_UNORM | ash::vk::Format::B8G8R8A8_SRGB => {
+                        for px in frame.chunks_exact_mut(4) {
+                            px.swap(0, 2);
+                        }
+                    }
+                    other => return Err(format!("no WSI: unreadable surface format {other:?}")),
+                }
+                let mut count = caps.min_image_count + 1;
+                if caps.max_image_count > 0 {
+                    count = count.min(caps.max_image_count);
+                }
+                let swap_info = ash::vk::SwapchainCreateInfoKHR::default()
+                    .surface(surface)
+                    .min_image_count(count)
+                    .image_format(format.format)
+                    .image_color_space(format.color_space)
+                    .image_extent(extent)
+                    .image_array_layers(1)
+                    .image_usage(ash::vk::ImageUsageFlags::TRANSFER_DST)
+                    .image_sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
+                    .pre_transform(caps.current_transform)
+                    .composite_alpha(alpha)
+                    .present_mode(ash::vk::PresentModeKHR::FIFO)
+                    .clipped(true);
+                let swapchain = swap_ext
+                    .create_swapchain(&swap_info, None)
+                    .map_err(|e| format!("create_swapchain: {e:?}"))?;
+                // Scoped teardown: every created handle dies on drop, so an
+                // early `?` never leaks (same pattern as the triangle present).
+                struct Scope<'a> {
+                    device: &'a ash::Device,
+                    swap_ext: &'a ash::khr::swapchain::Device,
+                    swapchain: Option<ash::vk::SwapchainKHR>,
+                    pool: Option<ash::vk::CommandPool>,
+                    sbuf: Option<ash::vk::Buffer>,
+                    sbuf_mem: Option<ash::vk::DeviceMemory>,
+                    fence: Option<ash::vk::Fence>,
+                }
+                impl Drop for Scope<'_> {
+                    fn drop(&mut self) {
+                        let d = self.device;
+                        unsafe {
+                            if let Some(f) = self.fence.take() {
+                                d.destroy_fence(f, None);
+                            }
+                            if let Some(p) = self.pool.take() {
+                                d.destroy_command_pool(p, None);
+                            }
+                            if let Some(s) = self.swapchain.take() {
+                                self.swap_ext.destroy_swapchain(s, None);
+                            }
+                            if let Some(b) = self.sbuf.take() {
+                                d.destroy_buffer(b, None);
+                            }
+                            if let Some(m) = self.sbuf_mem.take() {
+                                d.free_memory(m, None);
+                            }
+                        }
+                    }
+                }
+                let mut scope = Scope {
+                    device: &device,
+                    swap_ext: &swap_ext,
+                    swapchain: Some(swapchain),
+                    pool: None,
+                    sbuf: None,
+                    sbuf_mem: None,
+                    fence: None,
+                };
+                let images = swap_ext
+                    .get_swapchain_images(swapchain)
+                    .map_err(|e| format!("swapchain images: {e:?}"))?;
+                if images.is_empty() {
+                    return Err("no WSI: swapchain yielded no images".into());
+                }
+                // Host-visible staging upload of the whole frame.
+                let mem_props = instance.get_physical_device_memory_properties(phys);
+                let coherent = ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | ash::vk::MemoryPropertyFlags::HOST_COHERENT;
+                let sbytes = frame.len() as u64;
+                let sbi = ash::vk::BufferCreateInfo::default()
+                    .size(sbytes)
+                    .usage(ash::vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(ash::vk::SharingMode::EXCLUSIVE);
+                let sbuf = device
+                    .create_buffer(&sbi, None)
+                    .map_err(|e| format!("create_buffer(staging): {e}"))?;
+                scope.sbuf = Some(sbuf);
+                let sreq = device.get_buffer_memory_requirements(sbuf);
+                let sidx = find_memory_type(&mem_props, sreq.memory_type_bits, coherent)
+                    .ok_or_else(|| "no host-visible coherent memory type".to_string())?;
+                let sai = ash::vk::MemoryAllocateInfo::default()
+                    .allocation_size(sreq.size)
+                    .memory_type_index(sidx);
+                let smem = device
+                    .allocate_memory(&sai, None)
+                    .map_err(|e| format!("allocate_memory(staging): {e}"))?;
+                scope.sbuf_mem = Some(smem);
+                device
+                    .bind_buffer_memory(sbuf, smem, 0)
+                    .map_err(|e| format!("bind_buffer_memory(staging): {e}"))?;
+                let dst = device
+                    .map_memory(smem, 0, sbytes, ash::vk::MemoryMapFlags::empty())
+                    .map_err(|e| format!("map_memory(staging): {e}"))? as *mut u8;
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), dst, frame.len());
+                device.unmap_memory(smem);
+                // Acquire first, then record one buffer for that image.
+                let fence = device
+                    .create_fence(&ash::vk::FenceCreateInfo::default(), None)
+                    .map_err(|e| format!("create_fence: {e}"))?;
+                scope.fence = Some(fence);
+                let (idx, _) = swap_ext
+                    .acquire_next_image(swapchain, 5_000_000_000, ash::vk::Semaphore::null(), fence)
+                    .map_err(|e| format!("acquire_next_image: {e:?}"))?;
+                device
+                    .wait_for_fences(&[fence], true, 5_000_000_000)
+                    .map_err(|e| format!("acquire fence: {e}"))?;
+                device
+                    .reset_fences(&[fence])
+                    .map_err(|e| format!("reset_fences: {e}"))?;
+                let pool_info = ash::vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(qfi)
+                    .flags(ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+                let pool = device
+                    .create_command_pool(&pool_info, None)
+                    .map_err(|e| format!("create_command_pool: {e}"))?;
+                scope.pool = Some(pool);
+                let cmd_alloc = ash::vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(ash::vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1);
+                let cmds = device
+                    .allocate_command_buffers(&cmd_alloc)
+                    .map_err(|e| format!("allocate_command_buffers: {e}"))?;
+                let img = images[idx as usize];
+                let sub = ash::vk::ImageSubresourceRange {
+                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let barrier = |old: ash::vk::ImageLayout, new: ash::vk::ImageLayout, src: ash::vk::AccessFlags, dst: ash::vk::AccessFlags| {
+                    ash::vk::ImageMemoryBarrier::default()
+                        .src_access_mask(src)
+                        .dst_access_mask(dst)
+                        .old_layout(old)
+                        .new_layout(new)
+                        .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                        .image(img)
+                        .subresource_range(sub)
+                };
+                device
+                    .begin_command_buffer(
+                        cmds[0],
+                        &ash::vk::CommandBufferBeginInfo::default()
+                            .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| format!("begin_command_buffer: {e}"))?;
+                device.cmd_pipeline_barrier(
+                    cmds[0],
+                    ash::vk::PipelineStageFlags::TOP_OF_PIPE,
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        ash::vk::ImageLayout::UNDEFINED,
+                        ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        ash::vk::AccessFlags::empty(),
+                        ash::vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+                let region = ash::vk::BufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: ash::vk::ImageSubresourceLayers {
+                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: ash::vk::Offset3D { x: 0, y: 0, z: 0 },
+                    image_extent: ash::vk::Extent3D { width: ew, height: eh, depth: 1 },
+                };
+                device.cmd_copy_buffer_to_image(
+                    cmds[0],
+                    sbuf,
+                    img,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                device.cmd_pipeline_barrier(
+                    cmds[0],
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    ash::vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                        ash::vk::AccessFlags::TRANSFER_WRITE,
+                        ash::vk::AccessFlags::empty(),
+                    )],
+                );
+                device
+                    .end_command_buffer(cmds[0])
+                    .map_err(|e| format!("end_command_buffer: {e}"))?;
+                let submit = ash::vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmds[0]));
+                device
+                    .queue_submit(queue, &[submit], fence)
+                    .map_err(|e| format!("queue_submit: {e}"))?;
+                device
+                    .wait_for_fences(&[fence], true, 5_000_000_000)
+                    .map_err(|e| format!("wait_for_fences: {e:?}"))?;
+                let present_info = ash::vk::PresentInfoKHR::default()
+                    .swapchains(std::slice::from_ref(&swapchain))
+                    .image_indices(std::slice::from_ref(&idx));
+                swap_ext
+                    .queue_present(queue, &present_info)
+                    .map_err(|e| format!("queue_present: {e:?}"))?;
+                Ok(())
+                // `scope` drops here; `device` destroyed by the outer closure.
+            })();
+            device.destroy_device(None);
+            drawn
+        })();
+        // `_guard` (surface) dropped here, before the instance below; the
+        // window (X11 connection) drops last.
+        instance.destroy_instance(None);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::spirv::SpirvVsBackend;
@@ -1114,6 +1448,22 @@ mod tests {
             .unwrap();
         assert!(vs.complete());
         assert!(present_triangle_windowed(&vs.words, &[]).is_err());
+    }
+
+    #[test]
+    fn arbitrary_image_validates_and_presents_or_skips() {
+        // 1d(ii): bad dims/bytes fail closed (pure); a 2x2 frame presents for
+        // real, or skips cleanly with `"no "` headless (mirrors the triangle test).
+        assert!(present_rgba_image(0, 0, &[]).is_err());
+        assert!(present_rgba_image(4, 4, &[0u8; 8]).is_err());
+        assert!(present_rgba_image(4097, 1, &[0u8; 4097 * 4]).is_err());
+        match present_rgba_image(2, 2, &[0x11u8; 2 * 2 * 4]) {
+            Ok(()) => {}
+            Err(e) if e.starts_with("no ") => {
+                skip_test("no display/WSI/device");
+            }
+            Err(e) => panic!("present_rgba_image failed: {e}"),
+        }
     }
 
     #[test]

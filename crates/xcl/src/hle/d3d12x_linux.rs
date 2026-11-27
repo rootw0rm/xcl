@@ -20,10 +20,10 @@
 //! index — the title has zero static d3d12 imports). Routed today: device
 //! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #11, Vulkan-list
 //! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, Vulkan-device frame clock
-//! 1d(i) #78–#81 (Linux twin + ancillary routing; queue #30 `PresentX`
-//! follows in 1d(ii)). Null stays default behind `XCL_VULKAN_BACKEND`:
-//! unrouted slots keep logging stubs. No fake-success: a routed slot must
-//! present a real frame or stay an honest logging stub.
+//! #78–#81 (Linux twin + ancillary routing) and Vulkan-queue #30 `PresentX`
+//! (real swapchain present, 1d(ii)). Null stays default behind
+//! `XCL_VULKAN_BACKEND`: unrouted slots keep logging stubs. No fake-success:
+//! a routed slot presents a real frame or stays an honest logging stub.
 //
 //! Step-146 note (2026-11-27): re-verified at `46f7a172` — queue #30 and
 //! device #78–#81 are still logging stubs (no `v[78..81]` / queue `v[30]`
@@ -260,6 +260,9 @@ fn vtable(kind: Kind) -> *const usize {
         v[93] = VulList_Kickoff as usize;
         v[146] = Ret_Void as usize; // UAV barrier (single queue: already coherent)
         v[148] = VulList_AllocUpload as usize;
+    }
+    if kind == Kind::VulkanQueue {
+        v[30] = Queue_PresentX as usize; // 1d(ii) real present
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     g.push((kind, leaked.as_ptr() as usize));
@@ -1146,6 +1149,78 @@ unsafe extern "win64" fn Queue_GetClockCalibration(_t: *mut NullObj, gpu: *mut u
     }
     S_OK
 }
+
+/// Host RGBA bytes of a back-buffer resource (R8G8B8A8 2D texture only):
+/// committed resources from their Map backing, placed ones straight from
+/// title memory. Unmodelled shapes return `None` and the caller presents
+/// nothing. Linux trusts the pointers (no `/proc/self/maps` walk yet —
+/// `gpu::shader::readable` is windows-only), like every other Linux slot.
+unsafe fn read_rgba(o: *mut NullObj) -> Option<(u32, u32, Vec<u8>)> {
+    // D3D12_RESOURCE_DESC: Dimension u32 @0, Width u64 @16, Height u32 @24,
+    // Format u32 @32.
+    let d = &(*o).desc;
+    if d[0] != 3 || u32::from_le_bytes(d[32..36].try_into().ok()?) != 28 {
+        return None; // not a 2D R8G8B8A8_UNORM texture
+    }
+    let (w, h) = (
+        u64::from_le_bytes(d[16..24].try_into().ok()?) as u32,
+        u32::from_le_bytes(d[24..28].try_into().ok()?),
+    );
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    let n = (w as usize) * (h as usize) * 4;
+    let src = if (*o).kind == Kind::PlacedResource {
+        (*o).value.load(Ordering::Relaxed) as usize as *const u8
+    } else {
+        let (p, len) = resource_backing(o);
+        if p.is_null() || len < n {
+            return None;
+        }
+        p as *const u8
+    };
+    if src.is_null() {
+        return None;
+    }
+    let mut v = vec![0u8; n];
+    std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), n);
+    Some((w, h, v))
+}
+
+/// Queue #30 `PresentX` on a Vulkan queue (1d(ii)): plane 0's resource is the
+/// frame — upload its host bytes through the real swapchain present, then
+/// record the flip for #81. Headless (`"no ..."`) still records the flip and
+/// returns `S_OK`: a console present never fails for the title.
+unsafe extern "win64" fn Queue_PresentX(_t: *mut NullObj, plane_count: u32, planes: *const u8, _params: *const u8) -> HRESULT {
+    if plane_count != 0 && !planes.is_null() {
+        let token = (planes as *const u64).read_unaligned();
+        // plane 0: { u64 token @0; u32 count @8; resources @0x10 }
+        let mut rgba = None;
+        if (planes.add(8) as *const u32).read_unaligned() > 0 {
+            let list = (planes.add(0x10) as *const usize).read_unaligned();
+            if list != 0 {
+                let res = (list as *const usize).read_unaligned() as *mut NullObj;
+                if !res.is_null() && ((*res).kind == Kind::Resource || (*res).kind == Kind::PlacedResource) {
+                    rgba = read_rgba(res);
+                }
+            }
+        }
+        match rgba {
+            Some((w, h, px)) => {
+                match crate::gpu::recomp::vulkan_present::present_rgba_image(w, h, &px) {
+                    Ok(()) => crate::xlog_info!("D3D12.X Vulkan: presented {w}x{h} (token {token:#x})"),
+                    Err(e) if e.starts_with("no ") => {
+                        crate::xlog_debug!("D3D12.X Vulkan: present skipped ({e})")
+                    }
+                    Err(e) => crate::xlog_warn!("D3D12.X Vulkan: present failed ({e})"),
+                }
+            }
+            None => crate::xlog_debug!("D3D12.X Vulkan: PresentX with no readable plane-0 RGBA (token {token:#x})"),
+        }
+        crate::hle::d3d12x_frame_linux::mark_flipped(token);
+    }
+    S_OK
+}
 unsafe extern "win64" fn Fence_GetCompletedValue(this: *mut NullObj) -> u64 {
     (*this).value.load(Ordering::Acquire)
 }
@@ -1851,7 +1926,46 @@ mod tests {
             assert_eq!(wait(vdp, 1, 500, std::ptr::null(), 0, &mut t1), S_OK);
             assert_eq!(crate::hle::kernelx_linux::WaitForSingleObject(ev, 0), 0);
             let _ = sched(vdp, 1, 0, std::ptr::null(), 1); // unschedule
-            // queue #30 PresentX + #81 statistics follow in 1d(ii)
+            // queue #30 PresentX (1d(ii)): a queue from the Vulkan device carries
+            // it, the frame's bytes present (or skip headless), #81 names the flip
+            type MkQ = unsafe extern "win64" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkq: MkQ = std::mem::transmute(slot(vdp, 48));
+            let mut q = std::ptr::null_mut();
+            assert_eq!(mkq(vdp, [0x10u32, 0, 0, 0].as_ptr(), std::ptr::null(), &mut q), S_OK);
+            assert_eq!((*(q as *mut NullObj)).kind, Kind::VulkanQueue);
+            // 4x4 RGBA back buffer with host bytes
+            let mut desc = [0u8; 56];
+            desc[0] = 3; // TEXTURE2D
+            desc[16..24].copy_from_slice(&4u64.to_le_bytes());
+            desc[24] = 4;
+            desc[32..36].copy_from_slice(&28u32.to_le_bytes()); // R8G8B8A8_UNORM
+            type MkRes = unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkr: MkRes = std::mem::transmute(slot(vdp, 27));
+            let mut rb = std::ptr::null_mut();
+            assert_eq!(mkr(vdp, std::ptr::null(), 0, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+            let map: unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(slot(rb, 8));
+            let mut p = std::ptr::null_mut();
+            assert_eq!(map(rb, 0, std::ptr::null(), &mut p), S_OK);
+            std::slice::from_raw_parts_mut(p as *mut u8, 64).fill(0x7F);
+            let resources = [rb];
+            let mut plane = [0u8; 0x18];
+            plane[..8].copy_from_slice(&token.to_le_bytes());
+            plane[8..12].copy_from_slice(&1u32.to_le_bytes());
+            plane[0x10..0x18].copy_from_slice(&(resources.as_ptr() as u64).to_le_bytes());
+            type Present = unsafe extern "win64" fn(*mut c_void, u32, *const u8, *const u8) -> HRESULT;
+            let present: Present = std::mem::transmute(slot(q, 30));
+            assert_eq!(present(q, 1, plane.as_ptr(), std::ptr::null()), S_OK);
+            // ... and the flip shows up in #81 statistics
+            type Stats = unsafe extern "win64" fn(*mut c_void, u64, u32, *mut u32, *mut u8) -> HRESULT;
+            let stats: Stats = std::mem::transmute(slot(vdp, 81));
+            let (mut n, mut st) = (1u32, [0u8; 0x40]);
+            assert_eq!(stats(vdp, token, 0, &mut n, st.as_mut_ptr()), S_OK);
+            assert_eq!(n, 1);
+            let (origin, flip) = (
+                i64::from_le_bytes(st[0x10..0x18].try_into().unwrap()),
+                i64::from_le_bytes(st[0x18..0x20].try_into().unwrap()),
+            );
+            assert!(origin > 0 && origin <= flip);
             assert_eq!(set(vdp, std::ptr::null_mut(), 0, 0, 0), S_FALSE);
         }
     }

@@ -5,7 +5,8 @@
 //! the `Condvar`/monotonic clock thread with `wait_frame_event`. Split 1d(i):
 //! ancillary handle routing — `register_ancillary` remembers the schedule
 //! block's handles per type and the clock thread signals them at fire;
-//! device slots #78–#81 route here from `d3d12x_linux` (queue #30 follows).
+//! device slots #78–#81 route here from `d3d12x_linux`; queue #30 `PresentX`
+//! uploads through `vulkan_present::present_rgba_image` (1d(ii)).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -134,8 +135,8 @@ pub fn frame_statistics(token: u64) -> Result<(i64, i64), HRESULT> {
 }
 
 // --- Split 1c: `Condvar`/monotonic clock thread + `wait_frame_event`. ---
-// Split 1d(i) routes device slots #78–#81 here (behind `XCL_VULKAN_BACKEND` —
-// no behavior change while unset); queue #30 `PresentX` follows in 1d(ii).
+// Split 1d routes device slots #78–#81 here (behind `XCL_VULKAN_BACKEND` —
+// no behavior change while unset) plus queue #30 `PresentX` (1d(ii)).
 
 const TYPES: usize = 3;
 /// What `schedule_frame_event` returns when it starts the clock.
