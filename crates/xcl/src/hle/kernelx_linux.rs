@@ -2755,7 +2755,7 @@ fn gfx_contains(addr: usize) -> bool {
 
 /// First-fit `size` bytes at `align` inside the graphics pool. Committed ranges are
 /// `mprotect`ed `READWRITE` and zeroed; reserved ranges stay `PROT_NONE`.
-fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
+pub(crate) fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
     let m = gfx_state()?;
     let mut g = m.lock().unwrap();
     let align = align.max(GFX_GRAIN).next_power_of_two();

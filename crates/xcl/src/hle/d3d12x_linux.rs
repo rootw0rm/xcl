@@ -298,6 +298,10 @@ fn vtable(kind: Kind) -> *const usize {
     // upload (#148) slots run on the plain null lists too (M2 raytracing
     // slice: host upload memory + a coherent no-op barrier need no GPU).
     if kind == Kind::VulkanList || kind == Kind::CommandList {
+        // PC CopyBufferRegion (slot 15): the same immediate host memcpy as the
+        // console DMA one — the single queue is already coherent, so the copy
+        // lands at record time and ExecuteCommandLists stays a no-op.
+        v[15] = Dma_CopyBufferRegion as usize;
         v[60] = VulList_CopyMemory as usize;
         v[61] = VulList_Fill32 as usize;
         v[69] = VulList_Write32Bottom as usize;
@@ -684,13 +688,65 @@ unsafe extern "win64" fn Device_CreateCommittedResource(_t: *mut NullObj, _hp: *
 unsafe extern "win64" fn Device_CreateCommittedResource1(_t: *mut NullObj, _hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _ps: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     new_resource(desc, ppv)
 }
-unsafe extern "win64" fn Device_CreateHeap(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    out_obj(ppv, Kind::Heap)
+/// Back a console buffer heap with the high-VA graphics pool: the pool address is a
+/// real committable host address in window 0, so placed buffers on it get VA == Map
+/// address (the console's unified memory) with title-side offsets aliasing. Returns 0
+/// when the pool is exhausted — the heap still works, placed resources just fall back
+/// to the old fake-VA path and lose aliasing.
+unsafe fn heap_pool_backing(desc: *const c_void) -> u64 {
+    if desc.is_null() {
+        return 0;
+    }
+    // D3D12_HEAP_DESC: SizeInBytes u64 @0, Alignment u64 @32 (repr(C), unaligned reads).
+    let d = desc as *const u8;
+    let size = (d as *const u64).read_unaligned() as usize;
+    let align = (d.add(32) as *const u64).read_unaligned() as usize;
+    if size == 0 {
+        return 0;
+    }
+    crate::hle::kernelx_linux::gfx_alloc(size, align, true).unwrap_or(0) as u64
 }
-unsafe extern "win64" fn Device_CreateHeap1(_t: *mut NullObj, _d: *const c_void, _s: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    out_obj(ppv, Kind::Heap)
+unsafe extern "win64" fn Device_CreateHeap(_t: *mut NullObj, d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return S_FALSE;
+    }
+    let o = new_obj(Kind::Heap);
+    if !d.is_null() {
+        std::ptr::copy_nonoverlapping(d as *const u8, (*o).desc.as_mut_ptr(), 16);
+    }
+    (*o).value.store(heap_pool_backing(d), Ordering::Relaxed);
+    *ppv = o as *mut c_void;
+    S_OK
 }
-unsafe extern "win64" fn Device_CreatePlacedResource(_t: *mut NullObj, _h: *mut c_void, _o: u64, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "win64" fn Device_CreateHeap1(_t: *mut NullObj, d: *const c_void, _s: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return S_FALSE;
+    }
+    let o = new_obj(Kind::Heap);
+    if !d.is_null() {
+        std::ptr::copy_nonoverlapping(d as *const u8, (*o).desc.as_mut_ptr(), 16);
+    }
+    (*o).value.store(heap_pool_backing(d), Ordering::Relaxed);
+    *ppv = o as *mut c_void;
+    S_OK
+}
+unsafe extern "win64" fn Device_CreatePlacedResource(_t: *mut NullObj, h: *mut c_void, off: u64, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return S_FALSE;
+    }
+    if !h.is_null() && !desc.is_null() && (*(h as *mut NullObj)).kind == Kind::Heap {
+        let base = (*(h as *mut NullObj)).value.load(Ordering::Relaxed);
+        if base != 0 {
+            // heap-backed: VA == host address, so Map and aliasing offsets agree
+            let o = new_obj(Kind::Resource);
+            std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 56);
+            let size = approx_size(desc);
+            *(*o).mem.lock().unwrap() = (base.wrapping_add(off) as usize, size);
+            (*o).value.store(base.wrapping_add(off), Ordering::Relaxed);
+            *ppv = o as *mut c_void;
+            return S_OK;
+        }
+    }
     new_resource(desc, ppv)
 }
 unsafe extern "win64" fn Device_CreateReservedResource(_t: *mut NullObj, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
@@ -1934,6 +1990,70 @@ mod tests {
             // cell and the copied region survived it
             assert_eq!((mem.as_ptr().add(8) as *const u64).read(), 0x1122_3344_5566_7788);
             assert!((0..64).all(|i| *mem.as_ptr().add(0x200 + i) == i as u8 ^ 0x5A));
+        }
+    }
+
+    #[test]
+    fn heap_backed_placed_buffers_share_va_and_map_and_copy() {
+        // M2 VA-vs-Map leg: a heap comes from the high-VA graphics pool, so
+        // placed buffers on it report VA == Map address with title-side
+        // aliasing offsets, and PC CopyBufferRegion (slot 15) moves bytes at
+        // record time. Fails pre-slice three ways: each placed resource gets
+        // a fresh fake VA, Map hands out detached memory, slot 15 is a stub.
+        unsafe {
+            let dev = device() as *mut c_void;
+            // D3D12_HEAP_DESC (48 B): SizeInBytes u64 @0, Type u32 @8,
+            // Alignment u64 @32.
+            let mut hdesc = [0u8; 48];
+            (hdesc.as_mut_ptr() as *mut u64).write_unaligned(0x4_0000);
+            (hdesc.as_mut_ptr().add(8) as *mut u32).write_unaligned(1);
+            (hdesc.as_mut_ptr().add(32) as *mut u64).write_unaligned(0x1_0000);
+            type MkHeap = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk_heap: MkHeap = std::mem::transmute(slot(dev, 28));
+            let mut h = std::ptr::null_mut();
+            assert_eq!(mk_heap(dev, hdesc.as_ptr() as *const c_void, std::ptr::null(), &mut h), S_OK);
+            // D3D12_RESOURCE_DESC (56 B): BUFFER (dim 1) + Width @16.
+            let buf_desc = |bytes: u64| {
+                let mut d = [0u8; 56];
+                (d.as_mut_ptr() as *mut u32).write_unaligned(1);
+                (d.as_mut_ptr().add(16) as *mut u64).write_unaligned(bytes);
+                d
+            };
+            type MkPlaced = unsafe extern "win64" fn(*mut c_void, *mut c_void, u64, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk_placed: MkPlaced = std::mem::transmute(slot(dev, 29));
+            let (da, db) = (buf_desc(0x1_0000), buf_desc(0x1000));
+            let (mut a, mut b) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(mk_placed(dev, h, 0, da.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut a), S_OK);
+            assert_eq!(mk_placed(dev, h, 0x200, db.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut b), S_OK);
+            type Map = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let map: Map = std::mem::transmute(slot(a, 8));
+            type Va = unsafe extern "win64" fn(*mut c_void) -> u64;
+            let va: Va = std::mem::transmute(slot(a, 11));
+            let (mut pa, mut pb) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(map(a, 0, std::ptr::null(), &mut pa), S_OK);
+            assert_eq!(map(b, 0, std::ptr::null(), &mut pb), S_OK);
+            assert!(!pa.is_null() && !pb.is_null());
+            assert_eq!(va(a), pa as u64, "placed VA != Map address");
+            assert_eq!(va(b), pa as u64 + 0x200, "aliased VA mismatch");
+            assert_eq!(pb as u64, pa as u64 + 0x200, "aliased Map mismatch");
+            assert_ne!((va(a) >> 32) & 3, 3, "heap pool must avoid window 3");
+            // PC CopyBufferRegion (slot 15) into a committed buffer, at once.
+            type MkCommitted = unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk_committed: MkCommitted = std::mem::transmute(slot(dev, 27));
+            let dc = buf_desc(0x1000);
+            let mut rb = std::ptr::null_mut();
+            assert_eq!(mk_committed(dev, std::ptr::null(), 0, dc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+            (pa as *mut u32).write(0x1122_3344);
+            type MkList = unsafe extern "win64" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk_list: MkList = std::mem::transmute(slot(dev, 12));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(mk_list(dev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            type CopyBuf = unsafe extern "win64" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+            let copy: CopyBuf = std::mem::transmute(slot(l, 15));
+            copy(l, rb, 0, a, 0, 4);
+            let mut prb = std::ptr::null_mut();
+            assert_eq!(map(rb, 0, std::ptr::null(), &mut prb), S_OK);
+            assert_eq!((prb as *const u32).read(), 0x1122_3344, "slot-15 copy did not land");
         }
     }
 
