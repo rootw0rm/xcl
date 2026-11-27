@@ -37,6 +37,8 @@ pub mod xuser_linux;
 pub mod xaudio2_linux;
 #[path = "hle/d3d12x_linux.rs"]
 pub mod d3d12x_linux;
+#[path = "hle/d3d12x_frame_linux.rs"]
+pub mod d3d12x_frame_linux;
 #[path = "hle/d3dcompiler_linux.rs"]
 pub mod d3dcompiler_linux;
 #[path = "hle/vulkan_linux.rs"]
