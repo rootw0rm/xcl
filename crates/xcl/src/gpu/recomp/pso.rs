@@ -267,6 +267,9 @@ mod translated {
                 Backend::current(),
                 direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::declared_lds_enabled() {
+                identity_for(&id.to_string(), "declared-lds")
+            } else { id };
             // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
             let id = match crate::gpu::dxil::kernel::compact_mode() {
                 Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
@@ -525,6 +528,9 @@ mod translated {
             Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
             None => id,
         };
+        let id = if crate::gpu::dxil::kernel::declared_lds_enabled() {
+            identity_for(&id.to_string(), "declared-lds")
+        } else { id };
         let id = match nest_tag {
             Some(tag) => identity_for(&id.to_string(), tag),
             None => id,
@@ -1875,6 +1881,36 @@ mod shader_cache_tests {
             assert!(out.status.success(), "nest={nest}, split={split}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn declared_lds_disk_cache_separates_both_direct_routes() {
+        const CASE: &str = "XCL_TEST_DECLARED_LDS_CACHE";
+        if let Ok(case) = std::env::var(CASE) {
+            let (marker, expected) = case.split_once(':').unwrap();
+            let marker = marker.parse().unwrap();
+            let rerouted = !crate::gpu::dxil::kernel::enabled();
+            let shader = translated::cached(&dxc::cache_dir(), b"console-lds", Stage::Compute, 0, 1, true,
+                || Ok((compiled(marker), rerouted))).unwrap();
+            assert_eq!(shader.dxil[67], expected.parse::<u8>().unwrap());
+            return;
+        }
+        for direct in ["0", "1"] {
+            let dir = std::env::temp_dir().join(format!("xcl-declared-lds-{}-{direct}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for (lds, case) in [("0", "1:1"), ("1", "2:2"), ("0", "9:1"), ("1", "9:2")] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "gpu::recomp::pso::shader_cache_tests::declared_lds_disk_cache_separates_both_direct_routes"])
+                    .env(CASE, case)
+                    .env("XCL_DXIL_CACHE", &dir)
+                    .env("XCL_TRANSLATED_CACHE", "1")
+                    .env("XCL_DIRECT_DXIL", direct)
+                    .env("XCL_DECLARED_LDS", lds)
+                    .status().unwrap();
+                assert!(status.success(), "direct={direct}, declared={lds}, case={case}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     fn key(hash: u64) -> ShaderKey {

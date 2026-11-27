@@ -14,27 +14,30 @@ use super::module::{BinOp, Pred, RmwOp, Value};
 use super::ops::barrier;
 
 impl Lw {
-    /// Groupshared storage, created in the entry block before anything else:
-    /// the program's LDS (`lds_words` > 0) and, in the split form, the halves'
-    /// exchange words — in the top of the LDS block when there is one (D3D12
-    /// allows 32 KB, the whole LDS), as the HLSL kernel lays it out.
-    pub fn setup_storage(&mut self, lds: bool, slot: u32) {
+    /// Put private lane-exchange words after the guest LDS. D3D12 permits
+    /// 8192 dwords in total, including any arrival counter for a native 2-D group.
+    pub fn setup_storage(&mut self, lds: bool, slot: u32, declared: u32, native_counter: bool) {
         let i32 = self.s.m.i32();
         self.xslot = slot.max(1);
         if lds {
-            let g = self.s.groupshared("xcl_lds", i32, 8192);
+            let slots = 4 * self.xslot * self.waves;
+            let control = if self.split { slots + 2 * self.waves + 1 } else { u32::from(native_counter) };
+            // Unspecified or oversized reservations retain the existing 32 KiB layout.
+            let fits = declared != 0 && declared <= 8192 - control;
+            let words = if fits { declared + control } else { 8192 };
+            let g = self.s.groupshared("xcl_lds", i32, u64::from(words));
             self.lds = Some(g);
             if self.split {
-                // HLSL: exchange base = 8192 - slots - counters - 1 (slots = 4 · slot per console
-                // wave, 2 counters each); the program's LDS stops below it
-                let slots = 4 * self.xslot * self.waves;
-                let base = 8192 - slots - 2 * self.waves - 1;
+                let base = words - control;
                 self.lds_top = base - 1;
                 self.xs = Some((g, base));
                 self.xc = Some((g, base + slots));
-                self.xw = Some((g, 8191));
+                self.xw = Some((g, words - 1));
             } else {
-                self.lds_top = 8191;
+                self.lds_top = if fits { declared - 1 } else { 8191 };
+                if native_counter {
+                    self.xw = Some((g, words - 1));
+                }
             }
         } else if self.split {
             let w = self.s.groupshared("xcl_xw", i32, 1);
@@ -117,7 +120,7 @@ impl Lw {
         } else if y * z > 1 {
             let i32 = self.s.m.i32();
             let (g, at) = match (self.lds, lds_top_word) {
-                (Some(l), true) => (l, 8191),
+                (Some(_), true) => self.xw.expect("compute LDS arrival counter"),
                 _ => (self.s.groupshared("xcl_wt", i32, 1), 0),
             };
             let ai = self.c(at);

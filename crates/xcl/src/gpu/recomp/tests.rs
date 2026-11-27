@@ -5687,7 +5687,7 @@ fn gpu_compute_mode_dispatch_abi() {
         return;
     }
     use super::{dxc, CsInterface};
-    let cs = CsInterface { threads: [16, 8, 1], user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2 };
+    let cs = CsInterface { threads: [16, 8, 1], user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2, ..Default::default() };
     let p = prog(&[
         ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 132), ("VSRC1", 1)], None), // y · 16
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 2), ("VSRC1", 0)], None), // index in group
@@ -7833,7 +7833,7 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
     ]);
     for dims in [[256u32, 1, 1], [8, 8, 4]] {
         let threads = dims.iter().product::<u32>();
-        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
+        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3, ..Default::default() };
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -7912,7 +7912,7 @@ fn gpu_split_wave64_waves_diverge() {
     ]);
     for dims in [[256u32, 1, 1], [64, 1, 1], [8, 8, 4], [16, 4, 1]] {
         let threads = dims.iter().product::<u32>();
-        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
+        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3, ..Default::default() };
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -7990,7 +7990,7 @@ fn bench_split_wave64() {
             let mut ms = Vec::new();
             let mut exchanges = 0;
             for wave64 in [false, true] {
-                let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+                let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
                 let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
                 let t = translate(&p, &opt).unwrap();
                 // the loop's exchanges: masks read whole (`x64_masks`: not the v_cndmask
@@ -8041,7 +8041,7 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
     ]);
     for (threads, wave64) in [(96u32, true), (96, false), (64, true), (40, false), (128, true)] {
         let lanes = if wave64 { 64 } else { 32 };
-        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1, ..Default::default() };
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -9478,7 +9478,7 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
     ]);
 
-    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1, ..Default::default() };
     let base = 0x100usize;
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
@@ -10396,7 +10396,7 @@ fn gpu_ps_mask_loop_on_a_primitive_edge_ends() {
 /// backends follow the same predicate.
 #[test]
 fn compute_globallycoherent_only_when_needed() {
-    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1, ..Default::default() };
     let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
     let prog = |insts: &[(&str, &str, &[(&str, u64)])]| {
         let mut c = Vec::new();
@@ -10473,7 +10473,7 @@ fn gpu_compute_coherent_and_cached_loads() {
     if !gpu_ready() {
         return;
     }
-    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1, ..Default::default() };
     let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
 
     // 1. Plain cached compute: each thread reads a uniform dword via SMEM (s[0:1] = 0x100) and

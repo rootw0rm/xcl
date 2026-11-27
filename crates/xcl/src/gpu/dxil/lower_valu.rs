@@ -1541,7 +1541,7 @@ mod wave32_mask_src_tests {
     fn direct_wave32_valu_mask_32bit_only_sources_translate() {
         let ko32 = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
         let ko64 = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
-        let cs = recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let cs = recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
 
         for src2 in [124u64, 127] {
             let ops: [(&str, &str, &[(&str, u64)]); 4] = [
@@ -1639,8 +1639,8 @@ mod wave32_mask_src_tests {
         // Bitcode check on shipping `translate_compute`: with `user_sgprs = 12` and `SRC2 = s10`,
         // Wave32 emits a `rawBufferLoad` at `s10`'s `io` byte offset (`40`) and never `s11`'s
         // (`44`), whereas Wave64 loads both `s10` (`40`) and `s11` (`44`).
-        let cs32 = recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 12, tgid: [false; 3], tg_size: false, tid_components: 2 };
-        let cs64 = recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 12, tgid: [false; 3], tg_size: false, tid_components: 2 };
+        let cs32 = recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 12, tgid: [false; 3], tg_size: false, tid_components: 2, ..Default::default() };
+        let cs64 = recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 12, tgid: [false; 3], tg_size: false, tid_components: 2, ..Default::default() };
         let cs_s10 = asm(&[
             ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 10)]),
             ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 0), ("SOFFSET", 128)]),

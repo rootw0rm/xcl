@@ -69,7 +69,7 @@ fn translate_all() -> Vec<Vec<u8>> {
         input_ena: 0x302,
         attrs: None,
     };
-    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1, ..Default::default() };
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
     let mut out = Vec::new();
     for (w, s) in [(false, false), (true, true), (true, false)] {
@@ -269,7 +269,7 @@ fn split_wave64_whole_live_elides_exchange_barriers_for_lane_local_masks() {
         let cfg = Cfg::build(code).unwrap();
         let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
         let threads = [if wave64 { 64 } else { 32 }, 1, 1];
-        let cs = CsInterface { threads, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let cs = CsInterface { threads, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
         let mut lw = Lw::new(&cfg.insts, &leaders, KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 }, &Entry::Compute(cs.clone()));
         let (tid, gtid) = lw.setup_lanes_compute(cs.threads, false);
         compute_init(&mut lw, &cs, tid, gtid);

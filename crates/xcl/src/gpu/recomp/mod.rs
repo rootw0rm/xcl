@@ -296,6 +296,8 @@ impl GsInterface {
 /// Compute shader with the console's dispatch ABI (see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CsInterface {
+    /// Static workgroup LDS from COMPUTE_PGM_RSRC2, in dwords. Zero means unspecified.
+    pub lds_dwords: u32,
     pub threads: [u32; 3],
     pub user_sgprs: u32,
     /// TGID_X / Y / Z enabled: the group id follows the user SGPRs in this order
@@ -321,6 +323,7 @@ impl CsInterface {
     fn from_rsrc2(threads: [u32; 3], r: u32) -> Self {
         Self {
             threads,
+            lds_dwords: ((r >> 15) & 0x1ff) * 128,
             user_sgprs: (r >> 1) & 31,
             tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
             tg_size: (r >> 10) & 1 == 1,

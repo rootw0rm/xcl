@@ -40,6 +40,12 @@ pub struct KernelOptions {
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
 pub const TRANSLATOR_VERSION: u32 = 9;
 
+/// Opt in for dispatches whose guest LDS contract is fixed by the pipeline header.
+pub fn declared_lds_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_DECLARED_LDS").is_ok_and(|value| value == "1"))
+}
+
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
 pub fn enabled() -> bool {
@@ -609,7 +615,14 @@ impl Lw {
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
         }
-        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        let (declared, native_counter) = match entry {
+            Entry::Compute(cs) => {
+                let declared = if declared_lds_enabled() { cs.lds_dwords } else { 0 };
+                (declared, !split && (cs.threads[1] > 1 || cs.threads[2] > 1))
+            }
+            _ => (0, false),
+        };
+        lw.setup_storage(uses_lds, slot, declared, native_counter);
         if let (Some(t), true) = (group_threads, split) {
             lw.partner = match t {
                 0..=32 => Partner::Missing,

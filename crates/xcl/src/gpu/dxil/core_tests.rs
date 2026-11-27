@@ -925,3 +925,41 @@ fn scratch_reads_addr_only_in_the_sv_form() {
     assert!(kernel(0x7D, 2) != kernel(0x7D, 3), "SV (SADDR 0x7d) addresses VADDR + offset");
     assert!(kernel(0x7F, 2) != kernel(0x7D, 2), "ST is not the SV form");
 }
+
+#[test]
+fn compute_lds_reservation_matches_descriptor_and_lane_storage() {
+    // Exercise both cache modes on ordinary CI without changing the test process environment.
+    if std::env::var_os("XCL_TEST_LDS_CHILD").is_none() {
+        for mode in ["0", "1"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gpu::dxil::core_tests::compute_lds_reservation_matches_descriptor_and_lane_storage"])
+                .env("XCL_DECLARED_LDS", mode)
+                .env("XCL_TEST_LDS_CHILD", "1")
+                .status().unwrap();
+            assert!(status.success(), "declared LDS mode {mode}");
+        }
+        return;
+    }
+    use crate::gpu::recomp::CsInterface;
+    let code = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None)]);
+    for (threads, blocks, split, expected) in [
+        ([64, 1, 1], 2u32, false, 256),
+        ([8, 8, 1], 1, false, 129),
+        ([8, 8, 1], 1, true, 135),
+        ([128, 1, 1], 2, true, 269),
+        ([8, 8, 1], 0, true, 8192),
+        ([8, 8, 1], 64, true, 8192),
+    ] {
+        let mut descriptor = [0u8; 0x48];
+        for (i, v) in [blocks << 15, threads[0], threads[1], threads[2]].into_iter().enumerate() {
+            descriptor[0x38 + 4*i..0x3c + 4*i].copy_from_slice(&v.to_le_bytes());
+        }
+        let cs = CsInterface::from_descriptor(&descriptor, 0).unwrap();
+        assert_eq!(cs.lds_dwords, blocks * 128);
+        let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
+        let dxil = super::kernel::translate_compute(&code, options, &cs).unwrap().dxil;
+        let dis = super::validate::disassemble(&dxil).unwrap();
+        let words = if super::kernel::declared_lds_enabled() { expected } else { 8192 };
+        assert!(dis.contains(&format!("@xcl_lds = external addrspace(3) global [{words} x i32]")), "{threads:?}, {blocks}, split={split}");
+    }
+}

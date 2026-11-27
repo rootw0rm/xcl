@@ -2150,7 +2150,7 @@ impl Lw {
     fn lds_index(&mut self, at: Value) -> Value {
         let i = self.lshrc(at, 2);
         let i = self.andc(i, 8191);
-        if self.split {
+        if self.lds_top < 8191 {
             let k = self.c(self.lds_top);
             self.umin(i, k)
         } else {
