@@ -67,7 +67,7 @@ XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a 
   <tr>
     <td width="33%" valign="top" align="center">
       <img src="assets/readme/icon-texture.svg" width="56" alt=""><br>
-      <p align="left"><b>Console textures decode exactly</b> – the GFX10 tiling and mip layout reproduce 909 of 912 textures of the game's texture archive byte for byte, its volume textures included.</p>
+      <p align="left"><b>Console texture layouts</b> – the archive test reads and detiles all 912 entries in the retail sample, including cubemaps and volume textures.</p>
     </td>
     <td width="33%" valign="top" align="center">
       <img src="assets/readme/icon-storage.svg" width="56" alt=""><br>
@@ -157,7 +157,7 @@ For title and HLE modules, `GetModuleFileNameA/W` returns zero and sets
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
-| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
+| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 912 / 912 entries detiled in the tested retail archive; GPU upload bit exact in test fixtures |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
@@ -564,7 +564,7 @@ the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPP
 only `no wave64` skips. `XCL_REQUIRE_GPU=wave64,mesh` turns every skip from that helper into a failure.
 Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
-`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
+`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (an RDS5 texture archive, checked entry by entry),
 `XCL_SAMPLE_BCPACK` (a folder of BCPack streams `<name>.bc<mode>` with a reference decoder's blocks of each, `<name>.vic<mode>`), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
