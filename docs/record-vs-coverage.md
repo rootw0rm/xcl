@@ -64,8 +64,54 @@ The exact command on the parent directory (`--sample 100 --threads 4`) gives 100
 43 non-VS, 53 reject, 4 incomplete, 0 complete. 50 of the 53 rejects are `disasm/*.s` text
 (`not a console shader container`), not shader records.
 
+## Branch shapes and the control-flow decision (step-08, 2026-11-27)
+
+The single branch refusal is now split by `recomp::spirv::branch_flow`, the pure classifier the
+backend uses in its reject message. Same corpus, `--sample 0`, seed 1; the outcome counts are
+unchanged, only the branch reason is broken into its shapes:
+
+| reject shape | records |
+|---|---:|
+| exec-mask + scc/vcc branches | 877 |
+| exec-mask + scc/vcc branches, backward edges | 169 |
+| scc/vcc branches | 117 |
+| exec-mask branches | 28 |
+| exec-mask branches, backward edges | 9 |
+| scc/vcc branches, backward edges | 4 |
+| all branch rejects | 1,204 |
+
+`exec-mask` is `s_cbranch_execz/execnz`; `scc/vcc` is every other conditional; `backward edges`
+are targets at or before the branch (loops). The categories use words only, so `reason_key`
+keeps them apart; the 1,204 total matches the cross-tab of the decoded programs.
+
+**Decision: the SPIR-V bring-up backend does not emit structured control flow for these
+records.** Three measurements support it.
+
+1. **Branches are not what blocks these records.** A throwaway local patch (not shipped) removed
+   the branch check and counted branch instructions as ignored, then re-ran the same sweep:
+   still 10 complete, 2,226 incomplete, and **0 of the 1,204 branch records complete**. Each one
+   still carries at least 28 untranslated instructions (mean 344) across at least 7 distinct
+   reasons; `s_load_dwordx4` appears in all 1,204, `s_buffer_load_dword` in 1,187 and
+   `v_fmac_f32` in 1,155. `resolve_record_vs` accepts the words only on `complete()`, so branch
+   support alone would change no draw.
+2. **The shapes are not straight-line uniform `if`s.** 1,083 of the 1,204 use EXEC-mask
+   branches, opened by mask saves (`s_and_saveexec_b64`: 2,834 uses) — lane-divergent regions
+   where the bring-up model assumes full EXEC. The existing `recomp::lane_masks` analysis (the
+   only module that models per-lane masks; "nothing translates with this yet") accepts
+   570 of the 1,204 and refuses 634 (617 "a branch on whether any lane of a mask is set, with
+   lanes in EXEC without its bit", 17 indirect jump). Of the 570, 481 have lane branches and
+   only 89 are all-uniform — and those 89 still carry other untranslated instructions (the
+   branch-free sweep made none of the 1,204 complete).
+3. **The blockers rank differently.** Descriptor/buffer loads and VALU/SDWA dominate the
+   untranslated instructions; control flow is neither first nor independently sufficient.
+   Emitting `OpSelectionMerge`/`OpLoopMerge` around a body the emitter still cannot translate
+   would add risk without a complete shader.
+
+So the next coverage measurement should target the load/VALU reasons, not branches. Branch
+shapes stay visible in the sweep so a future decision can be re-made on data.
+
 ## Follow-up
 
-`code-assist:xcl-first-frame:step-08:record-vs-branches` (task-1795794902-51cb): console VS
-control flow (the `N branches are not supported by the SPIR-V bring-up backend` key). Not
-fixed in this measurement change.
+`code-assist:xcl-first-frame:step-08:record-vs-branches` (task-1795794902-51cb) is resolved as
+the documented decision above; the classifier and its tests live in `gpu/recomp/spirv.rs`
+(`BranchFlow`, `branch_flow`). No behavior change beyond the reject-reason shape.

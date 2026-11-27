@@ -2,7 +2,10 @@
 //!
 //! In-process emitter for the same straight-line blit subset the GLSL backend
 //! covers (`glsl.rs`): scalar ALU + a small VALU set + `exp pos`/`param` +
-//! `s_endpgm`. Branches are rejected; the full-EXEC entry state is assumed
+//! `s_endpgm`. Branches are rejected with their shape (`BranchFlow`): a
+//! structured translation would have to model them, and the console VS
+//! corpus says that is not this backend's blocker (see
+//! `docs/record-vs-coverage.md`). The full-EXEC entry state is assumed
 //! (documented, true of the blits gated here). Anything else is recorded in
 //! `unsupported`/`ignored`, never a crash.
 //!
@@ -39,6 +42,76 @@ impl SpirvTranslation {
     }
 }
 
+/// The control flow a decoded program has beyond straight-line code.
+///
+/// The bring-up backend rejects every branch; this says what a structured
+/// SPIR-V translation would have to model, so the refusal is measurable in
+/// `xcl shaders --record-vs` instead of one opaque reason. Counts are
+/// branches (one edge each), not instructions: `branch_flow` only sees
+/// resolved direct branches (`rdna2::branch_target`, far jumps included).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BranchFlow {
+    /// `s_cbranch_execz` / `s_cbranch_execnz`: the branch tests the EXEC lane
+    /// mask, i.e. a region guarded by `s_and_saveexec_b64`-class mask writes.
+    pub lane: usize,
+    /// Other conditionals: SCC (`s_cbranch_scc0/1`), VCC (`vccz/vccnz`) and
+    /// the debug/system forms.
+    pub predicate: usize,
+    /// `s_branch` and resolved far jumps.
+    pub unconditional: usize,
+    /// Edges whose target is at or before the branch itself (loops,
+    /// including a branch to its own pc).
+    pub loops: usize,
+}
+
+impl BranchFlow {
+    /// Branch instructions counted.
+    pub fn branches(&self) -> usize {
+        self.lane + self.predicate + self.unconditional
+    }
+
+    /// True for straight-line code (no direct branch).
+    pub fn is_empty(&self) -> bool {
+        self.branches() == 0
+    }
+
+    /// The shapes present as a reason suffix, e.g. `"exec-mask branches,
+    /// scc/vcc branches, backward edges"`; empty for straight-line code.
+    pub fn shape(&self) -> String {
+        let mut parts = Vec::new();
+        if self.lane > 0 {
+            parts.push("exec-mask branches");
+        }
+        if self.predicate > 0 {
+            parts.push("scc/vcc branches");
+        }
+        if self.loops > 0 {
+            parts.push("backward edges");
+        }
+        parts.join(", ")
+    }
+}
+
+/// Classifies the resolved direct branches of a decoded program.
+pub fn branch_flow(insts: &[Decoded]) -> BranchFlow {
+    let mut flow = BranchFlow::default();
+    for d in insts {
+        let Some(target) = rdna2::branch_target(d) else {
+            continue;
+        };
+        let name = d.inst.name.to_ascii_lowercase();
+        match name.as_str() {
+            "s_cbranch_execz" | "s_cbranch_execnz" => flow.lane += 1,
+            n if n.starts_with("s_cbranch") => flow.predicate += 1,
+            _ => flow.unconditional += 1,
+        }
+        if target <= d.pc {
+            flow.loops += 1;
+        }
+    }
+    flow
+}
+
 /// The SPIR-V backend behind the shared [`VsInterface`] contract.
 pub struct SpirvVsBackend;
 
@@ -64,13 +137,15 @@ pub fn translate_vs_spirv(
         insts.push(d);
     }
     rdna2::resolve_far_jumps(&mut insts);
-    for d in &insts {
-        if rdna2::branch_target(d).is_some() || d.far_target.is_some() {
-            return Err(format!(
-                "+{:#x}: branches are not supported by the SPIR-V bring-up backend",
-                d.pc
-            ));
-        }
+    if let Some(d) = insts
+        .iter()
+        .find(|d| rdna2::branch_target(d).is_some())
+    {
+        let shape = branch_flow(&insts).shape();
+        return Err(format!(
+            "+{:#x}: branches are not supported by the SPIR-V bring-up backend ({shape})",
+            d.pc
+        ));
     }
     let mut em = SpirvEm::new(vs.clone(), wave64);
     let mut ended = false;
@@ -1974,6 +2049,75 @@ mod tests {
         assert!(g.glsl.contains("gl_Position"), "{}", g.glsl);
         assert!(g.glsl.contains("gl_VertexIndex"), "{}", g.glsl);
         assert!(g.glsl.contains("out_p0"), "{}", g.glsl);
+    }
+
+    fn decoded(code: &[u8]) -> Vec<Decoded> {
+        let mut insts = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= code.len() {
+            let d = rdna2::decode(&code[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        rdna2::resolve_far_jumps(&mut insts);
+        insts
+    }
+
+    /// The branch refusal carries the shape a structured translation would have to
+    /// model, so `xcl shaders --record-vs` ranks the shapes separately.
+    #[test]
+    fn branch_flow_classifies_lane_predicate_and_loop_edges() {
+        let branch = |name: &str, simm: u16| {
+            encode(name, "ENC_SOPP", &[("SIMM16", simm as u64)], None).unwrap()
+        };
+        let mut code = Vec::new();
+        code.extend(branch("S_CBRANCH_SCC0", 2)); // forward, predicate
+        code.extend(branch("S_CBRANCH_EXECZ", 0xFFFF)); // target = own pc: lane loop
+        code.extend(branch("S_BRANCH", 0xFFFF)); // unconditional self loop
+        let flow = branch_flow(&decoded(&code));
+        assert_eq!(
+            flow,
+            BranchFlow {
+                lane: 1,
+                predicate: 1,
+                unconditional: 1,
+                loops: 2,
+            }
+        );
+        assert_eq!(flow.branches(), 3);
+        assert!(!flow.is_empty());
+        assert_eq!(
+            flow.shape(),
+            "exec-mask branches, scc/vcc branches, backward edges"
+        );
+    }
+
+    #[test]
+    fn branch_flow_is_empty_for_straight_line_code() {
+        let flow = branch_flow(&decoded(&blit_code()));
+        assert!(flow.is_empty());
+        assert_eq!(flow.branches(), 0);
+        assert_eq!(flow.shape(), "");
+    }
+
+    #[test]
+    fn translated_blit_rejection_names_the_branch_shape() {
+        let mut code = Vec::new();
+        code.extend(
+            encode(
+                "S_CBRANCH_EXECZ",
+                "ENC_SOPP",
+                &[("SIMM16", 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(blit_code());
+        let err = SpirvVsBackend::translate_vs(&code, &blit_vs(), true)
+            .expect_err("a branch must be rejected");
+        assert!(err.contains("branches are not supported"), "{err}");
+        assert!(err.contains("exec-mask branches"), "{err}");
+        assert!(err.contains("+0x0:"), "{err}");
     }
 
     #[test]
