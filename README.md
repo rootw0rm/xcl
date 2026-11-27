@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://discord.gg/xcl"><img alt="Discord: join the server" src="https://img.shields.io/badge/Discord-join%20the%20server-7c5cff?style=for-the-badge"></a>
   <a href="https://github.com/xcl-dev/xcl/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/xcl-dev/xcl/ci.yml?branch=main&style=for-the-badge&label=CI"></a>
-  <a href="LICENSE"><img alt="License: GPL-2.0-only" src="https://img.shields.io/badge/license-GPL--2.0--only-7c5cff?style=for-the-badge"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-7c5cff?style=for-the-badge"></a>
   <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-2f80ed?style=for-the-badge">
   <img alt="Direct3D 12, Shader Model 6.6" src="https://img.shields.io/badge/D3D12-SM%206.6-1fb9d8?style=for-the-badge">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable--msvc-1fb9d8?style=for-the-badge">
@@ -193,6 +193,35 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
+
+To override keyboard and mouse controls for one title, add an optional table to its `xcl.toml`.
+For example, use arrow keys for the left stick, clear the arrow-key D-pad bindings, and swap the
+mouse buttons:
+
+```toml
+[input_profile]
+move_up = ["up"]
+move_left = ["left"]
+move_down = ["down"]
+move_right = ["right"]
+dpad_up = []
+dpad_left = []
+dpad_down = []
+dpad_right = []
+left_trigger = ["mouse_left"]
+right_trigger = ["mouse_right"]
+```
+
+Omitted entries use the built-in bindings. An empty list clears a binding. The output names are
+`move_up`, `move_left`, `move_down`, `move_right`, `a`, `b`, `x`, `y`, the four `dpad_*`
+directions, `view`, `menu`, `left_bumper`, `right_bumper`, `left_stick`, `right_stick`,
+`left_trigger`, and `right_trigger`. Each accepts a list of alternative inputs. Input names
+include `a` through `z`, `digit0` through `digit9`, `num0` through `num9`, `f1` through `f12`,
+`left_shift`, `right_ctrl`, `right_alt`, `mouse_middle`, `mouse_x1`, and `mouse_x2`.
+The `physical_q`, `physical_w`, `physical_e`, `physical_a`, `physical_s`, and `physical_d`
+inputs follow the positions used by the default layout. Set `wheel_up` and `wheel_down` to a
+single gamepad button name such as `right_bumper` or `y`, or to `unbound`.
+Restart the title to apply changes.
 
 ## Configuration
 
@@ -581,8 +610,8 @@ questions and talk to the [Discord server](https://discord.gg/xcl).
 
 ## Licenses
 
-**GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's
-machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, AnyPS5,
+**GPL-3.0-or-later** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's
+machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, VIctory, FFmpeg,
 libHttpClient headers). WinDurango serves only as a reference – no code is ported from it. The
 repository contains no headers or binaries from the console SDK.
 

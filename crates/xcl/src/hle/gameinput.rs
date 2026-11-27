@@ -636,7 +636,6 @@ mod live {
 
 #[link(name = "user32")]
 extern "system" {
-    fn GetAsyncKeyState(key: i32) -> i16;
     fn GetForegroundWindow() -> *mut c_void;
     fn GetWindowThreadProcessId(window: *mut c_void, pid: *mut u32) -> u32;
 }
@@ -651,8 +650,7 @@ unsafe fn keyboard() -> u32 {
     if pid != std::process::id() {
         return 0;
     }
-    const KEYS: [(i32, u32); 10] = [(0x0D, A), (0x20, A), (0x1B, B), (0x08, B), (0x26, DPAD_UP), (0x28, DPAD_DOWN), (0x25, DPAD_LEFT), (0x27, DPAD_RIGHT), (0x09, VIEW), (0x50, MENU)];
-    KEYS.iter().filter(|(k, _)| GetAsyncKeyState(*k) as u16 & 0x8000 != 0).fold(0, |b, (_, g)| b | g)
+    super::kbm::navigation_buttons(w)
 }
 
 /// Merge host keyboard/mouse input (only when `keyboard_mouse` is enabled) and scripted

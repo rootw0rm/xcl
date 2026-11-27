@@ -69,6 +69,10 @@ pub struct Config {
     /// left stick, the mouse the right stick (the cursor is held in the window), the mouse
     /// buttons the triggers, the wheel the bumpers (see `hle::kbm`).
     pub keyboard_mouse: bool,
+    /// Per-title keyboard and mouse bindings. Omitted fields inherit XCL Default.
+    #[cfg(windows)]
+    #[serde(skip_serializing_if = "crate::hle::kbm::InputProfile::is_default")]
+    pub(crate) input_profile: crate::hle::kbm::InputProfile,
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
     pub mouse_sensitivity: f32,
@@ -190,6 +194,8 @@ impl Default for Config {
             window_pos: "auto".into(),
             xbox_live_tokens: false,
             keyboard_mouse: true,
+            #[cfg(windows)]
+            input_profile: Default::default(),
             mouse_sensitivity: 1.0,
         }
     }
