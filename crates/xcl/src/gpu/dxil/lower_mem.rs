@@ -2192,7 +2192,16 @@ impl Lw {
                 let x = self.addc(a, off16);
                 let x = self.lshrc(x, 2);
                 let l = self.andc(x, m);
-                let r = self.read_lane_any(v, l);
+                let mut r = self.read_lane_any(v, l);
+                // wave64 VS / PS in 32-lane waves: a source lane ≥ 32 the analysis follows
+                // holds a constant (the console value); `upper_lanes`
+                if let Some(crate::gpu::recomp::upper_lanes::Read::Const(c)) = self.upper_read(d.pc) {
+                    let c = self.c(c);
+                    let hw32 = self.hw32();
+                    let up = self.cmpc(Pred::UGe, l, 32);
+                    let take = self.land(hw32, up);
+                    r = self.sel(take, c, r);
+                }
                 let on = self.lanebit_at(el, eh, l);
                 let z = self.c(0);
                 let t = self.sel(on, r, z);

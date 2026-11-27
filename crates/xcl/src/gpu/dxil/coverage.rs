@@ -415,6 +415,72 @@ mod tests {
         assert_eq!(r.stages["GS"].translated, 1, "{}", r.text(5));
     }
 
+    /// A wave64 PS that runs in 32-lane waves (the driver's pick for graphics) reads a
+    /// console lane ≥ 32: where `upper_lanes` resolves the value (a whole-wave identity
+    /// constant, a `v_writelane` spill shadow) the direct translator must translate it, as
+    /// the HLSL path does; only a read it cannot follow stays refused.
+    #[test]
+    fn wave64_graphics_upper_lane_reads_resolve_or_refuse() {
+        use crate::gpu::dxbc::SigElement;
+        use crate::gpu::recomp::{Mode, PsInterface};
+        fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
+            let mut v = Vec::new();
+            for (n, e, f, l) in list {
+                v.extend(rdna2::encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}")));
+            }
+            v.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            v
+        }
+        let sig = |name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8| SigElement {
+            name: name.into(),
+            index,
+            system_value: sv,
+            component_type: ct,
+            register: reg,
+            mask,
+            rw_mask: mask,
+            stream: 0,
+        };
+        let exp = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 4), ("VSRC3", 5), ("DONE", 1), ("VM", 1)][..], None);
+        let psi = PsInterface {
+            inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+            outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
+            input_ena: 0x2,
+            attrs: None,
+        };
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let run = |code: &[u8]| translate_mode(code, &Mode::Pixel(psi.clone()), o, false);
+
+        // `s_or_saveexec_b64 s0, -1` makes every console lane active, `v_mov v4, 5` writes
+        // all of them: lane 63 holds 5, which `v_readlane` reads.
+        let constant = prog(&[
+            ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 193)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 133)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None),
+            exp.clone(),
+        ]);
+        run(&constant).unwrap_or_else(|e| panic!("a constant upper lane must translate: {e}"));
+
+        // `v_writelane v4, s0, 63` stores an SGPR spill into lane 63; the shadow keeps it.
+        let spill = prog(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 128), ("SRC1", 191)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None),
+            exp.clone(),
+        ]);
+        run(&spill).unwrap_or_else(|e| panic!("a spill-slot shadow must translate: {e}"));
+
+        // `v_writelane v4, s0, s10` picks the lane at run time, so which of lanes 32..63
+        // (if any) got the value is not known; the read has no value the analysis can
+        // follow and must still be refused.
+        let unknown = prog(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 128), ("SRC1", 10)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None),
+            exp.clone(),
+        ]);
+        let e = run(&unknown).err().expect("an unfollowed upper-lane read stays refused");
+        assert!(e.contains("cannot follow"), "unexpected error: {e}");
+    }
+
     #[test]
     fn live_fallback_summary() {
         record_translated("CS");

@@ -551,6 +551,31 @@ impl Lw {
         self.sel(mine, m, o)
     }
 
+    /// `upper_lanes` resolution of the cross-lane read at `pc`: None unless this is a
+    /// wave64 VS / PS that may run in 32-lane hardware waves.
+    pub fn upper_read(&self, pc: u64) -> Option<crate::gpu::recomp::upper_lanes::Read> {
+        self.upper_lanes.as_ref()?.reads.get(&pc).copied()
+    }
+
+    /// i1: this hardware wave has 32 lanes (the console's lanes 32..63 are not populated),
+    /// so an `upper_lanes` read takes the console value (the HLSL path's `xcl_hw32`).
+    pub fn hw32(&mut self) -> Value {
+        if let Some(v) = self.hw32 {
+            return v;
+        }
+        let n = self.s.wave_lane_count();
+        let v = self.cmpc(Pred::ULt, n, 64);
+        self.hw32 = Some(v);
+        v
+    }
+
+    /// The value of a spill slot's shadow (`upper_lanes`): every `v_writelane` of the slot
+    /// also wrote it, whatever the hardware wave size.
+    pub fn shadow_value(&mut self, slot: (u64, u32)) -> Value {
+        let var = *self.shadow_vars.get(&slot).expect("a read shadow has a variable");
+        self.rd(var)
+    }
+
     /// `v` of lane `l` within the reader's 32-lane half (DPP, swizzle, permlane).
     pub fn read_lane_half(&mut self, v: Value, l: Value) -> Value {
         if self.split {

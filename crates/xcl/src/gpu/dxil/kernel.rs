@@ -211,20 +211,26 @@ fn translate_on_this_thread(
     let kernel = matches!(entry, Entry::Kernel);
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
-    if gfx
-        && o.wave64
-        && o.split
-        && crate::gpu::recomp::upper_lanes::analyze(&cfg.insts)
-            .reads
-            .values()
-            .any(|&r| r != crate::gpu::recomp::upper_lanes::Read::Native)
-    {
-        return Err("wave64 VS / PS in 32-lane waves: a read of lanes 32–63".into());
+    // a wave64 VS / PS on a device whose driver may pick 32 lanes: lanes 32..63 do not
+    // exist there; a read of one is resolved to what the console lane holds where
+    // `upper_lanes` can follow it, and stays a refusal where it cannot
+    let upper_lanes = if gfx && o.wave64 && o.split { Some(crate::gpu::recomp::upper_lanes::analyze(&cfg.insts)) } else { None };
+    if let Some(u) = &upper_lanes {
+        if u.reads.values().any(|&r| r == crate::gpu::recomp::upper_lanes::Read::Unknown) {
+            return Err("wave64 VS / PS in 32-lane waves: a read of lanes 32–63 the analysis cannot follow".into());
+        }
+        if u.shadows.len() > super::lower::VAR_SHADOW_SLOTS as usize {
+            return Err("wave64 VS / PS in 32-lane waves: more spill slots than the shadow variables".into());
+        }
     }
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    if let Some(u) = upper_lanes {
+        lw.shadow_vars = u.shadows.iter().enumerate().map(|(i, &s)| (s, super::lower::VAR_SHADOW + i as u32)).collect();
+        lw.upper_lanes = Some(u);
+    }
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -570,6 +576,9 @@ impl Lw {
             guard_override: None,
             mask_override: None,
             local_masks: false,
+            upper_lanes: None,
+            shadow_vars: HashMap::new(),
+            hw32: None,
             exchange_error: None,
             pc: 0,
         };

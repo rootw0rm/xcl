@@ -1035,17 +1035,43 @@ impl Lw {
             }
             "v_readlane_b32" => {
                 let l = self.andc(b, wmask);
-                let t = self.read_lane_uniform(a, l);
+                let real = self.read_lane_uniform(a, l);
+                // wave64 VS / PS in 32-lane waves (`upper_lanes`): a lane ≥ 32 holds the
+                // constant the console put there, or the shadow of a spill slot
+                let t = match self.upper_read(d.pc) {
+                    Some(crate::gpu::recomp::upper_lanes::Read::Const(c)) => {
+                        let c = self.c(c);
+                        let hw32 = self.hw32();
+                        let up = self.cmpc(Pred::UGe, l, 32);
+                        let take = self.land(hw32, up);
+                        self.sel(take, c, real)
+                    }
+                    Some(crate::gpu::recomp::upper_lanes::Read::Shadow) => {
+                        let slot = crate::gpu::recomp::upper_lanes::slot(d).expect("a shadow read has a slot");
+                        let shadow = self.shadow_value(slot);
+                        let hw32 = self.hw32();
+                        self.sel(hw32, shadow, real)
+                    }
+                    _ => real,
+                };
                 self.write32(&dst, t);
                 return Ok(());
             }
             "v_writelane_b32" => {
+                // ignores EXEC
                 if let Dst::V(n) = dst {
                     let l = self.andc(b, wmask);
                     let lane = self.lane;
                     let me = self.cmp(Pred::Eq, lane, l);
                     let v = self.sel(me, a, cur);
                     self.wr(VAR_VGPR + n as u32, v);
+                    // a spill slot some read takes from its shadow (`upper_lanes`)
+                    if let Some(slot) = crate::gpu::recomp::upper_lanes::slot(d) {
+                        if self.upper_lanes.as_ref().is_some_and(|u| u.shadows.contains(&slot)) {
+                            let var = self.shadow_vars[&slot];
+                            self.wr(var, a);
+                        }
+                    }
                 }
                 return Ok(());
             }

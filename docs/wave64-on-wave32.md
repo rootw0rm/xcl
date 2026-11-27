@@ -238,6 +238,16 @@ shaders of the pack (3 540 reads) spill to lanes < 32.
 The wave size is checked at run time (`xcl_hw32 = WaveGetLaneCount() < 64`), so a driver that
 picks 64 lanes runs the program as before.
 
+The direct DXIL translator (`gpu/dxil`, `--direct`) uses the same analysis for a wave64 VS / PS
+translated with `split=1`: a `v_readlane` of a lane ≥ 32, or of a spill slot, and a
+`ds_bpermute` source lane ≥ 32 resolve to the constant / the shadow variable exactly as above,
+every `v_writelane` of a read slot writes its shadow, and the resolved value is taken only when
+`WaveGetLaneCount() < 64` (the same run-time check). A read the analysis cannot follow is still
+refused, so `pso.rs` falls back to the HLSL form for that program alone; the earlier blanket
+refusal of every non-native upper-lane read made those 84 PS of the `--direct` sweep fall back
+(`xcl shaders <dxbc> --direct --sample 0`: 22 445 programs, 22 361 translated before, all
+84 PS after).
+
 Which GPUs get the form: every GPU whose wave range includes 32 (`pso::graphics_wave32`), not
 only those without 64-lane waves. D3D12 has no `WaveSize` for graphics shaders, so the driver
 picks, and an RDNA2 driver (RX 6600 XT, issue #42) runs a wave64 PS in waves of 32 although it

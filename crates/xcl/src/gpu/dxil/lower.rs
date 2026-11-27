@@ -32,6 +32,11 @@ pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
+/// `v_writelane` shadow of a `(VGPR, lane)` spill slot a wave64 VS / PS reads in 32-lane
+/// waves (`upper_lanes`): one variable per slot, the recompiler's `xcl_sh<vgpr>_<lane>`
+pub const VAR_SHADOW: u32 = VAR_BUDGET + 32;
+/// Variables reserved for the shadows (a program's spill slots; see [`VAR_SHADOW`]).
+pub const VAR_SHADOW_SLOTS: u32 = 256;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
@@ -118,7 +123,9 @@ impl Init {
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var)
+            || (VAR_SHADOW..VAR_SHADOW + VAR_SHADOW_SLOTS).contains(&var)
+        {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -265,6 +272,14 @@ pub struct Lw {
     /// when it is never read whole. Set by a caller that reads back only each lane's own bit
     /// (the per-lane form's bridge), so no exchange meets the other half.
     pub local_masks: bool,
+    /// wave64 VS / PS that may run in 32-lane hardware waves: what the console's lanes
+    /// 32..63 hold where the program reads them (`recomp::upper_lanes`)
+    pub upper_lanes: Option<crate::gpu::recomp::upper_lanes::UpperLanes>,
+    /// the `v_writelane` shadow variable of each spill slot (`upper_lanes`)
+    pub shadow_vars: HashMap<(u64, u32), u32>,
+    /// `WaveGetLaneCount() < 64`: the wave really has 32 lanes, so the shadows / constants
+    /// replace the reads (the driver may still pick 64; the HLSL path's `xcl_hw32`)
+    pub hw32: Option<Value>,
 }
 
 impl Lw {

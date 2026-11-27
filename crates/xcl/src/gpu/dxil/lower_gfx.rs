@@ -96,6 +96,12 @@ impl Lw {
         self.lane31 = self.andc(lane, 31);
         self.upper = self.cmpc(Pred::UGe, lane, 32);
         self.half = self.lshrc(lane, 5);
+        // a wave64 VS / PS the driver may run in 32 lanes (`upper_lanes`): the reads of
+        // lanes 32..63 resolve to the console value only then (the HLSL path's `xcl_hw32`)
+        if self.upper_lanes.is_some() {
+            let n = self.s.wave_lane_count();
+            self.hw32 = Some(self.cmpc(Pred::ULt, n, 64));
+        }
     }
 
     /// VS entry: signatures, initial registers.

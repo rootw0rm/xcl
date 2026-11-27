@@ -187,13 +187,15 @@ fn branchy_graphics_stages_validate() {
     }
 }
 
-/// On 32-lane hardware waves (`split: true`), wave64 vertex / pixel shaders that read lanes
-/// 32–63 (as found by `upper_lanes::analyze`) must be refused by direct DXIL so `pso.rs` falls
-/// back to the HLSL `upper_lanes` path instead of caching broken wave64-only DXIL under
-/// `split=1`. Wave64 VS/PS with no upper-lane reads still translate under `split: true`, and
-/// native wave64 (`split: false`) still translates both (#1895).
+/// On 32-lane hardware waves (`split: true`), a wave64 vertex / pixel shader that reads
+/// lanes 32–63 is translated where `upper_lanes::analyze` resolves the read – a whole-wave
+/// identity constant, a `v_writelane` spill shadow – as the HLSL `upper_lanes` path does.
+/// Only a read the analysis cannot follow is refused (so `pso.rs` falls back to the HLSL
+/// path): caching DXIL that guesses such a value under `split=1` is the bug #1895 fixed.
+/// Wave64 VS/PS with no upper-lane reads still translate under `split: true`, and native
+/// wave64 (`split: false`) still translates both.
 #[test]
-fn wave64_graphics_with_upper_lane_reads_refused_in_32_lane_mode() {
+fn wave64_graphics_upper_lane_reads_resolve_in_32_lane_mode() {
     use crate::gpu::recomp::{Mode, PsInterface, VsInterface};
     let vsi = VsInterface { inputs: vec![], outputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], attr_base: 4, params: None };
     let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
@@ -204,6 +206,24 @@ fn wave64_graphics_with_upper_lane_reads_refused_in_32_lane_mode() {
             ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 133)], None),          // 5
             ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)], None),
             ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None), // lane 63
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 2)], None),
+            exp,
+        ])
+    };
+    // `v_writelane v4, s0, 63` spills s0 into lane 63; the shadow keeps it.
+    let spill_body = |exp| {
+        prog(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 128), ("SRC1", 191)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 2)], None),
+            exp,
+        ])
+    };
+    // A run-time lane: which of lanes 32..63 got the value is unknown.
+    let unknown_body = |exp| {
+        prog(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 128), ("SRC1", 10)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256 + 4), ("SRC1", 191)], None),
             ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 2)], None),
             exp,
         ])
@@ -221,18 +241,28 @@ fn wave64_graphics_with_upper_lane_reads_refused_in_32_lane_mode() {
     let split_o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
     let native_o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
 
-    let vs_upper = upper_body(vs_exp);
-    let ps_upper = upper_body(ps_exp);
-    let err_vs = super::kernel::translate_vertex(&vs_upper, split_o, &vsi).err().expect("VS upper-lane read must be refused when split=true");
-    assert!(err_vs.contains("lanes 32–63"), "unexpected VS error: {err_vs}");
-    let err_ps = super::kernel::translate_pixel(&ps_upper, split_o, &psi).err().expect("PS upper-lane read must be refused when split=true");
-    assert!(err_ps.contains("lanes 32–63"), "unexpected PS error: {err_ps}");
-    assert!(super::coverage::translate_mode(&vs_upper, &Mode::Vertex(vsi.clone()), split_o, false).is_err());
-    assert!(super::coverage::translate_mode(&ps_upper, &Mode::Pixel(psi.clone()), split_o, false).is_err());
+    // A constant (whole-wave identity) and a spill-slot shadow translate in 32-lane waves.
+    for body in [&upper_body, &spill_body] {
+        let vs_upper = body(vs_exp);
+        let ps_upper = body(ps_exp);
+        super::kernel::translate_vertex(&vs_upper, split_o, &vsi).unwrap_or_else(|e| panic!("VS upper-lane read must translate when split=true: {e}"));
+        super::kernel::translate_pixel(&ps_upper, split_o, &psi).unwrap_or_else(|e| panic!("PS upper-lane read must translate when split=true: {e}"));
+        super::coverage::translate_mode(&vs_upper, &Mode::Vertex(vsi.clone()), split_o, false).expect("VS upper-lane read through translate_mode");
+        super::coverage::translate_mode(&ps_upper, &Mode::Pixel(psi.clone()), split_o, false).expect("PS upper-lane read through translate_mode");
+        // Native wave64 (`split: false`) still translates both.
+        super::kernel::translate_vertex(&vs_upper, native_o, &vsi).expect("VS native wave64");
+        super::kernel::translate_pixel(&ps_upper, native_o, &psi).expect("PS native wave64");
+    }
 
-    // Native wave64 (`split: false`) still translates both.
-    super::kernel::translate_vertex(&vs_upper, native_o, &vsi).expect("VS native wave64");
-    super::kernel::translate_pixel(&ps_upper, native_o, &psi).expect("PS native wave64");
+    // An unfollowed read stays refused when split=true.
+    let vs_unknown = unknown_body(vs_exp);
+    let ps_unknown = unknown_body(ps_exp);
+    let err_vs = super::kernel::translate_vertex(&vs_unknown, split_o, &vsi).err().expect("VS unfollowed upper-lane read must be refused");
+    assert!(err_vs.contains("cannot follow"), "unexpected VS error: {err_vs}");
+    let err_ps = super::kernel::translate_pixel(&ps_unknown, split_o, &psi).err().expect("PS unfollowed upper-lane read must be refused");
+    assert!(err_ps.contains("cannot follow"), "unexpected PS error: {err_ps}");
+    assert!(super::coverage::translate_mode(&vs_unknown, &Mode::Vertex(vsi.clone()), split_o, false).is_err());
+    assert!(super::coverage::translate_mode(&ps_unknown, &Mode::Pixel(psi.clone()), split_o, false).is_err());
 
     // Wave64 VS/PS with no upper-lane reads still translate under `split: true`.
     let vs_native = native_body(vs_exp);
