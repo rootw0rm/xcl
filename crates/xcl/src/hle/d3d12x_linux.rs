@@ -22,8 +22,8 @@
 //! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, Vulkan-device frame clock
 //! #78–#81 (Linux twin + ancillary routing) and Vulkan-queue #30 `PresentX`
 //! (real swapchain present, 1d(ii)); a Vulkan device also answers the DXGI
-//! device IIDs with an adapter chain (GetAdapter/GetDesc, 1d follow-up).
-//! Null stays default behind
+//! device IIDs with an adapter/output chain (GetAdapter/GetDesc/EnumOutputs,
+//! 1d follow-up). Null stays default behind
 //! `XCL_VULKAN_BACKEND`: unrouted slots keep logging stubs. No fake-success:
 //! a routed slot presents a real frame or stays an honest logging stub.
 //
@@ -91,8 +91,11 @@ pub enum Kind {
     /// null device keeps answering queries with itself (no change unset).
     DxgiDevice,
     /// The adapter behind a [`Kind::DxgiDevice`]: GetDesc with the device's
-    /// LUID (plus the Vulkan name when one backs it). Outputs are part 2.
+    /// LUID (plus the Vulkan name when one backs it).
     DxgiAdapter,
+    /// A display output behind a [`Kind::DxgiAdapter`]: output 0 exists so
+    /// the title's `EnumOutputs(0)` succeeds; the desc is unattached.
+    DxgiOutput,
 }
 
 impl Kind {
@@ -115,6 +118,7 @@ impl Kind {
             Kind::Blob => "ID3DBlob",
             Kind::DxgiDevice => "IDXGIDevice",
             Kind::DxgiAdapter => "IDXGIAdapter",
+            Kind::DxgiOutput => "IDXGIOutput",
         }
     }
 }
@@ -251,10 +255,19 @@ fn vtable(kind: Kind) -> *const usize {
             v[7] = Dxgi_GetAdapter as usize;
         }
         Kind::DxgiAdapter => {
-            // IDXGIAdapter: GetDesc serves the title's LUID check (part 1).
+            // IDXGIAdapter: GetDesc serves the title's LUID check, EnumOutputs
+            // serves output 0 (a real object, not the DeviceChild default).
             v[0] = Dxgi_QI as usize;
             v[6] = Ret_E_NOTIMPL as usize; // GetParent
+            v[7] = Adapter_EnumOutputs as usize;
             v[8] = Adapter_GetDesc as usize;
+        }
+        Kind::DxgiOutput => {
+            // IDXGIOutput: the title only needs the object to exist; GetDesc
+            // reports it unattached.
+            v[0] = Dxgi_QI as usize;
+            v[6] = Ret_E_NOTIMPL as usize; // GetParent
+            v[7] = Output_GetDesc as usize;
         }
         _ => {}
     }
@@ -348,6 +361,8 @@ const IID_DXGI_DEVICE2: [u8; 16] = [0x17, 0x86, 0x00, 0x05, 0xfd, 0xfb, 0x51, 0x
 /// `2411e7e1-12ac-4ccf-bd14-9798e8534dc0` / `29038f61-3839-4626-91fd-086879011a05`.
 const IID_DXGI_ADAPTER: [u8; 16] = [0xe1, 0xe7, 0x11, 0x24, 0xac, 0x12, 0xcf, 0x4c, 0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0];
 const IID_DXGI_ADAPTER1: [u8; 16] = [0x61, 0x8f, 0x03, 0x29, 0x39, 0x38, 0x26, 0x46, 0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05];
+/// `ae02eedb-c735-4690-8d52-5a8dc20213aa`.
+const IID_DXGI_OUTPUT: [u8; 16] = [0xdb, 0xee, 0x02, 0xae, 0x35, 0xc7, 0x90, 0x46, 0x8d, 0x52, 0x5a, 0x8d, 0xc2, 0x02, 0x13, 0xaa];
 /// `00000000-0000-0000-c000-000000000046` / `189819f1-1db6-4b57-be54-1821339b85f7`.
 const IID_UNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
 const IID_D3D12DEVICE: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
@@ -721,9 +736,10 @@ unsafe extern "win64" fn Device_SetEventOnMultipleFenceCompletion(_t: *mut NullO
 }
 
 // ---------------------------------------------------------------------------------------
-// DXGI adapter chain, part 1 (1d follow-up): device → IDXGIDevice1 →
-// GetAdapter → GetDesc (LUID == GetAdapterLuid), then the routed #78–#81 /
-// #30 slots. Vulkan devices only; EnumOutputs/outputs are part 2.
+// DXGI adapter/output chain (1d follow-up): device → IDXGIDevice1 →
+// GetAdapter → GetDesc (LUID == GetAdapterLuid) → EnumOutputs, then the
+// routed #78–#81 / #30 slots. Vulkan devices only; the null device keeps
+// the old QueryInterface answer.
 // ---------------------------------------------------------------------------------------
 
 /// Shared QueryInterface for both wrapper kinds (plus IUnknown/IDXGIObject);
@@ -740,7 +756,8 @@ unsafe extern "win64" fn Dxgi_QI(this: *mut NullObj, riid: *const c_void, ppv: *
     let here = match (*this).kind {
         Kind::DxgiDevice => dxgi_device_iid(riid),
         Kind::DxgiAdapter => iid_is(riid, &IID_DXGI_ADAPTER) || iid_is(riid, &IID_DXGI_ADAPTER1),
-        _ => false, // outputs arrive in part 2
+        Kind::DxgiOutput => iid_is(riid, &IID_DXGI_OUTPUT),
+        _ => false,
     };
     if here || iid_is(riid, &IID_UNKNOWN) || iid_is(riid, &IID_DXGI_OBJECT) {
         (*this).refs.fetch_add(1, Ordering::AcqRel);
@@ -782,6 +799,23 @@ unsafe extern "win64" fn Dxgi_GetAdapter(this: *mut NullObj, ppv: *mut *mut c_vo
     S_OK
 }
 
+// DXGI adapter chain, part 2 (1d follow-up): EnumOutputs serves output 0 as
+// a real object (part 1 left the DeviceChild default, a bogus pointer the
+// title only survived because SetFrameIntervalX ignores it).
+/// IDXGIAdapter slot 7: output 0 exists; anything else is NOT_FOUND (a
+/// headless box still serves the object — the title tolerates either, and
+/// SetFrameIntervalX takes the output either way).
+unsafe extern "win64" fn Adapter_EnumOutputs(_t: *mut NullObj, output: u32, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    if output != 0 {
+        *ppv = std::ptr::null_mut();
+        return 0x887A_0002u32 as i32; // DXGI_ERROR_NOT_FOUND
+    }
+    out_obj(ppv, Kind::DxgiOutput)
+}
+
 /// IDXGIAdapter slot 8: DXGI_ADAPTER_DESC (304 B) with the device's LUID —
 /// the one field the title checks — plus the baked name and plausible memory.
 unsafe extern "win64" fn Adapter_GetDesc(this: *mut NullObj, ret: *mut u8) -> HRESULT {
@@ -802,6 +836,16 @@ unsafe extern "win64" fn Adapter_GetDesc(this: *mut NullObj, ret: *mut u8) -> HR
     (ret.add(272) as *mut u64).write_unaligned(4u64 << 30);
     (ret.add(288) as *mut u64).write_unaligned(8u64 << 30);
     (ret.add(296) as *mut u32).write_unaligned(0x5843_4C00); // == Device_GetAdapterLuid
+    S_OK
+}
+
+/// IDXGIOutput slot 7: DXGI_OUTPUT_DESC (96 B), zeroed — unattached, like a
+/// headless box.
+unsafe extern "win64" fn Output_GetDesc(_t: *mut NullObj, ret: *mut u8) -> HRESULT {
+    if ret.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_bytes(ret, 0, 96);
     S_OK
 }
 
@@ -2115,10 +2159,10 @@ mod tests {
 
     #[test]
     fn vulkan_dxgi_chain_serves_adapter_and_output() {
-        // 1d follow-up part 1: a Vulkan device answers the DXGI device IIDs
-        // with a wrapper whose GetAdapter/GetDesc chain works (adapter LUID
-        // == device LUID, D3D12 identity round-trips); the null device keeps
-        // answering with itself. Outputs + strict QI checks are part 2.
+        // 1d follow-up: a Vulkan device answers the DXGI device IIDs with a
+        // wrapper whose GetAdapter/GetDesc/EnumOutputs chain works (adapter
+        // LUID == device LUID, D3D12 identity round-trips, output 0 exists);
+        // the null device keeps answering with itself (no change unset).
         unsafe {
             type Qi = unsafe extern "win64" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
             let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
@@ -2154,6 +2198,20 @@ mod tests {
             let mut luid = 0u64;
             Device_GetAdapterLuid(vd as *mut NullObj, &mut luid);
             assert_eq!(&desc[296..304], &luid.to_le_bytes(), "adapter LUID == device LUID");
+            // ... and EnumOutputs (slot 7) serves a real output 0, nothing else
+            type EnumOut = unsafe extern "win64" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
+            let outputs: EnumOut = std::mem::transmute(slot(ad, 7));
+            let mut o = std::ptr::null_mut();
+            assert_eq!(outputs(ad, 0, &mut o), S_OK);
+            assert_eq!((*(o as *mut NullObj)).kind, Kind::DxgiOutput);
+            let mut o1 = std::ptr::null_mut();
+            assert_eq!(outputs(ad, 1, &mut o1), 0x887A_0002u32 as i32);
+            assert!(o1.is_null());
+            // unknown interfaces stay unknown, not the device
+            let aqi: Qi = std::mem::transmute(slot(ad, 0));
+            let mut nope = std::ptr::null_mut();
+            assert_eq!(aqi(ad, [0u8; 16].as_ptr() as *const c_void, &mut nope), E_NOINTERFACE);
+            assert!(nope.is_null());
             // the chain lands on the routed slots, not logging stubs
             for i in [78usize, 79, 80, 81] {
                 assert!(crate::stubs::info_of_stub(slot(vd, i)).is_none(), "slot {i} routes");
