@@ -2634,7 +2634,7 @@ pub unsafe extern "win64" fn XMemSetAllocationHooks(alloc: usize, free: usize) {
 // * heap (`memory_type == 0`): `libc` memory, aligned to `1 << alignment`, zeroed.
 //   The raw pointer hides 8 bytes below the aligned block; sizes live in
 //   `XMEM_HEAP_SIZES` so unknown pointers fail cleanly instead of aborting libc.
-// * graphics (`memory_type != 0`): a process-lifetime high-VA pool (one 8 GiB
+// * graphics (`memory_type != 0`): a process-lifetime high-VA pool (one 20 GiB
 //   `mmap` at/above 16 GiB, `PROT_NONE`) with a first-fit free list, 64 KiB grain
 //   (4 MiB when `page_size == 2`), alignment from the attrs, zeroed on commit,
 //   coalescing on free so freed blocks merge and are reused at the same address.
@@ -2668,7 +2668,10 @@ impl XAllocAttrs {
 }
 
 const GFX_GRAIN: usize = 0x1_0000;
-const GFX_POOL: usize = 8 << 30;
+/// 20 GiB: the title's 8 GiB+ graphics reservation first-fits at the base, and a
+/// later window-0 range ([base+16 GiB, base+20 GiB)) stays free for descriptor-heap
+/// metadata, which must stay in window 0 past the reservation.
+const GFX_POOL: usize = 20 << 30;
 
 struct GfxState {
     base: usize,
@@ -2756,17 +2759,60 @@ fn gfx_contains(addr: usize) -> bool {
 /// First-fit `size` bytes at `align` inside the graphics pool. Committed ranges are
 /// `mprotect`ed `READWRITE` and zeroed; reserved ranges stay `PROT_NONE`.
 pub(crate) fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
+    gfx_alloc_where(size, align, commit, |at, _| Some(at))
+}
+
+/// First-fit `size` bytes at `align` inside the graphics pool whose whole range sits
+/// in unified-memory window 0 (`(addr >> 32) & 3 == 0` with `addr >> 32 >= 4`):
+/// console descriptor-heap starts must stay there even after the title's 8 GiB+
+/// reservation takes the pool's low window-0 range, so heaps skip ahead within the
+/// same free range to the next window-0 window instead of landing past it.
+pub(crate) fn gfx_alloc_window0(size: usize, align: usize, commit: bool) -> Option<usize> {
+    gfx_alloc_where(size, align, commit, |at, end| {
+        // jumps are multiples of 4 GiB, which every real alignment (a power of two
+        // at or below 4 GiB) divides, so `at` stays aligned throughout.
+        let mut c = at;
+        loop {
+            let hi = c >> 32;
+            if hi >= 4 && hi & 3 == 0 {
+                if c.checked_add(size).is_some_and(|e| e <= end) && (c + size - 1) >> 32 == hi {
+                    return Some(c);
+                }
+                // no room left in this window: continue past its end
+                c = hi.checked_add(1)?.checked_shl(32)? as usize;
+            } else if hi < 4 {
+                c = 4 << 32;
+            } else {
+                c = hi.checked_add(4 - (hi & 3))?.checked_shl(32)? as usize;
+            }
+            if c >= end {
+                return None;
+            }
+        }
+    })
+}
+
+fn gfx_alloc_where(
+    size: usize,
+    align: usize,
+    commit: bool,
+    place: impl Fn(usize, usize) -> Option<usize>,
+) -> Option<usize> {
     let m = gfx_state()?;
     let mut g = m.lock().unwrap();
     let align = align.max(GFX_GRAIN).next_power_of_two();
     let size = size.max(1).div_ceil(GFX_GRAIN) * GFX_GRAIN;
     let mut pick: Option<(usize, usize, usize)> = None; // (free_base, free_len, aligned_at)
     for (&b, &n) in g.free.iter() {
+        let end = b + n;
         let at = b.next_multiple_of(align);
-        let pad = at - b;
-        if n >= pad + size {
-            pick = Some((b, n, at));
-            break;
+        // `place` may move the candidate forward inside the same range (the window-0
+        // sub-range starts later in the range); it re-checks room itself.
+        if at.checked_add(size).is_some_and(|e| e <= end) {
+            if let Some(ok) = place(at, end) {
+                pick = Some((b, n, ok));
+                break;
+            }
         }
     }
     let (b, n, at) = pick?;

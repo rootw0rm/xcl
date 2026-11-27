@@ -605,6 +605,13 @@ unsafe extern "win64" fn Device_CheckFeatureSupport(_t: *mut NullObj, feature: u
     }
     S_OK
 }
+
+/// Console descriptor heaps live in unified-memory window 0 (the retail game's
+/// first placeholder begins with its view heap, and shader tables address them
+/// with 32 bits): the handle range comes from the high-VA graphics pool's next
+/// window-0 range, committed host memory (views write words into the slots) —
+/// never plain host memory below the windows. Falls back to plain memory when
+/// the pool has no window-0 room, so the heap still works.
 unsafe extern "win64" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
         return S_FALSE;
@@ -613,9 +620,18 @@ unsafe extern "win64" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *co
     if !desc.is_null() {
         std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 16);
         let n = *(desc.add(4) as *const u32) as usize;
-        // unique, never-dereferenced-by-us address range for the handles
-        let mem = vec![0u8; (n.max(1) * 32).min(64 << 20)].leak();
-        (*o).value.store(mem.as_ptr() as u64, Ordering::Relaxed);
+        let bytes = (n.max(1) * 32).min(64 << 20);
+        // 64 KiB floor is the pool grain; the title reads slots back, so commit.
+        let start = crate::hle::kernelx_linux::gfx_alloc_window0(bytes, 0x1_0000, true).unwrap_or(0);
+        (*o).value.store(
+            if start != 0 {
+                start as u64
+            } else {
+                // exhaustion fallback: unique, never-dereferenced-by-us address range
+                vec![0u8; bytes].leak().as_ptr() as u64
+            },
+            Ordering::Relaxed,
+        );
     }
     *ppv = o as *mut c_void;
     S_OK
@@ -1824,6 +1840,38 @@ mod tests {
                     assert_eq!(start(h), base, "slot {i}");
                 }
             }
+        }
+    }
+
+    /// M2 desc-heaps leg: the title's 8 GiB+ graphics reservation is accepted, and
+    /// console descriptor heaps made after it still get window-0 starts outside it.
+    /// Fails pre-slice twice: the reservation is refused (the pool is exactly
+    /// 8 GiB) and heap starts are plain host memory below window 0.
+    #[test]
+    fn descriptor_heaps_stay_in_window_0_after_a_large_graphics_reservation() {
+        unsafe {
+            let big = 0x2_0041_0000usize;
+            let r = crate::hle::kernelx_linux::XMemVirtualAlloc(
+                std::ptr::null(),
+                big,
+                0x2000,
+                1u64 << 29,
+                4,
+            );
+            assert!(!r.is_null(), "graphics reservation of {big:#x} bytes refused");
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_heap: Fn4 = std::mem::transmute(slot(dev, 14));
+            for (ty, n) in [(0u32, 442_368u32), (1u32, 512u32)] {
+                let desc = [ty, n, 1, 0]; // shader visible
+                let mut h = std::ptr::null_mut();
+                assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), &mut h), S_OK);
+                let start: unsafe extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(slot(h, 9));
+                let p = start(h);
+                assert!(p >> 32 >= 4 && (p >> 32) & 3 == 0, "heap of {n} slots is not in window 0: {p:#x}");
+                assert!(p < r as u64 || p >= r as u64 + big as u64, "heap at {p:#x} inside the reservation {r:?}");
+            }
+            assert_eq!(crate::hle::kernelx_linux::VirtualFree(r, 0, 0x8000), 1);
         }
     }
 
