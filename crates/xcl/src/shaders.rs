@@ -5,9 +5,10 @@
 //! translates every program to HLSL (kernel mode) and reports what is still missing;
 //! `--compile N` also compiles N of the complete translations with DXC. `--export-hlsl`
 //! writes deterministic compute HLSL, and `--measure-pso` times one exact driver compile.
+//! `--record-vs` measures the console-VS S1-S4 fallback offline (no device, no DXC).
 
 #[cfg_attr(not(windows), allow(unused_imports))]
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -868,6 +869,7 @@ struct ShadersOptions {
     pipelines: bool,
     used_only: bool,
     direct: bool,
+    record_vs: bool,
     sample: Option<usize>,
     seed: u64,
     validate: bool,
@@ -903,6 +905,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         pipelines: false,
         used_only: false,
         direct: false,
+        record_vs: false,
         sample: None,
         seed: 1,
         validate: false,
@@ -941,6 +944,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--pipelines" => opts.pipelines = true,
             "--used-only" => opts.used_only = true,
             "--direct" => opts.direct = true,
+            "--record-vs" => opts.record_vs = true,
             "--sample" => opts.sample = Some(p.parse_usize("--sample")?),
             "--seed" => opts.seed = p.parse_u64("--seed")?,
             "--validate" => opts.validate = true,
@@ -1009,7 +1013,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             };
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
+        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() || opts.record_vs {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
@@ -1051,6 +1055,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             Ok(()) => 0,
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
+    }
+    if opts.record_vs {
+        return record_vs_sweep(&input, &opts, t0);
     }
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
@@ -2436,7 +2443,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::gpu::xbox::tests::{fssm, sample, CODE};
+    use crate::gpu::xbox::tests::{container, fssm, sample, CODE};
 
     /// The commit figures come in bytes: 6 GiB left on 16 logical processors is room for two
     /// workers, not twelve; a commit that is not known (0, 0) gives one.
@@ -2480,6 +2487,67 @@ mod tests {
         let (_tx, rx) = channel::<Result<u32, String>>();
         let e = sweep_result(&rx, Duration::from_millis(10)).unwrap_err();
         assert!(e.starts_with("timeout:"), "{e}");
+    }
+
+    /// `--record-vs` classifies a record by the S1 interface (console VS or not) and then by
+    /// the S2/S3 SPIR-V words (rejected / incomplete / complete).
+    #[test]
+    fn record_vs_classification_separates_the_four_outcomes() {
+        // console VS container: S1 interface + translatable program → complete
+        let vs = sample(1, &[fssm(&CODE, &[(4, 0)])]);
+        assert_eq!(classify_record_vs(&vs), RecordVsClass::Complete);
+
+        // console PS container: a readable shader, but not a VS
+        let ps = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        assert_eq!(classify_record_vs(&ps), RecordVsClass::NonVs);
+
+        // PC DXBC and empty bytes are not console records at all: rejected, not counted non-VS
+        for blob in [container(&[(b"ISG1", &[0u8; 8])]), Vec::new()] {
+            match classify_record_vs(&blob) {
+                RecordVsClass::Reject(_) => {}
+                other => panic!("expected reject, got {other:?}"),
+            }
+        }
+    }
+
+    /// The summary counts the four outcomes and ranks the reasons of rejects and incomplete
+    /// translations, with `reason_key` collapsing operands into one bucket.
+    #[test]
+    fn record_vs_summary_counts_and_ranks_reasons() {
+        let mut s = RecordVsSummary::default();
+        s.add("a", RecordVsClass::Complete);
+        s.add("b", RecordVsClass::NonVs);
+        s.add("c", RecordVsClass::Reject("not a console shader container".into()));
+        s.add(
+            "d",
+            RecordVsClass::Incomplete(BTreeMap::from([
+                ("v_add_f32 v1, v2, 0x10: unsupported modifier 3".to_string(), 1),
+                ("s_mov_b32: unsupported operand".to_string(), 1),
+            ])),
+        );
+        s.add(
+            "e",
+            RecordVsClass::Incomplete(BTreeMap::from([(
+                "v_add_f32 v7, s3, 0x20: unsupported modifier 4".to_string(),
+                2,
+            )])),
+        );
+        s.unreadable = 2;
+        assert_eq!((s.records, s.non_vs, s.reject, s.incomplete, s.complete), (5, 1, 1, 2, 1));
+        // the two `v_add_f32` variants collapse to one reason seen in two records
+        assert_eq!(s.ranked()[0].1, 2);
+        assert!(s.ranked()[0].0.contains("v_add_f32"), "{:?}", s.ranked());
+        let text = s.text(10);
+        assert!(text.contains("unreadable"), "{text}");
+        assert!(text.contains("v_add_f32"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&s.json(10)).expect("valid JSON");
+        assert_eq!(v["records"], 5);
+        assert_eq!(v["non_vs"], 1);
+        assert_eq!(v["reject"], 1);
+        assert_eq!(v["incomplete"], 2);
+        assert_eq!(v["complete"], 1);
+        assert_eq!(v["unreadable"], 2);
+        assert_eq!(v["reasons"][0]["records"], 2);
     }
 
     /// A signature part (v1): (name, system value, register, mask) per element, floats.
@@ -2732,6 +2800,189 @@ fn name_hash(name: &str) -> u64 {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+/// One record's `--record-vs` outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordVsClass {
+    /// A console shader that is not a VS, or a VS without an S1 interface.
+    NonVs,
+    /// S1 interface but S2/S3 refused the record.
+    Reject(String),
+    /// S2/S3 words exist with untranslated instructions: `unsupported_why` keys.
+    Incomplete(BTreeMap<String, usize>),
+    Complete,
+}
+
+/// `--record-vs`: the S1-S4 console-VS fallback classification of one record, offline (no
+/// device, no DXC, no GPU). S1 is [`recomp::record_vs_interface`]; S2/S3 are
+/// [`recomp::spirv::record_vs_words`] on the record's own bytes. Pure so the tests need no
+/// corpus files.
+fn classify_record_vs(blob: &[u8]) -> RecordVsClass {
+    // PC DXBC, empty and garbage bytes are not console records at all: rejected, not non-VS.
+    let Some(sh) = xbox::parse(blob) else {
+        return RecordVsClass::Reject("not a console shader container".to_string());
+    };
+    // S1: anything but a driveable console VS keeps today's non-VS path.
+    if sh.stage != "VS" || recomp::record_vs_interface(blob).is_none() {
+        return RecordVsClass::NonVs;
+    }
+    match recomp::spirv::record_vs_words(blob) {
+        Err(e) => RecordVsClass::Reject(e),
+        Ok(t) if t.complete() => RecordVsClass::Complete,
+        Ok(t) => RecordVsClass::Incomplete(t.unsupported_why),
+    }
+}
+
+/// Counts and ranked reasons of a `--record-vs` sweep.
+#[derive(Debug, Default, Clone)]
+struct RecordVsSummary {
+    /// Records classified (unreadable ones are not).
+    records: usize,
+    non_vs: usize,
+    reject: usize,
+    incomplete: usize,
+    complete: usize,
+    /// Records whose bytes could not be read or inflated.
+    unreadable: usize,
+    /// `reason_key` → (records that hit it, first example record name)
+    reasons: BTreeMap<String, (usize, String)>,
+}
+
+impl RecordVsSummary {
+    fn add(&mut self, name: &str, class: RecordVsClass) {
+        use crate::gpu::dxil::coverage::reason_key;
+        self.records += 1;
+        let reasons: BTreeSet<String> = match class {
+            RecordVsClass::NonVs => {
+                self.non_vs += 1;
+                BTreeSet::new()
+            }
+            RecordVsClass::Complete => {
+                self.complete += 1;
+                BTreeSet::new()
+            }
+            RecordVsClass::Reject(e) => {
+                self.reject += 1;
+                [reason_key(&e)].into()
+            }
+            RecordVsClass::Incomplete(why) => {
+                self.incomplete += 1;
+                why.keys().map(|k| reason_key(k)).collect()
+            }
+        };
+        for r in reasons {
+            let e = self.reasons.entry(r).or_insert_with(|| (0, name.to_string()));
+            e.0 += 1;
+        }
+    }
+
+    /// Reasons ranked by records (ties by name).
+    fn ranked(&self) -> Vec<(&String, usize)> {
+        let mut v: Vec<_> = self.reasons.iter().map(|(k, v)| (k, v.0)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v
+    }
+
+    fn text(&self, top: usize) -> String {
+        let pct = |n: usize| if self.records > 0 { 100.0 * n as f64 / self.records as f64 } else { 0.0 };
+        let mut s = String::from("console-VS record coverage\n  outcome      records   share\n");
+        let mut row = |name: &str, n: usize| s.push_str(&format!("  {name:<10} {:>7} ({:>5.1}%)\n", n, pct(n)));
+        row("non-VS", self.non_vs);
+        row("reject", self.reject);
+        row("incomplete", self.incomplete);
+        row("complete", self.complete);
+        row("all", self.records);
+        if self.unreadable > 0 {
+            s.push_str(&format!("  {:<10} {:>7}  (not read or inflated)\n", "unreadable", self.unreadable));
+        }
+        let ranked = self.ranked();
+        if !ranked.is_empty() {
+            s.push_str(&format!("  top reasons ({} kinds, top {}):\n", ranked.len(), top.min(ranked.len())));
+            for (k, n) in ranked.iter().take(top) {
+                s.push_str(&format!("  {n:>6}  {k}  e.g. {}\n", self.reasons[*k].1));
+            }
+        }
+        s
+    }
+
+    fn json(&self, top: usize) -> String {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let reasons: Vec<String> = self
+            .ranked()
+            .iter()
+            .take(top)
+            .map(|(k, n)| format!("{{\"reason\":\"{}\",\"records\":{n},\"example\":\"{}\"}}", esc(k), esc(&self.reasons[*k].1)))
+            .collect();
+        format!(
+            "{{\"records\":{},\"non_vs\":{},\"reject\":{},\"incomplete\":{},\"complete\":{},\"unreadable\":{},\"reasons\":[{}]}}",
+            self.records,
+            self.non_vs,
+            self.reject,
+            self.incomplete,
+            self.complete,
+            self.unreadable,
+            reasons.join(",")
+        )
+    }
+}
+
+/// `--record-vs [--sample N] [--seed S] [--threads N] [--top N] [--json]`: a seeded sample of
+/// records through S1 and S2/S3, classified as non-VS / rejected / incomplete (ranked
+/// `unsupported_why` keys) / complete. No device, no DXC, no GPU: the console-VS fallback
+/// measured offline.
+fn record_vs_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) -> i32 {
+    let want = match opts.sample.unwrap_or(200) {
+        0 => usize::MAX,
+        n => n,
+    };
+    let seed = opts.seed;
+    let order = crate::gpu::dxil::coverage::sample_indices(input.len(), want, seed);
+    let threads = opts
+        .threads
+        .map(|v| v.max(1))
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+    // a translator panic is one rejected record, not the end of the sweep (`--trace` keeps it)
+    if !opts.trace {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
+    let next = AtomicUsize::new(0);
+    let unreadable = AtomicUsize::new(0);
+    let results: Mutex<Vec<(String, RecordVsClass)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&ri) = order.get(i) else { break };
+                match input.get(ri) {
+                    (name, Some(blob)) => {
+                        let class = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| classify_record_vs(&blob))).unwrap_or_else(|e| {
+                            let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                            RecordVsClass::Reject(format!("panic: {msg}"))
+                        });
+                        results.lock().unwrap().push((name, class));
+                    }
+                    (_, None) => {
+                        unreadable.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut summary = RecordVsSummary { unreadable: unreadable.load(Ordering::Relaxed), ..Default::default() };
+    for (name, class) in &results {
+        summary.add(name, class.clone());
+    }
+    if opts.json {
+        println!("{}", summary.json(opts.top));
+    } else {
+        println!("{} records from {} sampled records (seed {seed}; {} unreadable)", summary.records, order.len(), summary.unreadable);
+        print!("{}", summary.text(opts.top));
+        println!("time {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    0
 }
 
 /// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
