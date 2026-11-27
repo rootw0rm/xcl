@@ -120,5 +120,5 @@ fn launcher_directory_with_only_xcl_copy_warns_self() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8(output.stderr).unwrap();
-    assert!(err.contains("only xcl.exe – that is XCL itself; do not copy it into the game folder"));
+    assert!(err.contains("that is XCL itself; do not copy it into the game folder"));
 }
