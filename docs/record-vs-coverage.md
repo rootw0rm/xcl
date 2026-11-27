@@ -171,6 +171,88 @@ Known approximations, documented not hidden: `v_rcp_iflag_f32` does not model th
 denormal flush (same as the HLSL backend's `rcp`); `v_rcp`/`v_rsq` are exact division/sqrt
 rather than the hardware approximation; `v_mul_hi_u32` needs `shaderInt64` on the device.
 
+## Pure-scalar SALU/SOPC widening (step-10, 2026-11-27)
+
+The emitter now translates the remaining self-contained scalar ALU and the 32-bit SOPC compare
+family. Same command and corpus (26,503 records, seed 1, release):
+
+| outcome | records | share of all | share of VS |
+|---|---:|---:|---:|
+| non-VS | 24,267 | 91.6% | — |
+| reject | 1,204 | 4.5% | 53.8% |
+| incomplete | 899 | 3.4% | 40.2% |
+| complete | 133 | 0.5% | 5.9% |
+| all | 26,503 | 100% | (VS: 2,236) |
+
+Outcome counts are unchanged from step-09. **No record flipped complete**: every record that
+carried an in-scope reason also carries at least one reason outside this slice. Reason kinds
+fell **63 → 51**; the 12 in-scope kinds disappeared with exactly their step-09 record counts,
+no other reason's count changed, and no new kind appeared. Total reason instances fell
+**4,568 → 4,387 (−181)** — exactly the in-scope sum:
+
+| reason | records (step-09 → step-10) |
+|---|---:|
+| `s_mul_i32` | 68 → 0 |
+| `s_mul_hi_u32` | 65 → 0 |
+| `s_lshl_b32` | 17 → 0 |
+| `s_bfe_i32` | 13 → 0 |
+| `s_lshr_b32` | 8 → 0 |
+| `s_addk_i32` | 3 → 0 |
+| `s_mulk_i32` | 2 → 0 |
+| `s_addc_u32` | 1 → 0 |
+| `s_bcnt1_i32_b32` | 1 → 0 |
+| `s_bfe_u32` | 1 → 0 |
+| `s_cmp_lg_u32` | 1 → 0 |
+| `s_ff1_i32_b32` | 1 → 0 |
+| total | 181 → 0 |
+
+Translated families (one test per family through `translate_vs_spirv` plus `spirv-val`):
+
+- `s_mul_i32` low product; `s_mul_hi_u32` widened 64-bit product's high word (declares
+  `Capability Int64`); `s_mulk_i32` `dst * sign_extended(SIMM16)`.
+- `s_lshl_b32`/`s_lshr_b32` shift by `src1 & 31`; `s_bfe_u32`/`s_bfe_i32` decode
+  `offset = c[4:0]`, `width = c[22:16]`, width 0 → 0, width ≥ 32 → the shifted word, with
+  sign extension for the `i32` form.
+- `s_addk_i32` adds the destination old value and the sign-extended immediate; signed overflow
+  materialises to SCC. `s_addc_u32` loads SCC as carry-in (two `OpIAdd`s), computes carry-out
+  as `(a+b < a) || (a+b+carry < a+b)`.
+- `s_bcnt1_i32_b32` is `OpBitCount`; `s_ff1_i32_b32` is GLSL.std.450 `FindILsb` (0xFFFF_FFFF
+  for zero); both leave SCC as the ISA specifies (`s_ff1` writes no SCC).
+- All 12 32-bit `s_cmp_{eq,lg,gt,ge,lt,le}_{i32,u32}` write SCC as `0`/`1`; signed relations
+  bitcast to the signed integer type and use the signed compare opcodes.
+- SCC on the already-translated scalar ops now follows the ISA too: carry for `s_add_u32`,
+  signed overflow for `s_add_i32`/`s_sub_i32`, borrow for `s_sub_u32`, result-nonzero for
+  bitwise/not/shift/bfe/bcnt, and the comparison result for `s_min_u32`/`s_max_u32`. This
+  changes no outcome count.
+- SOPK immediates decode from the 16-bit signed `SIMM16` field (the shared path also fixes
+  `s_movk_i32`, which previously read a literal dword instead of the field).
+
+The unmodified `s_bfe_*` field decoding and SCC model mirror `gpu/recomp/emit.rs` and
+`dxil/lower.rs`; `s_mul_hi_u32` carries the same `shaderInt64` device requirement as the VALU
+form.
+
+### Residual after step-10
+
+All 4,387 remaining reason instances are in four groups (counts are record instances, so they
+overlap and do not sum to the 899 incomplete records):
+
+- **Memory / descriptors — 2,263.** `s_load_dwordx4` 833, `s_buffer_load_dwordx4` 390,
+  `s_buffer_load_dwordx16` 308, `buffer_load_dwordx4` 237, `s_buffer_load_dwordx8` 137,
+  `s_buffer_load_dword` 109, `buffer_load_dword` 86, `buffer_load_dwordx3` 49,
+  `s_buffer_load_dwordx2` 48, `buffer_load_format_x` 18, `buffer_load_dwordx2` 16,
+  `image_load` 13, `s_load_dwordx8` 13, `tbuffer_load_format_xyzw` 3,
+  `buffer_load_format_xyzw` 1, `global_load_dword` 1, `global_load_dwordx2` 1. Gated on
+  draw-time root arguments/user SGPRs (see Step 9 evidence); still rejected.
+- **Control flow — 1,976.** Branch shapes 1,204 (877/169/117/28/9/4), `s_swappc_b64` 771,
+  `s_getpc_b64` 1. The step-08 decision stands.
+- **Documented non-goals — 148.** SDWA/DPP 80, b64/EXEC/VCC mask ops 27
+  (`s_or_b64` 11, `s_mov_b64` 8, `s_and_saveexec_b64` 6, `s_cselect_b64` 1, `s_xor_b64` 1),
+  `s_setreg_imm32_b32` 22, f16 value class 9, cube ops 3, `v_cmpx_*` EXEC writes 3, and the
+  small VALU residual 4 (`v_add_co_ci_u32` 2, `v_mad_u32_u24` 1, `v_lshlrev_b64` 1).
+
+In other words no self-contained 32-bit SALU/SOPC reason remains. The residual is memory,
+control flow, or one of the documented out-of-scope classes — not an unclassified ALU gap.
+
 ### Non-goals (unchanged, with evidence)
 
 - **SMEM/MUBUF/MTBUF/IMG/global/tbuffer loads.** The record path has no user data to feed them:
@@ -190,11 +272,12 @@ rather than the hardware approximation; `v_mul_hi_u32` needs `shaderInt64` on th
 
 ### Next dominant self-contained family
 
-SALU/SOPC, the step-10 slice: `s_mul_i32` (68), `s_mul_hi_u32` (65), `s_lshl_b32` (17),
-`s_bfe_i32` (13), `s_lshr_b32` (8), `s_addk_i32` (3), `s_mulk_i32` (2), `s_addc_u32` (1),
-`s_bcnt1_i32_b32` (1), `s_ff1_i32_b32` (1), `s_bfe_u32` (1), `s_cmp_lg_u32` (1) = 181
-record-instances. It reads only SGPRs and is the largest remaining block that is not blocked on
-draw-time user data, control flow, or `MODE`.
+SDWA/DPP forms, the step-12 slice: 80 record-instances, led by `v_cvt_f32_u32_sdwa` (65) plus
+`v_add_nc_u32_sdwa` (4), `v_lshlrev_b32_sdwa` (4), `v_or_b32_sdwa` (4), `v_cvt_f32_f16_sdwa` (2)
+and `v_cvt_f16_f32_sdwa` (1). SDWA/DPP select, extend and broadcast register operands; they do
+not need draw-time user data, control flow or `MODE`, so they are the next measured slice. The
+f16 value class (9), cube ops (3) and the small VALU residual (4) follow after that; b64/EXEC/VCC
+masks (27) still need the per-lane model and `s_setreg` (22) still needs the MODE register.
 
 ## Follow-up
 
@@ -203,5 +286,8 @@ the documented decision above; the classifier and its tests live in `gpu/recomp/
 (`BranchFlow`, `branch_flow`). No behavior change beyond the reject-reason shape.
 
 Step-09 (`code-assist:xcl-first-frame:step-09:record-vs-valu`, commit on
-`m22-vs-valu-coverage`) implements the VALU slice above; the SALU/SOPC gap is queued as
-`code-assist:xcl-first-frame:step-10:record-vs-salu`.
+`m22-vs-valu-coverage`) implements the VALU slice above. Step-10
+(`code-assist:xcl-first-frame:step-10:record-vs-salu`, commit on
+`m22-vs-salu-coverage`) implements the SALU/SOPC slice; the SDWA/DPP gap is queued as the next
+follow-up.
+

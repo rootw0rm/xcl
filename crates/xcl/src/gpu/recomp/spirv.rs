@@ -306,6 +306,7 @@ const OP_ISUB: u16 = 130;
 const OP_FSUB: u16 = 131;
 const OP_IMUL: u16 = 132;
 const OP_FMUL: u16 = 133;
+const OP_LOGICAL_OR: u16 = 167;
 const OP_SELECT: u16 = 169;
 const OP_I_EQUAL: u16 = 170;
 const OP_I_NOT_EQUAL: u16 = 171;
@@ -318,6 +319,7 @@ const OP_BITWISE_OR: u16 = 197;
 const OP_BITWISE_XOR: u16 = 198;
 const OP_BITWISE_AND: u16 = 199;
 const OP_NOT: u16 = 200;
+const OP_BIT_COUNT: u16 = 205;
 const OP_LABEL: u16 = 248;
 const OP_RETURN: u16 = 253;
 const OP_FUNCTION_END: u16 = 56;
@@ -353,6 +355,8 @@ const GLSL_EXP2: u32 = 29;
 const GLSL_LOG2: u32 = 30;
 const GLSL_SQRT: u32 = 31;
 const GLSL_INVERSE_SQRT: u32 = 32;
+/// `FindILsb`: index of the least-significant 1-bit, 0xFFFF_FFFF when zero.
+const GLSL_FIND_I_LSB: u32 = 73;
 
 const EXEC_MODEL_VERTEX: u32 = 0;
 const ADDR_LOGICAL: u32 = 0;
@@ -1090,8 +1094,10 @@ impl SpirvEm {
     fn salu(&mut self, d: &Decoded, name: &str) {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let dst_code = f("SDST");
+        // SOPK's immediate is a 16-bit signed field, not a literal dword.
+        let simm = Self::field(d, "SIMM16") as u16 as i16 as i32 as u32;
         let src0 = if d.enc.name == "ENC_SOPK" {
-            self.uint_const(d.literal.unwrap_or(0))
+            self.uint_const(simm)
         } else {
             match self.code_value(f("SSRC0"), d.literal) {
                 Some(s) => s,
@@ -1113,35 +1119,157 @@ impl SpirvEm {
             0
         };
         let uint_ty = self.uint_ty;
-        // Narrow VertexIndex-indexed select pattern: SOPC writes SCC (this encoding
-        // carries no SDST, so it must not fall through to the destination logic below).
+        // SOPC writes SCC and has no SDST, so it must not fall through to the
+        // destination logic below.
         if d.enc.name == "ENC_SOPC" {
-            if name != "s_cmp_eq_u32" {
-                self.unsupported(d, "salu");
-                return;
+            match self.sopc_cond(name, src0, src1) {
+                Some(cond) => {
+                    let v = self.bit01(cond);
+                    self.store_scc(v);
+                }
+                None => self.unsupported(d, "salu"),
             }
-            let cmp = self.tmp(self.bool_ty, OP_I_EQUAL, &[src0, src1]);
-            let one = self.uint_const(1);
-            let zero = self.uint_const(0);
-            let v = self.tmp(uint_ty, OP_SELECT, &[cmp, one, zero]);
-            self.store_scc(v);
             return;
         }
+        let zero = self.uint_const(0);
+        let c31 = self.uint_const(31);
+        // SOPK add/mul read the destination as their first source.
+        let cur = if matches!(name, "s_addk_i32" | "s_mulk_i32") {
+            if dst_code > 127 {
+                self.unsupported(d, "sdst");
+                return;
+            }
+            Some(if dst_code == 125 {
+                zero
+            } else {
+                self.load_sgpr(dst_code)
+            })
+        } else {
+            None
+        };
+        let mut scc: Option<u32> = None;
         let res: Option<u32> = match name {
             "s_mov_b32" => Some(src0),
-            "s_movk_i32" => Some(self.uint_const(d.literal.unwrap_or(0))),
-            "s_add_u32" | "s_add_i32" => Some(self.tmp(uint_ty, OP_IADD, &[src0, src1])),
-            "s_sub_u32" | "s_sub_i32" => Some(self.tmp(uint_ty, OP_ISUB, &[src0, src1])),
-            "s_and_b32" => Some(self.tmp(uint_ty, OP_BITWISE_AND, &[src0, src1])),
-            "s_or_b32" => Some(self.tmp(uint_ty, OP_BITWISE_OR, &[src0, src1])),
-            "s_xor_b32" => Some(self.tmp(uint_ty, OP_BITWISE_XOR, &[src0, src1])),
-            "s_not_b32" => Some(self.tmp(uint_ty, OP_NOT, &[src0])),
-            "s_min_u32" => Some(self.umin(src0, src1)),
-            "s_max_u32" => Some(self.umax(src0, src1)),
+            "s_movk_i32" => Some(self.uint_const(simm)),
+            "s_add_u32" => {
+                let t = self.tmp(uint_ty, OP_IADD, &[src0, src1]);
+                let carry = self.tmp(self.bool_ty, OP_U_LESS_THAN, &[t, src0]);
+                scc = Some(self.bit01(carry));
+                Some(t)
+            }
+            "s_add_i32" => {
+                let t = self.tmp(uint_ty, OP_IADD, &[src0, src1]);
+                let x = self.tmp(uint_ty, OP_BITWISE_XOR, &[src0, t]);
+                let y = self.tmp(uint_ty, OP_BITWISE_XOR, &[src1, t]);
+                let x = self.tmp(uint_ty, OP_BITWISE_AND, &[x, y]);
+                let x = self.tmp(uint_ty, OP_SHIFT_R_ARITH, &[x, c31]);
+                scc = Some(self.nz(x));
+                Some(t)
+            }
+            "s_sub_u32" => {
+                let t = self.tmp(uint_ty, OP_ISUB, &[src0, src1]);
+                let borrow = self.tmp(self.bool_ty, OP_U_GREATER_THAN, &[src1, src0]);
+                scc = Some(self.bit01(borrow));
+                Some(t)
+            }
+            "s_sub_i32" => {
+                let t = self.tmp(uint_ty, OP_ISUB, &[src0, src1]);
+                let x = self.tmp(uint_ty, OP_BITWISE_XOR, &[src0, src1]);
+                let y = self.tmp(uint_ty, OP_BITWISE_XOR, &[src0, t]);
+                let x = self.tmp(uint_ty, OP_BITWISE_AND, &[x, y]);
+                let x = self.tmp(uint_ty, OP_SHIFT_R_ARITH, &[x, c31]);
+                scc = Some(self.nz(x));
+                Some(t)
+            }
+            "s_and_b32" => {
+                let v = self.tmp(uint_ty, OP_BITWISE_AND, &[src0, src1]);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_or_b32" => {
+                let v = self.tmp(uint_ty, OP_BITWISE_OR, &[src0, src1]);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_xor_b32" => {
+                let v = self.tmp(uint_ty, OP_BITWISE_XOR, &[src0, src1]);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_not_b32" => {
+                let v = self.tmp(uint_ty, OP_NOT, &[src0]);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_min_u32" => {
+                let v = self.umin(src0, src1);
+                let lt = self.tmp(self.bool_ty, OP_U_LESS_THAN, &[src0, src1]);
+                scc = Some(self.bit01(lt));
+                Some(v)
+            }
+            "s_max_u32" => {
+                let v = self.umax(src0, src1);
+                let gt = self.tmp(self.bool_ty, OP_U_GREATER_THAN, &[src0, src1]);
+                scc = Some(self.bit01(gt));
+                Some(v)
+            }
+            "s_mul_i32" => Some(self.tmp(uint_ty, OP_IMUL, &[src0, src1])),
+            "s_mul_hi_u32" => Some(self.mul_hi_u32(src0, src1)),
+            "s_mulk_i32" => Some(self.tmp(uint_ty, OP_IMUL, &[cur.unwrap_or(zero), src0])),
+            "s_addk_i32" => {
+                let cur = cur.unwrap_or(zero);
+                let t = self.tmp(uint_ty, OP_IADD, &[cur, src0]);
+                let x = self.tmp(uint_ty, OP_BITWISE_XOR, &[cur, t]);
+                let y = self.tmp(uint_ty, OP_BITWISE_XOR, &[src0, t]);
+                let x = self.tmp(uint_ty, OP_BITWISE_AND, &[x, y]);
+                let x = self.tmp(uint_ty, OP_SHIFT_R_ARITH, &[x, c31]);
+                scc = Some(self.nz(x));
+                Some(t)
+            }
+            "s_lshl_b32" => {
+                let sh = self.tmp(uint_ty, OP_BITWISE_AND, &[src1, c31]);
+                let v = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[src0, sh]);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_lshr_b32" => {
+                let sh = self.tmp(uint_ty, OP_BITWISE_AND, &[src1, c31]);
+                let v = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[src0, sh]);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_bfe_u32" => {
+                let v = self.sbfe(src0, src1, false);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_bfe_i32" => {
+                let v = self.sbfe(src0, src1, true);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_bcnt1_i32_b32" => {
+                let v = self.tmp(uint_ty, OP_BIT_COUNT, &[src0]);
+                scc = Some(self.nz(v));
+                Some(v)
+            }
+            "s_ff1_i32_b32" => {
+                let glsl = self.glsl_id;
+                Some(self.tmp(uint_ty, OP_EXT_INST, &[glsl, GLSL_FIND_I_LSB, src0]))
+            }
+            "s_addc_u32" => {
+                let carry_in = self.load_scc();
+                let t0 = self.tmp(uint_ty, OP_IADD, &[src0, src1]);
+                let t = self.tmp(uint_ty, OP_IADD, &[t0, carry_in]);
+                let c0 = self.tmp(self.bool_ty, OP_U_LESS_THAN, &[t0, src0]);
+                let c1 = self.tmp(self.bool_ty, OP_U_LESS_THAN, &[t, t0]);
+                let carry_out = self.tmp(self.bool_ty, OP_LOGICAL_OR, &[c0, c1]);
+                scc = Some(self.bit01(carry_out));
+                Some(t)
+            }
             // Codebase/GPU convention (lower.rs, emit.rs): SCC-true picks SSRC0.
             "s_cselect_b32" => {
                 let scc = self.load_scc();
-                let zero = self.uint_const(0);
                 let cond = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[scc, zero]);
                 Some(self.tmp(uint_ty, OP_SELECT, &[cond, src0, src1]))
             }
@@ -1153,11 +1281,109 @@ impl SpirvEm {
                     // null: discarded.
                 } else if dst_code > 127 {
                     self.unsupported(d, "sdst");
+                    return;
                 } else {
                     self.store_sgpr(dst_code, v);
                 }
             }
-            None => self.unsupported(d, "salu"),
+            None => {
+                self.unsupported(d, "salu");
+                return;
+            }
+        }
+        if let Some(v) = scc {
+            self.store_scc(v);
+        }
+    }
+
+    /// Materialise a boolean as the SCC convention's `0`/`1` word.
+    fn bit01(&mut self, cond: u32) -> u32 {
+        let one = self.uint_const(1);
+        let zero = self.uint_const(0);
+        self.tmp(self.uint_ty, OP_SELECT, &[cond, one, zero])
+    }
+
+    /// SCC for result-nonzero writes.
+    fn nz(&mut self, v: u32) -> u32 {
+        let zero = self.uint_const(0);
+        let cond = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[v, zero]);
+        self.bit01(cond)
+    }
+
+    /// SOPC 32-bit compares: condition id for `s_cmp_*`, `None` unsupported.
+    fn sopc_cond(&mut self, name: &str, a: u32, b: u32) -> Option<u32> {
+        let (rel, signed) = match name {
+            "s_cmp_eq_i32" | "s_cmp_eq_u32" => ("eq", false),
+            "s_cmp_lg_i32" | "s_cmp_lg_u32" => ("lg", false),
+            "s_cmp_gt_i32" => ("gt", true),
+            "s_cmp_ge_i32" => ("ge", true),
+            "s_cmp_lt_i32" => ("lt", true),
+            "s_cmp_le_i32" => ("le", true),
+            "s_cmp_gt_u32" => ("gt", false),
+            "s_cmp_ge_u32" => ("ge", false),
+            "s_cmp_lt_u32" => ("lt", false),
+            "s_cmp_le_u32" => ("le", false),
+            _ => return None,
+        };
+        let (a, b) = if signed {
+            let int_ty = self.int_ty;
+            let ai = self.tmp(int_ty, OP_BITCAST, &[a]);
+            let bi = self.tmp(int_ty, OP_BITCAST, &[b]);
+            (ai, bi)
+        } else {
+            (a, b)
+        };
+        let op = match rel {
+            "eq" => OP_I_EQUAL,
+            "lg" => OP_I_NOT_EQUAL,
+            "gt" if signed => OP_S_GREATER_THAN,
+            "ge" if signed => OP_S_GREATER_THAN_EQUAL,
+            "lt" if signed => OP_S_LESS_THAN,
+            "le" if signed => OP_S_LESS_THAN_EQUAL,
+            "gt" => OP_U_GREATER_THAN,
+            "ge" => OP_U_GREATER_THAN_EQUAL,
+            "lt" => OP_U_LESS_THAN,
+            "le" => OP_U_LESS_THAN_EQUAL,
+            _ => return None,
+        };
+        Some(self.tmp(self.bool_ty, op, &[a, b]))
+    }
+
+    /// `s_bfe_u32`/`s_bfe_i32`: offset = c[4:0], width = c[22:16]; width 0
+    /// gives 0, width >= 32 the shifted word, otherwise the masked field.
+    fn sbfe(&mut self, v: u32, c: u32, signed: bool) -> u32 {
+        let uint_ty = self.uint_ty;
+        let int_ty = self.int_ty;
+        let c31 = self.uint_const(31);
+        let c16 = self.uint_const(16);
+        let c32 = self.uint_const(32);
+        let c7f = self.uint_const(0x7F);
+        let zero = self.uint_const(0);
+        let o = self.tmp(uint_ty, OP_BITWISE_AND, &[c, c31]);
+        let w = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[c, c16]);
+        let w = self.tmp(uint_ty, OP_BITWISE_AND, &[w, c7f]);
+        let s = self.tmp(uint_ty, OP_ISUB, &[c32, w]);
+        let s = self.tmp(uint_ty, OP_BITWISE_AND, &[s, c31]);
+        let big = self.tmp(self.bool_ty, OP_U_GREATER_THAN_EQUAL, &[w, c32]);
+        let wzero = self.tmp(self.bool_ty, OP_I_EQUAL, &[w, zero]);
+        if signed {
+            let vi = self.tmp(int_ty, OP_BITCAST, &[v]);
+            let oi = self.tmp(int_ty, OP_BITCAST, &[o]);
+            let x = self.tmp(int_ty, OP_SHIFT_R_ARITH, &[vi, oi]);
+            let si = self.tmp(int_ty, OP_BITCAST, &[s]);
+            let y = self.tmp(int_ty, OP_SHIFT_L_LOGICAL, &[x, si]);
+            let y = self.tmp(int_ty, OP_SHIFT_R_ARITH, &[y, si]);
+            let r = self.tmp(int_ty, OP_SELECT, &[big, x, y]);
+            let izero = self.int_const(0);
+            let r = self.tmp(int_ty, OP_SELECT, &[wzero, izero, r]);
+            self.tmp(uint_ty, OP_BITCAST, &[r])
+        } else {
+            let x = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[v, o]);
+            let all = self.uint_const(0xFFFF_FFFF);
+            let mask = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[all, s]);
+            let xm = self.tmp(uint_ty, OP_BITWISE_AND, &[x, mask]);
+            let r = self.tmp(uint_ty, OP_SELECT, &[big, x, xm]);
+            self.tmp(uint_ty, OP_SELECT, &[wzero, zero, r])
         }
     }
 
@@ -2961,5 +3187,287 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+    }
+
+    // ---- M2.2 step-10: pure-scalar SALU/SOPC coverage ----------------------
+
+    fn salu(name: &str, enc: &str, fields: &[(&str, u64)], literal: Option<u32>) -> Vec<u8> {
+        encode(name, enc, fields, literal).unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    /// Multiplying scalars: `s_mul_i32` low product, `s_mul_hi_u32` widened high
+    /// product (`Capability Int64`), `s_mulk_i32` immediate multiply.
+    #[test]
+    fn salu_mul_family_translates() {
+        let mut code = Vec::new();
+        code.extend(salu(
+            "S_MUL_I32",
+            "ENC_SOP2",
+            &[("SDST", 0), ("SSRC0", 128), ("SSRC1", 129)],
+            None,
+        ));
+        code.extend(salu(
+            "S_MUL_HI_U32",
+            "ENC_SOP2",
+            &[("SDST", 1), ("SSRC0", 128), ("SSRC1", 129)],
+            None,
+        ));
+        code.extend(salu(
+            "S_MULK_I32",
+            "ENC_SOPK",
+            &[("SDST", 2), ("SIMM16", 7)],
+            None,
+        ));
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_IMUL).count() >= 3,
+            "mul_i32, the widened mul_hi product and mulk must multiply"
+        );
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_CAPABILITY && a.as_slice() == [CAP_INT64]),
+            "s_mul_hi_u32 must declare Capability Int64"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_U_CONVERT),
+            "s_mul_hi_u32 must widen/narrow through OpUConvert"
+        );
+        assert_valid_spirv(&t, "salu_mul");
+    }
+
+    /// `s_lshl_b32`/`s_lshr_b32` mask the shift to 5 bits; `s_bfe_u32`/
+    /// `s_bfe_i32` decode offset/width from the packed control word and sign
+    /// extend for the signed form.
+    #[test]
+    fn salu_shift_and_bfe_family_translates() {
+        let mut code = Vec::new();
+        code.extend(salu(
+            "S_LSHL_B32",
+            "ENC_SOP2",
+            &[("SDST", 0), ("SSRC0", 128), ("SSRC1", 129)],
+            None,
+        ));
+        code.extend(salu(
+            "S_LSHR_B32",
+            "ENC_SOP2",
+            &[("SDST", 1), ("SSRC0", 128), ("SSRC1", 129)],
+            None,
+        ));
+        let ctl = Some(0x0008_0004); // offset 4, width 8
+        code.extend(salu(
+            "S_BFE_U32",
+            "ENC_SOP2",
+            &[("SDST", 2), ("SSRC0", 128), ("SSRC1", 255)],
+            ctl,
+        ));
+        code.extend(salu(
+            "S_BFE_I32",
+            "ENC_SOP2",
+            &[("SDST", 3), ("SSRC0", 128), ("SSRC1", 255)],
+            ctl,
+        ));
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        for (op, what) in [
+            (OP_SHIFT_L_LOGICAL, "s_lshl_b32"),
+            (OP_SHIFT_R_LOGICAL, "s_lshr_b32"),
+            (OP_SHIFT_R_ARITH, "s_bfe_i32 sign extension"),
+        ] {
+            assert!(ops.iter().any(|(o, _)| *o == op), "{what} missing op {op}");
+        }
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_CONSTANT && a.get(2) == Some(&0x7F)),
+            "s_bfe must mask the width with the 7-bit field"
+        );
+        assert_valid_spirv(&t, "salu_shift_bfe");
+    }
+
+    /// `s_addc_u32` takes SCC as carry-in and leaves the carry-out; `s_add_u32`
+    /// is the carry producer and `s_addk_i32` reports signed overflow. The
+    /// test traces the addc operand back to an SCC load whose previous store is
+    /// a select (the materialised SCC bit).
+    #[test]
+    fn salu_addk_addc_read_and_write_scc() {
+        let mut code = Vec::new();
+        code.extend(salu(
+            "S_MOV_B32",
+            "ENC_SOP1",
+            &[("SDST", 0), ("SSRC0", 255)],
+            Some(0xFFFF_FFFF),
+        ));
+        code.extend(salu(
+            "S_MOV_B32",
+            "ENC_SOP1",
+            &[("SDST", 1), ("SSRC0", 129)],
+            None,
+        ));
+        // 0xFFFF_FFFF + 1 carries out, 1 + 1 + carry = 3, addk uses the
+        // destination old value and reports signed overflow.
+        code.extend(salu(
+            "S_ADD_U32",
+            "ENC_SOP2",
+            &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 1)],
+            None,
+        ));
+        code.extend(salu(
+            "S_ADDC_U32",
+            "ENC_SOP2",
+            &[("SDST", 3), ("SSRC0", 1), ("SSRC1", 1)],
+            None,
+        ));
+        code.extend(salu(
+            "S_ADDK_I32",
+            "ENC_SOPK",
+            &[("SDST", 4), ("SIMM16", 5)],
+            None,
+        ));
+        code.extend(salu(
+            "S_CSELECT_B32",
+            "ENC_SOP2",
+            &[("SDST", 5), ("SSRC0", 0), ("SSRC1", 1)],
+            None,
+        ));
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_IADD).count() >= 4,
+            "add, both addc additions and addk each emit OpIAdd"
+        );
+        // Carry-out of s_add_u32 and the two addc carries.
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_U_LESS_THAN).count() >= 3,
+            "unsigned carry/borrow compares missing"
+        );
+        // Signed overflow of s_addk_i32.
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_BITWISE_XOR).count() >= 2
+                && ops.iter().any(|(o, _)| *o == OP_SHIFT_R_ARITH),
+            "s_addk_i32 overflow path missing"
+        );
+        // addc must consume a load from an SCC home whose previous store is a
+        // materialised boolean.
+        let loads: Vec<(usize, u32, u32)> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (o, a))| (*o == OP_LOAD && a.len() >= 3).then(|| (i, a[1], a[2])))
+            .collect();
+        let stores: Vec<(usize, u32, u32)> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (o, a))| (*o == OP_STORE && a.len() >= 2).then(|| (i, a[0], a[1])))
+            .collect();
+        let mut carry_in = 0usize;
+        for &(li, load_id, ptr) in &loads {
+            let used_by_add = ops[li + 1..].iter().any(|(o, a)| {
+                *o == OP_IADD && a.len() == 4 && (a[2] == load_id || a[3] == load_id)
+            });
+            if !used_by_add {
+                continue;
+            }
+            let Some(&(si, _, val)) = stores.iter().rev().find(|(si, p, _)| *si < li && *p == ptr)
+            else {
+                continue;
+            };
+            if ops[..si]
+                .iter()
+                .rev()
+                .any(|(o, a)| *o == OP_SELECT && a.len() >= 2 && a[1] == val)
+            {
+                carry_in += 1;
+            }
+        }
+        assert!(carry_in > 0, "s_addc_u32 did not load SCC as the carry-in");
+        assert_valid_spirv(&t, "salu_addc");
+    }
+
+    /// `s_bcnt1_i32_b32` is OpBitCount and `s_ff1_i32_b32` is GLSL FindILsb.
+    #[test]
+    fn salu_bit_scan_family_translates() {
+        let mut code = Vec::new();
+        code.extend(salu(
+            "S_BCNT1_I32_B32",
+            "ENC_SOP1",
+            &[("SDST", 0), ("SSRC0", 1)],
+            None,
+        ));
+        code.extend(salu(
+            "S_FF1_I32_B32",
+            "ENC_SOP1",
+            &[("SDST", 2), ("SSRC0", 3)],
+            None,
+        ));
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_BIT_COUNT),
+            "s_bcnt1_i32_b32 must emit OpBitCount"
+        );
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_EXT_INST && a.get(3) == Some(&GLSL_FIND_I_LSB)),
+            "s_ff1_i32_b32 must emit GLSL FindILsb"
+        );
+        assert_valid_spirv(&t, "salu_bit_scan");
+    }
+
+    /// The entire 32-bit SOPC compare family writes SCC (`0`/`1`), signed
+    /// relations through signed compare opcodes.
+    #[test]
+    fn salu_sopc_compare_family_sets_scc() {
+        let mut code = Vec::new();
+        for name in [
+            "S_CMP_EQ_I32",
+            "S_CMP_LG_I32",
+            "S_CMP_GT_I32",
+            "S_CMP_GE_I32",
+            "S_CMP_LT_I32",
+            "S_CMP_LE_I32",
+            "S_CMP_EQ_U32",
+            "S_CMP_LG_U32",
+            "S_CMP_GT_U32",
+            "S_CMP_GE_U32",
+            "S_CMP_LT_U32",
+            "S_CMP_LE_U32",
+        ] {
+            code.extend(salu(
+                name,
+                "ENC_SOPC",
+                &[("SSRC0", 128), ("SSRC1", 129)],
+                None,
+            ));
+        }
+        code.extend(salu(
+            "S_CSELECT_B32",
+            "ENC_SOP2",
+            &[("SDST", 0), ("SSRC0", 128), ("SSRC1", 129)],
+            None,
+        ));
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        for (op, what) in [
+            (OP_I_EQUAL, "eq_i32"),
+            (OP_I_NOT_EQUAL, "lg_i32"),
+            (OP_S_GREATER_THAN, "gt_i32"),
+            (OP_S_GREATER_THAN_EQUAL, "ge_i32"),
+            (OP_S_LESS_THAN, "lt_i32"),
+            (OP_S_LESS_THAN_EQUAL, "le_i32"),
+            (OP_U_GREATER_THAN, "gt_u32"),
+            (OP_U_GREATER_THAN_EQUAL, "ge_u32"),
+            (OP_U_LESS_THAN, "lt_u32 (and eq_u32's select)"),
+            (OP_U_LESS_THAN_EQUAL, "le_u32"),
+        ] {
+            assert!(
+                ops.iter().any(|(o, _)| *o == op),
+                "SOPC {what} missing op {op}"
+            );
+        }
+        assert_valid_spirv(&t, "salu_sopc");
     }
 }
