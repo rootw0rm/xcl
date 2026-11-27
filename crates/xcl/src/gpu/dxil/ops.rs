@@ -553,8 +553,12 @@ impl Shader {
     }
     /// `Buffer<comp>` / `RWBuffer<comp>` from the descriptor heap.
     pub fn heap_typed_buffer(&mut self, index: Value, uav: bool, comp: CompType, nonuniform: bool) -> TypedBuffer {
+        self.heap_typed_buffer_with_coherence(index, uav, comp, nonuniform, false)
+    }
+    pub fn heap_typed_buffer_with_coherence(&mut self, index: Value, uav: bool, comp: CompType, nonuniform: bool, coherent: bool) -> TypedBuffer {
         let h = self.handle_from_heap(index, false, nonuniform);
-        let handle = self.annotate(h, kind::TYPED_BUFFER | if uav { 0x1000 } else { 0 }, typed_props(comp, 1));
+        let properties = kind::TYPED_BUFFER | if uav { 0x1000 } else { 0 } | if coherent { 0x4000 } else { 0 };
+        let handle = self.annotate(h, properties, typed_props(comp, 1));
         TypedBuffer { handle, comp, binding: None }
     }
     fn comp_ty(&mut self, c: CompType) -> Ty {

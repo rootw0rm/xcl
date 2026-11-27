@@ -98,6 +98,11 @@ pub const MEM_HEAP_BASE: u32 = 4;
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+/// An additional descriptor row for single-byte format stores. The count still describes the raw windows.
+pub(crate) const BYTE_WINDOWS: u32 = 0x200;
+pub(crate) const BYTE_HEAP_BASE: u32 = MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+pub(crate) const BYTE_SEGMENT_SHIFT: u32 = 27;
+pub(crate) const BYTE_SEGMENTS: u32 = 1 << (32 - BYTE_SEGMENT_SHIFT);
 
 pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
     windows <= crate::gpu::uma::MAX_WINDOWS

@@ -512,7 +512,7 @@ impl Lw {
             s.enable_rov();
         }
         let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
-        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, coherent);
+        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows & !crate::gpu::recomp::BYTE_WINDOWS, coherent);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
@@ -527,6 +527,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            byte_windows: o.mem_windows & crate::gpu::recomp::BYTE_WINDOWS != 0 && heap_mem.is_some(),
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),

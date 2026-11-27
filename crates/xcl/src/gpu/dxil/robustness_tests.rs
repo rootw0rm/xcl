@@ -328,6 +328,27 @@ fn split_wave64_whole_live_elides_exchange_barriers_for_lane_local_masks() {
 }
 
 #[test]
+fn byte_windows_flag_strips_before_window_count_and_changes_translation() {
+    use super::kernel::{self, KernelOptions};
+    use crate::gpu::recomp::{BYTE_HEAP_BASE, BYTE_SEGMENTS, BYTE_SEGMENT_SHIFT, BYTE_WINDOWS, HEAP_WINDOWS, MEM_HEAP_BASE};
+    assert_eq!(BYTE_WINDOWS, 0x200);
+    assert_eq!(BYTE_HEAP_BASE, MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32);
+    assert_eq!(BYTE_SEGMENT_SHIFT, 27);
+    assert_eq!(BYTE_SEGMENTS, 1 << (32 - BYTE_SEGMENT_SHIFT));
+    let code = prog(&[(
+        "BUFFER_STORE_FORMAT_X",
+        "ENC_MUBUF",
+        &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)][..],
+        None,
+    )]);
+    let base = 4 | HEAP_WINDOWS;
+    let ko = |windows| KernelOptions { wave64: false, split: false, mem_windows: windows, sampler_base: 0 };
+    let normal = kernel::translate(&code, ko(base)).expect("formatted store translates");
+    let typed = kernel::translate(&code, ko(base | BYTE_WINDOWS)).expect("byte-window store translates");
+    assert_ne!(normal, typed, "BYTE_WINDOWS must change the translated container");
+}
+
+#[test]
 fn pops_pixel_shader_gates_rov_sfi0_flag_on_surviving_uav_handles() {
     use super::cfg::Cfg;
     use super::graphics::part;

@@ -535,6 +535,30 @@ impl Lw {
     /// `st_bytes`: store the low `n` bytes of `r` at byte address `a` (n ≤ 16; partial
     /// dwords through atomics so neighbours stay intact).
     fn st_bytes(&mut self, a: Value, r: [Value; 4], n: Value) -> LResult<()> {
+        // A row of R8_UINT views spans one raw window. Partial multi-byte stores still use the atomic path.
+        if self.byte_windows {
+            let win = self.rd(super::lower::VAR_WIN);
+            let in_range = self.cmpc(Pred::ULt, win, self.mems.len() as u32);
+            let byte = self.cmpc(Pred::Eq, n, 1);
+            let typed = self.land(in_range, byte);
+            self.guarded(typed, &mut |lw| {
+                let row = lw.shlc(win, crate::gpu::recomp::BYTE_SEGMENTS.trailing_zeros());
+                let segment = lw.lshrc(a, crate::gpu::recomp::BYTE_SEGMENT_SHIFT);
+                let index = lw.or(row, segment);
+                let index = lw.addc(index, crate::gpu::recomp::BYTE_HEAP_BASE);
+                let coherent = lw.heap_mem.unwrap_or(false);
+                let view = lw.s.heap_typed_buffer_with_coherence(index, true, super::ops::CompType::U32, true, coherent);
+                let offset = lw.andc(a, (1 << crate::gpu::recomp::BYTE_SEGMENT_SHIFT) - 1);
+                let value = lw.andc(r[0], 255);
+                lw.s.buffer_store(view, offset, &[value]);
+                Ok(())
+            })?;
+            let other = self.lnot(typed);
+            return self.guarded(other, &mut |lw| lw.st_bytes_raw(a, r, n));
+        }
+        self.st_bytes_raw(a, r, n)
+    }
+    fn st_bytes_raw(&mut self, a: Value, r: [Value; 4], n: Value) -> LResult<()> {
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
         let b = self.andc(a, !3);
