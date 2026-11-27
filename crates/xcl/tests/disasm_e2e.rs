@@ -326,3 +326,72 @@ fn disasm_xbox_container_unpacks_fssm_and_supports_hex_and_fssm_export() {
     let _ = std::fs::remove_file(&shader);
     let _ = std::fs::remove_file(&fssm_export);
 }
+
+#[test]
+fn disasm_fssm_reports_a_save_that_did_not_happen() {
+    let container = temp_path("fssm-src", ".bin");
+    std::fs::write(&container, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    // the parent directory does not exist, so the requested save cannot happen
+    let missing_dir = temp_path("fssm-missing", "");
+    let out = missing_dir.join("nested/x.fssm");
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("disasm")
+        .arg(&container)
+        .args(["--fssm", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert!(err.contains("xcl disasm:") && err.contains("x.fssm"), "{err}");
+    assert!(!out.exists(), "write failure left {}", out.display());
+
+    // A file with no console container has no FSSM to save.
+    let plain = temp_path("fssm-plain", ".bin");
+    std::fs::write(&plain, [0u8; 16]).unwrap();
+    let out = temp_path("fssm-plain-out", ".fssm");
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("disasm")
+        .arg(&plain)
+        .args(["--fssm", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert!(err.contains("no FSSM to save"), "{err}");
+    assert!(!out.exists());
+
+    let _ = std::fs::remove_file(&container);
+    let _ = std::fs::remove_file(&plain);
+}
+
+#[test]
+fn disasm_rejects_options_that_cannot_take_effect() {
+    let container = temp_path("scope-src", ".bin");
+    std::fs::write(&container, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    let out = temp_path("scope-out", ".fssm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("disasm")
+        .arg(&container)
+        .args(["--offset", "0", "--length", "16", "--fssm", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert!(err.contains("--fssm cannot be combined with --offset/--length"), "{err}");
+    assert!(output.stdout.is_empty(), "disassembly ran despite the bad argument");
+    assert!(!out.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("disasm")
+        .arg(&container)
+        .arg("--all")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert!(err.contains("--all requires --offset or --length"), "{err}");
+    assert!(output.stdout.is_empty(), "disassembly ran despite the bad argument");
+
+    let _ = std::fs::remove_file(&container);
+}

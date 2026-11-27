@@ -46,6 +46,14 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             other => return Err(Parser::unexpected(other)),
         }
     }
+    // `--all` only widens a forced range (`print_lines`); without one it would be dropped.
+    if parsed.all && parsed.offset.is_none() && parsed.length.is_none() {
+        return Err("--all requires --offset or --length".to_string());
+    }
+    // A forced range bypasses container parsing, so `--fssm` could never save there.
+    if parsed.fssm.is_some() && (parsed.offset.is_some() || parsed.length.is_some()) {
+        return Err("--fssm cannot be combined with --offset/--length".to_string());
+    }
     Ok(parsed)
 }
 
@@ -115,7 +123,11 @@ fn print_root_layout(data: &[u8], stage: &xbox::HwStage, all: bool) {
     }
 }
 
-fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
+/// Prints the container layout and, with `--fssm`, saves every FSSM.
+/// Returns how many were written; `Err(())` if a requested write failed.
+fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) -> Result<usize, ()> {
+    let mut saved = 0usize;
+    let mut failed = false;
     println!(
         "console container: stage {} (DXIL), SM {}.{}, XDAT @ +{:#x}",
         sh.stage, sh.shader_model.0, sh.shader_model.1, sh.xdat_offset
@@ -167,11 +179,18 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
         if let Some(out) = fssm_out {
             let name = if i == 0 { out.to_string() } else { format!("{out}.{i}") };
             match std::fs::write(&name, &f.data) {
-                Ok(()) => println!("  saved FSSM to {name}"),
-                Err(e) => eprintln!("xcl disasm: {name}: {e}"),
+                Ok(()) => {
+                    println!("  saved FSSM to {name}");
+                    saved += 1;
+                }
+                Err(e) => {
+                    eprintln!("xcl disasm: {name}: {e}");
+                    failed = true;
+                }
             }
         }
     }
+    if failed { Err(()) } else { Ok(saved) }
 }
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
@@ -210,9 +229,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             println!("  {}  +{:#x}  {} B", p.fourcc, p.offset, p.size);
         }
     }
+    let mut fssm_saved = 0usize;
+    let mut fssm_failed = false;
     if kind == shader::Kind::XboxNative {
         if let Some(sh) = xbox::parse(&data) {
-            print_xbox(&sh, args.hex, args.fssm.as_deref());
+            match print_xbox(&sh, args.hex, args.fssm.as_deref()) {
+                Ok(n) => fssm_saved = n,
+                Err(()) => fssm_failed = true,
+            }
         }
     }
     let listing = shader::rdna2_listing(&data);
@@ -223,6 +247,13 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     } else {
         print!("{listing}");
+    }
+    if fssm_failed {
+        return 2;
+    }
+    if args.fssm.is_some() && fssm_saved == 0 {
+        eprintln!("xcl disasm: {}: no FSSM to save", path.display());
+        return 2;
     }
     0
 }
@@ -237,13 +268,12 @@ mod tests {
 
     #[test]
     fn options_parse_values_and_reject_unknown_or_missing_ones() {
-        let parsed =
-            parse_args(&args(&["--offset", "0x40", "--length", "16", "--all", "--hex", "--fssm", "out.fssm"])).unwrap();
+        let parsed = parse_args(&args(&["--offset", "0x40", "--length", "16", "--all", "--hex"])).unwrap();
         assert_eq!(parsed.offset, Some(0x40));
         assert_eq!(parsed.length, Some(16));
         assert!(parsed.all);
         assert!(parsed.hex);
-        assert_eq!(parsed.fssm.as_deref(), Some("out.fssm"));
+        assert_eq!(parse_args(&args(&["--fssm", "out.fssm"])).unwrap().fssm.as_deref(), Some("out.fssm"));
 
         assert_eq!(parse_args(&args(&["--bogus"])).unwrap_err(), "unknown option: --bogus; see `xcl --help`");
         assert_eq!(parse_args(&args(&["stray"])).unwrap_err(), "unexpected argument: stray; see `xcl --help`");
@@ -251,5 +281,16 @@ mod tests {
         assert_eq!(parse_args(&args(&["--offset", "--hex"])).unwrap_err(), "--offset needs a value");
         assert_eq!(parse_args(&args(&["--offset", "xyz"])).unwrap_err(), "invalid value for --offset: xyz");
         assert_eq!(parse_args(&args(&["--fssm"])).unwrap_err(), "--fssm needs a value");
+        // options whose consumer is absent are errors, not silent no-ops
+        assert_eq!(parse_args(&args(&["--all"])).unwrap_err(), "--all requires --offset or --length");
+        assert_eq!(parse_args(&args(&["--all", "--hex"])).unwrap_err(), "--all requires --offset or --length");
+        assert_eq!(
+            parse_args(&args(&["--offset", "0", "--fssm", "out.fssm"])).unwrap_err(),
+            "--fssm cannot be combined with --offset/--length"
+        );
+        assert_eq!(
+            parse_args(&args(&["--length", "4", "--fssm", "out.fssm"])).unwrap_err(),
+            "--fssm cannot be combined with --offset/--length"
+        );
     }
 }
