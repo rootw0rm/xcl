@@ -300,6 +300,12 @@ fn vtable(kind: Kind) -> *const usize {
     // slice: host upload memory + a coherent no-op barrier need no GPU).
     if kind == Kind::VulkanList || kind == Kind::CommandList {
         v[25] = List_SetPipelineState as usize; // S1 record bind (store-only)
+        v[20] = List_IASetPrimitiveTopology as usize; // S2 topology (PC-side, store-only)
+        v[21] = List_RSSetViewports as usize; // S2 viewports (PC-side, store-only)
+        v[22] = List_RSSetScissorRects as usize; // S2 scissors (PC-side, store-only)
+        v[34] = List_SetGraphicsRootSignature as usize; // S2 root sig (store-only)
+        v[47] = List_IASetIndexBuffer as usize; // S2 index buffer (store-only)
+        v[50] = List_OMSetRenderTargets as usize; // S2 render targets (store-only)
         // PC CopyBufferRegion (slot 15): the same immediate host memcpy as the
         // console DMA one — the single queue is already coherent, so the copy
         // lands at record time and ExecuteCommandLists stays a no-op.
@@ -557,11 +563,25 @@ pub struct PsoRecord {
     pub dsv_format: u32,
 }
 
-/// List-bound draw state: the PSO bound at SetPipelineState plus its record.
+/// List-bound draw state: the PSO bound at SetPipelineState plus its record,
+/// with the list-bound assembly S2 stores (root sig, render targets, index
+/// buffer, viewports/scissors, topology). Store-only; S3 interprets.
 #[derive(Clone, Default)]
 pub struct ListDrawRecord {
     pub pso: usize,
     pub pso_info: PsoRecord,
+    pub root_sig: usize,
+    pub rtv_count: u32,
+    pub rtv_handles: [usize; 8],
+    pub dsv_handle: usize,
+    pub has_dsv: bool,
+    pub index_va: u64,
+    pub index_size: u32,
+    pub index_format: u32,
+    pub has_index: bool,
+    pub topology: u32,
+    pub viewports: Vec<u8>,
+    pub scissors: Vec<u8>,
 }
 
 fn pso_store() -> &'static Mutex<HashMap<usize, PsoRecord>> {
@@ -607,13 +627,104 @@ pub unsafe fn record_graphics_pso(obj: *mut NullObj, desc: *const u8) {
     pso_store().lock().unwrap().insert(obj as usize, r);
 }
 
-/// List slot 25 `SetPipelineState(pso)`: bind the PSO's record to this list.
+/// List slot 25 `SetPipelineState(pso)`: bind the PSO's record to this list,
+/// preserving any S2 state already stored (order-independent).
 unsafe extern "win64" fn List_SetPipelineState(this: *mut NullObj, pso: *mut c_void) {
     if this.is_null() {
         return;
     }
     let info = pso_store().lock().unwrap().get(&(pso as usize)).cloned().unwrap_or_default();
-    list_store().lock().unwrap().insert(this as usize, ListDrawRecord { pso: pso as usize, pso_info: info });
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    e.pso = pso as usize;
+    e.pso_info = info;
+}
+
+/// List slot 34 `SetGraphicsRootSignature(rs)`: stash the bound root signature.
+unsafe extern "win64" fn List_SetGraphicsRootSignature(this: *mut NullObj, rs: *mut c_void) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().root_sig = rs as usize;
+}
+
+/// List slot 50 `OMSetRenderTargets(n, rtvs, single, dsv)`: stash the target
+/// handles (CPU-descriptor-sized words; capped at 8 RTVs).
+unsafe extern "win64" fn List_OMSetRenderTargets(
+    this: *mut NullObj,
+    n: u32,
+    rtvs: *const usize,
+    _single: u32,
+    dsv: *const usize,
+) {
+    if this.is_null() {
+        return;
+    }
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    e.rtv_count = n.min(8);
+    e.rtv_handles = [0; 8];
+    if !rtvs.is_null() {
+        for (i, h) in e.rtv_handles.iter_mut().enumerate().take(e.rtv_count as usize) {
+            *h = *rtvs.add(i);
+        }
+    }
+    if dsv.is_null() {
+        e.has_dsv = false;
+        e.dsv_handle = 0;
+    } else {
+        e.has_dsv = true;
+        e.dsv_handle = *dsv;
+    }
+}
+
+/// List slot 47 `IASetIndexBuffer(view)`: stash the 16-byte view
+/// (BufferLocation u64, SizeInBytes u32, Format u32); null clears.
+unsafe extern "win64" fn List_IASetIndexBuffer(this: *mut NullObj, view: *const u8) {
+    if this.is_null() {
+        return;
+    }
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    if view.is_null() {
+        e.has_index = false;
+        e.index_va = 0;
+        e.index_size = 0;
+        e.index_format = 0;
+        return;
+    }
+    e.has_index = true;
+    e.index_va = *(view as *const u64);
+    e.index_size = *(view.add(8) as *const u32);
+    e.index_format = *(view.add(12) as *const u32);
+}
+
+/// PC list slot 20 `IASetPrimitiveTopology(topology)`: stash the topology.
+unsafe extern "win64" fn List_IASetPrimitiveTopology(this: *mut NullObj, topo: u32) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().topology = topo;
+}
+
+/// PC list slot 21 `RSSetViewports(n, vp)`: stash the raw 24-byte viewports.
+unsafe extern "win64" fn List_RSSetViewports(this: *mut NullObj, n: u32, vp: *const u8) {
+    if this.is_null() || vp.is_null() {
+        return;
+    }
+    let bytes = (n.min(16) as usize) * 24;
+    let v = std::slice::from_raw_parts(vp, bytes).to_vec();
+    list_store().lock().unwrap().entry(this as usize).or_default().viewports = v;
+}
+
+/// PC list slot 22 `RSSetScissorRects(n, rects)`: stash the raw 16-byte rects.
+unsafe extern "win64" fn List_RSSetScissorRects(this: *mut NullObj, n: u32, rects: *const u8) {
+    if this.is_null() || rects.is_null() {
+        return;
+    }
+    let bytes = (n.min(16) as usize) * 16;
+    let v = std::slice::from_raw_parts(rects, bytes).to_vec();
+    list_store().lock().unwrap().entry(this as usize).or_default().scissors = v;
 }
 
 /// (payload size, payload alignment) of D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values.
@@ -3183,6 +3294,78 @@ mod tests {
             assert_eq!(bound.pso, pso as usize);
             assert_eq!((bound.pso_info.vs_ptr, bound.pso_info.dsv_format), (vs.as_ptr() as usize, 45));
             assert_eq!(bound.pso_info.blend[7], 7);
+        }
+    }
+
+    /// M2 draw S2 failing-first: list-bound state assembly — root sig (#34),
+    /// render targets (#50), index buffer (#47), topology/viewports/scissors
+    /// (PC 20/21/22) — lands in the list record with no draw issued. Fails
+    /// pre-S2: the record has no S2 fields and the slots are unwired.
+    #[test]
+    fn draw_s2_list_state_recorded_pre_draw() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            type ListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let list_x: ListX = std::mem::transmute(slot(dev, 73));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            // root signature first: SetPipelineState must not clobber it
+            // (store-only: a dummy non-null handle suffices, no object needed)
+            let rs = 0x1234_5000usize as *mut c_void;
+            type SetRs = unsafe extern "win64" fn(*mut c_void, *mut c_void);
+            let set_rs: SetRs = std::mem::transmute(slot(l, 34));
+            set_rs(l, rs);
+            // PSO bind after root sig keeps both
+            let mut desc = vec![0u8; super::GFX_DESC_MIN];
+            type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
+            let mut pso = std::ptr::null_mut();
+            assert_eq!(pso_x(dev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut pso), S_OK);
+            type SetPso = unsafe extern "win64" fn(*mut c_void, *mut c_void);
+            let set_pso: SetPso = std::mem::transmute(slot(l, 25));
+            set_pso(l, pso);
+            // render targets (#50): 2 RTVs + DSV
+            let rtvs = [0x1000usize, 0x2000usize];
+            let dsv = 0x3000usize;
+            type OmRt = unsafe extern "win64" fn(*mut c_void, u32, *const usize, u32, *const usize);
+            let om: OmRt = std::mem::transmute(slot(l, 50));
+            om(l, 2, rtvs.as_ptr(), 0, &dsv);
+            // index buffer (#47): va + size + format
+            let mut view = [0u8; 16];
+            view[0..8].copy_from_slice(&0x9_0000u64.to_le_bytes());
+            view[8..12].copy_from_slice(&1024u32.to_le_bytes());
+            view[12..16].copy_from_slice(&44u32.to_le_bytes());
+            type Ib = unsafe extern "win64" fn(*mut c_void, *const u8);
+            let ib: Ib = std::mem::transmute(slot(l, 47));
+            ib(l, view.as_ptr());
+            // PC-side: topology (20), one viewport (21), one scissor (22)
+            type Topo = unsafe extern "win64" fn(*mut c_void, u32);
+            let topo: Topo = std::mem::transmute(slot(l, 20));
+            topo(l, 4);
+            let mut vp = [0u8; 24];
+            vp[8..12].copy_from_slice(&1280.0f32.to_le_bytes());
+            vp[12..16].copy_from_slice(&720.0f32.to_le_bytes());
+            type Vp = unsafe extern "win64" fn(*mut c_void, u32, *const u8);
+            let set_vp: Vp = std::mem::transmute(slot(l, 21));
+            set_vp(l, 1, vp.as_ptr());
+            let mut sc = [0u8; 16];
+            sc[8..12].copy_from_slice(&1280i32.to_le_bytes());
+            sc[12..16].copy_from_slice(&720i32.to_le_bytes());
+            type Sc = unsafe extern "win64" fn(*mut c_void, u32, *const u8);
+            let set_sc: Sc = std::mem::transmute(slot(l, 22));
+            set_sc(l, 1, sc.as_ptr());
+            // no draw issued; every stored field reads back
+            let r = super::list_record_for(l as usize).expect("S2 stores list state pre-draw");
+            assert_eq!((r.root_sig, r.pso), (rs as usize, pso as usize));
+            assert_eq!((r.rtv_count, r.rtv_handles[0], r.rtv_handles[1]), (2, 0x1000, 0x2000));
+            assert!((r.has_dsv, r.dsv_handle) == (true, 0x3000));
+            assert!((r.has_index, r.index_va, r.index_size, r.index_format) == (true, 0x9_0000, 1024, 44));
+            assert_eq!(r.topology, 4);
+            assert_eq!(r.viewports.len(), 24);
+            assert_eq!(&r.viewports[8..16], &vp[8..16]);
+            assert_eq!(r.scissors.len(), 16);
+            assert_eq!(&r.scissors[8..16], &sc[8..16]);
         }
     }
 
