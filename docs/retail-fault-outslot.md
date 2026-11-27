@@ -150,9 +150,14 @@ timeout 240 gdb -q -batch -x /tmp/xcl-trace2.gdb
 
 ## Static cross-checks
 
-- `0x29e5480` is referenced nowhere in the image: zero qword hits for
-  `0x14029e5480` (VA), zero for `0x29e5480` as qword or dword. It is dead
-  code for this boot, consistent with run 2's 0 entry / 0 exit hits.
+- `0x29e5480` is a real method — slot 1 of the class vtable VA
+  `0x146308300` (the only qword hit for VA `0x1429e5480` is RVA
+  `0x6308308` in `.rdata`). The first scan quoted the wrong value
+  (`0x14029e5480`) and an RVA-as-qword pattern, so it missed it. The
+  point it was used to support still holds: that class is never
+  constructed on this boot (statically unreachable constructor chain,
+  0 hits in two runs), so the method is dead here; see
+  `docs/retail-obj1-initializer.md` (Step 35).
 - The outer vtable `0x1462fd890` slot 1 is `0x140fc2490` (confirmed both by the
   file's `.rdata` and at run time). The prior "obj1 vtable slot 1 = RVA
   `0x29e5480`" identification is wrong for this call site.
