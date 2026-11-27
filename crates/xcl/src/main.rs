@@ -54,6 +54,9 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
+      --record-vs [--sample N] [--seed S] [--top N] [--threads N] [--json]: classifies
+          records as console VS (S1 interface + S2/S3 SPIR-V) and counts what the
+          bring-up backend rejects or cannot translate; no device, no DXC.
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.

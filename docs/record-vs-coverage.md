@@ -279,6 +279,27 @@ not need draw-time user data, control flow or `MODE`, so they are the next measu
 f16 value class (9), cube ops (3) and the small VALU residual (4) follow after that; b64/EXEC/VCC
 masks (27) still need the per-lane model and `s_setreg` (22) still needs the MODE register.
 
+## Tooling polish (step-11, 2026-11-27)
+
+Three debts from the step-07/08 reviews, no translation change:
+
+- `--record-vs` is now listed in the `xcl --help` usage block for `xcl shaders`
+  (`crates/xcl/src/main.rs`), including the `--sample`/`--seed`/`--top`/`--threads`/`--json`
+  switches the sweep accepts.
+- `BranchFlow::shape` names `unconditional branches` when a program's only flow is
+  `s_branch` or a resolved far jump, instead of rendering the empty shape `()` (which
+  collapsed every such record into one uninformative reason key). Mixed shapes are
+  unchanged, so the corpus keys stay byte-identical.
+- `far_jump_is_a_named_unconditional_branch_shape` pins the far-jump claim: synthetic
+  `s_getpc_b64; s_add_u32 <literal 0x40000>; s_addc_u32; s_setpc_b64` resolves to the
+  target `0x40004` (beyond the ±128 KB `s_branch` reach), classifies as one unconditional
+  branch with that shape, and the refusal text names it.
+
+Corpus re-run (26,503 records, seed 1, release): outcomes unchanged
+(24,267 non-VS / 1,204 reject / 899 incomplete / 133 complete), 51 reason kinds; the six
+branch keys remain 877 / 169 / 117 / 28 / 9 / 4 = 1,204. No corpus record had
+unconditional-only flow, so no key moved.
+
 ## Follow-up
 
 `code-assist:xcl-first-frame:step-08:record-vs-branches` (task-1795794902-51cb) is resolved as
@@ -289,5 +310,6 @@ Step-09 (`code-assist:xcl-first-frame:step-09:record-vs-valu`, commit on
 `m22-vs-valu-coverage`) implements the VALU slice above. Step-10
 (`code-assist:xcl-first-frame:step-10:record-vs-salu`, commit on
 `m22-vs-salu-coverage`) implements the SALU/SOPC slice; the SDWA/DPP gap is queued as the next
-follow-up.
+follow-up. Step-11 (`code-assist:xcl-first-frame:step-11:record-vs-polish`, commit on
+`m22-vs-polish`) is the help/shape/far-jump polish above; SDWA/DPP (step-12) starts from it.
 

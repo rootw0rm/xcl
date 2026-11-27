@@ -77,6 +77,10 @@ impl BranchFlow {
 
     /// The shapes present as a reason suffix, e.g. `"exec-mask branches,
     /// scc/vcc branches, backward edges"`; empty for straight-line code.
+    ///
+    /// Unconditional branches are named only when no conditional branch is
+    /// present (they are the whole shape), so a program whose only flow is
+    /// `s_branch` or a resolved far jump does not render as `()`.
     pub fn shape(&self) -> String {
         let mut parts = Vec::new();
         if self.lane > 0 {
@@ -84,6 +88,9 @@ impl BranchFlow {
         }
         if self.predicate > 0 {
             parts.push("scc/vcc branches");
+        }
+        if self.unconditional > 0 && self.lane == 0 && self.predicate == 0 {
+            parts.push("unconditional branches");
         }
         if self.loops > 0 {
             parts.push("backward edges");
@@ -2745,6 +2752,55 @@ mod tests {
         assert!(flow.is_empty());
         assert_eq!(flow.branches(), 0);
         assert_eq!(flow.shape(), "");
+    }
+
+    /// A resolved far jump (`s_getpc_b64` … `s_setpc_b64` with a 64-bit
+    /// offset) is an unconditional branch even when its target is outside the
+    /// `s_branch` ±128 KB reach, and the refusal names that shape instead of
+    /// rendering `()`.
+    #[test]
+    fn far_jump_is_a_named_unconditional_branch_shape() {
+        let mut code = Vec::new();
+        for (name, enc, fields, literal) in [
+            ("S_GETPC_B64", "ENC_SOP1", vec![("SDST", 0)], None),
+            (
+                "S_ADD_U32",
+                "ENC_SOP2",
+                vec![("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)],
+                Some(0x0004_0000u32),
+            ),
+            (
+                "S_ADDC_U32",
+                "ENC_SOP2",
+                vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)],
+                None,
+            ),
+            ("S_SETPC_B64", "ENC_SOP1", vec![("SSRC0", 0)], None),
+        ] {
+            code.extend(encode(name, enc, &fields, literal).unwrap());
+        }
+        code.extend(blit_code());
+        let insts = decoded(&code);
+        assert_eq!(
+            rdna2::branch_target(&insts[3]),
+            Some(0x0004_0000 + 4),
+            "far target = getpc end + 0x40000"
+        );
+        let flow = branch_flow(&insts);
+        assert_eq!(
+            flow,
+            BranchFlow {
+                unconditional: 1,
+                ..BranchFlow::default()
+            }
+        );
+        assert_eq!(flow.shape(), "unconditional branches");
+        let err = SpirvVsBackend::translate_vs(&code, &blit_vs(), true)
+            .expect_err("a far jump must be rejected");
+        assert!(
+            err.contains("(unconditional branches)"),
+            "refusal must name the shape, not (): {err}"
+        );
     }
 
     #[test]
