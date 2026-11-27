@@ -42,6 +42,7 @@
 
 #![allow(non_snake_case)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -298,6 +299,7 @@ fn vtable(kind: Kind) -> *const usize {
     // upload (#148) slots run on the plain null lists too (M2 raytracing
     // slice: host upload memory + a coherent no-op barrier need no GPU).
     if kind == Kind::VulkanList || kind == Kind::CommandList {
+        v[25] = List_SetPipelineState as usize; // S1 record bind (store-only)
         // PC CopyBufferRegion (slot 15): the same immediate host memcpy as the
         // console DMA one — the single queue is already coherent, so the copy
         // lands at record time and ExecuteCommandLists stays a no-op.
@@ -521,6 +523,99 @@ pub unsafe fn capture_compute_desc(desc: *const u8) {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// M2 draw S1: PSO record (store-only). The draw-relevant PSO bytes — VS/PS,
+// RTV formats/DSV format, rasterizer + blend — are stashed at creation
+// (#60/#55 + PC10, read with the PC graphics-desc layout like
+// `capture_graphics_desc` above) and bound to the list at SetPipelineState
+// (#25). No draw, no validation, no execute: S3 (pipeline) interprets the
+// bytes, S4 executes. `translate_vs_spirv` (`gpu/recomp/spirv.rs`) is the
+// future VS consumer.
+// ---------------------------------------------------------------------------------------
+
+/// PC D3D12_GRAPHICS_PIPELINE_STATE_DESC draw-field offsets (x64).
+pub const GFX_BLEND_OFF: usize = 120;
+pub const GFX_BLEND_LEN: usize = 328;
+pub const GFX_RASTER_OFF: usize = 452;
+pub const GFX_RASTER_LEN: usize = 44;
+pub const GFX_NUMRT_OFF: usize = 572;
+pub const GFX_RTV_OFF: usize = 576;
+pub const GFX_DSV_OFF: usize = 608;
+pub const GFX_DESC_MIN: usize = 644;
+
+/// Draw-relevant PSO bytes stashed at creation.
+#[derive(Clone, Default)]
+pub struct PsoRecord {
+    pub vs_ptr: usize,
+    pub vs_len: usize,
+    pub ps_ptr: usize,
+    pub ps_len: usize,
+    pub blend: Vec<u8>,
+    pub raster: Vec<u8>,
+    pub num_rtv: u32,
+    pub rtv_formats: [u32; 8],
+    pub dsv_format: u32,
+}
+
+/// List-bound draw state: the PSO bound at SetPipelineState plus its record.
+#[derive(Clone, Default)]
+pub struct ListDrawRecord {
+    pub pso: usize,
+    pub pso_info: PsoRecord,
+}
+
+fn pso_store() -> &'static Mutex<HashMap<usize, PsoRecord>> {
+    static S: OnceLock<Mutex<HashMap<usize, PsoRecord>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn list_store() -> &'static Mutex<HashMap<usize, ListDrawRecord>> {
+    static S: OnceLock<Mutex<HashMap<usize, ListDrawRecord>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn pso_record_for(pso: usize) -> Option<PsoRecord> {
+    pso_store().lock().unwrap().get(&pso).cloned()
+}
+
+pub fn list_record_for(list: usize) -> Option<ListDrawRecord> {
+    list_store().lock().unwrap().get(&list).cloned()
+}
+
+/// Stash the PSO's draw bytes for `obj` (store-only; keeps today's capture).
+pub unsafe fn record_graphics_pso(obj: *mut NullObj, desc: *const u8) {
+    capture_graphics_desc(desc);
+    if desc.is_null() {
+        return;
+    }
+    // Null-shim trust, like `Device_CreateDescriptorHeap` above: the title
+    // hands host pointers, so read them directly. (`shader::readable` is a
+    // no-op false on Linux — gating on it would store an empty record on
+    // the one platform S3 needs bytes on. A null desc stores nothing.)
+    let mut r = PsoRecord::default();
+    r.vs_ptr = *(desc.add(8) as *const usize);
+    r.vs_len = *(desc.add(16) as *const usize);
+    r.ps_ptr = *(desc.add(24) as *const usize);
+    r.ps_len = *(desc.add(32) as *const usize);
+    r.blend = std::slice::from_raw_parts(desc.add(GFX_BLEND_OFF), GFX_BLEND_LEN).to_vec();
+    r.raster = std::slice::from_raw_parts(desc.add(GFX_RASTER_OFF), GFX_RASTER_LEN).to_vec();
+    r.num_rtv = *(desc.add(GFX_NUMRT_OFF) as *const u32);
+    for (i, f) in r.rtv_formats.iter_mut().enumerate() {
+        *f = *(desc.add(GFX_RTV_OFF + 4 * i) as *const u32);
+    }
+    r.dsv_format = *(desc.add(GFX_DSV_OFF) as *const u32);
+    pso_store().lock().unwrap().insert(obj as usize, r);
+}
+
+/// List slot 25 `SetPipelineState(pso)`: bind the PSO's record to this list.
+unsafe extern "win64" fn List_SetPipelineState(this: *mut NullObj, pso: *mut c_void) {
+    if this.is_null() {
+        return;
+    }
+    let info = pso_store().lock().unwrap().get(&(pso as usize)).cloned().unwrap_or_default();
+    list_store().lock().unwrap().insert(this as usize, ListDrawRecord { pso: pso as usize, pso_info: info });
+}
+
 /// (payload size, payload alignment) of D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values.
 pub fn subobject_payload(ty: u32) -> Option<(usize, usize)> {
     Some(match ty {
@@ -580,8 +675,11 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
 }
 
 unsafe extern "win64" fn Device_CreateGraphicsPipelineState(_t: *mut NullObj, d: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    capture_graphics_desc(d);
-    out_obj(ppv, Kind::PipelineState)
+    let hr = out_obj(ppv, Kind::PipelineState);
+    if hr == S_OK && !ppv.is_null() && !(*ppv).is_null() {
+        record_graphics_pso(*ppv as *mut NullObj, d);
+    }
+    hr
 }
 unsafe extern "win64" fn Device_CreateComputePipelineState(_t: *mut NullObj, d: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     capture_compute_desc(d);
@@ -1075,8 +1173,11 @@ unsafe extern "win64" fn Device_CreateGraphicsPipelineStateX(
     _riid: *const c_void,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
-    capture_graphics_desc(d);
-    out_obj(ppv, Kind::PipelineState)
+    let hr = out_obj(ppv, Kind::PipelineState);
+    if hr == S_OK && !ppv.is_null() && !(*ppv).is_null() {
+        record_graphics_pso(*ppv as *mut NullObj, d);
+    }
+    hr
 }
 
 /// `CreateDerivedPipelineStateX(base, count, patch, riid, out)`: `patch[0]` selects the
@@ -1093,6 +1194,15 @@ unsafe extern "win64" fn Device_CreateDerivedPipelineStateX(
         return E_INVALIDARG;
     }
     match *patch {
+        // blend derivation carries the base record; S3 applies the patch bytes.
+        2 if !_base.is_null() => {
+            let hr = out_obj(ppv, Kind::PipelineState);
+            if hr == S_OK && !ppv.is_null() && !(*ppv).is_null() {
+                let base = pso_store().lock().unwrap().get(&(_base as usize)).cloned().unwrap_or_default();
+                pso_store().lock().unwrap().insert(*ppv as usize, base);
+            }
+            hr
+        }
         2 => out_obj(ppv, Kind::PipelineState),
         _ => E_INVALIDARG,
     }
@@ -3009,6 +3119,70 @@ mod tests {
             for i in [78usize, 79, 80, 81] {
                 assert!(crate::stubs::info_of_stub(slot(vd, i)).is_none(), "slot {i} routes");
             }
+        }
+    }
+
+    /// M2 draw S1 failing-first: the PSO's draw bytes (VS/PS/RTV/DSV +
+    /// rasterizer/blend, from #60/#55 + PC10) land in the list-bound record
+    /// at SetPipelineState, before any draw is issued. Fails pre-S1: no
+    /// record store exists, so this does not compile, let alone pass.
+    #[test]
+    fn draw_s1_pso_record_populated_pre_draw() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            // shader bytecodes the desc points at (must stay readable memory)
+            let vs = vec![0x11u8; 64];
+            let ps = vec![0x22u8; 64];
+            let mut desc = vec![0u8; super::GFX_DESC_MIN];
+            desc[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+            desc[16..24].copy_from_slice(&(vs.len()).to_le_bytes());
+            desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
+            desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
+            for (i, b) in desc[super::GFX_BLEND_OFF..super::GFX_BLEND_OFF + super::GFX_BLEND_LEN].iter_mut().enumerate() {
+                *b = (i & 0xFF) as u8;
+            }
+            desc[super::GFX_RASTER_OFF..super::GFX_RASTER_OFF + super::GFX_RASTER_LEN].fill(0x2A);
+            desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&2u32.to_le_bytes());
+            desc[super::GFX_RTV_OFF..super::GFX_RTV_OFF + 4].copy_from_slice(&28u32.to_le_bytes());
+            desc[super::GFX_RTV_OFF + 4..super::GFX_RTV_OFF + 8].copy_from_slice(&28u32.to_le_bytes());
+            desc[super::GFX_DSV_OFF..super::GFX_DSV_OFF + 4].copy_from_slice(&45u32.to_le_bytes());
+            // console PSO (#60) records + accepts
+            type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
+            let mut pso = std::ptr::null_mut();
+            assert_eq!(pso_x(dev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut pso), S_OK);
+            let rec = super::pso_record_for(pso as usize).expect("S1 records the PSO at creation");
+            assert_eq!((rec.vs_ptr, rec.vs_len), (vs.as_ptr() as usize, vs.len()));
+            assert_eq!((rec.ps_ptr, rec.ps_len), (ps.as_ptr() as usize, ps.len()));
+            assert_eq!(rec.blend.len(), super::GFX_BLEND_LEN);
+            assert_eq!(rec.blend[7], 7);
+            assert!(rec.raster.iter().all(|&b| b == 0x2A));
+            assert_eq!((rec.num_rtv, rec.rtv_formats[0], rec.rtv_formats[1], rec.dsv_format), (2, 28, 28, 45));
+            // PC PSO (#10) records too
+            let pso_pc: Fn4 = std::mem::transmute(slot(dev, 10));
+            let mut pso2 = std::ptr::null_mut();
+            assert_eq!(pso_pc(dev, desc.as_ptr() as *const c_void, std::ptr::null(), &mut pso2), S_OK);
+            assert!(super::pso_record_for(pso2 as usize).is_some(), "PC10 records as well");
+            // derived blend PSO (#55) inherits the base record
+            type DerivedX = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, *const u8, *const c_void, *mut *mut c_void) -> HRESULT;
+            let derive: DerivedX = std::mem::transmute(slot(dev, 55));
+            let mut d = std::ptr::null_mut();
+            assert_eq!(derive(dev, pso, 1, [2u8].as_ptr(), std::ptr::null(), &mut d), S_OK);
+            let drec = super::pso_record_for(d as usize).expect("derived PSO carries the base record");
+            assert_eq!(drec.vs_ptr, vs.as_ptr() as usize);
+            // list SetPipelineState (#25) binds the record pre-draw: no draw issued
+            type ListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let list_x: ListX = std::mem::transmute(slot(dev, 73));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            type SetPso = unsafe extern "win64" fn(*mut c_void, *mut c_void);
+            let set: SetPso = std::mem::transmute(slot(l, 25));
+            set(l, pso);
+            let bound = super::list_record_for(l as usize).expect("list record bound at SetPipelineState");
+            assert_eq!(bound.pso, pso as usize);
+            assert_eq!((bound.pso_info.vs_ptr, bound.pso_info.dsv_format), (vs.as_ptr() as usize, 45));
+            assert_eq!(bound.pso_info.blend[7], 7);
         }
     }
 
