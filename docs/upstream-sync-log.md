@@ -1643,3 +1643,58 @@ newest at the bottom.
   covers the flag plumbing) + step-148 (#2922 twin
   swapped-namespace test in `xuser_linux.rs`). Independent areas, both
   unblocked.
+
+## 2026-11-27 — step-149 (task-1795739533-528c): triage #2928–#2930 (window >2927), top now #2930, probe past #2930
+
+- `upstream/main` = `8b957bec` (unchanged; `merge-base --is-ancestor
+  upstream/main HEAD` exit 0 — zero sync fallout, fully merged).
+- Batched `git ls-remote upstream 'refs/pull/*/head'` (per
+  mem-1795715658-5c18): 2398 refs (delta +1 vs step-145's 2395/2397 —
+  push race, not a miss). Numbers >2927 present: 2928, 2929, 2930.
+  Per-PR probe #2931..#2950 ALL MISSING (sequential, per
+  mem-1795712765-78dc never stop at the first gap) → top now #2930.
+  All 3 heads fetched to `refs/tmp/prNNNN`. #2930's commit
+  (`00:12:41 UTC`) predates the step-145-critic probe that reported
+  "#2930+ MISSING" — ref created after that probe (push race per
+  mem-1795714025-21a1, not builder/critic fault).
+- Pins re-verified (zero drift, no force-push): #2907 `7575f671`
+  + #2913 `992ef508` match step-145 pins. All 3 new heads OPEN
+  (`merge-base --is-ancestor` vs `upstream/main` exit 1 each).
+- Triage (all 3 OPEN):
+  - #2928 SKIP (single-commit `1d3b766d` on `upstream/main`;
+    `perf(shaders)` precompile warm-cache + preparation timer.
+    `gpu/recomp/dxc.rs` is a `cfg(windows)` file (`recomp/mod.rs:56`);
+    `hle/d3d12x/present/preparation.rs` is Windows-only; the
+    `shaders.rs` +246/-? hunks all sit in the Windows-only precompile
+    flow (`#[cfg(windows)] fn precompile`, `shaders.rs:1793`) calling
+    `recomp::dxc::*` / `recomp::pso::*` (both `cfg(windows)` modules)
+    — the new file-scope helpers even reference
+    `recomp::dxc::toolchain_identity()`, so the PR as written cannot
+    compile on Linux. No Linux shape.)
+  - #2929 + #2930 SKIP-FOR-NOW as a competing pair (land once, never
+    separately, per PROMPT §0.3 — and while neither is merged, land
+    neither; port the merged form post-merge). Both are byte-identical
+    single-commit reverts of #2247 (`5081dc8b`, confirmed ancestor of
+    linux HEAD — arrived via sync, not a selective port):
+    `git diff pr2929 pr2930 -- emit.rs` empty. #2929 `a87d3c2a`
+    (Decodere) + #2930 `4e008ce5` (SergeAx, on `b49be183` base —
+    `upstream/main...pr2930` has no merge base, compared vs own
+    parent instead). Effect is HLSL-PRELUDE-text-only in shared
+    `gpu/recomp/emit.rs` (`select()` → ternary/`if` in `rla()`,
+    motivated by a Windows NVIDIA RTX 5080 `0x887a0005` device removal)
+    + deletion of 1 shared string test + 2 `#[cfg(windows)]` tests.
+    No Linux consumer compiles that HLSL (no DXC on Linux;
+    `glsl.rs` has no `rla`); `with_preludes` output is dump-text only
+    on Linux. Porting now would delete a passing Linux test
+    (`rla_pixel_helper_avoids_runtime_vector_indexing_and_branches`,
+    `emit.rs:6926`, not `cfg`-gated) for zero behavioral effect.
+    Recheck task filed: when one merges, port the merged form
+    (PRELUDE hunk verbatim + delete the string test it falsifies —
+    failing-first falls out naturally) and close the other as
+    superseded. Note for that task: our tree keeps pinning the
+    pre-revert select() form until then, harmlessly (dead HLSL text
+    on Linux).
+- Tasks filed: step-150 (P4 recheck of the #2929/#2930 revert pair
+  post-merge; future windows only look past the top, so without it a
+  merge would go unnoticed). No overlap with step-147 (#2926 dxil
+  hunks) or step-148 (xuser twin test).
