@@ -1481,6 +1481,32 @@ mod tests {
     }
 
     #[test]
+    fn record_vs_words_translates_blit_rejects_garbage() {
+        // S3 record VS path without a device: blit-class bytes translate
+        // in-process (Vertex entry + Position), garbage fails closed so the
+        // caller takes the title-triangle fallback.
+        use super::super::spirv::record_vs_words;
+        let t = record_vs_words(&recomp_triangle_code()).expect("blit VS must translate");
+        assert!(t.complete(), "{:?}", t.unsupported);
+        let ops = word_ops(&t.words);
+        let has =
+            |op: u16, pred: &dyn Fn(&[u32]) -> bool| ops.iter().any(|(o, a)| *o == op && pred(a));
+        assert!(
+            has(OP_ENTRY_POINT, &|a| !a.is_empty()
+                && a[0] == EXEC_MODEL_VERTEX),
+            "missing Vertex entry point"
+        );
+        assert!(
+            has(OP_DECORATE, &|a| a.len() == 3
+                && a[1] == DECOR_BUILTIN
+                && a[2] == BUILTIN_POSITION),
+            "missing Position builtin"
+        );
+        assert!(record_vs_words(&[0xAAu8; 64]).is_err(), "garbage must fail closed");
+        assert!(record_vs_words(&[]).is_err(), "empty bytes must fail closed");
+    }
+
+    #[test]
     fn triangle_bad_words_fail_closed() {
         let vs = triangle_vs_spv();
         let fs = green_fs_spv();

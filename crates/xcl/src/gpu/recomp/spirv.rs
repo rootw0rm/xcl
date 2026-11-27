@@ -90,6 +90,33 @@ pub fn translate_vs_spirv(
     })
 }
 
+/// M2 draw S3: VS words for a stashed draw record. Minimal VertexIndex-only
+/// interface (no vertex inputs, Position-only output, `attr_base` 4):
+/// blit-class bytes translate in-process; anything else (PC DXBC, non-blit)
+/// fails closed with the backend's reason and the caller falls back to the
+/// hand-assembled title triangle.
+pub fn record_vs_words(code: &[u8]) -> Result<SpirvTranslation, String> {
+    if code.is_empty() {
+        return Err("empty VS bytes: no instructions to translate".into());
+    }
+    let vs = VsInterface {
+        inputs: vec![],
+        outputs: vec![crate::gpu::dxbc::SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            system_value: 1,
+            component_type: 3,
+            register: 0,
+            mask: 0xF,
+            rw_mask: 0xF,
+            stream: 0,
+        }],
+        attr_base: 4,
+        params: None,
+    };
+    translate_vs_spirv(code, &vs, true)
+}
+
 /// Instructions without an effect in the bring-up execution model.
 const NOOPS: &[&str] = &[
     "s_nop",
