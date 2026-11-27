@@ -16,7 +16,10 @@ pack container** (`0x140fc21c0` factory, `0x140fc2240` ctor, vtable
 `0x1462fd890`). The container opens successfully; the very next step builds its
 **cache child device** (0x80 bytes, vtable `0x1462fd480`) via pack vtable slot
 1 (`0x140fc2490`), whose init `0x140fc2540` fails at `0x1408ec200`
-(`0x140a34890` subcheck: a pack entry's `+0x2e` flag is 0). Slot 1 then stores
+(`0x140a34890` → `0x1406bd160` → `0x140536a70` → `0x140613880`: the pack
+entry's kind byte is `0x0b`, kind 5, whose class descriptor is the
+zero-filled default at `0x1479f7060`, so the resource lookup is NULL).
+Slot 1 then stores
 NULL and the game dereferences it at `0x142237320` — the fault is the game's
 missing NULL check after its own producer refused the object, as M1.2
 concluded.
@@ -171,14 +174,24 @@ the same pack-path module as `0x14056eb10`.
 
 `0x1408ec200` (`..0x8ec270`) gates on `[parent+8] & 1`, then
 `0x140a34890(view)`, then `0x1428ce530`, `0x141fb2300`, `0x1406bd040`,
-`0x1408ec350`. The **first** subcheck fails:
+`0x1408ec350`. The **first** subcheck (`0x140a34890`) fails:
 
 ```
 140a348a7  mov rax, [rcx+8]        ; pack entry/header view object
-140a348ae  mov bl,  [rax+0x2e]     ; flags byte
+140a348ae  mov bl,  [rax+0x2e]     ; kind byte (measured 0x0b)
 140a348b3  call 0x140b85020        ; test cl,cl; setne al
-140a348ba  je   0x140a34964        ; -> return 0
+140a348ba  je   0x140a34964        ; kind == 0 -> al = 1 (SUCCESS)
+140a348c0  shr bl                  ; kind >> 1 = class id (5)
+140a348c4  call 0x140a349a0        ; class id -> descriptor
+140a34964  mov al, 1               ; (b0 01) the kind == 0 return
 ```
+
+`0x140a349a0` hands out a real class descriptor only for class id 1
+(`0x1479f707c`) and id 4 (`0x1479f7098`); anything else gets the zero-filled
+default `0x1479f7060`. For that default `word[desc+4] == 0`, which
+`0x140536a70` maps through the `.rdata` table `0x1462fe860`
+(`{0,1,2,0x10,0x10,0x10,0x12,0x12}`) to category 0; `0x140193f90` then takes
+its invalid-category branch to `0x140575a70(key=0, 0, 1)` → NULL.
 
 ## Dynamic evidence
 
@@ -218,8 +231,10 @@ BP fc2695 init_fail: child=0x7ff398196800 parent=0x7ff3981364a0
 ```
 
 So the pack container opened fine (factory returned a non-NULL object), and the
-refusal is in the child init’s second check’s first subcheck: the entry/header
-view’s `+0x2e` byte is 0 and `0x140a348a0` requires it non-zero.
+refusal is in the child init’s second check’s first subcheck `0x140a34890`.
+An earlier revision of this paragraph said the view’s `+0x2e` byte was 0 and
+that `0x140a348a0` required it non-zero; both halves were wrong — see the
+2026-11-27 re-trace at the end of this file.
 
 ## HLE / unmapped correlation
 
@@ -244,14 +259,46 @@ view’s `+0x2e` byte is 0 and `0x140a348a0` requires it non-zero.
 - **Key bytes:** `0x1474539f6` = `"appdata0.rpf"` (13 B with NUL) and
   `0x1474539d5` = `"packcache:/"` (12 B with NUL), both runtime-built ASCII.
 - **Observed gate:** path exists (al=1) → RPF9 container opens → cache child
-  init refuses at `0x1408ec200` (first subcheck `0x140a34890`, flag at
-  `[view+8]+0x2e` == 0) → slot 1 stores NULL → game faults.
+  init refuses at `0x1408ec200` (first subcheck `0x140a34890`: kind byte
+  `0x0b` → class 5 → zero-filled default descriptor → resource lookup NULL)
+  → slot 1 stores NULL → game faults.
 
-## Next (own task, no code yet)
+## Re-trace 2026-11-27 — the kind byte is 0x0b, and 0 would SUCCEED
 
-Name the `+0x2e` flag on the object at `[view+8]` (the view is built by
-`0x14087aec0` from the pack's header/entry fields at `child+0x18/+0x20`), and
-find who should set it for `appdata0.rpf`: it is plausibly an RPF9
-directory-entry flag (directory vs file / valid). If its value is derived from
-the RPF9 header fields HLE hands to the game, compare those fields with the
-on-disk header; otherwise this is game logic on a successfully opened pack.
+Re-probed at `linux` `71bb3ee6` (+ the M1.4/M2.4 landings) with soft
+breakpoints inserted after `xcl::loader::run_main`. Fresh-root retail run:
+exit 139, same RIP/code bytes, `called_stubs` 2. Evidence:
+
+```
+A 0x140a348b3  H[0x2e] = 0x0b          (view H = 0x7ff3a01aa4b0)
+B 0x140a349a0  cl = H[0x2e] >> 1 = 5
+C 0x140a3492b  desc = 0x1479f7060       (zeros; +0x18 = 0x8000007b)
+D 0x1406bd16a  word[desc+4] = 0
+E 0x1406bd187  0x140536a70 -> al = 0
+H 0x1408ec221  0x140a34890 -> al = 0
+```
+
+Byte identity: `H+0x10` matches `appdata0.rpf` file offset `0x1010` exactly
+(`42 30 26 7e 83 81 e6 5e` …), so `H[0x2e]` is file byte `0x102e` = `0x0b`.
+`H[0..0x0f]` is the outer `9FPR` header (`0x360/0x340/0x40`). The byte is a
+genuine file byte served correctly by the VFS — the same conclusion as
+`docs/retail-crypto-terminal.md`.
+
+Statics agree: `0x140a348ba je 0x140a34964` and `0x140a34964: b0 01`
+(`mov al, 1`) — kind 0 is the **success** path; `0x140a348c0` is `d0 eb`
+(`shr bl, 1`); `.rdata 0x1462fe860 = {0,1,2,0x10,0x10,0x10,0x12,0x12}`.
+
+This restores `docs/retail-step-07-31.md` steps 09–31 (`kind byte
+[blob+0x2e] = 0xb → 5 (default)`, `table[0] = 0`, zeroed class pool), which
+had already reached the same honest negative.
+
+## Next
+
+No code. Boot-input order was re-checked (`XCL_TRACE_STRNCMP=1`, one run):
+before the fault only `packroot:/appdata0.rpf` (plus the `G:/appdata0.rpf`
+probe) is resolved; no sibling `packcache:`/`dlc:` input arrives, so the
+console cannot be priming this from an earlier *file*. Pre-populating the
+class pool by hand stays fake-success. Reopen only with genuinely new
+evidence: a console-side trace showing the class-5 descriptor populated before
+this call, or the mechanism that is supposed to seed the pack-cache
+registration.
