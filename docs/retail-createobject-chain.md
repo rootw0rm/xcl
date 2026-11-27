@@ -274,6 +274,7 @@ A 0x140a348b3  H[0x2e] = 0x0b          (view H = 0x7ff3a01aa4b0)
 B 0x140a349a0  cl = H[0x2e] >> 1 = 5
 C 0x140a3492b  desc = 0x1479f7060       (zeros; +0x18 = 0x8000007b)
 D 0x1406bd16a  word[desc+4] = 0
+J 0x1406138e3  0x140193f90(key 0, category 0, 1) -> rax = 0 (lookup miss)
 E 0x1406bd187  0x140536a70 -> al = 0
 H 0x1408ec221  0x140a34890 -> al = 0
 ```
