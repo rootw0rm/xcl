@@ -302,6 +302,7 @@ const OP_LOAD: u16 = 61;
 const OP_STORE: u16 = 62;
 const OP_ACCESS_CHAIN: u16 = 65;
 const OP_COMPOSITE_EXTRACT: u16 = 81;
+const OP_COMPOSITE_CONSTRUCT: u16 = 80;
 const OP_CONVERT_F_TO_U: u16 = 109;
 const OP_CONVERT_F_TO_S: u16 = 110;
 const OP_CONVERT_S_TO_F: u16 = 111;
@@ -333,6 +334,7 @@ const OP_FUNCTION_END: u16 = 56;
 const OP_EXT_INST_IMPORT: u16 = 11;
 const OP_EXT_INST: u16 = 12;
 const OP_U_CONVERT: u16 = 113;
+const OP_F_CONVERT: u16 = 115;
 const OP_FDIV: u16 = 136;
 const OP_U_GREATER_THAN: u16 = 172;
 const OP_S_GREATER_THAN: u16 = 173;
@@ -353,6 +355,7 @@ const OP_FORD_GREATER_THAN_EQUAL: u16 = 190;
 const OP_FUNORD_GREATER_THAN_EQUAL: u16 = 191;
 /// Capability value (`SpvCapabilityInt64`), not an opcode.
 const CAP_INT64: u32 = 11;
+const CAP_FLOAT16: u32 = 9;
 /// GLSL.std.450 instruction numbers this backend emits.
 const GLSL_TRUNC: u32 = 3;
 const GLSL_FLOOR: u32 = 8;
@@ -364,6 +367,8 @@ const GLSL_SQRT: u32 = 31;
 const GLSL_INVERSE_SQRT: u32 = 32;
 /// `FindILsb`: index of the least-significant 1-bit, 0xFFFF_FFFF when zero.
 const GLSL_FIND_I_LSB: u32 = 73;
+/// `FClamp`.
+const GLSL_F_CLAMP: u32 = 43;
 
 const EXEC_MODEL_VERTEX: u32 = 0;
 const ADDR_LOGICAL: u32 = 0;
@@ -393,6 +398,71 @@ fn string_words(s: &str) -> Vec<u32> {
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// The extension encoding (SDWA/DPP fields in the second dword) of a VOP
+/// instruction, or None for a plain form or an encoding that carries none.
+fn ext_encoding(d: &Decoded) -> Option<&'static rdna2::Encoding> {
+    let base = match d.enc.name {
+        "ENC_VOP1" => "VOP1",
+        "ENC_VOP2" => "VOP2",
+        "ENC_VOPC" => "VOPC",
+        _ => return None,
+    };
+    let name = match (d.variant, base) {
+        (Variant::Sdwa, "VOPC") => "VOPC_VOP_SDWA_SDST_ENC".to_string(),
+        (Variant::Sdwa, b) => format!("{b}_VOP_SDWA"),
+        (Variant::Dpp16, b) => format!("{b}_VOP_DPP16"),
+        (Variant::Dpp8, b) => format!("{b}_VOP_DPP8"),
+        _ => return None,
+    };
+    rdna2::encoding(&name)
+}
+
+/// SDWA operand fields of a VOP1/VOP2 instruction: which byte/word of each
+/// source is read and how, and where in the destination the result lands.
+struct Sdwa {
+    src0: u64,
+    src0_scalar: bool,
+    src0_sel: u32,
+    src0_sext: bool,
+    src0_abs: bool,
+    src0_neg: bool,
+    src1: u64,
+    src1_scalar: bool,
+    src1_sel: u32,
+    src1_sext: bool,
+    dst_sel: u32,
+    dst_unused: u32,
+    omod: u32,
+    clamp: bool,
+}
+
+impl Sdwa {
+    fn of(d: &Decoded) -> Option<Sdwa> {
+        if d.variant != Variant::Sdwa {
+            return None;
+        }
+        let e = ext_encoding(d)?;
+        let f = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
+        let bit = |n: &str| f(n) != 0;
+        Some(Sdwa {
+            src0: f("VSRC0"),
+            src0_scalar: bit("S0"),
+            src0_sel: f("SRC0_SEL") as u32,
+            src0_sext: bit("SRC0_SEXT"),
+            src0_abs: bit("SRC0_ABS"),
+            src0_neg: bit("SRC0_NEG"),
+            src1: f("VSRC1"),
+            src1_scalar: bit("S1"),
+            src1_sel: f("SRC1_SEL") as u32,
+            src1_sext: bit("SRC1_SEXT"),
+            dst_sel: f("DST_SEL") as u32,
+            dst_unused: f("DST_UNUSED") as u32,
+            omod: f("OMOD") as u32,
+            clamp: bit("CLAMP"),
+        })
+    }
 }
 
 struct InputVar {
@@ -441,6 +511,12 @@ struct SpirvEm {
     u64_ty: u32,
     /// Whether the module uses 64-bit integers (gates `Capability Int64`).
     need_int64: bool,
+    /// 16-bit float type and its 2-lane vector, declared lazily by the SDWA
+    /// f16 conversions.
+    half_ty: u32,
+    v2half_ty: u32,
+    /// Whether the module uses 16-bit floats (gates `Capability Float16`).
+    need_float16: bool,
     // Module sections.
     names: Vec<u32>,
     decor: Vec<u32>,
@@ -496,6 +572,9 @@ impl SpirvEm {
             glsl_id: 0,
             u64_ty: 0,
             need_int64: false,
+            half_ty: 0,
+            v2half_ty: 0,
+            need_float16: false,
             names: Vec::new(),
             decor: Vec::new(),
             types_consts: Vec::new(),
@@ -925,6 +1004,172 @@ impl SpirvEm {
         self.tmp(ty, OP_U_CONVERT, &[hi])
     }
 
+    /// `v2f16` type, declared on first use with `Capability Float16`.
+    fn half2_ty(&mut self) -> u32 {
+        if self.v2half_ty == 0 {
+            let h = self.alloc();
+            inst(&mut self.types_consts, OP_TYPE_FLOAT, &[h, 16]);
+            let v = self.alloc();
+            inst(&mut self.types_consts, OP_TYPE_VECTOR, &[v, h, 2]);
+            self.half_ty = h;
+            self.v2half_ty = v;
+            self.need_float16 = true;
+        }
+        self.v2half_ty
+    }
+
+    /// `v_cvt_f32_f16` widening: the low 16 bits of `bits` are an f16. The
+    /// module deliberately declares no scalar 16-bit integer type, so the
+    /// dword bitcasts to a `v2f16` and lane 0 is widened.
+    fn f16_low_to_f32_bits(&mut self, bits: u32) -> u32 {
+        let v2 = self.half2_ty();
+        let hv = self.tmp(v2, OP_BITCAST, &[bits]);
+        let h = self.half_ty;
+        let half = self.tmp(h, OP_COMPOSITE_EXTRACT, &[hv, 0]);
+        let f = self.tmp(self.float_ty, OP_F_CONVERT, &[half]);
+        self.as_uint(f)
+    }
+
+    /// `v_cvt_f16_f32` narrowing: round to nearest even and return the f16
+    /// pattern in bits 15:0, zero above (the SDWA destination selector then
+    /// places it).
+    fn f32_bits_to_f16_low(&mut self, bits: u32) -> u32 {
+        let v2 = self.half2_ty();
+        let f = self.as_float(bits);
+        let half_ty = self.half_ty;
+        let h = self.tmp(half_ty, OP_F_CONVERT, &[f]);
+        let composed = self.alloc();
+        inst(
+            &mut self.body,
+            OP_COMPOSITE_CONSTRUCT,
+            &[v2, composed, h, h],
+        );
+        let packed = self.tmp(self.uint_ty, OP_BITCAST, &[composed]);
+        let mask = self.uint_const(0xFFFF);
+        self.tmp(self.uint_ty, OP_BITWISE_AND, &[packed, mask])
+    }
+
+    /// Read SDWA source `i` (0 or 1) from the extension dword: an SGPR or
+    /// inline constant when its `S` bit is set, else the named VGPR, then the
+    /// selected byte/word with its extension.
+    fn sdwa_read(&mut self, s: &Sdwa, i: usize) -> Option<u32> {
+        let (reg, scalar, sel, sext) = if i == 0 {
+            (s.src0, s.src0_scalar, s.src0_sel, s.src0_sext)
+        } else {
+            (s.src1, s.src1_scalar, s.src1_sel, s.src1_sext)
+        };
+        let raw = if scalar {
+            self.code_value(reg, None)?
+        } else {
+            self.load_vgpr(reg)
+        };
+        Some(self.sdwa_sel(raw, sel, sext))
+    }
+
+    /// SDWA source select: BYTE_0..3 / WORD_0..1 of `x`, zero-extended, or
+    /// sign-extended when `sext` is set. A DWORD select is a no-op.
+    fn sdwa_sel(&mut self, x: u32, sel: u32, sext: bool) -> u32 {
+        if sel >= 6 {
+            return x;
+        }
+        let (sh, w) = if sel < 4 {
+            (8 * sel, 8u32)
+        } else {
+            (16 * (sel - 4), 16u32)
+        };
+        let uint_ty = self.uint_ty;
+        let shc = self.uint_const(sh);
+        let x = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[x, shc]);
+        let mask = self.uint_const((1u32 << w) - 1);
+        let x = self.tmp(uint_ty, OP_BITWISE_AND, &[x, mask]);
+        if !sext {
+            return x;
+        }
+        let int_ty = self.int_ty;
+        let k = self.uint_const(32 - w);
+        let l = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[x, k]);
+        let li = self.tmp(int_ty, OP_BITCAST, &[l]);
+        let int_ty = self.int_ty;
+        let k = self.int_const((32 - w) as i32);
+        let r = self.tmp(int_ty, OP_SHIFT_R_ARITH, &[li, k]);
+        let uint_ty = self.uint_ty;
+        self.tmp(uint_ty, OP_BITCAST, &[r])
+    }
+
+    /// SDWA destination select and the unused-bits policy: PAD zeroes the
+    /// other parts, SEXT extends the written value's sign, PRESERVE keeps the
+    /// destination's old bits. A DWORD select returns the result unchanged.
+    fn sdwa_dst(&mut self, s: &Sdwa, r: u32, n: u64) -> u32 {
+        if s.dst_sel >= 6 {
+            return r;
+        }
+        let (sh, w) = if s.dst_sel < 4 {
+            (8 * s.dst_sel, 8u32)
+        } else {
+            (16 * (s.dst_sel - 4), 16u32)
+        };
+        let uint_ty = self.uint_ty;
+        let mask = ((1u32 << w) - 1) << sh;
+        let shc = self.uint_const(sh);
+        let v = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[r, shc]);
+        let m = self.uint_const(mask);
+        let v = self.tmp(uint_ty, OP_BITWISE_AND, &[v, m]);
+        match s.dst_unused {
+            2 => {
+                let old = self.load_vgpr(n);
+                let nm = self.uint_const(!mask);
+                let kept = self.tmp(uint_ty, OP_BITWISE_AND, &[old, nm]);
+                self.tmp(uint_ty, OP_BITWISE_OR, &[kept, v])
+            }
+            1 => {
+                let top = sh + w;
+                if top >= 32 {
+                    return v;
+                }
+                let shc = self.uint_const(w - 1);
+                let bit = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[r, shc]);
+                let one = self.uint_const(1);
+                let bit = self.tmp(uint_ty, OP_BITWISE_AND, &[bit, one]);
+                let zero = self.uint_const(0);
+                let neg = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[bit, zero]);
+                let ext = self.uint_const(u32::MAX << top);
+                let ext = self.tmp(uint_ty, OP_SELECT, &[neg, ext, zero]);
+                self.tmp(uint_ty, OP_BITWISE_OR, &[v, ext])
+            }
+            _ => v,
+        }
+    }
+
+    /// SDWA output modifier (x2 / x4 / /2) then clamp to [0, 1] on an f32
+    /// bit pattern (the DXIL backend's `fres`).
+    fn sdwa_output(&mut self, omod: u32, clamp: bool, bits: u32) -> u32 {
+        let float_ty = self.float_ty;
+        let mut x = bits;
+        if let Some(k) = match omod {
+            1 => Some(2.0f32),
+            2 => Some(4.0f32),
+            3 => Some(0.5f32),
+            _ => None,
+        } {
+            let fx = self.as_float(x);
+            let kb = self.uint_const(k.to_bits());
+            let fk = self.as_float(kb);
+            let m = self.tmp(float_ty, OP_FMUL, &[fx, fk]);
+            x = self.as_uint(m);
+        }
+        if clamp {
+            let fx = self.as_float(x);
+            let glsl = self.glsl_id;
+            let zb = self.uint_const(0);
+            let zero = self.as_float(zb);
+            let ob = self.uint_const(0x3F80_0000);
+            let one = self.as_float(ob);
+            let c = self.tmp(float_ty, OP_EXT_INST, &[glsl, GLSL_F_CLAMP, fx, zero, one]);
+            x = self.as_uint(c);
+        }
+        x
+    }
+
     fn vgpr_var(&mut self, n: u64) -> u32 {
         if let Some(&id) = self.vgpr_vars.get(&n) {
             return id;
@@ -1066,7 +1311,10 @@ impl SpirvEm {
             *self.ignored.entry(name).or_default() += 1;
             return Ok(false);
         }
-        if d.variant != Variant::Plain && d.enc.name != "ENC_EXP" {
+        // DPP reads another lane; the scalar bring-up model cannot express it.
+        // SDWA stays on the same lane and is translated for the measured forms
+        // in `valu`, which refuses every other SDWA instruction.
+        if matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) {
             self.unsupported(d, "SDWA/DPP in the bring-up backend");
             return Ok(false);
         }
@@ -1596,6 +1844,22 @@ impl SpirvEm {
     }
 
     fn valu(&mut self, d: &Decoded, name: &str) {
+        // The SDWA slice is the measured one (step-12); every other SDWA form
+        // and every VOPC SDWA compare stays refused.
+        if d.variant == Variant::Sdwa
+            && !matches!(
+                name,
+                "v_cvt_f32_u32"
+                    | "v_add_nc_u32"
+                    | "v_lshlrev_b32"
+                    | "v_or_b32"
+                    | "v_cvt_f32_f16"
+                    | "v_cvt_f16_f32"
+            )
+        {
+            self.unsupported(d, "SDWA/DPP in the bring-up backend");
+            return;
+        }
         // V_CMP/V_CMPX write a mask, not a register: VOPC has the implicit VCC
         // pair, VOP3 an explicit SGPR-pair destination. Neither may fall through
         // to the register-destination logic below.
@@ -1604,13 +1868,26 @@ impl SpirvEm {
             return;
         }
         let (outs, ins) = Self::ops(d);
+        let sdwa = Sdwa::of(d);
         let mut u = Vec::new();
-        for o in &ins {
-            match self.read(d, o) {
-                Some(s) => u.push(s),
-                None => {
-                    self.unsupported(d, "op");
-                    return;
+        if let Some(s) = &sdwa {
+            for i in 0..ins.len().min(2) {
+                match self.sdwa_read(s, i) {
+                    Some(v) => u.push(v),
+                    None => {
+                        self.unsupported(d, "op");
+                        return;
+                    }
+                }
+            }
+        } else {
+            for o in &ins {
+                match self.read(d, o) {
+                    Some(s) => u.push(s),
+                    None => {
+                        self.unsupported(d, "op");
+                        return;
+                    }
                 }
             }
         }
@@ -1665,6 +1942,14 @@ impl SpirvEm {
                 let mi = self.tmp(int_ty, OP_BITCAST, &[m]);
                 let r = self.tmp(int_ty, OP_SHIFT_R_ARITH, &[bi, mi]);
                 Some(self.tmp(uint_ty, OP_BITCAST, &[r]))
+            }
+            // SDWA CLAMP on the unsigned add saturates to 0xFFFF_FFFF
+            // (the DXIL backend's `v_add_nc_u32` clamp arm).
+            "v_add_nc_u32" if sdwa.as_ref().is_some_and(|s| s.clamp) => {
+                let t = self.tmp(uint_ty, OP_IADD, &[a, b]);
+                let over = self.tmp(self.bool_ty, OP_U_LESS_THAN, &[t, a]);
+                let all = self.uint_const(0xFFFF_FFFF);
+                Some(self.tmp(uint_ty, OP_SELECT, &[over, all, t]))
             }
             "v_add_nc_u32" | "v_add_u32" | "v_add_co_u32" => {
                 Some(self.tmp(uint_ty, OP_IADD, &[a, b]))
@@ -1768,6 +2053,23 @@ impl SpirvEm {
                 let ir = self.tmp(int_ty, OP_CONVERT_F_TO_S, &[fa]);
                 Some(self.tmp(uint_ty, OP_BITCAST, &[ir]))
             }
+            // SDWA-only f16 conversions: the plain forms stay in the
+            // documented f16 non-goal.
+            "v_cvt_f32_f16" if sdwa.is_some() => Some(self.f16_low_to_f32_bits(a)),
+            "v_cvt_f16_f32" if sdwa.is_some() => {
+                let s = sdwa.as_ref().unwrap();
+                let mut x = a;
+                if s.src0_abs {
+                    let m = self.uint_const(0x7FFF_FFFF);
+                    x = self.tmp(uint_ty, OP_BITWISE_AND, &[x, m]);
+                }
+                if s.src0_neg {
+                    let m = self.uint_const(0x8000_0000);
+                    x = self.tmp(uint_ty, OP_BITWISE_XOR, &[x, m]);
+                }
+                let x = self.sdwa_output(s.omod, s.clamp, x);
+                Some(self.f32_bits_to_f16_low(x))
+            }
             "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let k = (name.as_bytes()[name.len() - 1] - b'0') as u32;
                 let x = if k == 3 {
@@ -1822,8 +2124,22 @@ impl SpirvEm {
             }
             _ => None,
         };
+        // SDWA output modifiers apply to the f32 result of the widening
+        // conversions, before the destination selector.
+        let res = match (sdwa.as_ref(), res) {
+            (Some(s), Some(bits)) if matches!(name, "v_cvt_f32_u32" | "v_cvt_f32_f16") => {
+                Some(self.sdwa_output(s.omod, s.clamp, bits))
+            }
+            (_, r) => r,
+        };
         match (res, dst) {
-            (Some(v), Some(Dst::V(n))) => self.store_vgpr(n, v),
+            (Some(v), Some(Dst::V(n))) => {
+                let v = match &sdwa {
+                    Some(s) => self.sdwa_dst(s, v, n),
+                    None => v,
+                };
+                self.store_vgpr(n, v);
+            }
             (Some(v), Some(Dst::S(n))) => {
                 if n == 125 {
                     // null
@@ -2105,6 +2421,9 @@ impl SpirvEm {
         inst(&mut cap, OP_CAPABILITY, &[CAP_SHADER]);
         if self.need_int64 {
             inst(&mut cap, OP_CAPABILITY, &[CAP_INT64]);
+        }
+        if self.need_float16 {
+            inst(&mut cap, OP_CAPABILITY, &[CAP_FLOAT16]);
         }
         // GLSL.std.450 for the transcendental/rounding ops; always declared so
         // the import section does not depend on usage order.
@@ -3525,5 +3844,370 @@ mod tests {
             );
         }
         assert_valid_spirv(&t, "salu_sopc");
+    }
+
+    // ---- M2.2 step-12: SDWA operand forms ---------------------------------
+
+    /// The definition of a value id (an instruction's result is its second
+    /// operand; stores carry no result).
+    fn def<'a>(ops: &'a [(u16, Vec<u32>)], id: u32) -> Option<(u16, &'a [u32])> {
+        ops.iter()
+            .find_map(|(o, a)| (a.len() >= 2 && a[1] == id).then(|| (*o, a.as_slice())))
+    }
+
+    /// Like [`def`], but looks through any f32 bit-pattern bitcasts.
+    fn def_unbits<'a>(ops: &'a [(u16, Vec<u32>)], id: u32) -> Option<(u16, &'a [u32])> {
+        let mut id = id;
+        loop {
+            match def(ops, id) {
+                Some((OP_BITCAST, a)) => id = a[2],
+                other => return other,
+            }
+        }
+    }
+
+    /// An f32 bit pattern: the literal of `id`, or of the constant bitcast
+    /// that defines it.
+    fn const_bits(ops: &[(u16, Vec<u32>)], id: u32) -> Option<u32> {
+        match def(ops, id) {
+            Some((OP_BITCAST, a)) => const_value(ops, a[2]),
+            _ => const_value(ops, id),
+        }
+    }
+
+    /// The literal of the OpConstant that defines `id`.
+    fn const_value(ops: &[(u16, Vec<u32>)], id: u32) -> Option<u32> {
+        ops.iter()
+            .find_map(|(o, a)| (*o == OP_CONSTANT && a.len() >= 3 && a[1] == id).then(|| a[2]))
+    }
+
+    fn sdwa(name: &str, vop2: bool, fields: &[(&str, u64)]) -> Vec<u8> {
+        let enc = if vop2 {
+            "VOP2_VOP_SDWA"
+        } else {
+            "VOP1_VOP_SDWA"
+        };
+        // SRC0 = 0xF9 is the instruction-word marker that selects the SDWA
+        // extension dword.
+        let mut all = vec![("SRC0", 0xF9)];
+        all.extend_from_slice(fields);
+        encode(name, enc, &all, None).unwrap()
+    }
+
+    /// Source selection reads the chosen byte/word out of the extension dword
+    /// operand, zero-extends unless SEXT, and an `S` bit selects an SGPR /
+    /// inline constant instead of a VGPR.
+    #[test]
+    fn sdwa_source_select_sext_and_scalar_sources() {
+        // v_or_b32_sdwa v5, v1, v2: src0 BYTE_2 sign-extended, src1 BYTE_3.
+        let mut code = sdwa(
+            "V_OR_B32",
+            true,
+            &[
+                ("VDST", 5),
+                ("VSRC0", 1),
+                ("VSRC1", 2),
+                ("SRC0_SEL", 2),
+                ("SRC0_SEXT", 1),
+                ("SRC1_SEL", 3),
+                ("DST_SEL", 6),
+            ],
+        );
+        // v_add_nc_u32_sdwa v6, 1.0, v2: src0 is the inline constant 1.0
+        // (S0 = 1, VSRC0 = 242), read without a sub-dword select.
+        code.extend(sdwa(
+            "V_ADD_NC_U32",
+            true,
+            &[
+                ("VDST", 6),
+                ("S0", 1),
+                ("VSRC0", 242),
+                ("VSRC1", 2),
+                ("SRC0_SEL", 6),
+                ("SRC1_SEL", 6),
+                ("DST_SEL", 6),
+            ],
+        ));
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        for (value, what) in [(16, "BYTE_2 read"), (24, "BYTE_3 read")] {
+            assert!(
+                ops.iter().any(|(o, a)| *o == OP_SHIFT_R_LOGICAL
+                    && a.len() == 4
+                    && const_value(&ops, a[3]) == Some(value)),
+                "{what}: no shift by {value}"
+            );
+        }
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_SHIFT_R_ARITH
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(24)),
+            "sext(BYTE_2) must shift back arithmetically by 24"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_AND
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0xFF)),
+            "byte selection must mask the selected byte"
+        );
+        // The inline constant must enter the add as 1.0's bit pattern, not as
+        // a VGPR load.
+        let one = ops
+            .iter()
+            .find_map(|(o, a)| {
+                (*o == OP_CONSTANT && a.len() >= 3 && a[2] == 0x3F80_0000).then(|| a[1])
+            })
+            .expect("1.0 inline constant missing");
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_IADD && a.len() == 4 && (a[2] == one || a[3] == one)),
+            "S0 source is not read as the scalar constant"
+        );
+        assert_valid_spirv(&t, "sdwa_select");
+    }
+
+    /// `v_cvt_f16_f32_sdwa` applies source abs/neg, output modifiers and clamp
+    /// in f32 before the conversion, and PRESERVE keeps the destination half
+    /// it does not write. `v_cvt_f32_f16_sdwa` reads the selected half.
+    #[test]
+    fn sdwa_f16_conversions_and_destination_preserve() {
+        // v_cvt_f16_f32_sdwa v1, v9 dst_sel:WORD_1 dst_unused:PRESERVE
+        //   -|v9| src0_sel:DWORD
+        let mut code = sdwa(
+            "V_CVT_F16_F32",
+            false,
+            &[
+                ("VDST", 1),
+                ("VSRC0", 9),
+                ("SRC0_ABS", 1),
+                ("SRC0_NEG", 1),
+                ("SRC0_SEL", 6),
+                ("DST_SEL", 5),
+                ("DST_UNUSED", 2),
+            ],
+        );
+        // v_cvt_f32_f16_sdwa v2, v3 dst_sel:DWORD src0_sel:WORD_1
+        code.extend(sdwa(
+            "V_CVT_F32_F16",
+            false,
+            &[("VDST", 2), ("VSRC0", 3), ("SRC0_SEL", 5), ("DST_SEL", 6)],
+        ));
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_CAPABILITY && a.as_slice() == [CAP_FLOAT16]),
+            "f16 conversion must declare Capability Float16"
+        );
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_F_CONVERT).count() >= 2,
+            "both conversion directions must emit OpFConvert"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_AND
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0x7FFF_FFFF)),
+            "source abs missing"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_XOR
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0x8000_0000)),
+            "source neg missing"
+        );
+        // PRESERVE: the stored value is (old & 0xFFFF0000) | (half << 16), and
+        // the old value is a load of the destination variable.
+        let (ptr, val) = ops
+            .iter()
+            .find_map(|(o, a)| {
+                (*o == OP_STORE && def(&ops, a[1]).is_some_and(|(d, _)| d == OP_BITWISE_OR))
+                    .then(|| (a[0], a[1]))
+            })
+            .expect("no preserving store");
+        let (_, or_ops) = def(&ops, val).unwrap();
+        let mut kept = false;
+        let mut wrote_hi = false;
+        for &x in &or_ops[2..] {
+            let Some((OP_BITWISE_AND, a)) = def(&ops, x) else {
+                continue;
+            };
+            match const_value(&ops, a[3]) {
+                // PRESERVE keeps the halves outside WORD_1.
+                Some(0x0000_FFFF) => {
+                    let Some((OP_LOAD, l)) = def(&ops, a[2]) else {
+                        panic!("preserved half is not a load")
+                    };
+                    kept = l[2] == ptr;
+                }
+                // The written half is the converted f16 shifted into WORD_1.
+                Some(0xFFFF_0000) => {
+                    let Some((OP_SHIFT_L_LOGICAL, sh)) = def(&ops, a[2]) else {
+                        panic!("half write is not shifted")
+                    };
+                    assert_eq!(const_value(&ops, sh[3]), Some(16));
+                    let Some((OP_BITWISE_AND, m)) = def(&ops, sh[2]) else {
+                        panic!("half write is not masked")
+                    };
+                    assert_eq!(const_value(&ops, m[3]), Some(0xFFFF));
+                    let Some((OP_BITCAST, b)) = def(&ops, m[2]) else {
+                        panic!("half write is not a v2f16 bitcast")
+                    };
+                    let Some((OP_COMPOSITE_CONSTRUCT, c)) = def(&ops, b[2]) else {
+                        panic!("half write does not construct a v2f16")
+                    };
+                    wrote_hi = matches!(def(&ops, c[2]), Some((OP_F_CONVERT, _)));
+                }
+                _ => {}
+            }
+        }
+        assert!(kept, "UNUSED_PRESERVE must keep the old destination word");
+        assert!(
+            wrote_hi,
+            "WORD_1 must write the converted half into bits 31:16"
+        );
+        assert_valid_spirv(&t, "sdwa_f16");
+    }
+
+    /// `v_cvt_f32_u32_sdwa v5, v3 src0_sel:WORD_1` widens the selected word;
+    /// omod/clamp apply to the f32 result.
+    #[test]
+    fn sdwa_cvt_f32_u32_applies_omod_and_clamp() {
+        let mut code = sdwa(
+            "V_CVT_F32_U32",
+            false,
+            &[
+                ("VDST", 5),
+                ("VSRC0", 3),
+                ("SRC0_SEL", 5),
+                ("DST_SEL", 6),
+                ("OMOD", 1),
+                ("CLAMP", 1),
+            ],
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_SHIFT_R_LOGICAL
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(16)),
+            "WORD_1 source is not shifted down"
+        );
+        let mul = ops
+            .iter()
+            .find_map(|(o, a)| {
+                (*o == OP_FMUL
+                    && a.len() == 4
+                    && def(&ops, a[2]).is_some()
+                    && const_bits(&ops, a[3]) == Some(0x4000_0000))
+                .then(|| a[1])
+            })
+            .expect("omod mul:2 missing");
+        let Some((OP_CONVERT_U_TO_F, _)) = def_unbits(&ops, def(&ops, mul).unwrap().1[2]) else {
+            panic!("omod does not follow the u32-to-f32 conversion")
+        };
+        let store = ops
+            .iter()
+            .find(|(o, a)| {
+                *o == OP_STORE && def_unbits(&ops, a[1]).is_some_and(|(d, _)| d == OP_EXT_INST)
+            })
+            .expect("clamped result is not stored");
+        let (OP_EXT_INST, e) = def_unbits(&ops, store.1[1]).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(e[3], 43, "clamp must be GLSL.std.450 FClamp");
+        assert!(
+            matches!(def_unbits(&ops, e[4]), Some((OP_FMUL, f)) if f[1] == mul),
+            "clamp must consume the omod result"
+        );
+        assert_valid_spirv(&t, "sdwa_cvt_omod");
+    }
+
+    /// `v_add_nc_u32_sdwa` with clamp saturates unsigned to 0xFFFF_FFFF.
+    #[test]
+    fn sdwa_add_nc_u32_clamp_saturates() {
+        let mut code = sdwa(
+            "V_ADD_NC_U32",
+            true,
+            &[
+                ("VDST", 13),
+                ("VSRC0", 23),
+                ("VSRC1", 24),
+                ("SRC0_SEL", 6),
+                ("SRC1_SEL", 5),
+                ("DST_SEL", 6),
+                ("CLAMP", 1),
+            ],
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_SHIFT_R_LOGICAL
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(16)),
+            "src1 WORD_1 is not shifted down"
+        );
+        let all = ops
+            .iter()
+            .find_map(|(o, a)| {
+                (*o == OP_CONSTANT && a.len() >= 3 && a[2] == 0xFFFF_FFFF).then(|| a[1])
+            })
+            .expect("saturation constant missing");
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_U_LESS_THAN),
+            "clamped add must compare the wrapped sum"
+        );
+        let (_, store) = ops
+            .iter()
+            .find(|(o, a)| *o == OP_STORE && def(&ops, a[1]).is_some_and(|(d, _)| d == OP_SELECT))
+            .expect("saturated result is not stored");
+        let Some((OP_SELECT, s)) = def(&ops, store[1]) else {
+            unreachable!()
+        };
+        assert!(
+            s[3] == all || s[4] == all,
+            "saturation must select 0xFFFF_FFFF on overflow"
+        );
+        assert_valid_spirv(&t, "sdwa_sat_add");
+    }
+
+    /// Only the measured SDWA forms translate: other SDWA instructions and
+    /// every DPP form stay refused with the documented reason.
+    #[test]
+    fn sdwa_forms_outside_the_measured_slice_stay_unsupported() {
+        let mut code = sdwa(
+            "V_MOV_B32",
+            false,
+            &[("VDST", 1), ("VSRC0", 2), ("SRC0_SEL", 6), ("DST_SEL", 6)],
+        );
+        code.extend(
+            encode(
+                "V_MOV_B32",
+                "VOP1_VOP_DPP16",
+                &[
+                    ("SRC0", 0xFA),
+                    ("VDST", 2),
+                    ("VSRC0", 3),
+                    ("DPP_CTRL", 0x1b),
+                    ("ROW_MASK", 0xF),
+                    ("BANK_MASK", 0xF),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = SpirvVsBackend::translate_vs(&code, &blit_vs(), true).unwrap();
+        assert_eq!(t.unsupported.get("v_mov_b32_sdwa"), Some(&1));
+        assert_eq!(t.unsupported.get("v_mov_b32_dpp"), Some(&1));
+        for why in t.unsupported_why.keys() {
+            assert!(
+                why.contains("SDWA/DPP in the bring-up backend"),
+                "unexpected refusal reason {why}"
+            );
+        }
     }
 }

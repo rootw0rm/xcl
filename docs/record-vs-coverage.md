@@ -266,18 +266,21 @@ control flow, or one of the documented out-of-scope classes — not an unclassif
   1,204 branch records complete.
 - **EXEC/VCC b64 mask ops** (`s_mov_b64`, `s_or_b64`, `s_and_saveexec_b64`, …) and `v_cmpx_*`:
   the bring-up model has no per-lane masks.
-- **SDWA/DPP**, f16 value class (`v_fma_mix*`, `v_cvt_f16_f32`, `v_pack_b32_f16`), cube ops and
-  `v_add_co_ci_u32`: separate follow-ups; `s_setreg_imm32_b32` stays unsupported until the
-  emitter models the MODE register.
+- **DPP** (`quad_perm`, `row_*`, `dpp8`) reads another lane; the per-lane bring-up model has no
+  cross-lane value and the corpus carries no DPP instance. Other SDWA instructions and VOPC
+  SDWA compares stay refused; step-12 covers only the six measured SDWA forms.
+- **f16 value class** (plain `v_cvt_f32_f16`/`v_cvt_f16_f32`, `v_fma_mix*`, `v_pack_b32_f16`),
+  cube ops and `v_add_co_ci_u32`: separate follow-ups; `s_setreg_imm32_b32` stays unsupported
+  until the emitter models the MODE register.
 
 ### Next dominant self-contained family
 
-SDWA/DPP forms, the step-12 slice: 80 record-instances, led by `v_cvt_f32_u32_sdwa` (65) plus
-`v_add_nc_u32_sdwa` (4), `v_lshlrev_b32_sdwa` (4), `v_or_b32_sdwa` (4), `v_cvt_f32_f16_sdwa` (2)
-and `v_cvt_f16_f32_sdwa` (1). SDWA/DPP select, extend and broadcast register operands; they do
-not need draw-time user data, control flow or `MODE`, so they are the next measured slice. The
-f16 value class (9), cube ops (3) and the small VALU residual (4) follow after that; b64/EXEC/VCC
-masks (27) still need the per-lane model and `s_setreg` (22) still needs the MODE register.
+The f16 value class (9 record-instances) is the next slice after step-12: `v_fma_mix_f32` 3,
+`v_cvt_f32_f16` 2, `v_cvt_f16_f32` 1, `v_fma_mixhi_f16` 1, `v_fma_mixlo_f16` 1,
+`v_pack_b32_f16` 1. Step-12 already introduced the SPIR-V half type and
+`Capability Float16` for the SDWA conversions, so those plain forms can reuse them. Cube ops (3)
+and the small VALU residual (4) follow; b64/EXEC/VCC masks (27) still need the per-lane model
+and `s_setreg` (22) still needs the MODE register.
 
 ## Tooling polish (step-11, 2026-11-27)
 
@@ -300,6 +303,69 @@ Corpus re-run (26,503 records, seed 1, release): outcomes unchanged
 branch keys remain 877 / 169 / 117 / 28 / 9 / 4 = 1,204. No corpus record had
 unconditional-only flow, so no key moved.
 
+## SDWA operand forms (step-12, 2026-11-27)
+
+The emitter now translates the six SDWA forms the step-10 sweep named. Same command and corpus
+(26,503 records, seed 1, release):
+
+| outcome | records | share of all | share of VS |
+|---|---:|---:|---:|
+| non-VS | 24,267 | 91.6% | — |
+| reject | 1,204 | 4.5% | 53.8% |
+| incomplete | 899 | 3.4% | 40.2% |
+| complete | 133 | 0.5% | 5.9% |
+| all | 26,503 | 100% | (VS: 2,236) |
+
+Outcome counts are unchanged from step-11. **No record flipped complete**: every record that
+carried an in-scope reason still carries at least one reason outside this slice. Reason kinds
+fell **51 → 45**; the six in-scope kinds disappeared with exactly their step-10 record counts,
+no other reason's count changed, and no new kind appeared. Total reason instances fell
+**4,387 → 4,307 (−80)** — exactly the in-scope sum:
+
+| reason | records (step-10 → step-12) |
+|---|---:|
+| `v_cvt_f32_u32_sdwa` | 65 → 0 |
+| `v_add_nc_u32_sdwa` | 4 → 0 |
+| `v_lshlrev_b32_sdwa` | 4 → 0 |
+| `v_or_b32_sdwa` | 4 → 0 |
+| `v_cvt_f32_f16_sdwa` | 2 → 0 |
+| `v_cvt_f16_f32_sdwa` | 1 → 0 |
+| total | 80 → 0 |
+
+Translated semantics (`spirv::tests::sdwa_*` through `translate_vs_spirv` plus `spirv-val`,
+mirroring `gpu/recomp/emit.rs` and `gpu/dxil/lower_valu.rs` `sdwa_sel`/`sdwa_dst`/`mods`):
+
+- **Sources.** `SRC0_SEL`/`SRC1_SEL` read BYTE_0..3 or WORD_0..1 and zero-extend, or
+  sign-extend with `SEXT`. The `S0`/`S1` bit makes the field an SGPR or inline constant instead
+  of a VGPR. `ABS`/`NEG` apply to the f32 source of `v_cvt_f16_f32_sdwa`.
+- **Destination.** `DST_SEL` places the result's low 8/16/32 bits in the selected byte/word.
+  `DST_UNUSED` PAD zeroes the rest, SEXT sign-extends the written value, and PRESERVE keeps the
+  destination's old bits — the corpus pattern `v_cvt_f16_f32_sdwa …, dst_sel:WORD_1,
+  dst_unused:UNUSED_PRESERVE` keeps the low half.
+- **Output modifiers.** `OMOD` (x2/x4/÷2) and `CLAMP` apply in f32 to the
+  `v_cvt_f32_u32_sdwa`/`v_cvt_f32_f16_sdwa` results and to the `v_cvt_f16_f32_sdwa` source
+  before conversion. `CLAMP` on `v_add_nc_u32_sdwa` is unsigned saturation to 0xFFFF_FFFF (the
+  DXIL backend's rule).
+- **f16.** `v_cvt_f32_f16_sdwa` widens the selected half; `v_cvt_f16_f32_sdwa` narrows with
+  round-to-nearest-even. To avoid a 16-bit integer type, the dword bitcasts to a `v2f16` and
+  lane 0 is extracted/packed, so the module adds only `Capability Float16`. As with the
+  existing `shaderInt64` requirement, a consumer must enable `shaderFloat16` at device creation
+  (RDNA2 supports it; the record-VS path still has no retail consumer).
+- **Refused.** DPP (`quad_perm`/`row_*`/`dpp8`) reads another lane and stays refused (no corpus
+  instance); every other SDWA instruction and every VOPC SDWA compare stay refused with the
+  same `SDWA/DPP in the bring-up backend` reason.
+
+### Residual after step-12
+
+All 4,307 remaining reason instances are the step-10 groups minus the SDWA forms (counts are
+record instances, so they overlap and do not sum to the 899 incomplete records):
+
+- **Memory / descriptors — 2,263.** Unchanged; still gated on draw-time root arguments.
+- **Control flow — 1,976.** Unchanged; the step-08 decision stands.
+- **Documented non-goals — 68.** b64/EXEC/VCC mask ops 27, `s_setreg_imm32_b32` 22, f16 value
+  class 9, cube ops 3, `v_cmpx_*` EXEC writes 3, small VALU residual 4 (`v_add_co_ci_u32` 2,
+  `v_mad_u32_u24` 1, `v_lshlrev_b64` 1).
+
 ## Follow-up
 
 `code-assist:xcl-first-frame:step-08:record-vs-branches` (task-1795794902-51cb) is resolved as
@@ -311,5 +377,7 @@ Step-09 (`code-assist:xcl-first-frame:step-09:record-vs-valu`, commit on
 (`code-assist:xcl-first-frame:step-10:record-vs-salu`, commit on
 `m22-vs-salu-coverage`) implements the SALU/SOPC slice; the SDWA/DPP gap is queued as the next
 follow-up. Step-11 (`code-assist:xcl-first-frame:step-11:record-vs-polish`, commit on
-`m22-vs-polish`) is the help/shape/far-jump polish above; SDWA/DPP (step-12) starts from it.
+`m22-vs-polish`) is the help/shape/far-jump polish above. Step-12
+(`code-assist:xcl-first-frame:step-12:record-vs-sdwa`, commit on `m22-vs-sdwa-dpp`) implements
+the measured SDWA forms; the f16 value class is queued as the next follow-up.
 
