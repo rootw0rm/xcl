@@ -1844,3 +1844,55 @@ newest at the bottom.
   `upstream/main`; key
   `code-assist:linux-launcher:step-154:m5-sfollow-stack`). No overlap
   with step-147 (#2926 dxil hunks) or step-148 (xuser twin test).
+
+## Step 155 (2026-11-27, re-triage after critic reject — top now #2938, port #2937)
+- Window re-probed per the step-155 critic reject (builder's sequential +
+  batched probe false-MISSING #2936-#2938 under rate-limit flake,
+  mem-1795715658-5c18; batched 2402 vs live 2404 was the signal).
+  Live re-probe: #2936 `cae11a79` + #2937 `c4f2a7f3` + #2938 `bc4252d5`
+  all PRESENT and OPEN (is-ancestor exit 1 each); sequential 2932
+  MISSING (gap stands) / 2939-2950 ALL MISSING; batched 2405 refs
+  (29xx tail ends at #2938, zero 30xx) → top now #2938. No new arrivals
+  past it. Temp fetch refs (`refs/tmp/pr2936-2938`) deleted after review.
+- Pins re-verified (zero drift): #2907 `7575f671` + #2913 `992ef508`.
+  Old heads unchanged, all OPEN: #2929 `a87d3c2a` / #2930 `4e008ce5`
+  (step-150 stays pending) / #2931 `093a5fcd` / #2933 `2a318283`
+  (2nd commit, SKIP stands) / #2934 `dac9681b` / #2935 `b2a4ef48`
+  (step-154 watch stays pending). `upstream/main` `8b957bec`
+  is-ancestor HEAD exit 0 (zero fallout).
+- Triage (3 OPEN):
+  - #2936 SKIP, Windows-only (single commit `cae11a79` "segments
+    parked as spares stop holding their PC allocator": 3 files, all
+    `hle/d3d12x/` — `hle` is `#[cfg(windows)]`, replaced by
+    `hle_linux.rs` on Linux; no Linux consumer). No port task.
+  - #2937 PORTED as `f1a3ec3a` (single commit `c4f2a7f3` on
+    `upstream/main`, "XCL_DECLARED_LDS=1 sizes direct compute LDS
+    from the header": shared `gpu/dxil` + `gpu/recomp` recompiler-
+    soundness shape, env-gated off by default). Whole fix landed:
+    `lds_dwords` parse, `setup_storage` 4-arg, declared-sized LDS,
+    both-routes cache identity, all `..Default::default()` spreads.
+    Off-by-default layout is byte-identical (analysed per hunk:
+    `lds_top < 8191` == old `split` branch when env off; arrival
+    counter `xw.expect()` provably Some whenever the old
+    `(l, 8191)` arm fired). Tree adaptations only on our local-only
+    literals (robustness 1 + lower_valu 3). Linux pin added in
+    `robustness_tests` (parse test; upstream tests live in
+    Windows-only `core_tests`/`pso` and stay reference-only).
+  - #2938 SKIP-FOR-NOW, blocked on unmerged stack (8 commits
+    `25c6e901..bc4252d5`: evolved #2936/#2937 equivalents +
+    #2934-lineage watch-trap + new `uma_driver`/`title_textures`/
+    `host`/`vfs_hooks`/`eh`/`dstorage`/`kernelx` hunks — all in
+    Windows-only modules except a `gpu/uma.rs` hunk whose consumer
+    is the Windows `d3d12x` UMA driver). Per competing-PR discipline
+    it lands once, in merged form, after its parents land; the
+    #2936/#2937 equivalents inside are already covered by the
+    standalone ports. Re-triage when the stack's parents merge.
+- Gates: both checks 0 errors (22 lib / 28 lib-test warnings,
+  pre-existing); lib 787/0/1 serial (786 baseline + 1 pin; one
+  parallel run hit the known pre-existing global-VFS flake, green
+  on rerun + serially — do not chase); new pin failing-first in
+  isolated pre-fix worktree (E0609) → green post-fix;
+  `XCL_DECLARED_LDS=1` dxil subset 50/50; title e2e 4 passed/1
+  failed by design, 12 unique FAILs all D3D12.X GPU-only 0 non-GPU;
+  retail fresh-root exit 139 SIGSEGV `+0x2237320` fault 0x0, 20
+  called_stubs — frontier HOLDS.
