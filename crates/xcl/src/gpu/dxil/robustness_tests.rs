@@ -390,3 +390,24 @@ fn pops_pixel_shader_gates_rov_sfi0_flag_on_surviving_uav_handles() {
     assert_eq!(ps_sfi0(true, false) & 0x1000, 0, "POPS PS whose UAV handles are DCE'd must not set ROVs");
     assert_eq!(ps_sfi0(true, true) & 0x1000, 0x1000, "POPS PS with live UAV store must set ROVs");
 }
+
+/// Linux pin for upstream #2937 (`XCL_DECLARED_LDS`): COMPUTE_PGM_RSRC2's LDS field
+/// parses into `lds_dwords` for both translators. The upstream test lives in the
+/// Windows-only `core_tests` module, so this parse-only case guards the shared
+/// struct on Linux without needing DXC.
+#[test]
+fn declared_lds_descriptor_parses_static_workgroup_lds() {
+    for (threads, blocks, want) in [
+        ([64, 1, 1], 0u32, 0),
+        ([64, 1, 1], 1, 128),
+        ([64, 1, 1], 2, 256),
+        ([8, 8, 1], 64, 8192),
+    ] {
+        let mut descriptor = [0u8; 0x48];
+        for (i, v) in [blocks << 15, threads[0], threads[1], threads[2]].into_iter().enumerate() {
+            descriptor[0x38 + 4 * i..0x3c + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        let cs = CsInterface::from_descriptor(&descriptor, 0).unwrap();
+        assert_eq!(cs.lds_dwords, want, "{threads:?}, blocks={blocks}");
+    }
+}
