@@ -19,7 +19,8 @@
 //! `tests/testtitle/src/gpu.rs`, which reaches console slots by raw vtable
 //! index — the title has zero static d3d12 imports). Routed today: device
 //! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #11, null + Vulkan-list
-//! #60/#61/#69/#70/#71/#72/#89/#93, Vulkan-list #146/#148, Vulkan-device frame clock
+//! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, null + Vulkan-device AS SRV
+//! #18, Vulkan-device frame clock
 //! #78–#81 (Linux twin + ancillary routing) and Vulkan-queue #30 `PresentX`
 //! (real swapchain present, 1d(ii)); a Vulkan device also answers the DXGI
 //! device IIDs with an adapter/output chain (GetAdapter/GetDesc/EnumOutputs,
@@ -294,7 +295,8 @@ fn vtable(kind: Kind) -> *const usize {
     // the Vulkan lists — the title's graphics memory is host memory, so a
     // write the list applies is visible to the CPU at once on both
     // backends). GetDevice above stays Vulkan-only; the barrier (#146) and
-    // upload (#148) slots stay Vulkan-only with the raytracing slice.
+    // upload (#148) slots run on the plain null lists too (M2 raytracing
+    // slice: host upload memory + a coherent no-op barrier need no GPU).
     if kind == Kind::VulkanList || kind == Kind::CommandList {
         v[60] = VulList_CopyMemory as usize;
         v[61] = VulList_Fill32 as usize;
@@ -305,9 +307,15 @@ fn vtable(kind: Kind) -> *const usize {
         v[89] = VulList_Write64Top as usize;
         v[93] = VulList_Kickoff as usize;
     }
-    if kind == Kind::VulkanList {
+    if kind == Kind::VulkanList || kind == Kind::CommandList {
         v[146] = Ret_Void as usize; // UAV barrier (single queue: already coherent)
         v[148] = VulList_AllocUpload as usize;
+    }
+    // M2 raytracing slice: the null device writes the same RTAS view words
+    // as the Vulkan one (a pure host-memory write into the heap slot, no GPU
+    // needed) so the title's `raytracing_surface` leg 2 passes by default.
+    if kind == Kind::Device {
+        v[18] = Vulkan_CreateShaderResourceView as usize;
     }
     if kind == Kind::VulkanQueue {
         v[30] = Queue_PresentX as usize; // 1d(ii) real present
@@ -1115,11 +1123,12 @@ unsafe extern "win64" fn Vulkan_CheckFeatureSupport(_t: *mut NullObj, feature: u
     S_OK
 }
 
-/// `CreateShaderResourceView(res, desc, dest)` on a Vulkan device: a
+/// `CreateShaderResourceView(res, desc, dest)` on a Vulkan or null device: a
 /// raytracing-acceleration-structure view (dimension 11) writes the RDNA2 BVH
 /// descriptor words into the heap slot `dest` points at —
 /// `[(va >> 8), ((va >> 40) & 0xFF) | (1 << 31), u32::MAX, 0]` — the exact
-/// words the title reads back. Other view dimensions stay unmodelled (left
+/// words the title reads back. A pure host-memory write, so the null device
+/// shares it (no GPU needed). Other view dimensions stay unmodelled (left
 /// untouched, like the null stub) until a caller needs them.
 unsafe extern "win64" fn Vulkan_CreateShaderResourceView(_t: *mut NullObj, _res: *mut c_void, desc: *const u8, dest: usize) {
     const RTAS_DIM: u32 = 11;
@@ -2049,6 +2058,50 @@ mod tests {
                 S_OK
             );
             assert_eq!(&narrow, &[0xAA; 8]);
+        }
+    }
+
+    #[test]
+    fn null_device_serves_the_raytracing_surface() {
+        // M2 next slice (failing-first): the null device's AS SRV view +
+        // null list #146/#148 serve the title's `raytracing_surface` legs
+        // 2-3 with null-consistent host-memory values (the same words the
+        // Vulkan path writes — no GPU needed).
+        unsafe {
+            let dev = device() as *mut c_void;
+            type MkHeap = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkheap: MkHeap = std::mem::transmute(slot(dev, 14));
+            let mut heap = std::ptr::null_mut();
+            let hdesc = [6u32, 2, 1, 0]; // CBV_SRV_UAV, 2 slots, visible
+            assert_eq!(mkheap(dev, hdesc.as_ptr() as *const c_void, std::ptr::null(), &mut heap), S_OK);
+            type Start = unsafe extern "win64" fn(*mut c_void) -> usize;
+            let start: Start = std::mem::transmute(slot(heap, 9));
+            let cpu = start(heap);
+            type Srv = unsafe extern "win64" fn(*mut c_void, *mut c_void, *const u8, usize);
+            let srv: Srv = std::mem::transmute(slot(dev, 18));
+            let va = 0x1_2345_6780u64;
+            let mut desc = [0u8; 24];
+            desc[4..8].copy_from_slice(&11u32.to_le_bytes());
+            desc[16..24].copy_from_slice(&va.to_le_bytes());
+            srv(dev, std::ptr::null_mut(), desc.as_ptr(), cpu);
+            assert_eq!(
+                std::slice::from_raw_parts(cpu as *const u32, 4),
+                &[(va >> 8) as u32, (((va >> 40) as u32) & 0xFF) | (1 << 31), u32::MAX, 0]
+            );
+            // default title list: #148 upload memory + #146 barrier
+            type MkList = unsafe extern "win64" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: MkList = std::mem::transmute(slot(dev, 12));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(mk(dev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            type AllocUp = unsafe extern "win64" fn(*mut c_void, usize, usize) -> *mut u8;
+            let alloc_up: AllocUp = std::mem::transmute(slot(l, 148));
+            let up = alloc_up(l, 256, 256);
+            assert!(!up.is_null() && (up as usize).is_multiple_of(256));
+            *(up as *mut u32) = 0x5A5A_1234;
+            assert_eq!(*(up as *const u32), 0x5A5A_1234);
+            type Barrier = unsafe extern "win64" fn(*mut c_void, u32, *const c_void);
+            let barrier: Barrier = std::mem::transmute(slot(l, 146));
+            barrier(l, 1, std::ptr::null());
         }
     }
 
