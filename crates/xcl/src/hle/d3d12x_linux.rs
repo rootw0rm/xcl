@@ -18,8 +18,8 @@
 //! Slot-routing queue (M1 step-88 inventory, K-D3D-06 order; callers in
 //! `tests/testtitle/src/gpu.rs`, which reaches console slots by raw vtable
 //! index — the title has zero static d3d12 imports). Routed today: device
-//! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #11, Vulkan-list
-//! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, Vulkan-device frame clock
+//! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #11, null + Vulkan-list
+//! #60/#61/#69/#70/#71/#72/#89/#93, Vulkan-list #146/#148, Vulkan-device frame clock
 //! #78–#81 (Linux twin + ancillary routing) and Vulkan-queue #30 `PresentX`
 //! (real swapchain present, 1d(ii)); a Vulkan device also answers the DXGI
 //! device IIDs with an adapter/output chain (GetAdapter/GetDesc/EnumOutputs,
@@ -68,9 +68,11 @@ pub enum Kind {
     CommandAllocator,
     CommandList,
     /// A command list from a Vulkan device (step 17): the graphics recording
-    /// slots stay logging stubs like [`Kind::CommandList`], but the console
-    /// memory methods (#60/#61/#69–#72/#89/#93) run for real on host memory.
-    /// The object's `value` holds the creator device object.
+    /// slots stay logging stubs like [`Kind::CommandList`], and the console
+    /// memory methods (#60/#61/#69–#72/#89/#93) run for real on host memory —
+    /// shared with the plain null lists (#3: the title reads back through
+    /// them on both backends). The object's `value` holds the creator
+    /// device object.
     VulkanList,
     Fence,
     DescriptorHeap,
@@ -286,6 +288,14 @@ fn vtable(kind: Kind) -> *const usize {
     }
     if kind == Kind::VulkanList {
         v[7] = VulkanList_GetDevice as usize;
+    }
+    // #3 Execute leg: the console memory methods run for real on host
+    // memory on the plain null lists too (the same immediate semantics as
+    // the Vulkan lists — the title's graphics memory is host memory, so a
+    // write the list applies is visible to the CPU at once on both
+    // backends). GetDevice above stays Vulkan-only; the barrier (#146) and
+    // upload (#148) slots stay Vulkan-only with the raytracing slice.
+    if kind == Kind::VulkanList || kind == Kind::CommandList {
         v[60] = VulList_CopyMemory as usize;
         v[61] = VulList_Fill32 as usize;
         v[69] = VulList_Write32Bottom as usize;
@@ -294,6 +304,8 @@ fn vtable(kind: Kind) -> *const usize {
         v[72] = VulList_Wait64 as usize;
         v[89] = VulList_Write64Top as usize;
         v[93] = VulList_Kickoff as usize;
+    }
+    if kind == Kind::VulkanList {
         v[146] = Ret_Void as usize; // UAV barrier (single queue: already coherent)
         v[148] = VulList_AllocUpload as usize;
     }
@@ -1849,6 +1861,64 @@ mod tests {
             // a null out-pointer stays S_FALSE on every path
             assert_eq!(create_device_for(&null_sel, acquire(), std::ptr::null_mut()), S_FALSE);
             assert_eq!(create_device_for(&vulkan_sel, None, std::ptr::null_mut()), S_FALSE);
+        }
+    }
+
+    #[test]
+    fn null_list_shares_the_console_memory_methods() {
+        // #3 Execute leg: the null device's plain lists run the same
+        // immediate host-memory methods as the Vulkan lists (writes, fill,
+        // copy, a timestamp, waits, kickoff) — the title's
+        // `console_list_methods` reads back through these slots on both
+        // backends. Fails pre-route (slot 69 is a logging stub: no write).
+        unsafe {
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut ndev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&null_sel, None, &mut ndev), S_OK);
+            type MkList = unsafe extern "win64" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: MkList = std::mem::transmute(slot(ndev, 12));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(mk(ndev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            assert_eq!((*(l as *mut NullObj)).kind, Kind::CommandList);
+            let mut mem = vec![0u8; 0x400];
+            let base = mem.as_mut_ptr() as u64;
+            let r32 = |o: usize| (mem.as_ptr().add(o) as *const u32).read();
+            let r64 = |o: usize| (mem.as_ptr().add(o) as *const u64).read();
+            type W32 = unsafe extern "win64" fn(*mut c_void, u64, u32, u32, u32);
+            let w32: W32 = std::mem::transmute(slot(l, 69));
+            w32(l, base, 0x1234_5678, 0, 0);
+            assert_eq!(r32(0), 0x1234_5678);
+            type W64 = unsafe extern "win64" fn(*mut c_void, u64, u64, u32);
+            let w64: W64 = std::mem::transmute(slot(l, 89));
+            w64(l, base + 8, 0x1122_3344_5566_7788, 0);
+            assert_eq!(r64(8), 0x1122_3344_5566_7788);
+            type Ts = unsafe extern "win64" fn(*mut c_void, u64, u64, u32, u32);
+            let ts: Ts = std::mem::transmute(slot(l, 70));
+            ts(l, base + 0x10, 0, 0, 1);
+            assert_ne!(r64(0x10), 0);
+            type Fill = unsafe extern "win64" fn(*mut c_void, u64, u64, u32);
+            let fill: Fill = std::mem::transmute(slot(l, 61));
+            fill(l, base + 0x100, 0x100, 0xABCD_EF01);
+            assert!((0..64).all(|i| r32(0x100 + 4 * i) == 0xABCD_EF01));
+            assert_eq!(r32(0x200), 0);
+            type Copy = unsafe extern "win64" fn(*mut c_void, u64, u64, u64, u32);
+            let copy: Copy = std::mem::transmute(slot(l, 60));
+            for i in 0..64 {
+                *mem.as_mut_ptr().add(0x300 + i) = i as u8 ^ 0x5A;
+            }
+            copy(l, base + 0x200, base + 0x300, 64, 0);
+            assert!((0..64).all(|i| *mem.as_ptr().add(0x200 + i) == i as u8 ^ 0x5A));
+            // pre-satisfied waits return at once; kickoff is a silent no-op
+            type Wait = unsafe extern "win64" fn(*mut c_void, u64, u32, u32, u32, u32);
+            let wait: Wait = std::mem::transmute(slot(l, 71));
+            wait(l, base, 3, 0x1234_5678, u32::MAX, 0);
+            type Kick = unsafe extern "win64" fn(*mut c_void);
+            let kick: Kick = std::mem::transmute(slot(l, 93));
+            kick(l);
+            // the copy-source pattern fill clobbered offset 0; the write64
+            // cell and the copied region survived it
+            assert_eq!((mem.as_ptr().add(8) as *const u64).read(), 0x1122_3344_5566_7788);
+            assert!((0..64).all(|i| *mem.as_ptr().add(0x200 + i) == i as u8 ^ 0x5A));
         }
     }
 
