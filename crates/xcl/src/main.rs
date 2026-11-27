@@ -93,7 +93,7 @@ fn main() {
             };
             run_command(Path::new(&args[1]), &rest)
         }
-        Some("inspect") if args.len() >= 2 => inspect_command(Path::new(&args[1]), &args[2..]),
+        Some("inspect") if args.len() >= 2 => xcl::inspect::run(Path::new(&args[1]), &args[2..]),
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("preflight") => {
             let setting = args.get(1).map(String::as_str).unwrap_or("auto");
@@ -136,10 +136,6 @@ fn run_command(target: &Path, rest: &[String]) -> i32 {
 #[cfg(not(windows))]
 fn run_command(target: &Path, rest: &[String]) -> i32 {
     xcl::launcher::run(target, rest)
-}
-
-fn inspect_command(target: &Path, args: &[String]) -> i32 {
-    xcl::inspect::run(target, args.iter().any(|a| a == "--json"))
 }
 
 /// xcl.exe opened from Explorer with no arguments: run the picked game.

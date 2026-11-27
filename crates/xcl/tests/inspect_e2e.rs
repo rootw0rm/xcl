@@ -15,6 +15,34 @@ fn inspect_missing_arguments_prints_help_and_exits_two() {
 }
 
 #[test]
+fn inspect_unknown_option_and_stray_argument_exit_two() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let file = std::env::temp_dir().join(format!("xcl-inspect-args-{}-{nonce}.exe", std::process::id()));
+    std::fs::write(&file, b"NOT_A_VALID_PE_IMAGE").unwrap();
+
+    for (bad, expected) in [
+        ("--bogus", "xcl inspect: unknown option: --bogus; see `xcl --help`"),
+        ("extra", "xcl inspect: unexpected argument: extra; see `xcl --help`"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("inspect")
+            .arg(&file)
+            .arg(bad)
+            .output()
+            .expect("spawn xcl inspect with a bad argument");
+        assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(expected), "{bad}: {stderr}");
+        assert!(!stderr.contains("invalid signature"), "{bad}: analysis ran despite the bad argument: {stderr}");
+        assert!(out.stdout.is_empty(), "{bad}: analysis ran despite the bad argument");
+    }
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[test]
 fn inspect_nonexistent_file_exits_two_with_error() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

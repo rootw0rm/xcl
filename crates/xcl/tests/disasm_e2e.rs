@@ -228,6 +228,36 @@ fn disasm_missing_file_exits_code_two() {
 }
 
 #[test]
+fn disasm_unknown_option_and_stray_argument_exit_two() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let file =
+        std::env::temp_dir().join(format!("xcl-disasm-badargs-{}-{nonce}.bin", std::process::id()));
+    std::fs::write(&file, [0u8; 16]).unwrap();
+
+    for (args, expected) in [
+        (vec!["--bogus"], "xcl disasm: unknown option: --bogus; see `xcl --help`"),
+        (vec!["stray"], "xcl disasm: unexpected argument: stray; see `xcl --help`"),
+        (vec!["--offset", "--hex"], "xcl disasm: --offset needs a value"),
+        (vec!["--fssm"], "xcl disasm: --fssm needs a value"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("disasm")
+            .arg(&file)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(err.contains(expected), "{args:?}: {err}");
+        assert!(output.stdout.is_empty(), "{args:?}: disassembly ran despite the bad argument");
+    }
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[test]
 fn disasm_file_without_rdna2_programs_reports_diagnostic() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use crate::cli::Parser;
 use crate::gpu::{rdna2, shader, xbox};
 
 fn parse_num(s: &str) -> Option<usize> {
@@ -13,10 +14,39 @@ fn parse_num(s: &str) -> Option<usize> {
     }
 }
 
-fn number_option(args: &[String], name: &str) -> Result<Option<usize>, String> {
-    let Some(index) = args.iter().position(|arg| arg == name) else { return Ok(None) };
-    let value = args.get(index + 1).ok_or_else(|| format!("{name} requires a byte count"))?;
-    parse_num(value).map(Some).ok_or_else(|| format!("invalid value for {name}: {value}"))
+#[derive(Debug, Default)]
+struct Args {
+    offset: Option<usize>,
+    length: Option<usize>,
+    all: bool,
+    hex: bool,
+    fssm: Option<String>,
+}
+
+/// Parse `xcl disasm` options and reject anything unknown, so a typo cannot silently
+/// disassemble with defaults (`rpf`/`shaders` use the same `Parser`).
+fn parse_args(args: &[String]) -> Result<Args, String> {
+    let mut parsed = Args::default();
+    let mut p = Parser::new(args);
+    while let Some(arg) = p.next_arg() {
+        match arg {
+            "--offset" => {
+                let value = p.value("--offset")?;
+                parsed.offset =
+                    Some(parse_num(value).ok_or_else(|| format!("invalid value for --offset: {value}"))?);
+            }
+            "--length" => {
+                let value = p.value("--length")?;
+                parsed.length =
+                    Some(parse_num(value).ok_or_else(|| format!("invalid value for --length: {value}"))?);
+            }
+            "--fssm" => parsed.fssm = Some(p.value("--fssm")?.to_owned()),
+            "--all" => parsed.all = true,
+            "--hex" => parsed.hex = true,
+            other => return Err(Parser::unexpected(other)),
+        }
+    }
+    Ok(parsed)
 }
 
 fn print_lines(code: &[u8], base: usize, stop: bool) {
@@ -145,9 +175,9 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
 }
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
-    let (offset, length) = match (number_option(args, "--offset"), number_option(args, "--length")) {
-        (Ok(offset), Ok(length)) => (offset, length),
-        (Err(error), _) | (_, Err(error)) => {
+    let args = match parse_args(args) {
+        Ok(args) => args,
+        Err(error) => {
             eprintln!("xcl disasm: {error}");
             return 2;
         }
@@ -159,17 +189,16 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let all = args.iter().any(|a| a == "--all");
     println!("{} – {} B, decoder: {}", path.display(), data.len(), crate::gpu::RDNA2_ARCH);
 
-    if offset.is_some() || length.is_some() {
-        let off = offset.unwrap_or(0);
+    if args.offset.is_some() || args.length.is_some() {
+        let off = args.offset.unwrap_or(0);
         if off >= data.len() {
             eprintln!("xcl disasm: offset {off:#x} is past the end of the file");
             return 2;
         }
-        let len = length.unwrap_or(data.len() - off).min(data.len() - off);
-        print_lines(&data[off..off + len], off, !all);
+        let len = args.length.unwrap_or(data.len() - off).min(data.len() - off);
+        print_lines(&data[off..off + len], off, !args.all);
         return 0;
     }
 
@@ -183,8 +212,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     }
     if kind == shader::Kind::XboxNative {
         if let Some(sh) = xbox::parse(&data) {
-            let out = args.iter().position(|a| a == "--fssm").and_then(|i| args.get(i + 1)).map(String::as_str);
-            print_xbox(&sh, args.iter().any(|a| a == "--hex"), out);
+            print_xbox(&sh, args.hex, args.fssm.as_deref());
         }
     }
     let listing = shader::rdna2_listing(&data);
@@ -197,4 +225,31 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         print!("{listing}");
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn options_parse_values_and_reject_unknown_or_missing_ones() {
+        let parsed =
+            parse_args(&args(&["--offset", "0x40", "--length", "16", "--all", "--hex", "--fssm", "out.fssm"])).unwrap();
+        assert_eq!(parsed.offset, Some(0x40));
+        assert_eq!(parsed.length, Some(16));
+        assert!(parsed.all);
+        assert!(parsed.hex);
+        assert_eq!(parsed.fssm.as_deref(), Some("out.fssm"));
+
+        assert_eq!(parse_args(&args(&["--bogus"])).unwrap_err(), "unknown option: --bogus; see `xcl --help`");
+        assert_eq!(parse_args(&args(&["stray"])).unwrap_err(), "unexpected argument: stray; see `xcl --help`");
+        assert_eq!(parse_args(&args(&["--offset"])).unwrap_err(), "--offset needs a value");
+        assert_eq!(parse_args(&args(&["--offset", "--hex"])).unwrap_err(), "--offset needs a value");
+        assert_eq!(parse_args(&args(&["--offset", "xyz"])).unwrap_err(), "invalid value for --offset: xyz");
+        assert_eq!(parse_args(&args(&["--fssm"])).unwrap_err(), "--fssm needs a value");
+    }
 }

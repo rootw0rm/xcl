@@ -104,7 +104,27 @@ fn classify(dll: &str, what: &crate::pe::ImportName, _search_dir: Option<&Path>)
     status(&resolver::classify(dll, what))
 }
 
-pub fn run(path: &Path, json: bool) -> i32 {
+/// Parse `xcl inspect` options: `--json` only. Anything else is rejected before the
+/// file is read, so a typo cannot silently fall back to the text report.
+pub fn parse_args(args: &[String]) -> Result<bool, String> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => return Err(crate::cli::Parser::unexpected(other)),
+        }
+    }
+    Ok(json)
+}
+
+pub fn run(path: &Path, args: &[String]) -> i32 {
+    let json = match parse_args(args) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("xcl inspect: {error}");
+            return 2;
+        }
+    };
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -205,6 +225,19 @@ mod tests {
 
     fn name(s: &str) -> crate::pe::ImportName {
         crate::pe::ImportName::Name { hint: 0, name: s.into() }
+    }
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn options_accept_only_json_and_reject_the_rest() {
+        assert_eq!(parse_args(&args(&[])), Ok(false));
+        assert_eq!(parse_args(&args(&["--json"])), Ok(true));
+        assert_eq!(parse_args(&args(&["--json", "--json"])), Ok(true));
+        assert_eq!(parse_args(&args(&["--bogus"])).unwrap_err(), "unknown option: --bogus; see `xcl --help`");
+        assert_eq!(parse_args(&args(&["extra"])).unwrap_err(), "unexpected argument: extra; see `xcl --help`");
     }
 
     /// Linux has no `LoadLibrary`: unimplemented HLE-routed names are Stub metadata and
