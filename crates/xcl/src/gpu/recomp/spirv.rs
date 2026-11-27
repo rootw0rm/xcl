@@ -314,6 +314,7 @@ const OP_ISUB: u16 = 130;
 const OP_FSUB: u16 = 131;
 const OP_IMUL: u16 = 132;
 const OP_FMUL: u16 = 133;
+const OP_LOGICAL_AND: u16 = 166;
 const OP_LOGICAL_OR: u16 = 167;
 const OP_SELECT: u16 = 169;
 const OP_I_EQUAL: u16 = 170;
@@ -511,8 +512,8 @@ struct SpirvEm {
     u64_ty: u32,
     /// Whether the module uses 64-bit integers (gates `Capability Int64`).
     need_int64: bool,
-    /// 16-bit float type and its 2-lane vector, declared lazily by the SDWA
-    /// f16 conversions.
+    /// 16-bit float type and its 2-lane vector, declared lazily by the f16
+    /// conversions.
     half_ty: u32,
     v2half_ty: u32,
     /// Whether the module uses 16-bit floats (gates `Capability Float16`).
@@ -1018,16 +1019,60 @@ impl SpirvEm {
         self.v2half_ty
     }
 
-    /// `v_cvt_f32_f16` widening: the low 16 bits of `bits` are an f16. The
-    /// module deliberately declares no scalar 16-bit integer type, so the
-    /// dword bitcasts to a `v2f16` and lane 0 is widened.
-    fn f16_low_to_f32_bits(&mut self, bits: u32) -> u32 {
+    /// `v_cvt_f32_f16` widening: bits 15:0 (or 31:16 when `high`) of `bits`
+    /// are an f16. The module deliberately declares no scalar 16-bit integer
+    /// type, so the dword bitcasts to a `v2f16` and the selected lane is
+    /// widened.
+    fn f16_to_f32_bits(&mut self, bits: u32, high: bool) -> u32 {
         let v2 = self.half2_ty();
         let hv = self.tmp(v2, OP_BITCAST, &[bits]);
         let h = self.half_ty;
-        let half = self.tmp(h, OP_COMPOSITE_EXTRACT, &[hv, 0]);
+        let half = self.tmp(h, OP_COMPOSITE_EXTRACT, &[hv, high as u32]);
         let f = self.tmp(self.float_ty, OP_F_CONVERT, &[half]);
         self.as_uint(f)
+    }
+
+    /// The half `high` of `bits` (`OP_SEL`), zero-extended into bits 15:0.
+    fn half_bits(&mut self, bits: u32, high: bool) -> u32 {
+        let uint_ty = self.uint_ty;
+        if high {
+            let sh = self.uint_const(16);
+            self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[bits, sh])
+        } else {
+            let mask = self.uint_const(0xFFFF);
+            self.tmp(uint_ty, OP_BITWISE_AND, &[bits, mask])
+        }
+    }
+
+    /// `src0` / `neg` on an f32 bit pattern (the operand modifiers).
+    fn f32_abs_neg(&mut self, bits: u32, abs: bool, neg: bool) -> u32 {
+        let uint_ty = self.uint_ty;
+        let mut x = bits;
+        if abs {
+            let m = self.uint_const(0x7FFF_FFFF);
+            x = self.tmp(uint_ty, OP_BITWISE_AND, &[x, m]);
+        }
+        if neg {
+            let m = self.uint_const(0x8000_0000);
+            x = self.tmp(uint_ty, OP_BITWISE_XOR, &[x, m]);
+        }
+        x
+    }
+
+    /// Write the f16 pattern `half` into the `high` (or low) half of `cur`,
+    /// keeping the other half (the `v_cvt_f16_f32` / `v_fma_mix*` destination
+    /// rule).
+    fn merge_half(&mut self, cur: u32, half: u32, high: bool) -> u32 {
+        let uint_ty = self.uint_ty;
+        let (keep, placed) = if high {
+            let keep = self.uint_const(0x0000_FFFF);
+            let sh = self.uint_const(16);
+            (keep, self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[half, sh]))
+        } else {
+            (self.uint_const(0xFFFF_0000), half)
+        };
+        let kept = self.tmp(uint_ty, OP_BITWISE_AND, &[cur, keep]);
+        self.tmp(uint_ty, OP_BITWISE_OR, &[kept, placed])
     }
 
     /// `v_cvt_f16_f32` narrowing: round to nearest even and return the f16
@@ -1047,6 +1092,33 @@ impl SpirvEm {
         let packed = self.tmp(self.uint_ty, OP_BITCAST, &[composed]);
         let mask = self.uint_const(0xFFFF);
         self.tmp(self.uint_ty, OP_BITWISE_AND, &[packed, mask])
+    }
+
+    /// `v_fma_mixlo_f16` / `v_fma_mixhi_f16` narrowing: the codebase's
+    /// `f32tof16` convention, round toward zero. SPIR-V `OpFConvert` rounds to
+    /// nearest even, so a conversion that rounded away from zero is corrected
+    /// down one magnitude step.
+    fn f32_bits_to_f16_low_rtz(&mut self, bits: u32) -> u32 {
+        let h = self.f32_bits_to_f16_low(bits);
+        let back = self.f16_to_f32_bits(h, false);
+        let uint_ty = self.uint_ty;
+        let float_ty = self.float_ty;
+        let m = self.uint_const(0x7FFF_FFFF);
+        let a = self.tmp(uint_ty, OP_BITWISE_AND, &[bits, m]);
+        let b = self.tmp(uint_ty, OP_BITWISE_AND, &[back, m]);
+        let fa = self.tmp(float_ty, OP_BITCAST, &[a]);
+        let fb = self.tmp(float_ty, OP_BITCAST, &[b]);
+        let away = self.tmp(self.bool_ty, OP_FORD_GREATER_THAN, &[fb, fa]);
+        let finite = self.tmp(self.bool_ty, OP_FORD_EQUAL, &[fa, fa]);
+        let low = self.uint_const(0x7FFF);
+        let mag = self.tmp(uint_ty, OP_BITWISE_AND, &[h, low]);
+        let zero = self.uint_const(0);
+        let nz = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[mag, zero]);
+        let away = self.tmp(self.bool_ty, OP_LOGICAL_AND, &[finite, away]);
+        let cond = self.tmp(self.bool_ty, OP_LOGICAL_AND, &[away, nz]);
+        let one = self.uint_const(1);
+        let dec = self.tmp(uint_ty, OP_ISUB, &[h, one]);
+        self.tmp(uint_ty, OP_SELECT, &[cond, dec, h])
     }
 
     /// Read SDWA source `i` (0 or 1) from the extension dword: an SGPR or
@@ -1140,9 +1212,10 @@ impl SpirvEm {
         }
     }
 
-    /// SDWA output modifier (x2 / x4 / /2) then clamp to [0, 1] on an f32
-    /// bit pattern (the DXIL backend's `fres`).
-    fn sdwa_output(&mut self, omod: u32, clamp: bool, bits: u32) -> u32 {
+    /// Output modifier (x2 / x4 / /2) then clamp to [0, 1] on an f32 bit
+    /// pattern (the DXIL backend's `fres`), shared by the SDWA and plain VOP3
+    /// forms.
+    fn f32_output_mods(&mut self, omod: u32, clamp: bool, bits: u32) -> u32 {
         let float_ty = self.float_ty;
         let mut x = bits;
         if let Some(k) = match omod {
@@ -2053,22 +2126,73 @@ impl SpirvEm {
                 let ir = self.tmp(int_ty, OP_CONVERT_F_TO_S, &[fa]);
                 Some(self.tmp(uint_ty, OP_BITCAST, &[ir]))
             }
-            // SDWA-only f16 conversions: the plain forms stay in the
-            // documented f16 non-goal.
-            "v_cvt_f32_f16" if sdwa.is_some() => Some(self.f16_low_to_f32_bits(a)),
+            // The SDWA forms select their source and destination through the
+            // extension dword. The plain forms use the encoding's OP_SEL
+            // (which half) and, for v_cvt_f16_f32, ABS/NEG/OMOD/CLAMP.
+            "v_cvt_f32_f16" if sdwa.is_some() => Some(self.f16_to_f32_bits(a, false)),
             "v_cvt_f16_f32" if sdwa.is_some() => {
                 let s = sdwa.as_ref().unwrap();
-                let mut x = a;
-                if s.src0_abs {
-                    let m = self.uint_const(0x7FFF_FFFF);
-                    x = self.tmp(uint_ty, OP_BITWISE_AND, &[x, m]);
-                }
-                if s.src0_neg {
-                    let m = self.uint_const(0x8000_0000);
-                    x = self.tmp(uint_ty, OP_BITWISE_XOR, &[x, m]);
-                }
-                let x = self.sdwa_output(s.omod, s.clamp, x);
+                let x = self.f32_abs_neg(a, s.src0_abs, s.src0_neg);
+                let x = self.f32_output_mods(s.omod, s.clamp, x);
                 Some(self.f32_bits_to_f16_low(x))
+            }
+            "v_cvt_f32_f16" => {
+                let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+                let bits = self.f16_to_f32_bits(a, fv("OP_SEL") & 1 == 1);
+                Some(self.f32_output_mods(fv("OMOD") as u32, fv("CLAMP") != 0, bits))
+            }
+            "v_cvt_f16_f32" => {
+                let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+                let x = self.f32_abs_neg(a, fv("ABS") & 1 == 1, fv("NEG") & 1 == 1);
+                let x = self.f32_output_mods(fv("OMOD") as u32, fv("CLAMP") != 0, x);
+                let h = self.f32_bits_to_f16_low(x);
+                let cur = match &dst {
+                    Some(Dst::V(n)) => self.load_vgpr(*n),
+                    _ => self.uint_const(0),
+                };
+                Some(self.merge_half(cur, h, fv("OP_SEL") >> 3 & 1 == 1))
+            }
+            "v_pack_b32_f16" => {
+                let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+                let op_sel = fv("OP_SEL");
+                let lo = self.half_bits(a, op_sel & 1 == 1);
+                let hi = self.half_bits(b, op_sel & 2 == 2);
+                let sh = self.uint_const(16);
+                let hi = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[hi, sh]);
+                Some(self.tmp(uint_ty, OP_BITWISE_OR, &[lo, hi]))
+            }
+            "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+                let (sel, hi2) = (fv("OP_SEL"), fv("OP_SEL_HI") | fv("OP_SEL_HI_2") << 2);
+                let (neg, abs) = (fv("NEG"), fv("NEG_HI"));
+                let mut src = [0u32; 3];
+                for (i, raw) in [a, b, c].into_iter().enumerate() {
+                    let bits = if hi2 >> i & 1 == 1 {
+                        self.f16_to_f32_bits(raw, sel >> i & 1 == 1)
+                    } else {
+                        raw
+                    };
+                    src[i] = self.f32_abs_neg(bits, abs >> i & 1 == 1, neg >> i & 1 == 1);
+                }
+                let fa = self.tmp(float_ty, OP_BITCAST, &[src[0]]);
+                let fb = self.tmp(float_ty, OP_BITCAST, &[src[1]]);
+                let fc = self.tmp(float_ty, OP_BITCAST, &[src[2]]);
+                let m = self.tmp(float_ty, OP_FMUL, &[fa, fb]);
+                let r = self.tmp(float_ty, OP_FADD, &[m, fc]);
+                let mut bits = self.as_uint(r);
+                if fv("CLAMP") != 0 {
+                    bits = self.f32_output_mods(0, true, bits);
+                }
+                if name == "v_fma_mix_f32" {
+                    Some(bits)
+                } else {
+                    let h = self.f32_bits_to_f16_low_rtz(bits);
+                    let cur = match &dst {
+                        Some(Dst::V(n)) => self.load_vgpr(*n),
+                        _ => self.uint_const(0),
+                    };
+                    Some(self.merge_half(cur, h, name == "v_fma_mixhi_f16"))
+                }
             }
             "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let k = (name.as_bytes()[name.len() - 1] - b'0') as u32;
@@ -2128,7 +2252,7 @@ impl SpirvEm {
         // conversions, before the destination selector.
         let res = match (sdwa.as_ref(), res) {
             (Some(s), Some(bits)) if matches!(name, "v_cvt_f32_u32" | "v_cvt_f32_f16") => {
-                Some(self.sdwa_output(s.omod, s.clamp, bits))
+                Some(self.f32_output_mods(s.omod, s.clamp, bits))
             }
             (_, r) => r,
         };
@@ -3849,9 +3973,13 @@ mod tests {
     // ---- M2.2 step-12: SDWA operand forms ---------------------------------
 
     /// The definition of a value id (an instruction's result is its second
-    /// operand; stores carry no result).
+    /// operand; stores carry no result). Only the function body defines body
+    /// ids: header instructions (decorations, types, constants) carry numbers
+    /// in the same operand slot that can collide with a body id.
     fn def<'a>(ops: &'a [(u16, Vec<u32>)], id: u32) -> Option<(u16, &'a [u32])> {
-        ops.iter()
+        let start = ops.iter().position(|(o, _)| *o == OP_FUNCTION).unwrap_or(0);
+        ops[start..]
+            .iter()
             .find_map(|(o, a)| (a.len() >= 2 && a[1] == id).then(|| (*o, a.as_slice())))
     }
 
@@ -4209,5 +4337,375 @@ mod tests {
                 "unexpected refusal reason {why}"
             );
         }
+    }
+
+    // ---- M2.2 step-13: plain f16 value class ------------------------------
+
+    /// Plain `v_cvt_f32_f16` widens the half `OP_SEL` bit 0 names (0 = low,
+    /// 1 = high) and applies the VOP3 output modifier to the widened f32.
+    #[test]
+    fn valu_plain_cvt_f32_f16_selects_the_half_and_applies_omod() {
+        let mut code = encode(
+            "V_CVT_F32_F16",
+            "ENC_VOP3",
+            &[("VDST", 5), ("SRC0", 256 + 3), ("OP_SEL", 1), ("OMOD", 1)],
+            None,
+        )
+        .unwrap();
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_COMPOSITE_EXTRACT && a.len() == 4 && a[3] == 1),
+            "OP_SEL must extract v2f16 lane 1"
+        );
+        let mul = ops
+            .iter()
+            .find_map(|(o, a)| {
+                (*o == OP_FMUL && a.len() == 4 && const_bits(&ops, a[3]) == Some(0x4000_0000))
+                    .then(|| a[1])
+            })
+            .expect("omod x2 missing");
+        assert!(
+            matches!(
+                def_unbits(&ops, def(&ops, mul).unwrap().1[2]),
+                Some((OP_F_CONVERT, _))
+            ),
+            "omod must follow the widened half"
+        );
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_CAPABILITY && a.as_slice() == [CAP_FLOAT16]),
+            "f16 conversion must declare Capability Float16"
+        );
+        assert_valid_spirv(&t, "plain_cvt_f32_f16");
+    }
+
+    /// Plain `v_cvt_f16_f32` applies abs/neg and output modifiers in f32,
+    /// narrows with round-to-nearest-even, and keeps the destination half it
+    /// does not write. `OP_SEL` bit 3 moves the write to the high half.
+    #[test]
+    fn valu_plain_cvt_f16_f32_merges_the_destination_half() {
+        // v1 = (v1 & 0xFFFF0000) | rne(clamp(|-v9| * 2))
+        let mut code = encode(
+            "V_CVT_F16_F32",
+            "ENC_VOP3",
+            &[
+                ("VDST", 1),
+                ("SRC0", 256 + 9),
+                ("ABS", 1),
+                ("NEG", 1),
+                ("OMOD", 1),
+                ("CLAMP", 1),
+            ],
+            None,
+        )
+        .unwrap();
+        // v2 = (v2 & 0xFFFF) | (rne(v9) << 16)
+        code.extend(
+            encode(
+                "V_CVT_F16_F32",
+                "ENC_VOP3",
+                &[("VDST", 2), ("SRC0", 256 + 9), ("OP_SEL", 8)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_AND
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0x7FFF_FFFF)),
+            "source abs missing"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_XOR
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0x8000_0000)),
+            "source neg missing"
+        );
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_EXT_INST && a.len() >= 4 && a[3] == GLSL_F_CLAMP),
+            "clamp missing"
+        );
+        // Round-to-nearest-even: the plain form must not emit the RTZ
+        // correction's self-compare.
+        assert!(
+            !ops.iter().any(|(o, _)| *o == OP_FORD_EQUAL),
+            "plain v_cvt_f16_f32 must round to nearest even, not RTZ"
+        );
+        let stores: Vec<&Vec<u32>> = ops
+            .iter()
+            .filter(|(o, a)| {
+                *o == OP_STORE && def(&ops, a[1]).is_some_and(|(d, _)| d == OP_BITWISE_OR)
+            })
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(
+            stores.len(),
+            2,
+            "both conversions must merge into the destination"
+        );
+        // Default: keep bits 31:16, write the low half.
+        let Some((OP_BITWISE_OR, lo)) = def(&ops, stores[0][1]) else {
+            unreachable!()
+        };
+        let Some((OP_BITWISE_AND, kept)) = def(&ops, lo[2]) else {
+            panic!("low-half write does not keep the old high half")
+        };
+        assert_eq!(const_value(&ops, kept[3]), Some(0xFFFF_0000));
+        assert!(
+            matches!(def(&ops, kept[2]), Some((OP_LOAD, l)) if l[2] == stores[0][0]),
+            "kept half is not the old destination"
+        );
+        assert!(
+            matches!(def(&ops, lo[3]), Some((OP_BITWISE_AND, m)) if const_value(&ops, m[3]) == Some(0xFFFF)),
+            "low-half write does not mask the f16 to bits 15:0"
+        );
+        // OP_SEL bit 3: keep the low half, write the high half.
+        let Some((OP_BITWISE_OR, hi)) = def(&ops, stores[1][1]) else {
+            unreachable!()
+        };
+        let Some((OP_BITWISE_AND, kept)) = def(&ops, hi[2]) else {
+            panic!("high-half write does not keep the old low half")
+        };
+        assert_eq!(const_value(&ops, kept[3]), Some(0x0000_FFFF));
+        let Some((OP_SHIFT_L_LOGICAL, sh)) = def(&ops, hi[3]) else {
+            panic!("high-half write is not shifted")
+        };
+        assert_eq!(const_value(&ops, sh[3]), Some(16));
+        assert_valid_spirv(&t, "plain_cvt_f16_f32");
+    }
+
+    /// `v_pack_b32_f16` packs the halves `OP_SEL` names: bit 0 picks src0's
+    /// half, bit 1 picks src1's, as the low and high half of the result.
+    #[test]
+    fn valu_pack_b32_f16_packs_the_selected_halves() {
+        let mut code = encode(
+            "V_PACK_B32_F16",
+            "ENC_VOP3",
+            &[
+                ("VDST", 7),
+                ("SRC0", 256 + 1),
+                ("SRC1", 256 + 2),
+                ("OP_SEL", 3),
+            ],
+            None,
+        )
+        .unwrap();
+        code.extend(
+            encode(
+                "V_PACK_B32_F16",
+                "ENC_VOP3",
+                &[("VDST", 8), ("SRC0", 256 + 1), ("SRC1", 256 + 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        let stores: Vec<&Vec<u32>> = ops
+            .iter()
+            .filter(|(o, a)| {
+                *o == OP_STORE && def(&ops, a[1]).is_some_and(|(d, _)| d == OP_BITWISE_OR)
+            })
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(stores.len(), 2);
+        // OP_SEL = 3: both halves are the high half (>> 16).
+        let Some((OP_BITWISE_OR, or)) = def(&ops, stores[0][1]) else {
+            unreachable!()
+        };
+        for (half, x) in [("low", or[2]), ("high", or[3])] {
+            let x = if half == "high" {
+                let Some((OP_SHIFT_L_LOGICAL, sh)) = def(&ops, x) else {
+                    panic!("high half is not shifted into bits 31:16")
+                };
+                assert_eq!(const_value(&ops, sh[3]), Some(16));
+                sh[2]
+            } else {
+                x
+            };
+            assert!(
+                matches!(def(&ops, x), Some((OP_SHIFT_R_LOGICAL, s)) if const_value(&ops, s[3]) == Some(16)),
+                "{half} half did not take the high 16 bits"
+            );
+        }
+        // OP_SEL = 0: both halves are the low half (& 0xFFFF).
+        let Some((OP_BITWISE_OR, or)) = def(&ops, stores[1][1]) else {
+            unreachable!()
+        };
+        let Some((OP_BITWISE_AND, low)) = def(&ops, or[2]) else {
+            panic!("low half is not masked")
+        };
+        assert_eq!(const_value(&ops, low[3]), Some(0xFFFF));
+        let Some((OP_SHIFT_L_LOGICAL, sh)) = def(&ops, or[3]) else {
+            panic!("high half is not shifted")
+        };
+        assert!(
+            matches!(def(&ops, sh[2]), Some((OP_BITWISE_AND, high)) if const_value(&ops, high[3]) == Some(0xFFFF)),
+            "high half is not the masked low half"
+        );
+        assert_valid_spirv(&t, "pack_b32_f16");
+    }
+
+    /// The lane indices of the source halves widened by `f16_to_f32_bits`, in
+    /// emission order: a `v2f16` bitcast of a VGPR load. The RTZ correction
+    /// also widens a half, but from a computed pattern, so it is excluded.
+    fn source_half_lanes(ops: &[(u16, Vec<u32>)]) -> Vec<u32> {
+        ops.iter()
+            .filter_map(|(o, a)| {
+                if *o != OP_COMPOSITE_EXTRACT || a.len() != 4 {
+                    return None;
+                }
+                let d2 = def(ops, a[2]);
+                let (OP_BITCAST, b) = d2? else {
+                    return None;
+                };
+                matches!(def(ops, b[2]), Some((OP_LOAD, _))).then(|| a[3])
+            })
+            .collect()
+    }
+
+    /// `v_fma_mix*` widens the sources `OP_SEL_HI` names half-width, selects
+    /// the half `OP_SEL` names, applies abs (`NEG_HI`) and neg (`NEG`), then
+    /// fma/clamp. `mixlo`/`mixhi` narrow with round-toward-zero and keep the
+    /// destination half they do not write; `f32` writes the f32 bits.
+    #[test]
+    fn valu_fma_mix_translates_and_narrows_to_the_selected_half() {
+        // v3 = (v3 & 0xFFFF0000) | rtz(clamp(mixlo))
+        let mut code = encode(
+            "V_FMA_MIXLO_F16",
+            "ENC_VOP3P",
+            &[
+                ("VDST", 3),
+                ("SRC0", 256 + 4),
+                ("SRC1", 256 + 5),
+                ("SRC2", 256 + 6),
+                ("OP_SEL", 0b010),
+                ("OP_SEL_HI", 0b011),
+                ("NEG_HI", 0b001),
+                ("NEG", 0b100),
+                ("CLAMP", 1),
+            ],
+            None,
+        )
+        .unwrap();
+        // v4 = (v4 & 0xFFFF) | (rtz(mixhi) << 16)
+        code.extend(
+            encode(
+                "V_FMA_MIXHI_F16",
+                "ENC_VOP3P",
+                &[
+                    ("VDST", 4),
+                    ("SRC0", 256 + 4),
+                    ("SRC1", 256 + 5),
+                    ("SRC2", 256 + 6),
+                    ("OP_SEL", 0b111),
+                    ("OP_SEL_HI", 0b11),
+                    ("OP_SEL_HI_2", 1),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        // v5 = asuint(mix f32)
+        code.extend(
+            encode(
+                "V_FMA_MIX_F32",
+                "ENC_VOP3P",
+                &[
+                    ("VDST", 5),
+                    ("SRC0", 256 + 4),
+                    ("SRC1", 256 + 5),
+                    ("SRC2", 256 + 6),
+                    ("OP_SEL", 0b001),
+                    ("OP_SEL_HI", 0b11),
+                    ("OP_SEL_HI_2", 1),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        // Emission order: mixlo [src0 low, src1 high], mixhi [high, high,
+        // high], mix_f32 [src0 high, src1 low, src2 low].
+        assert_eq!(
+            source_half_lanes(&ops),
+            [0, 1, 1, 1, 1, 1, 0, 0],
+            "only the sources OP_SEL_HI names are half-width, in the OP_SEL half"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_AND
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0x7FFF_FFFF)),
+            "NEG_HI abs missing"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_XOR
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0x8000_0000)),
+            "NEG missing"
+        );
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_EXT_INST && a.len() >= 4 && a[3] == GLSL_F_CLAMP),
+            "CLAMP missing"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_FORD_EQUAL)
+                && ops.iter().any(|(o, _)| *o == OP_FORD_GREATER_THAN),
+            "mixlo/mixhi must correct the RNE conversion to round toward zero"
+        );
+        let stores: Vec<&Vec<u32>> = ops
+            .iter()
+            .filter(|(o, a)| {
+                *o == OP_STORE && def(&ops, a[1]).is_some_and(|(d, _)| d == OP_BITWISE_OR)
+            })
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(stores.len(), 2);
+        // mixlo: keep the old high half, write the RTZ half low.
+        let Some((OP_BITWISE_OR, lo)) = def(&ops, stores[0][1]) else {
+            unreachable!()
+        };
+        let Some((OP_BITWISE_AND, kept)) = def(&ops, lo[2]) else {
+            panic!("mixlo does not keep the old high half")
+        };
+        assert_eq!(const_value(&ops, kept[3]), Some(0xFFFF_0000));
+        assert!(
+            matches!(def(&ops, lo[3]), Some((OP_SELECT, _))),
+            "mixlo must write the RTZ-corrected half"
+        );
+        // mixhi: keep the old low half, write the RTZ half high.
+        let Some((OP_BITWISE_OR, hi)) = def(&ops, stores[1][1]) else {
+            unreachable!()
+        };
+        let Some((OP_BITWISE_AND, kept)) = def(&ops, hi[2]) else {
+            panic!("mixhi does not keep the old low half")
+        };
+        assert_eq!(const_value(&ops, kept[3]), Some(0x0000_FFFF));
+        let Some((OP_SHIFT_L_LOGICAL, sh)) = def(&ops, hi[3]) else {
+            panic!("mixhi does not shift the half into bits 31:16")
+        };
+        assert_eq!(const_value(&ops, sh[3]), Some(16));
+        assert!(
+            matches!(def(&ops, sh[2]), Some((OP_SELECT, _))),
+            "mixhi must write the RTZ-corrected half"
+        );
+        // mix_f32 writes the f32 result without a half merge.
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_STORE
+                && def_unbits(&ops, a[1]).is_some_and(|(d, _)| d == OP_FADD)),
+            "v_fma_mix_f32 must store the f32 fma result"
+        );
+        assert_valid_spirv(&t, "fma_mix");
     }
 }

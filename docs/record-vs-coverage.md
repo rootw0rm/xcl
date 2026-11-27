@@ -269,18 +269,17 @@ control flow, or one of the documented out-of-scope classes — not an unclassif
 - **DPP** (`quad_perm`, `row_*`, `dpp8`) reads another lane; the per-lane bring-up model has no
   cross-lane value and the corpus carries no DPP instance. Other SDWA instructions and VOPC
   SDWA compares stay refused; step-12 covers only the six measured SDWA forms.
-- **f16 value class** (plain `v_cvt_f32_f16`/`v_cvt_f16_f32`, `v_fma_mix*`, `v_pack_b32_f16`),
-  cube ops and `v_add_co_ci_u32`: separate follow-ups; `s_setreg_imm32_b32` stays unsupported
-  until the emitter models the MODE register.
+- **f16 value class** is translated for the measured plain forms (step-13); cube ops and the
+  small VALU residual (`v_add_co_ci_u32`, `v_mad_u32_u24`, `v_lshlrev_b64`) are separate
+  follow-ups; `s_setreg_imm32_b32` stays unsupported until the emitter models the MODE register.
 
 ### Next dominant self-contained family
 
-The f16 value class (9 record-instances) is the next slice after step-12: `v_fma_mix_f32` 3,
-`v_cvt_f32_f16` 2, `v_cvt_f16_f32` 1, `v_fma_mixhi_f16` 1, `v_fma_mixlo_f16` 1,
-`v_pack_b32_f16` 1. Step-12 already introduced the SPIR-V half type and
-`Capability Float16` for the SDWA conversions, so those plain forms can reuse them. Cube ops (3)
-and the small VALU residual (4) follow; b64/EXEC/VCC masks (27) still need the per-lane model
-and `s_setreg` (22) still needs the MODE register.
+The cube ops (3 record-instances, one record) and the small VALU residual (4, four records) are
+the next slice after step-13: `v_cubema_f32`/`v_cubesc_f32`/`v_cubetc_f32`, `v_add_co_ci_u32`,
+`v_mad_u32_u24` and `v_lshlrev_b64`. They are pure VALU with no memory, mask or MODE
+involvement. b64/EXEC/VCC masks (27) still need the per-lane model, `s_setreg` (22) the MODE
+register and `v_cmpx_*` (3) the per-lane mask.
 
 ## Tooling polish (step-11, 2026-11-27)
 
@@ -366,6 +365,72 @@ record instances, so they overlap and do not sum to the 899 incomplete records):
   class 9, cube ops 3, `v_cmpx_*` EXEC writes 3, small VALU residual 4 (`v_add_co_ci_u32` 2,
   `v_mad_u32_u24` 1, `v_lshlrev_b64` 1).
 
+## Plain f16 value class (step-13, 2026-11-27)
+
+The emitter now translates the six measured plain f16 forms step-12 left. Same command and
+corpus (26,503 records, seed 1, release):
+
+| outcome | records | share of all | share of VS |
+|---|---:|---:|---:|
+| non-VS | 24,267 | 91.6% | — |
+| reject | 1,204 | 4.5% | 53.8% |
+| incomplete | 899 | 3.4% | 40.2% |
+| complete | 133 | 0.5% | 5.9% |
+| all | 26,503 | 100% | (VS: 2,236) |
+
+Outcome counts are unchanged from step-12. **No record flipped complete**: the nine in-scope
+instances live in two records (`(VS_FireVolumeFrontBack_24e49fd7`, `VS_Transform_c38bc63c`) that
+still fail on `s_buffer_load_dwordx16`, `s_load_dwordx4` and `s_swappc_b64`. Reason kinds fell
+**45 → 39**; total reason instances fell **4,307 → 4,298 (−9)** — exactly the in-scope sum, no
+other reason's count changed and no new kind appeared:
+
+| reason | records (step-12 → step-13) |
+|---|---:|
+| `v_fma_mix_f32` | 3 → 0 |
+| `v_cvt_f32_f16` | 2 → 0 |
+| `v_cvt_f16_f32` | 1 → 0 |
+| `v_fma_mixhi_f16` | 1 → 0 |
+| `v_fma_mixlo_f16` | 1 → 0 |
+| `v_pack_b32_f16` | 1 → 0 |
+| total | 9 → 0 |
+
+Translated semantics (`spirv::tests::valu_*` through `translate_vs_spirv` plus `spirv-val`,
+mirroring `gpu/recomp/emit.rs` and `gpu/dxil/lower_valu.rs`):
+
+- **`v_cvt_f32_f16`.** `OP_SEL` bit 0 selects the half (0 = low, 1 = high); the dword bitcasts
+  to a `v2f16` and the selected lane widens. The VOP3 `OMOD`/`CLAMP` apply to the f32 result.
+- **`v_cvt_f16_f32`.** `ABS`/`NEG` (VOP3) and `OMOD`/`CLAMP` apply in f32 before a
+  round-to-nearest-even narrowing (`OpFConvert`). The plain form keeps the destination half it
+  does not write; `OP_SEL` bit 3 moves the write to the high half. SDWA keeps the step-12
+  destination-selector behavior.
+- **`v_pack_b32_f16`.** `OP_SEL` bit 0 picks src0's half for bits 15:0, bit 1 picks src1's half
+  for bits 31:16.
+- **`v_fma_mix*`.** `OP_SEL_HI`/`OP_SEL_HI_2` name which sources are f16, `OP_SEL` the half,
+  `NEG_HI` the abs and `NEG` the negation per source. The product-add is `OpFMUL` + `OpFADD`
+  and `CLAMP` saturates in f32. `v_fma_mix_f32` writes the f32 bits; `mixlo`/`mixhi` narrow
+  toward zero — the codebase's `f32tof16` convention; `OpFConvert` rounds to nearest even, so a
+  conversion that rounded away from zero is stepped back one magnitude — and keep the other
+  destination half.
+- **Half type.** Reuses step-12's `v2f16` + `Capability Float16`; the module declares no 16-bit
+  integer type.
+
+### Residual after step-13
+
+All 4,298 remaining reason instances are the step-10 groups minus the SDWA and f16 forms
+(counts are record instances, so they overlap and do not sum to the 899 incomplete records):
+
+- **Memory / descriptors — 2,263.** Unchanged; still gated on draw-time root arguments.
+- **Control flow — 1,976.** Unchanged; the step-08 decision stands.
+- **Documented non-goals — 59.** b64/EXEC/VCC mask ops 27, `s_setreg_imm32_b32` 22, cube ops 3
+  (`v_cubema_f32`/`v_cubesc_f32`/`v_cubetc_f32`), `v_cmpx_*` EXEC writes 3, and the small VALU
+  residual 4 (`v_add_co_ci_u32` 2, `v_mad_u32_u24` 1, `v_lshlrev_b64` 1).
+
+### Next dominant self-contained family
+
+Cube ops (3, one record) and the small VALU residual (4, four records) are the next slice: they
+are pure VALU with no memory, mask or MODE involvement. b64/EXEC/VCC masks (27) still need the
+per-lane model, `s_setreg` (22) the MODE register and `v_cmpx_*` (3) the per-lane mask.
+
 ## Follow-up
 
 `code-assist:xcl-first-frame:step-08:record-vs-branches` (task-1795794902-51cb) is resolved as
@@ -379,5 +444,7 @@ Step-09 (`code-assist:xcl-first-frame:step-09:record-vs-valu`, commit on
 follow-up. Step-11 (`code-assist:xcl-first-frame:step-11:record-vs-polish`, commit on
 `m22-vs-polish`) is the help/shape/far-jump polish above. Step-12
 (`code-assist:xcl-first-frame:step-12:record-vs-sdwa`, commit on `m22-vs-sdwa-dpp`) implements
-the measured SDWA forms; the f16 value class is queued as the next follow-up.
+the measured SDWA forms. Step-13 (`code-assist:xcl-first-frame:step-13:record-vs-f16`, commit on
+`m22-vs-f16`) implements the plain f16 value class; cube ops and the small VALU residual are
+queued as the next follow-up.
 
