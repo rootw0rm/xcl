@@ -1736,3 +1736,63 @@ newest at the bottom.
 - Tasks filed: none (no keepers in window; #2929/#2930 already owned by
   step-150). No overlap with step-147 (#2926 dxil hunks) or step-148
   (xuser twin test).
+
+## 2026-11-27 — step-152 (task-1795740676-49df): triage #2933+#2934 (window >2931), top now #2934, probe past #2934
+
+- `upstream/main` = `8b957bec` (unchanged; `merge-base --is-ancestor
+  upstream/main HEAD` exit 0 — zero sync fallout, fully merged).
+- Batched `git ls-remote upstream 'refs/pull/*/head'` (per
+  mem-1795715658-5c18): 2401 refs (delta +2 vs step-151's 2399 — the
+  #2933 + #2934 refs themselves, not misses). Numbers >2931 present:
+  2933 + 2934 (29xx glob tail ends at `refs/pull/2934/head`). Per-PR
+  probe: #2932 MISSING (gap per mem-1795712765-78dc — probed past it),
+  #2933 PRESENT (`1286ef91`), #2934 PRESENT (`dac9681b`), #2935..#2950
+  ALL MISSING (sequential) → top now #2934. Heads fetched (`pr2933`,
+  `pr2934`, deleted after review).
+- Pins re-verified (zero drift, no force-push): #2907 `7575f671`
+  + #2913 `992ef508` match step-145 pins. #2929 `a87d3c2a` + #2930
+  `4e008ce5` + #2931 `093a5fcd` re-verified still OPEN (heads
+  unchanged, `merge-base --is-ancestor` vs `upstream/main` exit 1
+  each) → step-150 recheck stays pending.
+- Triage (2 OPEN):
+  - #2933 SKIP (single-commit `1286ef91` "xcl run: scripted
+    XCL_PRESS_* times count from guest entry, not host start":
+    `hle/gameinput.rs` `press_held` + `scripted` rewire,
+    `host.rs` `mark_guest_entry` call, shared `log.rs`
+    `GUEST`/`guest_uptime`/`mark_guest_entry` (+12), one gameinput
+    unit test). The functional hunks live in Windows-only modules on
+    Linux: `hle/gameinput.rs` and `host.rs` are not compiled on Linux
+    (`lib.rs:31` `hle` is `cfg(windows)` / `hle_linux.rs`;
+    `lib.rs:39` `host` is `cfg(windows)` / `host_linux.rs`). The
+    shared `log.rs` hunk compiles (unconditional `mod log`,
+    `lib.rs:16`) but has no Linux consumer: `gameinput_linux.rs`
+    (160 lines) has zero `XCL_PRESS`/scripted support (headless
+    `IGameInput` stub; full input is Phase E per its header), and
+    `host_linux.rs run_boot` has no shader-preparation phase
+    (straight `init` → `load_main` → `run_main`), so the mistiming
+    bug class the PR fixes (preparation eating the script timeline)
+    does not exist on Linux — porting `log.rs` alone would land a
+    dead API with no caller. Revisit when scripted input lands on
+    Linux. Same category as #2928.
+  - #2934 SKIP (Windows-only; 2-commit branch `340f2e3b` +
+    `dac9681b` "D3D12.X: the watch trap's look walks the read-only
+    spans once", +747/-3 across 11 files). The new
+    `hle/d3d12x/watch_trap.rs` (707-line tip form: VEH handler via
+    `AddVectoredExceptionHandler`, `VirtualProtect` /
+    `MEM_WRITE_WATCH` / `GetWriteWatch` — `windows_sys` throughout)
+    lives in `d3d12x`, which is not compiled on Linux (null-device
+    `d3d12x_linux.rs` instead). All 10 guard call sites sit in
+    Windows-only modules: `eh.rs is_writable` (`:291`;
+    `eh_linux.rs` is sigaction-based, has no `is_writable` twin),
+    `hle/kernelx.rs` + `lazy.rs` + `dstorage.rs` +
+    `parallel.rs` (Linux twins `kernelx_linux.rs` /
+    `dstorage_linux.rs` carry no watch code),
+    `hle/d3d12x/{cpu_writes,sparse,title_textures,mod}.rs`, and
+    `vfs_hooks.rs hk_read_file` `read_start`/`read_end`
+    (`vfs_hooks_linux.rs` has no `hk_read_file`). No Linux consumer:
+    no title-texture dirty-range tracking runs against the null
+    device. Revisit if the Vulkan texture path ever needs
+    write-watch dirty ranges.
+- Tasks filed: none (no keepers in window; #2929/#2930 already owned
+  by step-150 P4). No overlap with step-147 (#2926 dxil hunks) or
+  step-148 (xuser twin test).
