@@ -1013,8 +1013,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             };
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() || opts.record_vs {
-            // one shader file: the record to export or measure
+        } else if opts.export_hlsl.is_some()
+            || opts.measure_pso.is_some()
+            || opts.record_vs
+            || opts.precompile
+            || opts.direct
+        {
+            // one shader file: the record for a mode that needs the raw bytes; a plain
+            // analysis (`--recomp`/`--compile`) stays the fast path below
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };

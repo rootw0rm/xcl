@@ -253,6 +253,36 @@ fn shaders_handles_non_console_file_and_missing_path() {
 }
 
 #[test]
+fn shaders_single_file_runs_the_requested_sweep_modes() {
+    let dir = TempDir::new("single-modes");
+    let file = dir.path().join("ps.bin");
+    std::fs::write(&file, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    // `--direct` is a mode: on one file it runs the direct sweep, as it does on a folder.
+    let direct = run_shaders(&file, &["--direct"]);
+    assert!(direct.status.success(), "{direct:?}");
+    let text = String::from_utf8(direct.stdout).unwrap();
+    assert!(text.contains("direct DXIL coverage"), "{text}");
+    assert!(!text.contains("single file"), "{text}");
+
+    // `--precompile` is a mode too: Linux refuses it by name instead of analysing the file.
+    let pre = run_shaders(&file, &["--precompile"]);
+    #[cfg(windows)]
+    {
+        assert!(pre.status.success(), "{pre:?}");
+        let text = String::from_utf8(pre.stdout).unwrap();
+        assert!(!text.contains("single file"), "{text}");
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(pre.status.code(), Some(2), "{pre:?}");
+        assert!(pre.stdout.is_empty(), "{pre:?}");
+        let stderr = String::from_utf8_lossy(&pre.stderr);
+        assert!(stderr.contains("--precompile") && stderr.contains("DXC is Windows-only"), "{stderr}");
+    }
+}
+
+#[test]
 fn shaders_missing_arguments_prints_help_and_exits_two() {
     let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
         .arg("shaders")
