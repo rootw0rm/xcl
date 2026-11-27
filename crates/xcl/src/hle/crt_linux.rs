@@ -683,17 +683,65 @@ pub unsafe extern "win64" fn strcmp(a: *const u8, b: *const u8) -> i32 {
 
 /// `int strncmp(a, b, n)` — bounded `strcmp`, `0` when the first `n` bytes match.
 pub unsafe extern "win64" fn strncmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    let mut result = 0;
     for i in 0..n {
         let x = *a.add(i);
         let y = *b.add(i);
         if x != y {
-            return x as i32 - y as i32;
+            result = x as i32 - y as i32;
+            break;
         }
         if x == 0 {
-            return 0;
+            break;
         }
     }
-    0
+    trace_strncmp(a, b, n, result);
+    result
+}
+
+/// `XCL_TRACE_STRNCMP`: log each `strncmp` call's bounded arg previews and
+/// result (retail M1 step-04: the `0x140968480` dispatcher's key probes reach
+/// this shim, so the log names the keys the game looks up on the abort path).
+/// Off by default; capped so a boot flood stays a bounded xcl.log tail.
+fn strncmp_tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_TRACE_STRNCMP").is_some())
+}
+
+/// Preview cap: at most this many bytes per arg, and at most this many logged
+/// calls per process (atomic counter, first-come).
+const STRNCMP_PREVIEW_MAX: usize = 64;
+const STRNCMP_LOG_MAX: usize = 512;
+static STRNCMP_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// Bounded, NUL-terminated, lossy preview of a `strncmp` arg: reads at most
+/// `min(n, STRNCMP_PREVIEW_MAX)` bytes — never more than `strncmp` itself
+/// reads — and stops at the first NUL.
+fn strncmp_arg_preview(s: *const u8, n: usize) -> String {
+    let take = n.min(STRNCMP_PREVIEW_MAX);
+    let mut buf = Vec::with_capacity(take);
+    for i in 0..take {
+        // SAFETY: caller guarantees `s` is valid for the `n` bytes the
+        // `strncmp(a, b, n)` call itself reads; this reads a prefix of that.
+        let c = unsafe { *s.add(i) };
+        if c == 0 {
+            break;
+        }
+        buf.push(c);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn trace_strncmp(a: *const u8, b: *const u8, n: usize, result: i32) {
+    if !strncmp_tracing() {
+        return;
+    }
+    if STRNCMP_LOGGED.fetch_add(1, Ordering::Relaxed) >= STRNCMP_LOG_MAX {
+        return;
+    }
+    let pa = strncmp_arg_preview(a, n);
+    let pb = strncmp_arg_preview(b, n);
+    crate::xlog_info!("[STRNCMP] n={n} a={pa:?} b={pb:?} -> {result}");
 }
 
 /// `int _strnicmp(a, b, n)` — bounded case-insensitive `strcmp` (ASCII fold),
@@ -3353,6 +3401,24 @@ mod tests {
             );
             _invalid_parameter_noinfo();
             _set_invalid_parameter_handler(prev_ip);
+        }
+    }
+
+    #[test]
+    fn strncmp_trace_preview_renders_bounded_lossy_args() {
+        unsafe {
+            // Previews stop at NUL and are bounded: the full key is longer
+            // than the 64-byte preview cap.
+            let long = b"globalroot_extra_long_key_material_padding_0123456789abcdef\0";
+            let p = strncmp_arg_preview(long.as_ptr(), 128);
+            assert!(p.len() <= 64, "preview must be capped, got {p:?}");
+            assert!(p.starts_with("globalroot"), "got {p:?}");
+            // Stops at NUL even when n runs past it.
+            assert_eq!(strncmp_arg_preview(b"ab\0cd\0".as_ptr(), 5), "ab");
+            // Non-UTF8 bytes render lossy instead of panicking.
+            assert_eq!(strncmp_arg_preview(b"\xff\xfe\0".as_ptr(), 3), "��");
+            // Zero length previews empty.
+            assert_eq!(strncmp_arg_preview(b"abc\0".as_ptr(), 0), "");
         }
     }
 
