@@ -1,0 +1,33 @@
+#!/bin/sh
+# XCL guard: shared branches move fast-forward only.
+# The loop must never rewrite or delete linux/main (no --force, no
+# "fix the divergence" heroics - hand a diverged branch to the owner).
+# Deliberate bypass (owner only): git push --no-verify
+set -u
+
+zero="0000000000000000000000000000000000000000"
+protected=" refs/heads/linux refs/heads/main "
+refused=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$protected" in
+    *" $remote_ref "*)
+      if [ "$local_sha" = "$zero" ]; then
+        echo "pre-push: REFUSED - deleting protected branch $remote_ref" >&2
+        refused=1
+      elif [ "$remote_sha" != "$zero" ] \
+        && ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+        echo "pre-push: REFUSED - non-fast-forward update of $remote_ref" >&2
+        echo "pre-push: ($remote_sha -> $local_sha). Do not force-push;" >&2
+        echo "pre-push: hand a diverged branch to the owner (PROMPT.md rule 8)." >&2
+        refused=1
+      fi
+      ;;
+  esac
+done
+
+if [ "$refused" -ne 0 ]; then
+  echo "pre-push: Owner bypass: git push --no-verify" >&2
+  exit 1
+fi
+exit 0

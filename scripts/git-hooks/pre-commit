@@ -1,0 +1,35 @@
+#!/bin/sh
+# XCL guard: the loop must NEVER finalize a merge.
+# Incident: cd42bbae ("chore: auto-commit before merge (loop primary)")
+# committed a conflicted 39-UU tree and dropped ~5.5k branch-only lines.
+# Only the repo owner resolves merges (PROMPT.md rule 8).
+# Deliberate bypass (owner merge-resolution commit only):
+#   git commit --no-verify
+set -u
+
+# 1. An unfinished `git merge` is in progress.
+if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  echo "pre-commit: REFUSED - MERGE_HEAD is present (unfinished 'git merge')." >&2
+  echo "pre-commit: Do not 'git add' or 'git commit' over it. Stop and hand" >&2
+  echo "pre-commit: the tree to the owner (PROMPT.md rule 8, cd42bbae incident)." >&2
+  echo "pre-commit: Owner merge-resolution commit: git commit --no-verify" >&2
+  exit 1
+fi
+
+# 2. Unmerged index entries must never be committed.
+unmerged="$(git diff --cached --name-only --diff-filter=U || true)"
+if [ -n "$unmerged" ]; then
+  echo "pre-commit: REFUSED - index still has unmerged paths:" >&2
+  echo "$unmerged" >&2
+  exit 1
+fi
+
+# 3. No conflict markers in staged content.
+markers="$(git grep --cached -l -e '^<<<<<<< ' -e '^>>>>>>> ' -- . 2>/dev/null || true)"
+if [ -n "$markers" ]; then
+  echo "pre-commit: REFUSED - staged content contains conflict markers:" >&2
+  echo "$markers" >&2
+  exit 1
+fi
+
+exit 0

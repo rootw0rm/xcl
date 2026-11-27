@@ -37,6 +37,11 @@ headers/binaries, keys, or DRM circumvention.
 
 - One logical change per commit, small diffs. Do what was asked, nothing
   more: no refactors, renames, reformatting, or new deps on the side.
+- Never commit over an unfinished merge: if `git rev-parse -q --verify
+  MERGE_HEAD` prints anything, or `git diff --name-only --diff-filter=U`
+  is non-empty, stop and hand the tree to the owner. A `pre-commit` hook
+  (`scripts/git-hooks/`, installed via `core.hooksPath`) enforces this
+  plus fast-forward-only pushes of `linux`/`main`; see PROMPT.md rule 8.
 - Follow the module around you; reuse existing helpers instead of adding
   layers. Format only the lines you touch (`cargo fmt` on the whole tree
   is off-limits: it is not rustfmt-clean).
