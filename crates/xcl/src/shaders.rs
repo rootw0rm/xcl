@@ -1003,6 +1003,18 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
     if let [first, second, ..] = modes.as_slice() {
         return Err(format!("{first} and {second} are exclusive modes; run one mode per invocation"));
     }
+    // `--compile`/`--recomp`/`--iface`/`--example` are read only by the analysis run, which a
+    // terminal mode replaces; together they would drop the request (and, for `--compile`, even
+    // its platform refusal), so reject the combination instead of picking one half.
+    let analysis: &[(bool, &str)] = &[
+        (opts.compile > 0, "--compile"),
+        (opts.recomp, "--recomp"),
+        (opts.iface, "--iface"),
+        (opts.example.is_some(), "--example"),
+    ];
+    if let (Some(mode), Some((_, opt))) = (modes.first(), analysis.iter().find(|(on, _)| *on)) {
+        return Err(format!("{opt} cannot be combined with {mode}; it only affects the analysis run"));
+    }
     for (opt, required) in given {
         if required.iter().any(|m| modes.contains(m)) {
             continue;

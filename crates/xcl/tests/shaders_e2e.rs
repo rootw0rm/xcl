@@ -380,6 +380,82 @@ fn shaders_mode_options_require_their_mode() {
     }
 }
 
+/// `--compile`/`--recomp`/`--iface`/`--example` are read only by the analysis path; a terminal
+/// mode dispatches before it, so the request would be silently dropped. Given with a terminal
+/// mode, reject the combination instead of running less than was asked.
+#[test]
+fn shaders_terminal_modes_reject_analysis_options() {
+    let dir = TempDir::new("terminal-analysis");
+    let file = dir.path().join("ps.bin");
+    std::fs::write(&file, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    let out_dir = dir.path().join("hlsl");
+    let out_arg = out_dir.to_str().unwrap();
+
+    // Both sweeps that can run here, against each analysis-only option.
+    for mode in ["--record-vs", "--direct"] {
+        for opt in [&["--compile", "1"][..], &["--recomp"], &["--iface"], &["--example", "foo"]] {
+            let mut args = vec![mode, "--sample", "1"];
+            args.extend_from_slice(opt);
+            let out = run_shaders(&file, &args);
+            assert_eq!(out.status.code(), Some(2), "args {args:?}: {out:?}");
+            assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("xcl shaders:"), "args {args:?}: {stderr}");
+            assert!(
+                stderr.contains(&format!("{} cannot be combined with {mode}", opt[0])),
+                "args {args:?}: expected the scope error in {stderr:?}"
+            );
+        }
+    }
+
+    // The scope error comes before the Windows-only modes' Linux refusal.
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["--precompile", "--recomp"], "--recomp", "--precompile"),
+        (&["--export-hlsl", out_arg, "--compile", "1"], "--compile", "--export-hlsl"),
+        (&["--measure-pso", "CAFE", "--recomp"], "--recomp", "--measure-pso"),
+    ];
+    for (args, opt, mode) in cases {
+        let out = run_shaders(&file, args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("xcl shaders:"), "args {args:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!("{opt} cannot be combined with {mode}")),
+            "args {args:?}: expected the scope error in {stderr:?}"
+        );
+        assert!(!stderr.contains("DXC is Windows-only"), "args {args:?}: the platform refusal came first: {stderr:?}");
+    }
+    assert!(!out_dir.exists(), "a rejected --export-hlsl must not create {}", out_dir.display());
+
+    // Positive controls: alone they keep their analysis behavior.
+    for opt in [&["--recomp"][..], &["--iface"], &["--example", "foo"]] {
+        let out = run_shaders(&file, opt);
+        assert!(out.status.success(), "args {opt:?}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("single file"), "args {opt:?}: {out:?}");
+    }
+    let compiled = run_shaders(&file, &["--compile", "1"]);
+    #[cfg(windows)]
+    assert!(compiled.status.success(), "{compiled:?}");
+    #[cfg(not(windows))]
+    {
+        // Still the analysis run followed by the honest DXC refusal, not a scope error.
+        assert_eq!(compiled.status.code(), Some(2), "{compiled:?}");
+        let stderr = String::from_utf8_lossy(&compiled.stderr);
+        assert!(stderr.contains("DXC is Windows-only"), "{stderr}");
+        assert!(!compiled.stdout.is_empty(), "the analysis still runs: {compiled:?}");
+    }
+    assert!(!String::from_utf8_lossy(&compiled.stderr).contains("cannot be combined"), "{compiled:?}");
+
+    // The sweeps alone are unchanged.
+    for mode in ["--record-vs", "--direct"] {
+        let out = run_shaders(&file, &[mode, "--sample", "1"]);
+        assert!(out.status.success(), "{mode}: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains(if mode == "--direct" { "direct DXIL coverage" } else { "records from" }), "{mode}: {text}");
+    }
+}
+
 #[test]
 fn shaders_direct_reports_an_unusable_dump_directory() {
     let dir = TempDir::new("dump-fail");
