@@ -1,14 +1,15 @@
 //! Linux twin of the console frame clock (`hle/d3d12x/frame.rs` is Windows-only).
 //! Split 1a: the pure core — interval helpers plus token issuance and flip statistics.
-//! Split 1b (this): the schedule state machine (`set_frame_interval`,
+//! Split 1b: the schedule state machine (`set_frame_interval`,
 //! `schedule_frame_event`) plus the `signal_ancillary` honest stub. Split 1c
-//! adds the `Condvar`/monotonic clock thread with `wait_frame_event`;
+//! (this): the `Condvar`/monotonic clock thread with `wait_frame_event`;
 //! device slots #78–#81 and queue #30 `PresentX` stay unrouted until 1d.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
-use crate::util::{E_FAIL, E_INVALIDARG, HRESULT, S_FALSE};
+use crate::util::{E_FAIL, E_INVALIDARG, HRESULT, S_FALSE, S_OK};
 
 const TOKEN_MASK: u64 = 0xFFFF_FFFF_FFFF;
 const KNOWN_TOKENS: usize = 64;
@@ -72,8 +73,7 @@ static FLIPPED: Mutex<Vec<(u64, i64, i64)>> = Mutex::new(Vec::new()); // (token,
 static LAST_ORIGIN: AtomicI64 = AtomicI64::new(0);
 
 /// Hand out a waiter token for `origin` (`token_in == 0` issues one, else re-stamps).
-/// 1b calls this from `wait_frame_event`; until then the unit test below drives it.
-#[allow(dead_code)]
+/// 1c waits call this; the unit tests below drive it directly too.
 fn issue(token: &mut u64, token_in: u64, origin: i64) {
     let mut issued = ISSUED.lock().unwrap();
     if token_in != 0 {
@@ -127,11 +127,10 @@ pub fn frame_statistics(token: u64) -> Result<(i64, i64), HRESULT> {
         .ok_or(E_FAIL)
 }
 
-// --- Split 1b: schedule state machine + `signal_ancillary` honest stub. ---
+// --- Split 1c: `Condvar`/monotonic clock thread + `wait_frame_event`. ---
 // Unrouted (null default): device slots #78–#81 and queue #30 stay logging
 // stubs in `d3d12x_linux`, so this clock only runs once routed behind
-// `XCL_VULKAN_BACKEND` — no behavior change while unset. Split 1c adds the
-// `Condvar`/monotonic clock thread with `wait_frame_event`; `PresentX` stays
+// `XCL_VULKAN_BACKEND` — no behavior change while unset. `PresentX` stays
 // stubbed until 1d.
 
 const TYPES: usize = 3;
@@ -139,13 +138,20 @@ const TYPES: usize = 3;
 const STARTED_CLOCK: HRESULT = 0x1000_0000;
 /// `ScheduleFrameEventX` flag.
 const UNSCHEDULE: u32 = 1;
+/// `WaitFrameEventX` flag: take a fresh stamp on timeout instead of failing it.
+const TOKEN_ON_TIMEOUT: u32 = 2;
+/// Origins fired and not yet consumed by a wait (the console caps pending
+/// origins at 4): each token gets its own frame's origin.
+const ORIGINS_KEEP: usize = 4;
 
 struct Clock {
     interval_us: u32,
     active: bool,
     offset_us: [u32; TYPES],
     scheduled: [bool; TYPES],
-    /// Bumped on every change: the 1c clock thread re-plans off this.
+    /// Origins fired since boot, per type: waiters sleep until this moves.
+    fired: [u64; TYPES],
+    /// Bumped on every change: the clock thread re-plans off this.
     generation: u64,
     base_ns: i64,
 }
@@ -155,12 +161,16 @@ static CLOCK: Mutex<Clock> = Mutex::new(Clock {
     active: false,
     offset_us: [0; TYPES],
     scheduled: [false; TYPES],
+    fired: [0; TYPES],
     generation: 0,
     base_ns: 0,
 });
+/// Wakes the clock thread and the waiters (paired with `CLOCK`'s guard).
+static CLOCK_WAKE: Condvar = Condvar::new();
+static THREAD: AtomicBool = AtomicBool::new(false);
+static ORIGINS: Mutex<VecDeque<i64>> = Mutex::new(VecDeque::new());
 
-/// `XCL_FRAME_INTERVAL_US` override, read once (1a parses; the 1c clock applies).
-#[allow(dead_code)]
+/// `XCL_FRAME_INTERVAL_US` override, read once (1a parses, the clock applies).
 fn interval_override() -> Option<u32> {
     static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
     *OVERRIDE
@@ -189,13 +199,13 @@ pub fn set_frame_interval(len_us: u32) -> HRESULT {
         }
         c.generation += 1;
     }
+    CLOCK_WAKE.notify_all();
     S_FALSE
 }
 
-/// Device #79 twin (no ancillary block yet — 1c routes handles): `E_INVALIDARG`
-/// without an interval, for type >= 3, for a nonzero type before the origin is
-/// scheduled, or when unscheduling the origin; `STARTED_CLOCK` when this call
-/// starts the clock, else `S_FALSE`.
+/// Device #79 twin: `E_INVALIDARG` without an interval, for type >= 3, for a
+/// nonzero type before the origin is scheduled, or when unscheduling the
+/// origin; `STARTED_CLOCK` when this call starts the clock, else `S_FALSE`.
 pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
     let unschedule = flags & UNSCHEDULE != 0;
     let mut c = CLOCK.lock().unwrap();
@@ -218,6 +228,9 @@ pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
         c.offset_us[ty as usize] = offset_us % c.interval_us.max(1);
     }
     c.generation += 1;
+    drop(c);
+    ensure_clock_thread();
+    CLOCK_WAKE.notify_all();
     if started {
         STARTED_CLOCK
     } else {
@@ -225,13 +238,153 @@ pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
     }
 }
 
-/// Ancillary handles of a frame event: honest stub (1c routes real handles).
-/// Returns `S_FALSE` — nothing was signaled — and never fake-successes.
+/// Ancillary handles of a frame event: honest stub (handles stay unrouted
+/// until 1d). Returns `S_FALSE` — nothing was signaled — and never fake-successes.
 pub fn signal_ancillary(count: usize) -> HRESULT {
     if count > 0 {
         crate::xlog_debug!("frame clock: {count} ancillary handles not routed yet");
     }
     S_FALSE
+}
+
+/// Start the clock thread once: it sleeps on `CLOCK_WAKE` between schedules.
+fn ensure_clock_thread() {
+    if !THREAD.swap(true, Ordering::SeqCst) {
+        let _ = std::thread::Builder::new().name("xcl-frame-clock".into()).spawn(clock_thread);
+    }
+}
+
+fn clock_thread() {
+    let mut last = [i64::MIN / 2; TYPES];
+    loop {
+        // The next events of the current schedule: every type due at the
+        // earliest deadline fires together, like Windows.
+        let plan = {
+            let clock = CLOCK.lock().unwrap();
+            if !clock.active {
+                None
+            } else {
+                match effective_clock_interval_us(clock.interval_us, interval_override()) {
+                    None => None,
+                    Some(eff_us) => {
+                        let interval_ns = eff_us as i64 * 1000;
+                        let now = nanos();
+                        let mut due = Vec::new();
+                        for i in 0..TYPES {
+                            if !clock.scheduled[i] {
+                                continue;
+                            }
+                            let off_ns = (clock.offset_us[i] % eff_us.max(1)) as i64 * 1000;
+                            let mut d = next_deadline(clock.base_ns, interval_ns, off_ns, now - 1);
+                            if d - last[i] < interval_ns / 2 {
+                                d += interval_ns; // this point of the frame already fired
+                            }
+                            due.push((d, i));
+                        }
+                        let first = due.iter().map(|e| e.0).min();
+                        first.map(|f| {
+                            (
+                                clock.generation,
+                                f,
+                                due.into_iter().filter(|e| e.0 == f).collect::<Vec<_>>(),
+                            )
+                        })
+                    }
+                }
+            }
+        };
+        let Some((generation, first, due)) = plan else {
+            let clock = CLOCK.lock().unwrap();
+            let _unused = CLOCK_WAKE.wait(clock).unwrap();
+            continue;
+        };
+        let wait_ns = first - nanos();
+        if wait_ns > 0 {
+            let clock = CLOCK.lock().unwrap();
+            if clock.generation != generation {
+                continue;
+            }
+            let (clock, _) = CLOCK_WAKE
+                .wait_timeout(clock, std::time::Duration::from_nanos(wait_ns as u64))
+                .unwrap();
+            if clock.generation != generation || nanos() < first {
+                continue;
+            }
+        }
+        {
+            let mut clock = CLOCK.lock().unwrap();
+            if clock.generation != generation {
+                continue;
+            }
+            let mut origins = ORIGINS.lock().unwrap();
+            for (_, i) in due {
+                last[i] = first;
+                clock.fired[i] += 1;
+                if i == 0 {
+                    LAST_ORIGIN.store(first, Ordering::Relaxed);
+                    origins.push_back(first);
+                    while origins.len() > ORIGINS_KEEP {
+                        origins.pop_front();
+                    }
+                }
+            }
+        }
+        CLOCK_WAKE.notify_all();
+    }
+}
+
+/// Device #80 twin: block until event `ty` fires (or `timeout_ms` elapses).
+/// `S_OK` names the fired event (`token` takes a fresh origin token,
+/// re-stamped when one is passed in); `S_FALSE` on timeout; `E_INVALIDARG`
+/// when `ty` is not scheduled. Uncapped (`XCL_FRAME_INTERVAL_US=0`) returns
+/// immediately with a fresh token, like Windows.
+pub fn wait_frame_event(ty: u32, timeout_ms: u32, flags: u32, token: &mut u64) -> HRESULT {
+    let token_in = *token;
+    let start = {
+        let clock = CLOCK.lock().unwrap();
+        if (ty as usize) >= TYPES || !clock.scheduled[ty as usize] {
+            return E_INVALIDARG;
+        }
+        if ty == 0
+            && token_in != 0
+            && (!ISSUED.lock().unwrap().iter().any(|e| e.0 == token_in)
+                || flags & TOKEN_ON_TIMEOUT != 0)
+        {
+            return E_INVALIDARG;
+        }
+        clock.fired[ty as usize]
+    };
+    if interval_override() == Some(0) {
+        let now = nanos();
+        if ty == 0 {
+            LAST_ORIGIN.store(now, Ordering::Relaxed);
+            issue(token, token_in, now);
+        }
+        return S_OK;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    loop {
+        let clock = CLOCK.lock().unwrap();
+        if clock.fired[ty as usize] != start {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return S_FALSE;
+        }
+        let (clock, r) = CLOCK_WAKE.wait_timeout(clock, deadline - now).unwrap();
+        if clock.fired[ty as usize] != start {
+            break;
+        }
+        if r.timed_out() {
+            return S_FALSE;
+        }
+    }
+    if ty == 0 {
+        let origin = ORIGINS.lock().unwrap().pop_front().unwrap_or_else(nanos);
+        issue(token, token_in, origin);
+    }
+    S_OK
 }
 
 #[cfg(test)]
@@ -284,8 +437,7 @@ mod tests {
         assert_eq!(frame_statistics(0xDEAD), Err(E_FAIL));
     }
 
-    /// 1b failing-first: the schedule state machine validates like Windows
-    /// (the 1c clock thread has no waiter yet, so pacing is not asserted here).
+    /// 1b: the schedule state machine validates like Windows.
     #[test]
     fn schedule_validates_like_the_windows_clock() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -300,5 +452,31 @@ mod tests {
         assert_eq!(signal_ancillary(0), S_FALSE, "honest stub: nothing signaled");
         assert_eq!(set_frame_interval(0), S_FALSE, "stops the clock");
         assert_eq!(schedule_frame_event(0, 0, 0), E_INVALIDARG, "no interval, no schedule");
+    }
+
+    /// 1c failing-first: waits on a 60 Hz origin return about one interval
+    /// apart with fresh tokens (mirrors the Windows `origin_events_...` test).
+    #[test]
+    fn origin_waits_pace_like_the_windows_clock() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(set_frame_interval(16667), S_FALSE);
+        assert_eq!(wait_frame_event(0, 10, 0, &mut 0), E_INVALIDARG, "not scheduled");
+        let hr = schedule_frame_event(0, 0, 0);
+        assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+        let mut tokens = Vec::new();
+        let t0 = std::time::Instant::now();
+        for _ in 0..4 {
+            let mut t = 0u64;
+            assert_eq!(wait_frame_event(0, 200, 0, &mut t), S_OK);
+            tokens.push(t);
+        }
+        let ms = t0.elapsed().as_millis();
+        assert!((25..=500).contains(&ms), "4 origins at 60 Hz took {ms} ms");
+        assert!(tokens.windows(2).all(|w| w[1] > w[0]), "{tokens:?}");
+        mark_flipped(tokens[2]);
+        assert!(frame_statistics(tokens[2]).is_ok());
+        assert_eq!(frame_statistics(0xDEAD), Err(E_FAIL));
+        assert_eq!(wait_frame_event(1, 10, 0, &mut 0), E_INVALIDARG, "type 1 idle");
+        assert_eq!(set_frame_interval(0), S_FALSE, "stops the clock");
     }
 }
