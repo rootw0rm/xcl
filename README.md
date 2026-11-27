@@ -303,6 +303,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   title are created during play. Later launches reuse matching cache entries.
   Closing the window cancels the launch. A compiler or driver failure stops it and reports
   the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
+  `XCL_PREPARE=0` leaves the preparation out: the game starts at once and builds the shaders it
+  uses as it goes (it stands still while they build).
 - For compute shaders that XCL can split, the runtime first tries the saved driver blob for
   the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
   or the driver rejects it, XCL builds the split pieces.
