@@ -744,6 +744,9 @@ pub fn execute_record_draw(vs_bytes: &[u8]) -> Result<(OffscreenPixels, bool), S
 /// top-left quadrant lands top-left. `rt0_mask` is the D3D12 write mask
 /// (`RED = 1, GREEN = 2, BLUE = 4, ALPHA = 8` — the same bit order as
 /// `VkColorComponentFlags`); the title's derived PSO passes green+alpha only.
+/// `vs_bytes` is the S4 per-group VS: the bytes of the PSO bound at that
+/// draw call (empty inherits the list-level bytes, the single-PSO title
+/// shape), so each group resolves to its own pipeline variant.
 #[derive(Debug, Clone)]
 pub struct ReplayDraw {
     /// `[x, y, w, h, min_depth, max_depth]`; `w <= 0 || h <= 0` skips the group.
@@ -760,6 +763,8 @@ pub struct ReplayDraw {
     pub depth_slope: f32,
     /// Effective bias clamp.
     pub depth_clamp: f32,
+    /// Per-group VS container bytes; empty inherits the list-level bytes.
+    pub vs_bytes: Vec<u8>,
 }
 
 impl Default for ReplayDraw {
@@ -773,16 +778,53 @@ impl Default for ReplayDraw {
             depth_bias: 0.0,
             depth_slope: 0.0,
             depth_clamp: 0.0,
+            vs_bytes: Vec::new(),
         }
     }
 }
 
+/// M2 draw DXBC S4: per-group VS word sets behind [`execute_draw_ops`].
+/// Slot 0 is always the list-level resolve; a group with empty `vs_bytes`
+/// inherits it, otherwise its own bytes resolve (with the S3 triangle
+/// fallback) and dedup by bytes so one PSO resolves once. Returns the
+/// distinct sets plus each group's set index; the fallback flag ORs every
+/// used resolve. (Single-PSO lists — the title today — collapse to one set.)
+fn group_vs_sets(
+    list_bytes: &[u8],
+    groups: &[ReplayDraw],
+) -> (Vec<Vec<u32>>, Vec<usize>, bool) {
+    let (list_words, list_fallback, _) = resolve_record_vs(list_bytes);
+    let mut sets = vec![list_words];
+    let mut set_fallback = vec![list_fallback];
+    // Slot 0 stands for the list bytes: a group carrying those exact bytes
+    // shares the slot without re-resolving.
+    let mut set_bytes = vec![list_bytes.to_vec()];
+    let mut idx: Vec<usize> = Vec::with_capacity(groups.len());
+    for g in groups {
+        if g.vs_bytes.is_empty() {
+            idx.push(0);
+            continue;
+        }
+        if let Some(i) = set_bytes.iter().position(|b| *b == g.vs_bytes) {
+            idx.push(i);
+            continue;
+        }
+        let (words, fallback, _) = resolve_record_vs(&g.vs_bytes);
+        idx.push(sets.len());
+        set_bytes.push(g.vs_bytes.clone());
+        sets.push(words);
+        set_fallback.push(fallback);
+    }
+    let any_fallback = idx.iter().any(|&i| set_fallback[i]);
+    (sets, idx, any_fallback)
+}
+
 /// M2 draw S6: replay recorded draw groups into the 64×64 offscreen image —
-/// one render pass, one `cmd_draw` per group with dynamic viewport/scissor
-/// and a per-group pipeline variant (blend mask × depth+bias). An empty group
-/// list replays the S4 single full-target draw. `vs_bytes` takes the same
-/// translate-or-fallback path as [`execute_record_draw`] (one VS per list;
-/// per-group VS waits for real DXBC translation).
+/// one render pass, one `cmd_draw` per group with dynamic viewport/scissor,
+/// a per-group pipeline variant (VS word set × blend mask × depth+bias), and
+/// per-group VS bytes (S4: each group resolves its own PSO's bytes, empty
+/// inherits the list-level bytes; single-PSO lists keep one word set).
+/// An empty group list replays the S4 single full-target draw.
 ///
 /// Depth (only when a group binds a DSV): a `D32_SFLOAT` attachment cleared
 /// to `0.5` with `LESS`, and the [`triangle_vs_spv_z05`] triangle, so the
@@ -795,15 +837,16 @@ pub fn execute_draw_ops(
     vs_bytes: &[u8],
     ops: &[ReplayDraw],
 ) -> Result<(OffscreenPixels, bool), String> {
-    let (vs_words, vs_fallback, _) = resolve_record_vs(vs_bytes);
-    let fs_words = green_fs_spv();
     let groups: Vec<ReplayDraw> = if ops.is_empty() {
         vec![ReplayDraw::default()]
     } else {
         ops.to_vec()
     };
+    let (vs_sets, group_vs, vs_fallback) = group_vs_sets(vs_bytes, &groups);
+    let fs_words = green_fs_spv();
     let want_depth = groups.iter().any(|g| g.depth_test);
-    draw_groups_offscreen(&vs_words, &fs_words, &groups, want_depth).map(|p| (p, vs_fallback))
+    draw_groups_offscreen(&vs_sets, &group_vs, &fs_words, &groups, want_depth)
+        .map(|p| (p, vs_fallback))
 }
 
 /// Shared offscreen draw behind [`draw_offscreen`] and [`draw_triangle_offscreen`]:
@@ -1367,18 +1410,25 @@ pub fn draw_offscreen(vs_words: &[u32], positions: &[[f32; 4]]) -> Result<Offscr
 /// M2 draw S6 worker behind [`execute_draw_ops`]: the same 64×64 offscreen
 /// shape as [`draw_common`] (color image cleared to [`TRIANGLE_CLEAR`] blue,
 /// bare 3-vertex draws, host readback) but with one draw per group, dynamic
-/// viewport/scissor, and per-group pipeline variants. With `want_depth` the
-/// pass gains a `D32_SFLOAT` attachment cleared to `0.5` (`LESS`, writes on)
-/// and draws the [`triangle_vs_spv_z05`] triangle, mirroring the title's
-/// `z == clear` bias-leg construction so native `depthBias` flips the
-/// comparison. Same contract as the other offscreen draws: one submit, 5 s
-/// fence wait, `"no "`-prefixed missing-device errors.
+/// viewport/scissor, and per-group pipeline variants. S4 per-group VS:
+/// `vs_sets` holds one SPIR-V word set per distinct group VS (slot 0 is the
+/// list-level resolve), `group_vs` maps each group to its set, one shader
+/// module is created per set, and the pipeline-variant key includes the set.
+/// With `want_depth` the pass gains a `D32_SFLOAT` attachment cleared to
+/// `0.5` (`LESS`, writes on) and draws the [`triangle_vs_spv_z05`] triangle
+/// for every group, mirroring the title's `z == clear` bias-leg construction
+/// so native `depthBias` flips the comparison. Same contract as the other
+/// offscreen draws: one submit, 5 s fence wait, `"no "`-prefixed
+/// missing-device errors.
 fn draw_groups_offscreen(
-    vs_words: &[u32],
+    vs_sets: &[Vec<u32>],
+    group_vs: &[usize],
     fs_words: &[u32],
     groups: &[ReplayDraw],
     want_depth: bool,
 ) -> Result<OffscreenPixels, String> {
+    debug_assert!(!vs_sets.is_empty(), "S4 always resolves at least the list set");
+    debug_assert_eq!(group_vs.len(), groups.len(), "S4 maps every group to a VS set");
     unsafe {
         let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
         let app = CString::new("xcl").unwrap();
@@ -1438,7 +1488,7 @@ fn draw_groups_offscreen(
                 rp: Option<ash::vk::RenderPass>,
                 fbo: Option<ash::vk::Framebuffer>,
                 layout: Option<ash::vk::PipelineLayout>,
-                vs_mod: Option<ash::vk::ShaderModule>,
+                vs_mods: Vec<ash::vk::ShaderModule>,
                 fs_mod: Option<ash::vk::ShaderModule>,
                 pipes: Vec<ash::vk::Pipeline>,
                 pool: Option<ash::vk::CommandPool>,
@@ -1462,7 +1512,7 @@ fn draw_groups_offscreen(
                         if let Some(m) = self.fs_mod.take() {
                             d.destroy_shader_module(m, None);
                         }
-                        if let Some(m) = self.vs_mod.take() {
+                        for m in self.vs_mods.drain(..) {
                             d.destroy_shader_module(m, None);
                         }
                         if let Some(l) = self.layout.take() {
@@ -1513,7 +1563,7 @@ fn draw_groups_offscreen(
                     rp: None,
                     fbo: None,
                     layout: None,
-                    vs_mod: None,
+                    vs_mods: Vec::new(),
                     fs_mod: None,
                     pipes: Vec::new(),
                     pool: None,
@@ -1699,35 +1749,39 @@ fn draw_groups_offscreen(
                     .create_pipeline_layout(&layout_info, None)
                     .map_err(|e| format!("create_pipeline_layout(groups): {e}"))?;
                 scope.layout = Some(layout);
-                // Depth-tested replay draws the z = 0.5 triangle (see the
-                // worker docs); anything else uses the caller's words.
+                // S4 per-group VS: one module per distinct word set; the
+                // depth-tested replay appends the z = 0.5 triangle (see the
+                // worker docs) and every group uses it.
+                for (i, words) in vs_sets.iter().enumerate() {
+                    let vs_info = ash::vk::ShaderModuleCreateInfo::default().code(words);
+                    let vs_mod = d
+                        .create_shader_module(&vs_info, None)
+                        .map_err(|e| format!("create_shader_module(groups vs {i}): {e}"))?;
+                    scope.vs_mods.push(vs_mod);
+                }
                 let z05;
-                let vs_use: &[u32] = if want_depth {
+                let z05_idx = if want_depth {
                     z05 = triangle_vs_spv_z05();
-                    &z05
+                    let vs_info = ash::vk::ShaderModuleCreateInfo::default().code(&z05);
+                    let vs_mod = d
+                        .create_shader_module(&vs_info, None)
+                        .map_err(|e| format!("create_shader_module(groups vs z05): {e}"))?;
+                    scope.vs_mods.push(vs_mod);
+                    Some(scope.vs_mods.len() - 1)
                 } else {
-                    vs_words
+                    None
                 };
-                let vs_info = ash::vk::ShaderModuleCreateInfo::default().code(vs_use);
-                let vs_mod = d
-                    .create_shader_module(&vs_info, None)
-                    .map_err(|e| format!("create_shader_module(groups vs): {e}"))?;
-                scope.vs_mod = Some(vs_mod);
+                let vs_handles = scope.vs_mods.clone();
                 let fs_info = ash::vk::ShaderModuleCreateInfo::default().code(fs_words);
                 let fs_mod = d
                     .create_shader_module(&fs_info, None)
                     .map_err(|e| format!("create_shader_module(groups fs): {e}"))?;
                 scope.fs_mod = Some(fs_mod);
                 let entry_name = CString::new("main").unwrap();
-                let vs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
-                    .stage(ash::vk::ShaderStageFlags::VERTEX)
-                    .module(vs_mod)
-                    .name(&entry_name);
                 let fs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
                     .stage(ash::vk::ShaderStageFlags::FRAGMENT)
                     .module(fs_mod)
                     .name(&entry_name);
-                let stages = [vs_stage, fs_stage];
                 let vi_info = ash::vk::PipelineVertexInputStateCreateInfo::default();
                 let ia_info = ash::vk::PipelineInputAssemblyStateCreateInfo::default()
                     .topology(ash::vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -1758,18 +1812,27 @@ fn draw_groups_offscreen(
                     ash::vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
                 let ms_info = ash::vk::PipelineMultisampleStateCreateInfo::default()
                     .rasterization_samples(ash::vk::SampleCountFlags::TYPE_1);
-                // Per-group pipeline variant: (mask, depth, bias, slope, clamp).
-                let mut variants: Vec<((u8, bool, u32, u32, u32), ash::vk::Pipeline)> = Vec::new();
-                let mut pipeline_for = |mask: u8,
+                // Per-group pipeline variant: (VS set, mask, depth, bias,
+                // slope, clamp). The VS stage is built per variant so each
+                // group draws with its own module.
+                let mut variants: Vec<((usize, u8, bool, u32, u32, u32), ash::vk::Pipeline)> =
+                    Vec::new();
+                let mut pipeline_for = |vi: usize,
+                                        mask: u8,
                                         depth: bool,
                                         bias: f32,
                                         slope: f32,
                                         clamp: f32|
                  -> Result<ash::vk::Pipeline, String> {
-                    let key = (mask, depth, bias.to_bits(), slope.to_bits(), clamp.to_bits());
+                    let key = (vi, mask, depth, bias.to_bits(), slope.to_bits(), clamp.to_bits());
                     if let Some((_, p)) = variants.iter().find(|(k, _)| *k == key) {
                         return Ok(*p);
                     }
+                    let vs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
+                        .stage(ash::vk::ShaderStageFlags::VERTEX)
+                        .module(vs_handles[vi])
+                        .name(&entry_name);
+                    let stages = [vs_stage, fs_stage];
                     let biased = depth && (bias != 0.0 || slope != 0.0);
                     let rs_info = ash::vk::PipelineRasterizationStateCreateInfo::default()
                         .polygon_mode(ash::vk::PolygonMode::FILL)
@@ -1888,7 +1951,7 @@ fn draw_groups_offscreen(
                     })
                     .clear_values(&clears);
                 d.cmd_begin_render_pass(cmds[0], &rp_begin, ash::vk::SubpassContents::INLINE);
-                for g in groups {
+                for (gi, g) in groups.iter().enumerate() {
                     let (vx, vy, vw, vh, vmin, vmax) = (
                         g.viewport[0],
                         g.viewport[1],
@@ -1915,8 +1978,12 @@ fn draw_groups_offscreen(
                         continue;
                     }
                     let eff_depth = want_depth && g.depth_test;
-                    let pipe =
-                        pipeline_for(g.rt0_mask, eff_depth, g.depth_bias, g.depth_slope, g.depth_clamp)?;
+                    // S4: depth groups share the z05 module; the rest draw
+                    // with their own set's module.
+                    let vi = z05_idx.unwrap_or(group_vs[gi]);
+                    let pipe = pipeline_for(
+                        vi, g.rt0_mask, eff_depth, g.depth_bias, g.depth_slope, g.depth_clamp,
+                    )?;
                     d.cmd_bind_pipeline(cmds[0], ash::vk::PipelineBindPoint::GRAPHICS, pipe);
                     // D3D viewports address y-down: negative-height Vulkan
                     // viewport lands the title's top-left quadrant top-left.
@@ -2640,6 +2707,28 @@ mod tests {
         assert!(!detail.is_empty(), "fallback must say why");
         let (_, fallback_empty, _) = super::resolve_record_vs(&[]);
         assert!(fallback_empty, "empty bytes must fall back");
+    }
+
+    #[test]
+    fn group_vs_sets_resolve_per_group_vs() {
+        // S4 failing shape: groups under different PSOs resolve to distinct
+        // word sets (slot 0 is the list resolve, inherited by empty groups);
+        // same-bytes groups share one set. No device: resolve is in-process.
+        use crate::gpu::xbox::tests::{fssm, sample};
+        let list = sample(1, &[fssm(&blit_code(), &[(4, 0)])]);
+        let own = ReplayDraw { vs_bytes: list.clone(), ..Default::default() };
+        let bad = ReplayDraw { vs_bytes: vec![0xAAu8; 64], ..Default::default() };
+        let inherit = ReplayDraw::default();
+        let (sets, idx, fallback) = super::group_vs_sets(&list, &[own, bad, inherit]);
+        assert_eq!(sets.len(), 2, "container words + fallback triangle");
+        assert_eq!(idx, vec![0, 1, 0], "own/inherit slot mapping");
+        assert!(fallback, "garbage group must flag fallback");
+        // Single-PSO title shape: everything inherits, one set, no fallback.
+        let (single, sidx, sfb) =
+            super::group_vs_sets(&list, &[ReplayDraw::default(), ReplayDraw::default()]);
+        assert_eq!(single.len(), 1, "one PSO means one word set");
+        assert_eq!(sidx, vec![0, 0]);
+        assert!(!sfb, "complete container must not fall back");
     }
 
     #[test]

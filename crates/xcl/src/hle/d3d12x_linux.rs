@@ -682,6 +682,27 @@ pub fn list_record_for(list: usize) -> Option<ListDrawRecord> {
     list_store().lock().unwrap().get(&list).cloned()
 }
 
+/// Copy one PSO record's VS bytes out (title graphics memory is host
+/// memory; garbage lengths fail closed to the triangle fallback instead of
+/// faulting). S4 uses this per group so each draw replays its own PSO's VS.
+fn pso_vs_bytes(rec: &PsoRecord) -> Vec<u8> {
+    if rec.vs_ptr != 0 && rec.vs_len != 0 && rec.vs_len < (16 << 20) {
+        unsafe { std::slice::from_raw_parts(rec.vs_ptr as *const u8, rec.vs_len).to_vec() }
+    } else {
+        Vec::new()
+    }
+}
+
+/// S4: per-group VS bytes for Execute — a group drawn under a different PSO
+/// carries that PSO's bytes; same-PSO and unknown-PSO groups inherit the
+/// list-level bytes (empty).
+fn group_own_vs_bytes(op_pso: usize, list_pso: usize) -> Vec<u8> {
+    if op_pso == 0 || op_pso == list_pso {
+        return Vec::new();
+    }
+    pso_record_for(op_pso).map(|rec| pso_vs_bytes(&rec)).unwrap_or_default()
+}
+
 /// Stash the PSO's draw bytes for `obj` (store-only; keeps today's capture).
 pub unsafe fn record_graphics_pso(obj: *mut NullObj, desc: *const u8) {
     capture_graphics_desc(desc);
@@ -891,11 +912,7 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
         // Copy the VS bytes out from under the store lock (the title's
         // graphics memory is host memory; cap garbage lengths at the
         // triangle fallback instead of faulting).
-        let bytes = if r.pso_info.vs_ptr != 0 && r.pso_info.vs_len < (16 << 20) && r.pso_info.vs_len != 0 {
-            std::slice::from_raw_parts(r.pso_info.vs_ptr as *const u8, r.pso_info.vs_len).to_vec()
-        } else {
-            Vec::new()
-        };
+        let bytes = pso_vs_bytes(&r.pso_info);
         match crate::gpu::recomp::vulkan_graphics::build_record_pipeline(&bytes, r.pso_info.num_rtv) {
             Ok(sum) => crate::xlog_debug!(
                 "D3D12.X Execute: record pipeline built (vs {} words, fallback {}: {})",
@@ -914,6 +931,8 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
         }
         // S6: replay each counted draw group (viewport, blend mask, depth
         // bias) in list order; an empty group list replays the S4 single draw.
+        // S4: a group drawn under a different PSO carries that PSO's VS
+        // bytes (empty inherits the list bytes above).
         let groups: Vec<crate::gpu::recomp::vulkan_graphics::ReplayDraw> = r
             .ops
             .iter()
@@ -925,11 +944,13 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
                 depth_bias: o.depth_bias,
                 depth_slope: o.depth_slope,
                 depth_clamp: o.depth_clamp,
+                vs_bytes: group_own_vs_bytes(o.pso, r.pso),
             })
             .collect();
         match crate::gpu::recomp::vulkan_graphics::execute_draw_ops(&bytes, &groups) {
             Ok((px, fallback)) => {
-                crate::xlog_debug!("D3D12.X Execute: offscreen submit ({} groups, fallback {fallback})", groups.len());
+                let own = groups.iter().filter(|g| !g.vs_bytes.is_empty()).count();
+                crate::xlog_debug!("D3D12.X Execute: offscreen submit ({} groups, {own} own-VS, fallback {fallback})", groups.len());
                 *last_pixels_store().lock().unwrap() = Some(px.clone());
                 // S5 readback: fill the list's stashed committed-RT copies
                 // from the submit's pixels, then drop them.
@@ -4355,6 +4376,25 @@ mod tests {
             assert_eq!(at2(8, 48), [0, 255, 0, 255], "static PSO bias passes");
             assert_eq!(at2(8, 8), [0, 0, 255, 255], "zero PSO bias does not leak");
         }
+    }
+
+    #[test]
+    fn draw_s4_per_group_vs_bytes_follow_bound_pso() {
+        // S4 failing shape: a group drawn under a different PSO carries that
+        // PSO's VS bytes; same-PSO and unknown-PSO groups inherit (empty).
+        let a: &'static [u8] = Box::leak(vec![0xA1u8; 32].into_boxed_slice());
+        let b: &'static [u8] = Box::leak(vec![0xB2u8; 48].into_boxed_slice());
+        let (pa, pb, pl) = (0x5_4000_001usize, 0x5_4000_002usize, 0x5_4000_003usize);
+        for (id, blob) in [(pa, a), (pb, b), (pl, a)] {
+            super::pso_store().lock().unwrap().insert(
+                id,
+                super::PsoRecord { vs_ptr: blob.as_ptr() as usize, vs_len: blob.len(), ..Default::default() },
+            );
+        }
+        assert_eq!(super::group_own_vs_bytes(pa, pl), a, "other PSO carries its own bytes");
+        assert_eq!(super::group_own_vs_bytes(pb, pl), b);
+        assert!(super::group_own_vs_bytes(pl, pl).is_empty(), "list PSO inherits");
+        assert!(super::group_own_vs_bytes(0x5_4000_099, pl).is_empty(), "unknown PSO inherits");
     }
 
     /// Calls `f(this)` (Win64) the way console code does, with a writable pointer left in rdx.    #[cfg(all(target_arch = "x86_64", windows))]
