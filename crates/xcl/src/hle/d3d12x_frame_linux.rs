@@ -1,13 +1,14 @@
 //! Linux twin of the console frame clock (`hle/d3d12x/frame.rs` is Windows-only).
 //! Split 1a: the pure core — interval helpers plus token issuance and flip statistics.
-//! Split 1b adds the schedule state machine, the `Condvar`/monotonic clock thread with
-//! `wait_frame_event`, and the `signal_ancillary` stub (the `kernelx_linux::SetEvent`
-//! compat point); device slots #78–#81 and `PresentX` stay unrouted until then.
+//! Split 1b (this): the schedule state machine (`set_frame_interval`,
+//! `schedule_frame_event`) plus the `signal_ancillary` honest stub. Split 1c
+//! adds the `Condvar`/monotonic clock thread with `wait_frame_event`;
+//! device slots #78–#81 and queue #30 `PresentX` stay unrouted until 1d.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::util::{E_FAIL, HRESULT};
+use crate::util::{E_FAIL, E_INVALIDARG, HRESULT, S_FALSE};
 
 const TOKEN_MASK: u64 = 0xFFFF_FFFF_FFFF;
 const KNOWN_TOKENS: usize = 64;
@@ -126,9 +127,119 @@ pub fn frame_statistics(token: u64) -> Result<(i64, i64), HRESULT> {
         .ok_or(E_FAIL)
 }
 
+// --- Split 1b: schedule state machine + `signal_ancillary` honest stub. ---
+// Unrouted (null default): device slots #78–#81 and queue #30 stay logging
+// stubs in `d3d12x_linux`, so this clock only runs once routed behind
+// `XCL_VULKAN_BACKEND` — no behavior change while unset. Split 1c adds the
+// `Condvar`/monotonic clock thread with `wait_frame_event`; `PresentX` stays
+// stubbed until 1d.
+
+const TYPES: usize = 3;
+/// What `schedule_frame_event` returns when it starts the clock.
+const STARTED_CLOCK: HRESULT = 0x1000_0000;
+/// `ScheduleFrameEventX` flag.
+const UNSCHEDULE: u32 = 1;
+
+struct Clock {
+    interval_us: u32,
+    active: bool,
+    offset_us: [u32; TYPES],
+    scheduled: [bool; TYPES],
+    /// Bumped on every change: the 1c clock thread re-plans off this.
+    generation: u64,
+    base_ns: i64,
+}
+
+static CLOCK: Mutex<Clock> = Mutex::new(Clock {
+    interval_us: 0,
+    active: false,
+    offset_us: [0; TYPES],
+    scheduled: [false; TYPES],
+    generation: 0,
+    base_ns: 0,
+});
+
+/// `XCL_FRAME_INTERVAL_US` override, read once (1a parses; the 1c clock applies).
+#[allow(dead_code)]
+fn interval_override() -> Option<u32> {
+    static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+    *OVERRIDE
+        .get_or_init(|| parse_interval_override(std::env::var("XCL_FRAME_INTERVAL_US").ok().as_deref()))
+}
+
+/// Device #78 twin (length only): `E_INVALIDARG` off-display intervals, else
+/// `S_FALSE`; length 0 stops the clock. 120 Hz needs a high-refresh display,
+/// unprobed on Linux, so those lengths stay invalid until 1c.
+pub fn set_frame_interval(len_us: u32) -> HRESULT {
+    if len_us != 0 && !interval_valid(len_us, false) {
+        return E_INVALIDARG;
+    }
+    {
+        let mut c = CLOCK.lock().unwrap();
+        if c.interval_us != len_us {
+            c.scheduled[0] = false;
+            if c.active && len_us != 0 {
+                c.base_ns = nanos();
+            }
+        }
+        c.interval_us = len_us;
+        if len_us == 0 {
+            c.active = false;
+            c.scheduled = [false; TYPES];
+        }
+        c.generation += 1;
+    }
+    S_FALSE
+}
+
+/// Device #79 twin (no ancillary block yet — 1c routes handles): `E_INVALIDARG`
+/// without an interval, for type >= 3, for a nonzero type before the origin is
+/// scheduled, or when unscheduling the origin; `STARTED_CLOCK` when this call
+/// starts the clock, else `S_FALSE`.
+pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
+    let unschedule = flags & UNSCHEDULE != 0;
+    let mut c = CLOCK.lock().unwrap();
+    if c.interval_us == 0
+        || (ty as usize) >= TYPES
+        || (!c.active && ty != 0)
+        || (unschedule && (ty == 0 || !c.scheduled[0]))
+    {
+        return E_INVALIDARG;
+    }
+    let started = !c.active;
+    if started {
+        c.active = true;
+        c.base_ns = nanos();
+    }
+    if unschedule {
+        c.scheduled[ty as usize] = false;
+    } else {
+        c.scheduled[ty as usize] = true;
+        c.offset_us[ty as usize] = offset_us % c.interval_us.max(1);
+    }
+    c.generation += 1;
+    if started {
+        STARTED_CLOCK
+    } else {
+        S_FALSE
+    }
+}
+
+/// Ancillary handles of a frame event: honest stub (1c routes real handles).
+/// Returns `S_FALSE` — nothing was signaled — and never fake-successes.
+pub fn signal_ancillary(count: usize) -> HRESULT {
+    if count > 0 {
+        crate::xlog_debug!("frame clock: {count} ancillary handles not routed yet");
+    }
+    S_FALSE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clock is one per process: the tests that drive it take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn interval_helpers_match_the_windows_clock() {
@@ -171,5 +282,23 @@ mod tests {
         assert_eq!(frame_statistics(a).unwrap().0, 44);
         assert!(frame_statistics(b).unwrap().0 >= 43);
         assert_eq!(frame_statistics(0xDEAD), Err(E_FAIL));
+    }
+
+    /// 1b failing-first: the schedule state machine validates like Windows
+    /// (the 1c clock thread has no waiter yet, so pacing is not asserted here).
+    #[test]
+    fn schedule_validates_like_the_windows_clock() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(set_frame_interval(16000), E_INVALIDARG);
+        assert_eq!(set_frame_interval(16667), S_FALSE);
+        assert_eq!(schedule_frame_event(1, 0, 0), E_INVALIDARG, "type 1 needs the origin");
+        assert_eq!(schedule_frame_event(3, 0, 0), E_INVALIDARG, "no type 3");
+        let hr = schedule_frame_event(0, 0, 0);
+        assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+        assert_eq!(schedule_frame_event(0, 0, UNSCHEDULE), E_INVALIDARG, "the origin never unschedules");
+        assert_eq!(schedule_frame_event(1, 0, UNSCHEDULE), S_FALSE, "unscheduling idle type 1");
+        assert_eq!(signal_ancillary(0), S_FALSE, "honest stub: nothing signaled");
+        assert_eq!(set_frame_interval(0), S_FALSE, "stops the clock");
+        assert_eq!(schedule_frame_event(0, 0, 0), E_INVALIDARG, "no interval, no schedule");
     }
 }
