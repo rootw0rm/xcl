@@ -2201,6 +2201,236 @@ mod tests {
         }
     }
 
+    /// M2 title-mem leg (title `title_texture`): `GetCopyableFootprints` hands
+    /// each subresource its own offset and mip dims, and PC `CopyTextureRegion`
+    /// (list slot 16) detiles the placed title memory into the readback buffer
+    /// — all four subs read back, and a rewritten sub re-reads its new texels.
+    /// Fails pre-slice: every footprint shares offset 0 and slot 16 is a stub.
+    #[test]
+    fn title_memory_texture_copy_detiles_all_subresources() {
+        unsafe {
+            // XG desc (0x38 B): the title's 80x40 array-2 mip-2 64KB_S_X shape.
+            let mut xd = [0u8; 0x38];
+            (xd.as_mut_ptr() as *mut u32).write_unaligned(3);
+            (xd.as_mut_ptr().add(0x10) as *mut u64).write_unaligned(80);
+            (xd.as_mut_ptr().add(0x18) as *mut u32).write_unaligned(40);
+            (xd.as_mut_ptr().add(0x1C) as *mut u16).write_unaligned(2);
+            (xd.as_mut_ptr().add(0x1E) as *mut u16).write_unaligned(2);
+            (xd.as_mut_ptr().add(0x20) as *mut u32).write_unaligned(28);
+            (xd.as_mut_ptr().add(0x2C) as *mut u32).write_unaligned(0x119);
+            let create_addr = crate::hle::xg_linux::exports()
+                .into_iter()
+                .find(|(n, _)| *n == "XGCreateTextureComputer")
+                .map(|(_, a)| a)
+                .unwrap();
+            type CreateXg = unsafe extern "win64" fn(*const u8, *mut *mut c_void) -> HRESULT;
+            let create: CreateXg = std::mem::transmute(create_addr);
+            let mut xg = std::ptr::null_mut();
+            assert!(create(xd.as_ptr(), &mut xg) >= 0 && !xg.is_null());
+            type Size = unsafe extern "win64" fn(*mut c_void) -> u64;
+            let size: Size = std::mem::transmute(slot(xg, 3));
+            let mut title = vec![0u8; size(xg) as usize];
+            type Into = unsafe extern "win64" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+            let into: Into = std::mem::transmute(slot(xg, 8));
+            let dims = |mip: u32| ((80u32 >> mip).max(1), (40u32 >> mip).max(1));
+            let texels = |sub: u32, salt: u8| -> Vec<u8> {
+                let (w, h) = dims(sub % 2);
+                (0..w * h * 4).map(|i| (i as u8).wrapping_mul(7).wrapping_add(sub as u8 * 31).wrapping_add(salt)).collect()
+            };
+            for sub in 0..4u32 {
+                let (w, h) = dims(sub % 2);
+                let t = texels(sub, 0);
+                assert_eq!(into(xg, title.as_mut_ptr(), 0, sub, t.as_ptr(), w * 4, w * h * 4), 0, "into sub {sub}");
+            }
+            // device side (u64-backed: the HLE reads descs with aligned loads)
+            let dev = device() as *mut c_void;
+            let mut desc = [0u64; 7];
+            let db = desc.as_mut_ptr() as *mut u8;
+            (db as *mut u32).write_unaligned(3);
+            (db.add(16) as *mut u64).write_unaligned(80);
+            (db.add(24) as *mut u32).write_unaligned(40);
+            (db.add(28) as *mut u16).write_unaligned(2);
+            (db.add(30) as *mut u16).write_unaligned(2);
+            (db.add(32) as *mut u32).write_unaligned(28);
+            (db.add(44) as *mut u32).write_unaligned(0x119);
+            type PlacedX = unsafe extern "win64" fn(*mut c_void, u64, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let placed: PlacedX = std::mem::transmute(slot(dev, 44));
+            let mut raw = std::ptr::null_mut();
+            assert_eq!(placed(dev, title.as_ptr() as u64, db as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut raw), S_OK);
+            type Fp = unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u64, *mut u8, *mut u32, *mut u64, *mut u64);
+            let fp: Fp = std::mem::transmute(slot(dev, 38));
+            let mut fps = [0u64; 16];
+            let mut total = 0u64;
+            fp(dev, db as *const u8, 0, 4, 0, fps.as_mut_ptr() as *mut u8, std::ptr::null_mut(), std::ptr::null_mut(), &mut total);
+            let fpsb = std::slice::from_raw_parts(fps.as_ptr() as *const u8, 128);
+            // each subresource gets its own offset and its mip dims
+            let mut offs = [0u64; 4];
+            for (i, b) in fpsb.chunks(32).enumerate().take(4) {
+                offs[i] = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                let w = u32::from_le_bytes(b[12..16].try_into().unwrap());
+                let h = u32::from_le_bytes(b[16..20].try_into().unwrap());
+                let (ew, eh) = dims(i as u32 % 2);
+                assert_eq!((w, h), (ew, eh), "fp[{i}] dims");
+            }
+            assert!(offs[0] < offs[1] && offs[1] < offs[2] && offs[2] < offs[3], "footprint offsets overlap: {offs:#x?}");
+            // readback buffer + PC list; CopyTextureRegion is list slot 16
+            let mut buf = [0u64; 7];
+            let bb = buf.as_mut_ptr() as *mut u8;
+            (bb as *mut u32).write_unaligned(1);
+            (bb.add(16) as *mut u64).write_unaligned(total);
+            let mut hp = [0u64; 3];
+            let hb = hp.as_mut_ptr() as *mut u8;
+            (hb as *mut u32).write_unaligned(3);
+            type Mk = unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: Mk = std::mem::transmute(slot(dev, 27));
+            let mut rb = std::ptr::null_mut();
+            assert_eq!(mk(dev, hb as *const c_void, 0, bb as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+            type MkList = unsafe extern "win64" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkl: MkList = std::mem::transmute(slot(dev, 12));
+            let mut list = std::ptr::null_mut();
+            assert_eq!(mkl(dev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut list), S_OK);
+            type Copy = unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u32, *const u8, *const u8);
+            let copy: Copy = std::mem::transmute(slot(list, 16));
+            type Map = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let map: Map = std::mem::transmute(slot(rb, 8));
+            let read_back = |salt: u8| {
+                for (i, f) in fpsb.chunks(32).enumerate().take(4) {
+                    let mut dst = [0u8; 48];
+                    (dst.as_mut_ptr() as *mut usize).write_unaligned(rb as usize);
+                    (dst.as_mut_ptr().add(8) as *mut u32).write_unaligned(1);
+                    dst[16..48].copy_from_slice(&f[..32]);
+                    let mut src = [0u8; 24];
+                    (src.as_mut_ptr() as *mut usize).write_unaligned(raw as usize);
+                    (src.as_mut_ptr().add(8) as *mut u32).write_unaligned(0);
+                    (src.as_mut_ptr().add(16) as *mut u32).write_unaligned(i as u32);
+                    copy(list, dst.as_ptr(), 0, 0, 0, src.as_ptr(), std::ptr::null());
+                }
+                let mut p = std::ptr::null_mut();
+                assert_eq!(map(rb, 0, std::ptr::null(), &mut p), S_OK);
+                for sub in 0..4u32 {
+                    let (w, h) = dims(sub % 2);
+                    let exp = texels(sub, if sub == 2 { salt } else { 0 });
+                    let b = &fpsb[sub as usize * 32..];
+                    let off = u64::from_le_bytes(b[0..8].try_into().unwrap()) as usize;
+                    let rp = u32::from_le_bytes(b[24..28].try_into().unwrap()) as usize;
+                    for y in 0..h as usize {
+                        let got = std::slice::from_raw_parts((p as *const u8).add(off + y * rp), w as usize * 4);
+                        assert_eq!(got, &exp[y * w as usize * 4..(y + 1) * w as usize * 4], "sub {sub} row {y}");
+                    }
+                }
+            };
+            read_back(0);
+            // a rewritten subresource re-reads with the new texels
+            let t2 = texels(2, 99);
+            assert_eq!(into(xg, title.as_mut_ptr(), 0, 2, t2.as_ptr(), 80 * 4, 80 * 40 * 4), 0);
+            read_back(99);
+            type Release = unsafe extern "win64" fn(*mut c_void) -> u32;
+            let release: Release = std::mem::transmute(slot(xg, 1));
+            release(xg);
+        }
+    }
+
+    /// M2 streaming leg (title `streamed_texture`): a texture placed at a
+    /// reservation copies zeros while nothing is mapped there, then copies its
+    /// texels once they are written — the copy runs at record time against the
+    /// placed VA. Fails pre-slice: slot 16 is a stub, so the texels never land.
+    #[test]
+    fn streamed_texture_copy_sees_texels_written_after_placement() {
+        unsafe {
+            // XG desc (0x38 B): the title's 64x64 4KB_S streaming shape.
+            let mut xd = [0u8; 0x38];
+            (xd.as_mut_ptr() as *mut u32).write_unaligned(3);
+            (xd.as_mut_ptr().add(0x10) as *mut u64).write_unaligned(64);
+            (xd.as_mut_ptr().add(0x18) as *mut u32).write_unaligned(64);
+            (xd.as_mut_ptr().add(0x1C) as *mut u16).write_unaligned(1);
+            (xd.as_mut_ptr().add(0x1E) as *mut u16).write_unaligned(1);
+            (xd.as_mut_ptr().add(0x20) as *mut u32).write_unaligned(28);
+            (xd.as_mut_ptr().add(0x2C) as *mut u32).write_unaligned(0x105);
+            let create_addr = crate::hle::xg_linux::exports()
+                .into_iter()
+                .find(|(n, _)| *n == "XGCreateTextureComputer")
+                .map(|(_, a)| a)
+                .unwrap();
+            type CreateXg = unsafe extern "win64" fn(*const u8, *mut *mut c_void) -> HRESULT;
+            let create: CreateXg = std::mem::transmute(create_addr);
+            let mut xg = std::ptr::null_mut();
+            assert!(create(xd.as_ptr(), &mut xg) >= 0 && !xg.is_null());
+            type Size = unsafe extern "win64" fn(*mut c_void) -> u64;
+            let size: Size = std::mem::transmute(slot(xg, 3));
+            // the reservation: address space with nothing mapped yet
+            let mut title = vec![0u8; size(xg) as usize];
+            let dev = device() as *mut c_void;
+            let mut desc = [0u64; 7];
+            let db = desc.as_mut_ptr() as *mut u8;
+            (db as *mut u32).write_unaligned(3);
+            (db.add(16) as *mut u64).write_unaligned(64);
+            (db.add(24) as *mut u32).write_unaligned(64);
+            (db.add(28) as *mut u16).write_unaligned(1);
+            (db.add(30) as *mut u16).write_unaligned(1);
+            (db.add(32) as *mut u32).write_unaligned(28);
+            (db.add(44) as *mut u32).write_unaligned(0x105);
+            type PlacedX = unsafe extern "win64" fn(*mut c_void, u64, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let placed: PlacedX = std::mem::transmute(slot(dev, 44));
+            let mut raw = std::ptr::null_mut();
+            assert_eq!(placed(dev, title.as_ptr() as u64, db as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut raw), S_OK);
+            type Fp = unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u64, *mut u8, *mut u32, *mut u64, *mut u64);
+            let fp: Fp = std::mem::transmute(slot(dev, 38));
+            let mut fpb = [0u64; 4];
+            let mut total = 0u64;
+            fp(dev, db as *const u8, 0, 1, 0, fpb.as_mut_ptr() as *mut u8, std::ptr::null_mut(), std::ptr::null_mut(), &mut total);
+            let mut buf = [0u64; 7];
+            let bbp = buf.as_mut_ptr() as *mut u8;
+            (bbp as *mut u32).write_unaligned(1);
+            (bbp.add(16) as *mut u64).write_unaligned(total);
+            let mut hp = [0u64; 3];
+            let hbp = hp.as_mut_ptr() as *mut u8;
+            (hbp as *mut u32).write_unaligned(3);
+            type Mk = unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: Mk = std::mem::transmute(slot(dev, 27));
+            let mut rb = std::ptr::null_mut();
+            assert_eq!(mk(dev, hbp as *const c_void, 0, bbp as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+            type MkList = unsafe extern "win64" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkl: MkList = std::mem::transmute(slot(dev, 12));
+            let mut list = std::ptr::null_mut();
+            assert_eq!(mkl(dev, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut list), S_OK);
+            type Copy = unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u32, *const u8, *const u8);
+            let copy: Copy = std::mem::transmute(slot(list, 16));
+            type Map = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let map: Map = std::mem::transmute(slot(rb, 8));
+            let fpbytes = std::slice::from_raw_parts(fpb.as_ptr() as *const u8, 32);
+            let mut dst = [0u8; 48];
+            (dst.as_mut_ptr() as *mut usize).write_unaligned(rb as usize);
+            (dst.as_mut_ptr().add(8) as *mut u32).write_unaligned(1);
+            dst[16..48].copy_from_slice(&fpbytes[..32]);
+            let mut src = [0u8; 24];
+            (src.as_mut_ptr() as *mut usize).write_unaligned(raw as usize);
+            (src.as_mut_ptr().add(8) as *mut u32).write_unaligned(0);
+            (src.as_mut_ptr().add(16) as *mut u32).write_unaligned(0);
+            // nothing mapped yet: the copy reads zeros
+            copy(list, dst.as_ptr(), 0, 0, 0, src.as_ptr(), std::ptr::null());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(map(rb, 0, std::ptr::null(), &mut p), S_OK);
+            let off = u64::from_le_bytes(fpbytes[0..8].try_into().unwrap()) as usize;
+            let rp = u32::from_le_bytes(fpbytes[24..28].try_into().unwrap()) as usize;
+            for y in 0..64usize {
+                assert!(std::slice::from_raw_parts((p as *const u8).add(off + y * rp), 256).iter().all(|&b| b == 0), "row {y} not zero before map-in");
+            }
+            // pages mapped in and texels written: the next copy sees them
+            let texels: Vec<u8> = (0..64 * 64 * 4).map(|i: u32| (i as u8).wrapping_mul(13) ^ 0x5A).collect();
+            type Into = unsafe extern "win64" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+            let into: Into = std::mem::transmute(slot(xg, 8));
+            assert_eq!(into(xg, title.as_mut_ptr(), 0, 0, texels.as_ptr(), 256, 256 * 64), 0);
+            copy(list, dst.as_ptr(), 0, 0, 0, src.as_ptr(), std::ptr::null());
+            assert_eq!(map(rb, 0, std::ptr::null(), &mut p), S_OK);
+            for y in 0..64usize {
+                assert_eq!(std::slice::from_raw_parts((p as *const u8).add(off + y * rp), 256), &texels[y * 256..(y + 1) * 256], "row {y}");
+            }
+            type Release = unsafe extern "win64" fn(*mut c_void) -> u32;
+            let release: Release = std::mem::transmute(slot(xg, 1));
+            release(xg);
+        }
+    }
+
     #[test]
     fn vulkan_list_memory_methods_act_on_host_memory() {
         // Step-17 list slice, pure logic (no device needed): writes, fill,
