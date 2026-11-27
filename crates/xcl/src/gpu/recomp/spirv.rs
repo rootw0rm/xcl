@@ -90,14 +90,44 @@ pub fn translate_vs_spirv(
     })
 }
 
-/// M2 draw S3: VS words for a stashed draw record. Minimal VertexIndex-only
-/// interface (no vertex inputs, Position-only output, `attr_base` 4):
-/// blit-class bytes translate in-process; anything else (PC DXBC, non-blit)
-/// fails closed with the backend's reason and the caller falls back to the
-/// hand-assembled title triangle.
+/// M2 draw DXBC S2: VS words for a stashed record container: the S1 console
+/// interface (inputs/locations, param table) with the FSSM's own program
+/// bytes and wave size (`fssm_wave64`), through the same `translate_vs_spirv`
+/// the S3 blit path uses. A non-VS stage, a missing program, or anything the
+/// backend rejects fails closed and the caller keeps today's triangle
+/// fallback.
+pub fn record_container_vs_words(blob: &[u8]) -> Result<SpirvTranslation, String> {
+    let sh = crate::gpu::xbox::parse(blob).ok_or_else(|| "not a console VS container".to_string())?;
+    if sh.stage != "VS" {
+        return Err(format!("console stage {} is not VS", sh.stage));
+    }
+    let f = sh
+        .fssm
+        .iter()
+        .find(|f| f.stages.first().is_some_and(|s| s.hw == 4))
+        .ok_or_else(|| "no hardware VS variant".to_string())?;
+    let vs = match super::interface(blob, &sh, f) {
+        Some(super::Mode::Vertex(vs)) => vs,
+        _ => return Err("unknown VS interface".into()),
+    };
+    let p = f.programs.first().ok_or_else(|| "FSSM without a program".to_string())?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    translate_vs_spirv(code, &vs, super::fssm_wave64(f, code))
+}
+
+/// M2 draw S3: VS words for a stashed draw record. A console VS container
+/// (S2) translates with its own interface (inputs/locations, param table)
+/// and wave size; raw bytes keep the minimal VertexIndex-only bring-up
+/// interface (no vertex inputs, Position-only output, `attr_base` 4).
+/// Empty bytes or anything the backend rejects (PC DXBC, non-blit) fails
+/// closed and the caller falls back to the hand-assembled title triangle.
 pub fn record_vs_words(code: &[u8]) -> Result<SpirvTranslation, String> {
     if code.is_empty() {
         return Err("empty VS bytes: no instructions to translate".into());
+    }
+    // S2: a stashed console container carries its own interface — use it.
+    if crate::gpu::xbox::is_xbox(code) {
+        return record_container_vs_words(code);
     }
     let vs = VsInterface {
         inputs: vec![],
@@ -1591,6 +1621,72 @@ mod tests {
         assert!(out_locs.contains(&0), "param out location 0 missing");
         assert!(g.glsl.contains("gl_Position"), "{}", g.glsl);
         assert!(g.glsl.contains("out_p0"), "{}", g.glsl);
+    }
+
+    #[test]
+    fn record_container_vs_uses_the_real_interface() {
+        // S2: a console VS container translates with its S1 interface
+        // (attr_base 4, FSSM param table) over its own program bytes/wave64 —
+        // the whole blob is not raw code. spirv-val gates the words.
+        use crate::gpu::xbox::tests::{fssm, sample};
+        let blob = sample(1, &[fssm(&blit_code(), &[(4, 0)])]);
+        let vs = super::super::record_vs_interface(&blob).expect("S1 interface");
+        assert_eq!(vs.attr_base, 4);
+        let t = super::record_vs_words(&blob).expect("container VS must translate");
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let ops = word_ops(&t.words);
+        let has = |op: u16, pred: &dyn Fn(&[u32]) -> bool| {
+            ops.iter().any(|(o, a)| *o == op && pred(a))
+        };
+        assert!(
+            has(OP_ENTRY_POINT, &|a| !a.is_empty()
+                && a[0] == EXEC_MODEL_VERTEX),
+            "missing Vertex entry point"
+        );
+        assert!(
+            has(OP_DECORATE, &|a| a.len() == 3
+                && a[1] == DECOR_BUILT_IN
+                && a[2] == BUILT_IN_POSITION),
+            "missing Position builtin"
+        );
+        let val = std::process::Command::new("spirv-val")
+            .arg("--version")
+            .output();
+        let Ok(which) = val else {
+            println!("spirv-val not available – skipping, structural checks gate");
+            return;
+        };
+        if !which.status.success() {
+            println!("spirv-val not available – skipping, structural checks gate");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-spirv-record-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spv = dir.join("record.vert.spv");
+        let bytes: Vec<u8> = t.words.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(&spv, &bytes).unwrap();
+        let out = std::process::Command::new("spirv-val")
+            .arg(&spv)
+            .output()
+            .expect("spawn spirv-val");
+        assert!(
+            out.status.success(),
+            "spirv-val failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn record_non_container_bytes_still_fail_closed() {
+        // S2 keeps today's fallback contract: PC DXBC (the title's bytes) and
+        // empty input never yield complete words — the caller stands the
+        // title triangle in.
+        use crate::gpu::xbox::tests::container;
+        let pc = container(&[(b"ISG1", &[0u8; 8])]);
+        let complete = super::record_vs_words(&pc).map(|t| t.complete()).unwrap_or(false);
+        assert!(!complete, "PC DXBC must fail closed");
+        assert!(super::record_vs_words(&[]).is_err(), "empty bytes must fail closed");
     }
 
     /// Same interface as the blit gate (position + one param), but selected by
