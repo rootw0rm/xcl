@@ -189,6 +189,83 @@ pub unsafe extern "win64" fn __acrt_iob_func(fd: u32) -> *mut u8 {
 }
 
 // ---------------------------------------------------------------------------------------
+// Time / RNG / stdio mode (M1.1a): the auto-stubs returned epoch 0 and a constant.
+// ---------------------------------------------------------------------------------------
+
+/// `__time64_t _time64(__time64_t *destTime)` — Unix epoch seconds from the host
+/// realtime clock, also mirrored through `destTime` when non-NULL. The title feeds the
+/// return to `imul rax,0xf4240` to build a millisecond stamp; the auto-stub's epoch 0
+/// made every derived timestamp 1970.
+pub unsafe extern "win64" fn _time64(dest: *mut i64) -> i64 {
+    let mut ts: libc::timespec = std::mem::zeroed();
+    libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+    let now = ts.tv_sec as i64;
+    if !dest.is_null() {
+        *dest = now;
+    }
+    now
+}
+
+/// `errno_t _set_fmode(int mode)` — report success without applying `mode`: this HLE
+/// has no backed CRT stdio translation, and the title only checks the return. The
+/// `__p__fmode` cell keeps its zeroed default so a read-back stays stable.
+pub unsafe extern "win64" fn _set_fmode(_mode: i32) -> i32 {
+    0
+}
+
+/// `int _register_thread_local_exe_atexit_callback(void (__cdecl *)(void))` — accept
+/// the pointer and report registered (`0`). XCL does not run the CRT's per-thread
+/// teardown, so the callback is deliberately not stored or invoked; the contract test
+/// pins that documented behaviour.
+pub unsafe extern "win64" fn _register_thread_local_exe_atexit_callback(_cb: usize) -> i32 {
+    0
+}
+
+/// SplitMix64 finalizer — the deterministic last resort for `_Random_device`.
+fn mix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// OS entropy for `std::_Random_device`: `getrandom(2)` first, `/dev/urandom` second.
+fn os_entropy_u32() -> Option<u32> {
+    let mut buf = [0u8; 4];
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_getrandom,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len() as libc::size_t,
+            0 as libc::c_uint,
+        )
+    };
+    if n == buf.len() as libc::c_long {
+        return Some(u32::from_ne_bytes(buf));
+    }
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom").ok()?;
+    f.read_exact(&mut buf).ok()?;
+    Some(u32::from_ne_bytes(buf))
+}
+
+/// Last resort when neither entropy source answers: mix the monotonic clock, which
+/// still advances between draws (never the auto-stub's constant 0).
+fn entropy_fallback() -> u32 {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let seed = (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64);
+    (mix64(seed) as u32) ^ ((mix64(seed ^ 0x9e37_79b9_7f4a_7c15) >> 32) as u32)
+}
+
+/// `unsigned int ?_Random_device@std@@YAIXZ` (MSVC `std::_Random_device`) — a live OS
+/// entropy draw, falling back to the monotonic-clock mix if both sources fail.
+pub unsafe extern "win64" fn random_device_std() -> u32 {
+    os_entropy_u32().unwrap_or_else(entropy_fallback)
+}
+
+// ---------------------------------------------------------------------------------------
 // Narrow init / atexit / initterm (success codes, with real table walks).
 // ---------------------------------------------------------------------------------------
 
@@ -3150,6 +3227,13 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("__p__wenviron", __p__wenviron as usize),
         ("_errno", _errno as usize),
         ("__acrt_iob_func", __acrt_iob_func as usize),
+        ("_time64", _time64 as usize),
+        ("_set_fmode", _set_fmode as usize),
+        (
+            "_register_thread_local_exe_atexit_callback",
+            _register_thread_local_exe_atexit_callback as usize,
+        ),
+        ("?_Random_device@std@@YAIXZ", random_device_std as usize),
         ("_set_app_type", _set_app_type as usize),
         ("_set_invalid_parameter_handler", _set_invalid_parameter_handler as usize),
         ("_get_invalid_parameter_handler", _get_invalid_parameter_handler as usize),
@@ -3351,6 +3435,52 @@ mod tests {
             assert!(!strerror(2).is_null());
             assert_eq!(strlen(strerror(2)), 13);
             assert!(!localeconv().is_null());
+        }
+    }
+
+    #[test]
+    fn time_rng_and_mode_contracts_are_live() {
+        // Retail M1.1a: these names resolved to the generic auto-stub (epoch 0, a
+        // constant RNG, no write at all). Wiring is only real when the export table
+        // carries the implementations.
+        for name in [
+            "_time64",
+            "_set_fmode",
+            "_register_thread_local_exe_atexit_callback",
+            "?_Random_device@std@@YAIXZ",
+        ] {
+            assert!(exports().iter().any(|(n, _)| *n == name), "{name} must be wired");
+        }
+        unsafe {
+            // `_time64` is the live epoch clock and mirrors it through the out-param.
+            let mut out = 0i64;
+            let t = _time64(&mut out);
+            assert_eq!(t, out);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            assert!(t >= 1_577_836_800, "epoch {t} is before 2020-01-01");
+            assert!((t - now).abs() <= 2, "epoch {t} vs now {now}");
+            assert!(_time64(std::ptr::null_mut()) >= t - 1);
+            // `_set_fmode` is a success no-op (CRT stdio is unbacked here).
+            assert_eq!(_set_fmode(0x4000), 0);
+            assert_eq!(_set_fmode(0x8000), 0);
+            // The thread-local exe-atexit registration reports success; XCL runs no
+            // CRT thread teardown, so the pointer is accepted and never invoked.
+            assert_eq!(_register_thread_local_exe_atexit_callback(0), 0);
+            assert_eq!(_register_thread_local_exe_atexit_callback(probe_a as usize), 0);
+            // `std::_Random_device` draws live entropy, never the constant 0.
+            assert!(os_entropy_u32().is_some(), "no OS entropy source answered");
+            let draws: Vec<u32> = (0..64).map(|_| random_device_std()).collect();
+            assert!(
+                draws.windows(2).any(|w| w[0] != w[1]),
+                "constant RNG: {draws:?}"
+            );
+            // The deterministic fallback still derives distinct values from distinct
+            // seeds (it is never the auto-stub's constant).
+            assert_ne!(mix64(1), mix64(2));
+            assert_ne!(mix64(1), 0);
         }
     }
 

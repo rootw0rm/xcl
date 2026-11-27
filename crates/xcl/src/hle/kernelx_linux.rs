@@ -2374,6 +2374,14 @@ pub unsafe extern "win64" fn GetSystemTimeAsFileTime(out: *mut FileTime) {
     (*out).high = (ticks >> 32) as u32;
 }
 
+/// `void GetSystemTimePreciseAsFileTime(LPFILETIME)` — 100 ns ticks since 1601-01-01
+/// from the host realtime clock. `clock_gettime` already yields nanosecond resolution,
+/// so this is the precise variant's precision class; NULL is a safe no-op (the
+/// auto-stub never wrote the out-param, leaving callers reading stale stack).
+pub unsafe extern "win64" fn GetSystemTimePreciseAsFileTime(out: *mut FileTime) {
+    GetSystemTimeAsFileTime(out);
+}
+
 pub unsafe extern "win64" fn Sleep(ms: u32) {
     if ms == 0 {
         std::thread::yield_now();
@@ -9562,6 +9570,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("QueryPerformanceCounter", QueryPerformanceCounter as usize),
         ("QueryPerformanceFrequency", QueryPerformanceFrequency as usize),
         ("GetSystemTimeAsFileTime", GetSystemTimeAsFileTime as usize),
+        ("GetSystemTimePreciseAsFileTime", GetSystemTimePreciseAsFileTime as usize),
         ("CreateEventW", CreateEventW as usize),
         ("CreateEventA", CreateEventA as usize),
         ("CreateSemaphoreExW", CreateSemaphoreExW as usize),
@@ -10144,6 +10153,27 @@ mod tests {
             GetSystemTimeAsFileTime(&mut ft);
             assert!(ft.high != 0 || ft.low != 0);
         }
+    }
+
+    #[test]
+    fn precise_file_time_tracks_realtime_clock() {
+        // Retail M1.1a: the auto-stub never wrote the out-param (3 calls before the
+        // fault), so callers read stale stack. The precise variant must land the
+        // current 100 ns FILETIME.
+        let mut ft = FileTime { low: 0, high: 0 };
+        unsafe { GetSystemTimePreciseAsFileTime(&mut ft) };
+        let ticks = ((ft.high as u64) << 32) | ft.low as u64;
+        assert_ne!(ticks, 0);
+        let unix = (ticks as i128 / 10_000_000) - 11_644_473_600;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i128;
+        assert!(unix > 1_577_836_800, "filetime {unix} is before 2020-01-01");
+        assert!((unix - now).abs() <= 2, "filetime {unix} vs now {now}");
+        // NULL is a safe no-op, and the name is wired into the export table.
+        unsafe { GetSystemTimePreciseAsFileTime(std::ptr::null_mut()) };
+        assert!(exports().iter().any(|(n, _)| *n == "GetSystemTimePreciseAsFileTime"));
     }
 
     #[test]

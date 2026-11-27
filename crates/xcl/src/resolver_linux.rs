@@ -579,6 +579,10 @@ mod tests {
             ("api-ms-win-crt-runtime-l1-1-0.dll", "_get_terminate"),
             ("api-ms-win-crt-heap-l1-1-0.dll", "_get_invalid_parameter_handler"),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "__CxxFrameHandler3"),
+            // M1.1a time/RNG/CRT-mode slice: real implementations, not auto-stubs.
+            ("api-ms-win-crt-time-l1-1-0.dll", "_time64"),
+            ("api-ms-win-crt-stdio-l1-1-0.dll", "_set_fmode"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_register_thread_local_exe_atexit_callback"),
             ("ucrtbase.dll", "memcpy"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
@@ -680,6 +684,8 @@ mod tests {
             ("msvcp140.dll", "_CxxThrowException"),
             ("vcruntime140.dll", "__CxxFrameHandler3"),
             ("msvcp140.dll", "__CxxFrameHandler4"),
+            // M1.1a: `std::_Random_device` is real OS entropy, not the constant stub.
+            ("msvcp140.dll", "?_Random_device@std@@YAIXZ"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
