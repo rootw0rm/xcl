@@ -63,12 +63,14 @@ const ERROR_MOD_NOT_FOUND: u32 = 126;
 
 // Wait results.
 pub const WAIT_OBJECT_0: u32 = 0;
+pub const WAIT_ABANDONED: u32 = 0x80;
 pub const WAIT_TIMEOUT: u32 = 258;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 
 const ERROR_TIMEOUT: u32 = 1460;
 const ERROR_TOO_MANY_POSTS: u32 = 298;
+const ERROR_NOT_OWNER: u32 = 288;
 
 // Memory types.
 const MEM_COMMIT: u32 = 0x1000;
@@ -444,6 +446,18 @@ fn resolve_tid(handle: usize) -> Option<u32> {
     }
 }
 
+/// Whether `tid` still names a live thread of this process (`tgkill(..., 0)` probe).
+fn thread_is_alive(tid: u32) -> bool {
+    unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::getpid() as libc::c_long,
+            tid as libc::c_long,
+            0 as libc::c_long,
+        ) == 0
+    }
+}
+
 pub unsafe extern "win64" fn GetCurrentProcess() -> usize {
     current_process_handle()
 }
@@ -468,6 +482,47 @@ pub unsafe extern "win64" fn GetThreadId(handle: usize) -> u32 {
             0
         }
     }
+}
+
+/// `HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid)` — opens a fresh handle for a
+/// live thread of this process. Access and inheritance are accepted (`-1` pseudo handles
+/// already carry all rights); the handle joins the `THREADS` table, so thread-state calls
+/// through it see the same record as the creation handle. Waits stay registered on the
+/// creation handle: a wait needs that thread's join, and an opened handle has none.
+pub unsafe extern "win64" fn OpenThread(_access: u32, _inherit: i32, tid: u32) -> usize {
+    if tid == 0 || !thread_is_alive(tid) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let record = threads()
+        .lock()
+        .unwrap()
+        .values()
+        .find(|r| r.tid.load(Ordering::Relaxed) == tid)
+        .cloned()
+        .unwrap_or_else(|| {
+            let current = tid == current_tid();
+            std::sync::Arc::new(ThreadRecord {
+                tid: AtomicU32::new(tid),
+                priority: AtomicU32::new(if current {
+                    CURRENT_PRIO.load(Ordering::Relaxed)
+                } else {
+                    THREAD_PRIORITY_NORMAL as u32
+                }),
+                boost: AtomicU32::new(if current {
+                    CURRENT_BOOST.load(Ordering::Relaxed)
+                } else {
+                    0
+                }),
+                ideal: AtomicU32::new(0),
+                name: Mutex::new(format!("xcl-open-{tid:x}")),
+                suspended_gate: None,
+            })
+        });
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    threads().lock().unwrap().insert(handle, record);
+    set_error(ERROR_SUCCESS);
+    handle
 }
 
 // ---------------------------------------------------------------------------------------
@@ -766,6 +821,27 @@ pub unsafe extern "win64" fn GetThreadPriorityBoost(handle: usize, disable: *mut
     1
 }
 
+/// `BOOL SetProcessPriorityBoost(HANDLE process, BOOL disable)` — Linux has no dynamic
+/// priority boost to toggle, so the request is an accepted scheduling hint: a disable
+/// request describes the host's behavior, and an enable request is logged once and
+/// ignored. A handle other than the current process fails like Windows.
+pub unsafe extern "win64" fn SetProcessPriorityBoost(handle: usize, disable: i32) -> i32 {
+    if handle != current_process_handle() {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if disable == 0 {
+        static WARNED: AtomicU32 = AtomicU32::new(0);
+        if WARNED.swap(1, Ordering::Relaxed) == 0 {
+            crate::xlog_debug!(
+                "SetProcessPriorityBoost(enable): Linux has no dynamic priority boost; ignored"
+            );
+        }
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
 /// The console's dedicated title cores (7 cores, cores 0..6).
 pub const CONSOLE_TITLE_CORES: u32 = 7;
 /// The console's title core affinity mask (cores 0..6).
@@ -797,11 +873,12 @@ pub fn fit_affinity_mask(mask: usize, allowed: usize) -> usize {
         })
 }
 
-fn process_affinity() -> usize {
+/// Live affinity mask of one host thread (`tid == 0` = the calling thread).
+fn affinity_mask_for_tid(tid: u32) -> Option<usize> {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) != 0 {
-            return usize::MAX;
+        if libc::sched_getaffinity(tid as libc::pid_t, std::mem::size_of_val(&set), &mut set) != 0 {
+            return None;
         }
         let mut mask = 0usize;
         for cpu in 0..(8 * std::mem::size_of::<libc::cpu_set_t>() as u32).min(usize::BITS) {
@@ -809,8 +886,12 @@ fn process_affinity() -> usize {
                 mask |= 1 << cpu;
             }
         }
-        if mask == 0 { usize::MAX } else { mask }
+        (mask != 0).then_some(mask)
     }
+}
+
+fn process_affinity() -> usize {
+    affinity_mask_for_tid(0).unwrap_or(usize::MAX)
 }
 
 fn fitted_affinity(mask: usize, what: &str) -> usize {
@@ -909,6 +990,44 @@ pub unsafe extern "win64" fn SetThreadGroupAffinity(
         (*prev).group = 0;
         (*prev).reserved = [0; 3];
     }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+/// `BOOL GetThreadGroupAffinity(HANDLE hThread, PGROUP_AFFINITY GroupAffinity)` — the target
+/// thread's live host mask in the single processor group Linux exposes. Mirrors
+/// [`SetThreadGroupAffinity`]: pseudo handles target the caller, a known record whose kernel
+/// tid is not stored yet inherits the process affinity, and an unknown handle fails.
+pub unsafe extern "win64" fn GetThreadGroupAffinity(
+    handle: usize,
+    out: *mut GroupAffinity,
+) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if handle == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let tid = if handle == current_thread_handle() {
+        current_tid()
+    } else {
+        match threads().lock().unwrap().get(&handle).map(|r| r.tid.load(Ordering::Relaxed)) {
+            Some(0) => 0, // created thread has not stored its kernel tid: inherit affinity
+            Some(tid) => tid,
+            None => {
+                set_error(ERROR_INVALID_HANDLE);
+                return 0;
+            }
+        }
+    };
+    let mask = affinity_mask_for_tid(tid)
+        .or_else(|| affinity_mask_for_tid(0))
+        .unwrap_or(usize::MAX);
+    (*out).mask = mask;
+    (*out).group = 0;
+    (*out).reserved = [0; 3];
     set_error(ERROR_SUCCESS);
     1
 }
@@ -1412,6 +1531,13 @@ pub unsafe extern "win64" fn WaitForSingleObject(handle: usize, timeout_ms: u32)
             WAIT_TIMEOUT
         };
     }
+    if let Some(m) = is_mutex(handle) {
+        return match wait_mutex(&m, timeout_ms) {
+            MutexOutcome::Acquired => WAIT_OBJECT_0,
+            MutexOutcome::Abandoned => WAIT_ABANDONED,
+            MutexOutcome::Timeout => WAIT_TIMEOUT,
+        };
+    }
     if joins().lock().unwrap().contains_key(&handle) {
         if let Some(code) = join_if_finished(handle) {
             let _ = code;
@@ -1735,6 +1861,167 @@ pub unsafe extern "win64" fn ReleaseSemaphore(
     }
     set_error(ERROR_SUCCESS);
     1
+}
+
+// ---------------------------------------------------------------------------------------
+// Mutexes: Linux-backed recursive mutexes (retail `CreateMutexA` path).
+// ---------------------------------------------------------------------------------------
+//
+// The title's early startup creates unnamed mutexes and releases them through
+// `ReleaseMutex`; the old auto-stubs returned NULL / FALSE, so every later wait on the
+// returned handle failed. These are real host objects in their own handle table (closed
+// through `CloseHandle`) and waitable through `WaitForSingleObject`: acquiring records the
+// owner's kernel tid and recurses for repeat acquires by that thread, `ReleaseMutex`
+// unwinds the recursion and wakes one waiter, and a release by anyone else fails with
+// `ERROR_NOT_OWNER`. Names/security/access are accepted and ignored (no cross-process
+// sharing on Linux), like the semaphore table.
+//
+// A waiter whose owner dies without releasing reports `WAIT_ABANDONED` and takes
+// ownership, as on Windows; the owner's liveness is probed with `tgkill`, so blocked
+// waits recheck it on a 20 ms tick. Multi-object waits (`WaitForMultipleObjects`) do not
+// cover mutexes yet: the title has no such consumer.
+//
+// Calling convention: every export is `unsafe extern "win64"` (DEC-013).
+
+struct MutexState {
+    inner: Mutex<MutexInner>,
+    cvar: Condvar,
+}
+
+struct MutexInner {
+    owner: u32,
+    recursion: u32,
+}
+
+static MUTEXES: OnceLock<Mutex<HashMap<usize, std::sync::Arc<MutexState>>>> = OnceLock::new();
+
+fn mutexes() -> &'static Mutex<HashMap<usize, std::sync::Arc<MutexState>>> {
+    MUTEXES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_mutex(handle: usize) -> Option<std::sync::Arc<MutexState>> {
+    mutexes().lock().unwrap().get(&handle).cloned()
+}
+
+fn close_mutex_handle(handle: usize) -> bool {
+    if let Some(m) = mutexes().lock().unwrap().remove(&handle) {
+        let mut g = m.inner.lock().unwrap();
+        g.owner = 0;
+        g.recursion = 0;
+        drop(g);
+        // Blocked waiters hold their own reference; wake them so a closed handle never
+        // strands a wait, then let them take the orphaned object.
+        m.cvar.notify_all();
+        true
+    } else {
+        false
+    }
+}
+
+enum MutexOutcome {
+    Acquired,
+    Abandoned,
+    Timeout,
+}
+
+const MUTEX_ABANDON_POLL: Duration = Duration::from_millis(20);
+
+fn wait_mutex(m: &std::sync::Arc<MutexState>, timeout_ms: u32) -> MutexOutcome {
+    let me = current_tid();
+    let deadline = if timeout_ms == 0 || timeout_ms == INFINITE {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+    };
+    let mut g = m.inner.lock().unwrap();
+    loop {
+        if g.owner == 0 {
+            g.owner = me;
+            g.recursion = 1;
+            return MutexOutcome::Acquired;
+        }
+        if g.owner == me {
+            g.recursion = g.recursion.saturating_add(1);
+            return MutexOutcome::Acquired;
+        }
+        if !thread_is_alive(g.owner) {
+            g.owner = me;
+            g.recursion = 1;
+            return MutexOutcome::Abandoned;
+        }
+        if timeout_ms == 0 {
+            return MutexOutcome::Timeout;
+        }
+        let step = match deadline {
+            None => MUTEX_ABANDON_POLL,
+            Some(d) => {
+                let now = Instant::now();
+                if now >= d {
+                    return MutexOutcome::Timeout;
+                }
+                (d - now).min(MUTEX_ABANDON_POLL)
+            }
+        };
+        let (guard, _) = m.cvar.wait_timeout(g, step).unwrap();
+        g = guard;
+    }
+}
+
+/// `HANDLE CreateMutexA(SECURITY_ATTRIBUTES*, BOOL initialOwner, LPCSTR name)` — a recursive
+/// mutex, owned by the caller when `initialOwner` is nonzero. Never NULL for valid args.
+pub unsafe extern "win64" fn CreateMutexA(
+    _attrs: *const c_void,
+    initial_owner: i32,
+    _name: *const u8,
+) -> usize {
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let owned = initial_owner != 0;
+    mutexes().lock().unwrap().insert(
+        id,
+        std::sync::Arc::new(MutexState {
+            inner: Mutex::new(MutexInner {
+                owner: if owned { current_tid() } else { 0 },
+                recursion: u32::from(owned),
+            }),
+            cvar: Condvar::new(),
+        }),
+    );
+    set_error(ERROR_SUCCESS);
+    id
+}
+
+/// `BOOL ReleaseMutex(HANDLE)` — unwinds one recursion level; the last release wakes one
+/// waiter. A thread that does not own the mutex fails with `ERROR_NOT_OWNER`.
+pub unsafe extern "win64" fn ReleaseMutex(handle: usize) -> i32 {
+    let Some(m) = is_mutex(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let mut g = m.inner.lock().unwrap();
+    if g.owner != current_tid() {
+        set_error(ERROR_NOT_OWNER);
+        return 0;
+    }
+    g.recursion = g.recursion.saturating_sub(1);
+    if g.recursion == 0 {
+        g.owner = 0;
+        drop(g);
+        m.cvar.notify_one();
+    }
+    set_error(ERROR_SUCCESS);
+    1
+}
+
+// ---------------------------------------------------------------------------------------
+// SList: the x64 SLIST_HEADER is two 64-bit words; an empty list is all zeros.
+// ---------------------------------------------------------------------------------------
+
+/// `VOID InitializeSListHead(PSLIST_HEADER)` — zero the 16-byte header (NULL is a no-op).
+pub unsafe extern "win64" fn InitializeSListHead(head: *mut c_void) {
+    if head.is_null() {
+        return;
+    }
+    std::ptr::write_bytes(head as *mut u8, 0, 16);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2289,6 +2576,10 @@ pub unsafe extern "win64" fn CloseHandle(handle: usize) -> i32 {
         return 1;
     }
     if close_sem_handle(handle) {
+        set_error(ERROR_SUCCESS);
+        return 1;
+    }
+    if close_mutex_handle(handle) {
         set_error(ERROR_SUCCESS);
         return 1;
     }
@@ -9522,6 +9813,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetThreadName", GetThreadName as usize),
         ("SetThreadpoolAffinityMask", SetThreadpoolAffinityMask as usize),
         ("SetThreadAffinityMask", SetThreadAffinityMask as usize),
+        ("GetThreadGroupAffinity", GetThreadGroupAffinity as usize),
         ("SetThreadGroupAffinity", SetThreadGroupAffinity as usize),
         ("SetThreadIdealProcessor", SetThreadIdealProcessor as usize),
         ("SetThreadIdealProcessorEx", SetThreadIdealProcessorEx as usize),
@@ -9552,12 +9844,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("GetCurrentProcessId", GetCurrentProcessId as usize),
         ("GetCurrentThreadId", GetCurrentThreadId as usize),
         ("GetThreadId", GetThreadId as usize),
+        ("OpenThread", OpenThread as usize),
         ("ExitProcess", ExitProcess as usize),
         ("TerminateProcess", TerminateProcess as usize),
         ("GetThreadPriority", GetThreadPriority as usize),
         ("SetThreadPriority", SetThreadPriority as usize),
         ("GetThreadPriorityBoost", GetThreadPriorityBoost as usize),
         ("SetThreadPriorityBoost", SetThreadPriorityBoost as usize),
+        ("SetProcessPriorityBoost", SetProcessPriorityBoost as usize),
         ("GetLastError", GetLastError as usize),
         ("SetLastError", SetLastError as usize),
         ("Sleep", Sleep as usize),
@@ -9578,6 +9872,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("CreateSemaphoreExA", CreateSemaphoreExA as usize),
         ("CreateSemaphoreA", CreateSemaphoreA as usize),
         ("ReleaseSemaphore", ReleaseSemaphore as usize),
+        ("CreateMutexA", CreateMutexA as usize),
+        ("ReleaseMutex", ReleaseMutex as usize),
+        ("InitializeSListHead", InitializeSListHead as usize),
         ("SetEvent", SetEvent as usize),
         ("ResetEvent", ResetEvent as usize),
         ("CloseHandle", CloseHandle as usize),
@@ -9882,6 +10179,172 @@ mod tests {
                 SetThreadIdealProcessorEx(0xDEAD_BEEF, &ideal, std::ptr::null_mut()),
                 0
             );
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn thread_group_affinity_reports_live_masks() {
+        unsafe {
+            // Null out-param, NULL handle and unknown handles fail cleanly.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(
+                GetThreadGroupAffinity(current_thread_handle(), std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            let mut ga: GroupAffinity = std::mem::zeroed();
+            set_error(ERROR_SUCCESS);
+            assert_eq!(GetThreadGroupAffinity(0, &mut ga), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            set_error(ERROR_SUCCESS);
+            assert_eq!(GetThreadGroupAffinity(0xDEAD_BEEF, &mut ga), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+
+            // The current thread reports group 0 and the live host mask, overwriting
+            // whatever the caller left in the out-param.
+            ga.mask = 0xAA;
+            ga.group = 7;
+            ga.reserved = [1, 2, 3];
+            assert_eq!(GetThreadGroupAffinity(current_thread_handle(), &mut ga), 1);
+            assert_ne!(ga.mask, 0);
+            assert_eq!(ga.group, 0);
+            assert_eq!(ga.reserved, [0; 3]);
+            assert_eq!(ga.mask, process_affinity());
+            assert_eq!(GetLastError(), ERROR_SUCCESS);
+        }
+    }
+
+    #[test]
+    fn open_thread_returns_distinct_handles_for_live_threads() {
+        unsafe {
+            let me = current_tid();
+            let a = OpenThread(0x1FFFFF, 0, me);
+            assert_ne!(a, 0);
+            assert_ne!(a, current_thread_handle());
+            let b = OpenThread(0x1FFFFF, 0, me);
+            assert_ne!(b, 0);
+            assert_ne!(b, a);
+            // Both handles address the same live thread state.
+            assert_eq!(SetThreadPriority(a, THREAD_PRIORITY_ABOVE_NORMAL), 1);
+            assert_eq!(GetThreadPriority(b), THREAD_PRIORITY_ABOVE_NORMAL);
+            let mut ga: GroupAffinity = std::mem::zeroed();
+            assert_eq!(GetThreadGroupAffinity(b, &mut ga), 1);
+            assert_eq!(ga.mask, process_affinity());
+            // Closing one opened handle leaves the other usable.
+            assert_eq!(CloseHandle(a), 1);
+            assert_eq!(GetThreadPriority(b), THREAD_PRIORITY_ABOVE_NORMAL);
+            assert_eq!(CloseHandle(b), 1);
+            assert_eq!(SetThreadPriority(current_thread_handle(), THREAD_PRIORITY_NORMAL), 1);
+
+            // Bogus and zero thread ids fail with NULL, never a fake handle.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(OpenThread(0x1FFFFF, 0, 0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+            set_error(ERROR_SUCCESS);
+            assert_eq!(OpenThread(0x1FFFFF, 0, 0x7FFF_FFF0), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn mutex_recursion_and_release_ownership() {
+        unsafe {
+            // Unnamed mutex, not initially owned: the first wait acquires, a second wait
+            // recurses, and only the owning thread can release.
+            let m = CreateMutexA(std::ptr::null(), 0, std::ptr::null());
+            assert_ne!(m, 0);
+            assert_eq!(WaitForSingleObject(m, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(m, 0), WAIT_OBJECT_0); // recursive acquire
+            let m2 = m;
+            assert_eq!(
+                std::thread::spawn(move || WaitForSingleObject(m2, 0)).join().unwrap(),
+                WAIT_TIMEOUT
+            );
+            assert_eq!(ReleaseMutex(m), 1); // recursion 2 -> 1
+            assert_eq!(ReleaseMutex(m), 1); // recursion 1 -> 0
+            set_error(ERROR_SUCCESS);
+            assert_eq!(ReleaseMutex(m), 0); // unowned: not the owner
+            assert_eq!(GetLastError(), ERROR_NOT_OWNER);
+            // Another thread can now acquire and release it.
+            let m3 = m;
+            let waiter = std::thread::spawn(move || {
+                let r = WaitForSingleObject(m3, 2000);
+                assert_eq!(r, WAIT_OBJECT_0);
+                assert_eq!(ReleaseMutex(m3), 1);
+                r
+            });
+            assert_eq!(waiter.join().unwrap(), WAIT_OBJECT_0);
+            // Unknown handles fail cleanly.
+            set_error(ERROR_SUCCESS);
+            assert_eq!(ReleaseMutex(0xDEAD_BEEF), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            assert_eq!(CloseHandle(m), 1);
+            assert_eq!(WaitForSingleObject(m, 0), WAIT_FAILED);
+            assert_eq!(ReleaseMutex(m), 0);
+        }
+    }
+
+    #[test]
+    fn mutex_wait_blocks_until_the_owner_releases() {
+        unsafe {
+            // Initially owned mutex: a 5 s wait in another thread is released by main.
+            let m = CreateMutexA(std::ptr::null(), 1, std::ptr::null());
+            assert_ne!(m, 0);
+            let m2 = m;
+            let waiter = std::thread::spawn(move || {
+                let r = WaitForSingleObject(m2, 5000);
+                if r == WAIT_OBJECT_0 {
+                    assert_eq!(ReleaseMutex(m2), 1);
+                }
+                r
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(ReleaseMutex(m), 1);
+            assert_eq!(waiter.join().unwrap(), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(m), 1);
+        }
+    }
+
+    #[test]
+    fn mutex_owner_death_reports_abandoned() {
+        unsafe {
+            let m = CreateMutexA(std::ptr::null(), 0, std::ptr::null());
+            assert_ne!(m, 0);
+            let m2 = m;
+            std::thread::spawn(move || {
+                assert_eq!(WaitForSingleObject(m2, 0), WAIT_OBJECT_0);
+                // Exit still holding the mutex.
+            })
+            .join()
+            .unwrap();
+            // Windows reports abandonment and grants ownership to the waiter.
+            assert_eq!(WaitForSingleObject(m, 0), WAIT_ABANDONED);
+            assert_eq!(ReleaseMutex(m), 1);
+            assert_eq!(CloseHandle(m), 1);
+        }
+    }
+
+    #[test]
+    fn initialize_slist_head_zeroes_the_16_byte_header() {
+        let mut buf = [0xFFu8; 24];
+        unsafe { InitializeSListHead(buf.as_mut_ptr() as *mut c_void) };
+        assert_eq!(&buf[..16], &[0u8; 16]);
+        assert_eq!(&buf[16..], &[0xFFu8; 8]); // guard bytes untouched
+        unsafe { InitializeSListHead(std::ptr::null_mut()) }; // NULL is a no-op
+    }
+
+    #[test]
+    fn set_process_priority_boost_accepts_the_current_process() {
+        unsafe {
+            // Linux has no dynamic priority boost; both requests are accepted hints.
+            assert_eq!(SetProcessPriorityBoost(current_process_handle(), 1), 1);
+            assert_eq!(SetProcessPriorityBoost(current_process_handle(), 0), 1);
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetProcessPriorityBoost(0xDEAD_BEEF, 1), 0);
+            assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+            set_error(ERROR_SUCCESS);
+            assert_eq!(SetProcessPriorityBoost(0, 1), 0);
             assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
         }
     }

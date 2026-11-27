@@ -398,6 +398,13 @@ mod tests {
             ("api-ms-win-core-synch-l1-1-0.dll", "CreateSemaphoreExW"),
             ("api-ms-win-core-synch-l1-1-0.dll", "CreateSemaphoreW"),
             ("api-ms-win-core-synch-l1-1-0.dll", "ReleaseSemaphore"),
+            // Step-02 thread/mutex/SList/affinity/priority pack.
+            ("api-ms-win-core-synch-l1-1-0.dll", "CreateMutexA"),
+            ("api-ms-win-core-synch-l1-1-0.dll", "ReleaseMutex"),
+            ("api-ms-win-core-processtopology-l1-1-0.dll", "GetThreadGroupAffinity"),
+            ("api-ms-win-core-processthreads-l1-1-0.dll", "OpenThread"),
+            ("api-ms-win-core-processthreads-l1-1-2.dll", "SetProcessPriorityBoost"),
+            ("api-ms-win-core-interlocked-l1-1-0.dll", "InitializeSListHead"),
             ("api-ms-win-core-synch-l1-1-0.dll", "InitializeConditionVariable"),
             ("api-ms-win-core-synch-l1-1-0.dll", "SleepConditionVariableCS"),
             ("api-ms-win-core-synch-l1-1-0.dll", "WakeConditionVariable"),
