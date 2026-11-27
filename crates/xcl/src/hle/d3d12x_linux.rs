@@ -660,7 +660,30 @@ unsafe fn approx_size(desc: *const u8) -> usize {
     (width.max(1) * height * depth * 4 * 4 / 3).min(256 << 20)
 }
 
-unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
+/// Committed-resource backing in the high-VA graphics pool (real committable host
+/// memory, so `Map` hands out the VA itself): small `READBACK` buffers go to
+/// window 3 (the coherent room) while committed textures avoid window 3 so they
+/// never eat that room — past it both fall back to the old fake-VA path, like
+/// the Windows slice past `COHERENT_KEPT` / `COHERENT_READBACK_MAX`. Buffers of
+/// any other heap type keep the old path (their legs already pass on it).
+unsafe fn committed_backing(hp: *const c_void, desc: *const u8, size: usize) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
+    // D3D12_HEAP_PROPERTIES: Type u32 @0 (DEFAULT=1, UPLOAD=2, READBACK=3).
+    let heap_ty = if hp.is_null() { 0 } else { (hp as *const u32).read_unaligned() };
+    // D3D12_RESOURCE_DESC: Dimension u32 @0 (BUFFER=1).
+    let dim = if desc.is_null() { 0 } else { *(desc as *const u32) };
+    if heap_ty == 3 && size <= (64 << 20) {
+        crate::hle::kernelx_linux::gfx_alloc_window3(size, 0x1_0000, true)
+    } else if dim != 1 {
+        crate::hle::kernelx_linux::gfx_alloc_avoid_window3(size, 0x1_0000, true)
+    } else {
+        None
+    }
+}
+
+unsafe fn new_resource(hp: *const c_void, desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
         return S_FALSE;
     }
@@ -669,6 +692,13 @@ unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
         std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 56);
     }
     let size = approx_size(desc);
+    if let Some(base) = committed_backing(hp, desc, size) {
+        // pool-backed: VA == Map address (the console's unified memory)
+        *(*o).mem.lock().unwrap() = (base, size);
+        (*o).value.store(base as u64, Ordering::Relaxed);
+        *ppv = o as *mut c_void;
+        return S_OK;
+    }
     *(*o).mem.lock().unwrap() = (0, size);
     // unique fake GPU VA (64 KiB aligned bump allocator)
     static NEXT_VA: AtomicU64 = AtomicU64::new(0x1_0000_0000);
@@ -698,11 +728,11 @@ unsafe extern "win64" fn Device_GetCustomHeapProperties(_t: *mut NullObj, ret: *
     }
     ret
 }
-unsafe extern "win64" fn Device_CreateCommittedResource(_t: *mut NullObj, _hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    new_resource(desc, ppv)
+unsafe extern "win64" fn Device_CreateCommittedResource(_t: *mut NullObj, hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    new_resource(hp, desc, ppv)
 }
-unsafe extern "win64" fn Device_CreateCommittedResource1(_t: *mut NullObj, _hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _ps: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    new_resource(desc, ppv)
+unsafe extern "win64" fn Device_CreateCommittedResource1(_t: *mut NullObj, hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _ps: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    new_resource(hp, desc, ppv)
 }
 /// Back a console buffer heap with the high-VA graphics pool: the pool address is a
 /// real committable host address in window 0, so placed buffers on it get VA == Map
@@ -763,10 +793,10 @@ unsafe extern "win64" fn Device_CreatePlacedResource(_t: *mut NullObj, h: *mut c
             return S_OK;
         }
     }
-    new_resource(desc, ppv)
+    new_resource(std::ptr::null(), desc, ppv)
 }
 unsafe extern "win64" fn Device_CreateReservedResource(_t: *mut NullObj, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    new_resource(desc, ppv)
+    new_resource(std::ptr::null(), desc, ppv)
 }
 unsafe extern "win64" fn Device_CreateFence(_t: *mut NullObj, initial: u64, _f: u32, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
@@ -2102,6 +2132,72 @@ mod tests {
             let mut prb = std::ptr::null_mut();
             assert_eq!(map(rb, 0, std::ptr::null(), &mut prb), S_OK);
             assert_eq!((prb as *const u32).read(), 0x1122_3344, "slot-15 copy did not land");
+        }
+    }
+
+    #[test]
+    fn committed_textures_leave_room_for_window3_readback() {
+        // M2 committed-tex leg (title `committed_textures_leave_room_for_readback`):
+        // committed textures avoid window 3, leaving the coherent room for
+        // readback, and a readback buffer made afterwards gets a window-3 VA
+        // with Map handing out the VA itself. Fails pre-slice: every
+        // committed resource gets a fake bump-allocator VA outside window 3.
+        unsafe {
+            let dev = device() as *mut c_void;
+            type MkCommitted = unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: MkCommitted = std::mem::transmute(slot(dev, 27));
+            // D3D12_RESOURCE_DESC (56 B): dim @0, Width u64 @16, Height u32 @24,
+            // Format u32 @32.
+            let tex_desc = |side: u64| {
+                let mut d = [0u8; 56];
+                (d.as_mut_ptr() as *mut u32).write_unaligned(3); // TEXTURE2D
+                (d.as_mut_ptr().add(16) as *mut u64).write_unaligned(side);
+                (d.as_mut_ptr().add(24) as *mut u32).write_unaligned(side as u32);
+                (d.as_mut_ptr().add(32) as *mut u32).write_unaligned(28); // R8G8B8A8_UNORM
+                d
+            };
+            let buf_desc = |bytes: u64| {
+                let mut d = [0u8; 56];
+                (d.as_mut_ptr() as *mut u32).write_unaligned(1); // BUFFER
+                (d.as_mut_ptr().add(16) as *mut u64).write_unaligned(bytes);
+                d
+            };
+            // D3D12_HEAP_PROPERTIES (20 B): Type u32 @0 (DEFAULT=1, READBACK=3).
+            let props = |ty: u32| {
+                let mut p = [0u8; 20];
+                (p.as_mut_ptr() as *mut u32).write_unaligned(ty);
+                p
+            };
+            let (def, rb_props) = (props(1), props(3));
+            let td = tex_desc(512);
+            let mut kept = Vec::new();
+            for _ in 0..8 {
+                let mut t = std::ptr::null_mut();
+                assert_eq!(mk(dev, def.as_ptr() as *const c_void, 0, td.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut t), S_OK);
+                assert!(!t.is_null());
+                kept.push(t);
+            }
+            // a render target with a console-only flag bit is still created
+            let rt = tex_desc(2048);
+            let mut r = std::ptr::null_mut();
+            assert_eq!(mk(dev, def.as_ptr() as *const c_void, 0, rt.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut r), S_OK);
+            assert!(!r.is_null());
+            kept.push(r);
+            type Va = unsafe extern "win64" fn(*mut c_void) -> u64;
+            let va: Va = std::mem::transmute(slot(kept[0], 11));
+            for t in &kept {
+                assert_ne!((va(*t) >> 32) & 3, 3, "committed texture in window 3: {:#x}", va(*t));
+            }
+            let bd = buf_desc(1 << 20);
+            let mut rb = std::ptr::null_mut();
+            assert_eq!(mk(dev, rb_props.as_ptr() as *const c_void, 0, bd.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+            assert!(!rb.is_null());
+            assert_eq!((va(rb) >> 32) & 3, 3, "readback buffer after the textures is not in window 3: {:#x}", va(rb));
+            type Map = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let map: Map = std::mem::transmute(slot(rb, 8));
+            let mut p = std::ptr::null_mut();
+            assert_eq!(map(rb, 0, std::ptr::null(), &mut p), S_OK);
+            assert_eq!(p as u64, va(rb), "readback Map != VA");
         }
     }
 

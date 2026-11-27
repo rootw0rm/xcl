@@ -2792,6 +2792,65 @@ pub(crate) fn gfx_alloc_window0(size: usize, align: usize, commit: bool) -> Opti
     })
 }
 
+/// First-fit `size` bytes at `align` inside the graphics pool whose whole range sits
+/// in unified-memory window 3 (`(addr >> 32) & 3 == 3` with `addr >> 32 >= 4`):
+/// the coherent room committed textures leave free, so small readback buffers made
+/// after them still get coherent memory (the title's `committed-tex` leg).
+pub(crate) fn gfx_alloc_window3(size: usize, align: usize, commit: bool) -> Option<usize> {
+    gfx_alloc_where(size, align, commit, |at, end| {
+        // jumps are multiples of 4 GiB, which every real alignment (a power of two
+        // at or below 4 GiB) divides, so `at` stays aligned throughout.
+        let mut c = at;
+        loop {
+            let hi = c >> 32;
+            if hi >= 4 && hi & 3 == 3 {
+                if c.checked_add(size).is_some_and(|e| e <= end) && (c + size - 1) >> 32 == hi {
+                    return Some(c);
+                }
+                // no room left in this window: continue past its end
+                c = hi.checked_add(1)?.checked_shl(32)? as usize;
+            } else if hi < 4 {
+                c = 4 << 32;
+            } else {
+                c = hi.checked_add((3 + 4 - (hi & 3)) % 4)?.checked_shl(32)? as usize;
+            }
+            if c >= end {
+                return None;
+            }
+        }
+    })
+}
+
+/// First-fit `size` bytes at `align` inside the graphics pool whose whole range
+/// avoids unified-memory window 3 (single-window containment, like UMA: no
+/// allocation straddles windows): committed textures never eat the coherent
+/// readback room. `None` when no such range is free — the texture is then a
+/// plain PC resource, like the Windows slice past `COHERENT_KEPT`.
+pub(crate) fn gfx_alloc_avoid_window3(size: usize, align: usize, commit: bool) -> Option<usize> {
+    gfx_alloc_where(size, align, commit, |at, end| {
+        let mut c = at;
+        loop {
+            let hi = c >> 32;
+            if hi >= 4
+                && hi & 3 != 3
+                && c.checked_add(size).is_some_and(|e| e <= end)
+                && (c + size - 1) >> 32 == hi
+            {
+                return Some(c);
+            }
+            if hi < 4 {
+                c = 4 << 32;
+            } else {
+                // window 3, or no room / straddles the window end: past this window
+                c = hi.checked_add(1)?.checked_shl(32)? as usize;
+            }
+            if c >= end {
+                return None;
+            }
+        }
+    })
+}
+
 fn gfx_alloc_where(
     size: usize,
     align: usize,
