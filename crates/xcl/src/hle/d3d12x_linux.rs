@@ -24,6 +24,18 @@
 //! (`gpu.rs:312`) — the M1 first-frame gate, to route behind
 //! `XCL_VULKAN_BACKEND` (null stays default). No fake-success: the route must
 //! present a real frame or stay an honest logging stub.
+//
+//! Step-146 note (2026-11-27): re-verified at `46f7a172` — queue #30 and
+//! device #78–#81 are still logging stubs (no `v[78..81]` / queue `v[30]`
+//! assignment below), and the retail abort path still issues zero d3d12
+//! calls (`SIGSEGV game_scarlett_master.exe+0x2237320`, 20 `called_stubs`
+//! with no d3d12 entry, `xcl.log` with no d3d12/PresentX/frame line, xgr
+//! exactly XAsync/XNetworking/XUser). Routing this slice moves nothing until
+//! the game advances past the abort, so it stays unrouted. Linux PresentX
+//! additionally needs a `frame_linux` twin (`hle/d3d12x/frame.rs` is
+//! Windows-only: `windows_sys` handles + waitable-timer clock thread) plus
+//! windowed present wiring — queued for when the frontier reaches a console
+//! slot call, not before.
 
 #![allow(non_snake_case)]
 
