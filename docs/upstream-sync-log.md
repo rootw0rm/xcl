@@ -1796,3 +1796,51 @@ newest at the bottom.
 - Tasks filed: none (no keepers in window; #2929/#2930 already owned
   by step-150 P4). No overlap with step-147 (#2926 dxil hunks) or
   step-148 (xuser twin test).
+
+## 2026-11-27 — step-153 (task-1795741500-8257): triage #2935 (window >2934), top now #2935, probe past #2935
+
+- `upstream/main` = `8b957bec` (unchanged; `merge-base --is-ancestor
+  upstream/main HEAD` exit 0 — zero sync fallout, fully merged).
+- Batched `git ls-remote upstream 'refs/pull/*/head'` (per
+  mem-1795715658-5c18): 2402 refs (delta +1 vs step-152's 2401 — the
+  #2935 ref itself). Numbers >2934 present: 2935 only (29xx glob tail
+  ends at `refs/pull/2935/head`). Per-PR probe: 2936..2960 ALL MISSING
+  (sequential per mem-1795712765-78dc — probed past first hit; #2932
+  gap stands) → top now #2935. Heads fetched (`pr2935`,
+  `pr2935merge`, deleted after review).
+- Pins re-verified (zero drift, no force-push): #2907 `7575f671`
+  + #2913 `992ef508` match step-145 pins. #2929 `a87d3c2a` + #2930
+  `4e008ce5` + #2931 `093a5fcd` + #2933 `1286ef91` + #2934 `dac9681b`
+  re-verified still OPEN (heads unchanged, `merge-base --is-ancestor`
+  vs `upstream/main` exit 1 each) → step-150 recheck stays pending.
+- Triage (1 OPEN):
+  - #2935 SKIP-FOR-NOW, blocked on parent stack (single commit
+    `b2a4ef48` "Recompiler: compute programs follow S# constants
+    across blocks too": `gpu/dxil/kernel.rs` +1/-1, `recomp/mod.rs`
+    +13/-2 inc. `s_movreld`/`s_movrelsd_2` forget-all, `recomp/tests.rs`
+    +206). The branch is stacked on feature-branch work NOT in
+    `upstream/main`: base `ecc0bb57` is-ancestor exit 1,
+    `merge-base HEAD pr2935` = `b49be183` with a 249-file diff, and
+    the parent S#-follow lineage (`82e4a9bb` = PR #2624 head — never
+    triaged in the notes archive; `fbfac4d0`; `d3602331` s_bfm +
+    64-bit-literal words) is in neither `upstream/main` nor the linux
+    tree. Our `constant_samplers` is still the old 2-arg
+    block-by-block form (`recomp/mod.rs:1509`, call sites
+    `mod.rs:1631` + `dxil/kernel.rs:598` carry no `follow`), and we
+    have no `S_BFM_B32` arm — so NO hunk of #2935 applies cleanly;
+    porting it alone is meaningless. Keeper SHAPE, not keeper yet:
+    the core (`recomp/mod.rs` `translate()` + `emit.rs` `static_ss`
+    at `:58`/`:620`/`:2084`/`:2817`, all ungated) is shared code that
+    feeds the Linux HLSL/GLSL/SPIR-V output, so the feature WILL
+    matter on Linux once the parent lands (`recomp/tests.rs` itself
+    is `#[cfg(all(test, windows))]` and the direct-DXIL/kernel.rs
+    consumer is Windows/GPU-gated, but the `translate()` path is
+    not). Revisit when S#-follow lands in `upstream/main` (normal
+    sync will surface it: new `follow` param at the call sites).
+    Same blocked-shape category as #2929/#2930, whose parent-state
+    polling lives in step-150.
+- Tasks filed: step-154 (P4 watch: port the S#-follow stack —
+  parent #2624-lineage + #2935 — once the parent is in
+  `upstream/main`; key
+  `code-assist:linux-launcher:step-154:m5-sfollow-stack`). No overlap
+  with step-147 (#2926 dxil hunks) or step-148 (xuser twin test).
