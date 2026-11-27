@@ -302,6 +302,9 @@ fn vtable(kind: Kind) -> *const usize {
         // console DMA one — the single queue is already coherent, so the copy
         // lands at record time and ExecuteCommandLists stays a no-op.
         v[15] = Dma_CopyBufferRegion as usize;
+        // M2 title-mem/streaming leg: PC CopyTextureRegion (slot 16) detiles a
+        // placed title-memory texture into the readback buffer, same timing.
+        v[16] = List_CopyTextureRegion as usize;
         v[60] = VulList_CopyMemory as usize;
         v[61] = VulList_Fill32 as usize;
         v[69] = VulList_Write32Bottom as usize;
@@ -810,7 +813,7 @@ unsafe extern "win64" fn Device_CreateFence(_t: *mut NullObj, initial: u64, _f: 
 unsafe extern "win64" fn Device_GetCopyableFootprints(
     _t: *mut NullObj,
     desc: *const u8,
-    _first: u32,
+    first: u32,
     num: u32,
     base: u64,
     layouts: *mut u8,
@@ -823,6 +826,40 @@ unsafe extern "win64" fn Device_GetCopyableFootprints(
     let height = if desc.is_null() { 1 } else { (*(desc.add(24) as *const u32)).max(1) };
     let format = if desc.is_null() { 0 } else { *(desc.add(32) as *const u32) };
     let row = ((width * 4 + 255) & !255) as u32;
+    // M2 title-mem leg: a 2D texture's subresources (mip + slice × mips) each
+    // get their own offset and their mip dims, so per-subresource copies land
+    // in disjoint rows. Other descs keep the old shape.
+    let dim = if desc.is_null() { 0 } else { *(desc as *const u32) };
+    if dim == 3 && !desc.is_null() {
+        let mips = ((*(desc.add(30) as *const u16)) as u32).max(1);
+        let mut off = base;
+        for i in 0..num as usize {
+            let mip = (first as usize + i) as u32 % mips;
+            let w = (width >> mip).max(1);
+            let h = (height >> mip).max(1);
+            let rp = ((w * 4 + 255) & !255) as u32;
+            if !layouts.is_null() {
+                let l = layouts.add(i * 32);
+                *(l as *mut u64) = off;
+                *(l.add(8) as *mut u32) = format;
+                *(l.add(12) as *mut u32) = w as u32;
+                *(l.add(16) as *mut u32) = h as u32;
+                *(l.add(20) as *mut u32) = 1;
+                *(l.add(24) as *mut u32) = rp;
+            }
+            if !num_rows.is_null() {
+                *num_rows.add(i) = h as u32;
+            }
+            if !row_sizes.is_null() {
+                *row_sizes.add(i) = w * 4;
+            }
+            off += rp as u64 * h as u64;
+        }
+        if !total.is_null() {
+            *total = off - base;
+        }
+        return;
+    }
     for i in 0..num as usize {
         if !layouts.is_null() {
             let l = layouts.add(i * 32);
@@ -1198,6 +1235,116 @@ unsafe extern "win64" fn Dma_CopyBufferRegion(
         }
         std::ptr::copy_nonoverlapping(sp.add(src_off as usize), dp.add(dst_off as usize), n);
     }
+}
+
+/// An XG texture computer for the console's 0x38-byte desc, or `None` when the
+/// layout is not modelled. The table address is fixed: cache it.
+fn xg_computer(desc: &[u8; 0x38]) -> Option<*mut c_void> {
+    static ADDR: OnceLock<usize> = OnceLock::new();
+    let addr = *ADDR.get_or_init(|| {
+        crate::hle::xg_linux::exports()
+            .into_iter()
+            .find(|(n, _)| *n == "XGCreateTextureComputer")
+            .map(|(_, a)| a)
+            .unwrap_or(0)
+    });
+    if addr == 0 {
+        return None;
+    }
+    type Create = unsafe extern "win64" fn(*const u8, *mut *mut c_void) -> HRESULT;
+    let mut c = std::ptr::null_mut();
+    if unsafe { std::mem::transmute::<usize, Create>(addr)(desc.as_ptr(), &mut c) } < 0 || c.is_null() {
+        None
+    } else {
+        Some(c)
+    }
+}
+
+/// PC `CopyTextureRegion(dst, x, y, z, src, box)` on a command list: detile the
+/// subresource out of a placed title-memory texture into the destination
+/// buffer's footprint at record time (the single queue is already coherent, so
+/// the copy lands at once and `ExecuteCommandLists` stays a no-op — the same
+/// immediate semantics as the DMA `CopyBufferRegion`). Only the title's
+/// texture-readback shape is modelled: a whole-subresource (`box` null) RGBA8
+/// copy from a `PlacedResource` with no D3D12 flags into a buffer. Anything
+/// else (committed render targets, boxes, other formats) stays a silent no-op
+/// like the old stub.
+unsafe extern "win64" fn List_CopyTextureRegion(
+    _t: *mut NullObj,
+    dst: *const u8,
+    x: u32,
+    y: u32,
+    _z: u32,
+    src: *const u8,
+    bx: *const u8,
+) {
+    if dst.is_null() || src.is_null() || !bx.is_null() {
+        return;
+    }
+    // D3D12_TEXTURE_COPY_LOCATION: pResource @0, Type u32 @8 (destination
+    // PLACED_FOOTPRINT = 1, source SUBRESOURCE_INDEX = 0), union @16: the
+    // footprint (Offset u64 @16, Format u32 @24, Height u32 @32, RowPitch u32
+    // @40) or the subresource index u32 @16.
+    let dob = (dst as *const *mut NullObj).read_unaligned();
+    let sob = (src as *const *mut NullObj).read_unaligned();
+    if dob.is_null() || sob.is_null() {
+        return;
+    }
+    if (dst.add(8) as *const u32).read_unaligned() != 1
+        || (src.add(8) as *const u32).read_unaligned() != 0
+    {
+        return;
+    }
+    if (*sob).kind != Kind::PlacedResource {
+        return;
+    }
+    if (dst.add(24) as *const u32).read_unaligned() != 28 {
+        return;
+    }
+    let sub = (src.add(16) as *const u32).read_unaligned();
+    let va = (*sob).value.load(Ordering::Relaxed);
+    if va == 0 {
+        return;
+    }
+    // the placed texture's desc (56 B recorded at creation) as the console's
+    // 0x38-byte XG desc (dim, width, height, array, mips, format, samples,
+    // layout — D3D12 flags stay out: a flagged texture lays out differently).
+    let sd = &(*sob).desc;
+    if (sd.as_ptr() as *const u32).read_unaligned() != 3
+        || (sd.as_ptr().add(48) as *const u32).read_unaligned() != 0
+    {
+        return;
+    }
+    let mut xd = [0u8; 0x38];
+    xd[0..4].copy_from_slice(&sd[0..4]);
+    xd[0x10..0x18].copy_from_slice(&sd[16..24]);
+    xd[0x18..0x1C].copy_from_slice(&sd[24..28]);
+    xd[0x1C..0x1E].copy_from_slice(&sd[28..30]);
+    xd[0x1E..0x20].copy_from_slice(&sd[30..32]);
+    xd[0x20..0x24].copy_from_slice(&sd[32..36]);
+    xd[0x24..0x28].copy_from_slice(&sd[36..40]);
+    xd[0x2C..0x30].copy_from_slice(&sd[44..48]);
+    let Some(xg) = xg_computer(&xd) else {
+        return;
+    };
+    type Release = unsafe extern "win64" fn(*mut c_void) -> u32;
+    let release: Release = std::mem::transmute(*(*(xg as *const *const usize)).add(1));
+    // the computer's CopyFromSubresource detiles into linear rows (its slot 9):
+    // (computer, linear dst, plane, sub, tiled src, row pitch, slice pitch, 0).
+    type From = unsafe extern "win64" fn(*mut c_void, *mut u8, u32, u32, usize, usize, usize, usize) -> HRESULT;
+    let from: From = std::mem::transmute(*(*(xg as *const *const usize)).add(9));
+    let rp = (dst.add(40) as *const u32).read_unaligned() as u64;
+    let h = (dst.add(32) as *const u32).read_unaligned() as u64;
+    let off = (dst.add(16) as *const u64).read_unaligned();
+    let (dp, dn) = resource_backing(dob);
+    let start = off.saturating_add(y as u64 * rp).saturating_add(x as u64 * 4);
+    let end = start.saturating_add(rp.saturating_mul(h));
+    if dp.is_null() || end as usize > dn {
+        release(xg);
+        return;
+    }
+    from(xg, dp.add(start as usize), 0, sub, va as usize, rp as usize, rp.saturating_mul(h) as usize, 0);
+    release(xg);
 }
 
 // ---------------------------------------------------------------------------------------
