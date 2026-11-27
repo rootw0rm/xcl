@@ -1576,3 +1576,70 @@ newest at the bottom.
   retail fresh-root exit 139 SIGSEGV `exe+0x2237320` fault `0x0`,
   stubs 20, xgr exactly XAsync/XNetworking/XUser, `unmapped_paths` []
   — HOLDS. Lock audit: 0 new `lock()`; `diff --check` clean.
+
+## 2026-11-27 — step-145 (task-1795738571-a270): triage #2921–#2927 (window >2919), top now #2927, probe past #2927
+
+- `upstream/main` = `8b957bec` (unchanged; `merge-base --is-ancestor
+  upstream/main HEAD` exit 0 — zero sync fallout, fully merged).
+- Batched `git ls-remote upstream 'refs/pull/*/head'` (per
+  mem-1795715658-5c18, batched not sequential): 2395 refs. Numbers
+  >2919 present: 2921, 2922, 2923, 2924, 2925, 2926, 2927 (#2920 gap —
+  no ref, never-created/withdrawn; not a miss). Probe past top:
+  #2928/#2929/#2930 MISSING → top now #2927. All 7 heads fetched to
+  `prNNNNhead`.
+- Pins re-verified (steps 143–144, zero drift, no force-push): #2907
+  `7575f671` matches the step-143 pin (single-commit on
+  `upstream/main`, ported in `a867ee61`); #2913 `992ef508` — ref
+  unchanged since the manual sync fetch (no update line), matches what
+  `81bfb2c8` ported. Both still OPEN (`merge-base --is-ancestor` vs
+  `upstream/main` exit 1 each).
+- Triage (all 7 OPEN, `merge-base` exit 1 each):
+  - #2921 SKIP (single-commit `8b57c36e` on post-main stack `eff3bcab`;
+    2 files `hle/d3d12x/{pso_async,dispatch_chain}` — Windows-only
+    split-PSO whole-worker; no Linux twin).
+  - #2922 ALREADY-SATISFIED (single-commit `ecaa62d6` on
+    `upstream/main`; `api.rs` slots 10/12 → direct fns + COM
+    cross-namespace test. Linux twin `hle/xuser_linux.rs:612-635`
+    already enforces separate namespaces — `ByLocalId` only `LOCAL_ID`
+    (1), `ById` only `config().user_id` (default
+    `0x0009_0000_0000_0001`, distinct); slot table `:1206-1207`
+    already direct. No production port. Twin test gap: existing
+    `result_and_lookup_functions_null_outptrs_on_failure` covers
+    unknown IDs, not swapped-namespace IDs → follow-up task filed).
+  - #2923 ALREADY-SATISFIED (single-commit `143ddb11` on post-main
+    stack; `eh.rs`/`tls.rs` Windows RtlVirtualUnwind-over-stack-copy.
+    Linux `eh_linux.rs:80-91` already implements the same
+    copy-then-unwind discipline since #253 — SIGUSR2 park, `pread`
+    stack copy, walk reads only the copy. TEB/`frame_reach`/CONTEXT
+    machinery has no Linux consumer. No port.)
+  - #2924 SKIP (top commit `34161433`; README + `gpu/texture.rs` —
+    `texture.rs` is `cfg(windows)` (`gpu/mod.rs:23-24`); no Linux
+    texture path yet (Phase D). TTPF detile/archive improvements stay
+    Windows-only.)
+  - #2925 SKIP (3-commit stack `7fce1295`/`23d31316`/`a089b840` on
+    `b49be183`, parts of #1452/#2787; `hle/d3d12x/{list_x,real,
+    title_list}` — Windows-only split-list recovery. No Linux twin.)
+  - #2926 KEEPER (single-commit `a0e4c943` on `upstream/main`; typed
+    R8_UINT byte-store experiment, fully gated behind
+    `XCL_BYTE_STORE_CS=<hex hash>` for one compute shader. Shared
+    hunks have a Linux shape: `gpu/dxil` is shared (`gpu/mod.rs:12`,
+    no gate) — `kernel.rs` +3 (`byte_windows` flag + mask),
+    `lower.rs` +1 (`Lw::byte_windows` field), `lower_mem.rs` +24
+    (`st_bytes` typed path + `st_bytes_raw` split-out), `ops.rs` +6
+    (`heap_typed_buffer_with_coherence`); `gpu/recomp/mod.rs` +5
+    (`BYTE_WINDOWS`/`BYTE_HEAP_BASE`/`BYTE_SEGMENT_SHIFT`/
+    `BYTE_SEGMENTS` in the shared region) — all compile on Linux,
+    dormant unless `BYTE_WINDOWS` is set, which only the
+    Windows-only `recomp/pso.rs::console_to_dxil_in` does.
+    `core_tests.rs` is `cfg(all(test, windows))` (`dxil/mod.rs:51`)
+    so the test stays out per §9; `pso.rs` + `console_heap.rs`
+    hunks are Windows-only reference. → port task filed.)
+  - #2927 SKIP (single-commit `db0780c3` on post-main stack;
+    `hle/d3d12x/{title_textures,vram}` level-page giveback —
+    Windows-only. No Linux twin.)
+- Tasks filed: step-147 (port #2926 shared-dxil hunks verbatim, README
+  hunk included, failing-first via the Linux-runnable shape — the
+  upstream test itself is Windows-gated so a Linux-shaped pin test
+  covers the flag plumbing) + step-148 (#2922 twin
+  swapped-namespace test in `xuser_linux.rs`). Independent areas, both
+  unblocked.
