@@ -321,6 +321,38 @@ const OP_NOT: u16 = 200;
 const OP_LABEL: u16 = 248;
 const OP_RETURN: u16 = 253;
 const OP_FUNCTION_END: u16 = 56;
+const OP_EXT_INST_IMPORT: u16 = 11;
+const OP_EXT_INST: u16 = 12;
+const OP_U_CONVERT: u16 = 113;
+const OP_FDIV: u16 = 136;
+const OP_U_GREATER_THAN: u16 = 172;
+const OP_S_GREATER_THAN: u16 = 173;
+const OP_U_GREATER_THAN_EQUAL: u16 = 174;
+const OP_S_GREATER_THAN_EQUAL: u16 = 175;
+const OP_S_LESS_THAN: u16 = 177;
+const OP_U_LESS_THAN_EQUAL: u16 = 178;
+const OP_S_LESS_THAN_EQUAL: u16 = 179;
+const OP_FORD_EQUAL: u16 = 180;
+const OP_FUNORD_EQUAL: u16 = 181;
+const OP_FUNORD_NOT_EQUAL: u16 = 183;
+const OP_FUNORD_LESS_THAN: u16 = 185;
+const OP_FORD_GREATER_THAN: u16 = 186;
+const OP_FUNORD_GREATER_THAN: u16 = 187;
+const OP_FORD_LESS_THAN_EQUAL: u16 = 188;
+const OP_FUNORD_LESS_THAN_EQUAL: u16 = 189;
+const OP_FORD_GREATER_THAN_EQUAL: u16 = 190;
+const OP_FUNORD_GREATER_THAN_EQUAL: u16 = 191;
+/// Capability value (`SpvCapabilityInt64`), not an opcode.
+const CAP_INT64: u32 = 11;
+/// GLSL.std.450 instruction numbers this backend emits.
+const GLSL_TRUNC: u32 = 3;
+const GLSL_FLOOR: u32 = 8;
+const GLSL_SIN: u32 = 13;
+const GLSL_COS: u32 = 14;
+const GLSL_EXP2: u32 = 29;
+const GLSL_LOG2: u32 = 30;
+const GLSL_SQRT: u32 = 31;
+const GLSL_INVERSE_SQRT: u32 = 32;
 
 const EXEC_MODEL_VERTEX: u32 = 0;
 const ADDR_LOGICAL: u32 = 0;
@@ -392,6 +424,12 @@ struct SpirvEm {
     func_ty: u32,
     func_id: u32,
     label_id: u32,
+    /// GLSL.std.450 instruction-set id (declared once, used by unary float ops).
+    glsl_id: u32,
+    /// 64-bit unsigned type, declared lazily by `v_mul_hi_u32`.
+    u64_ty: u32,
+    /// Whether the module uses 64-bit integers (gates `Capability Int64`).
+    need_int64: bool,
     // Module sections.
     names: Vec<u32>,
     decor: Vec<u32>,
@@ -444,6 +482,9 @@ impl SpirvEm {
             func_ty: 0,
             func_id: 0,
             label_id: 0,
+            glsl_id: 0,
+            u64_ty: 0,
+            need_int64: false,
             names: Vec::new(),
             decor: Vec::new(),
             types_consts: Vec::new(),
@@ -578,6 +619,7 @@ impl SpirvEm {
         );
         let func_id = self.alloc();
         let label_id = self.alloc();
+        let glsl_id = self.alloc();
         self.void_ty = void_ty;
         self.bool_ty = bool_ty;
         self.uint_ty = uint_ty;
@@ -600,6 +642,7 @@ impl SpirvEm {
         self.func_ty = func_ty;
         self.func_id = func_id;
         self.label_id = label_id;
+        self.glsl_id = glsl_id;
     }
 
     fn global_var(&mut self, ptr_ty: u32, storage: u32) -> u32 {
@@ -734,6 +777,141 @@ impl SpirvEm {
 
     fn load(&mut self, ty: u32, ptr: u32) -> u32 {
         self.tmp(ty, OP_LOAD, &[ptr])
+    }
+
+    /// `OpBitcast` uint bits → f32.
+    fn as_float(&mut self, bits: u32) -> u32 {
+        let ty = self.float_ty;
+        self.tmp(ty, OP_BITCAST, &[bits])
+    }
+
+    /// `OpBitcast` f32 → uint bits (the register model stores bit patterns).
+    fn as_uint(&mut self, f: u32) -> u32 {
+        let ty = self.uint_ty;
+        self.tmp(ty, OP_BITCAST, &[f])
+    }
+
+    /// One-operand GLSL.std.450 instruction on an f32 bit pattern.
+    fn glsl_unary_f32(&mut self, x: u32, opnum: u32) -> u32 {
+        let ty = self.float_ty;
+        let glsl = self.glsl_id;
+        let fx = self.as_float(x);
+        let r = self.tmp(ty, OP_EXT_INST, &[glsl, opnum, fx]);
+        self.as_uint(r)
+    }
+
+    /// `v_fract_f32`: `x - floor(x)`, with RDNA's `>= 1.0` clamp to the
+    /// largest f32 below one (NaN stays NaN; matches the HLSL backend).
+    fn fract_f32(&mut self, x: u32) -> u32 {
+        let ft = self.float_ty;
+        let fx = self.as_float(x);
+        let floor = self.tmp(ft, OP_EXT_INST, &[self.glsl_id, GLSL_FLOOR, fx]);
+        let r = self.tmp(ft, OP_FSUB, &[fx, floor]);
+        let one_bits = self.uint_const(0x3F80_0000);
+        let one = self.as_float(one_bits);
+        let below_bits = self.uint_const(0x3F7F_FFFF);
+        let below_one = self.as_float(below_bits);
+        let cond = self.tmp(self.bool_ty, OP_FORD_GREATER_THAN_EQUAL, &[r, one]);
+        let sel = self.tmp(ft, OP_SELECT, &[cond, below_one, r]);
+        self.as_uint(sel)
+    }
+
+    /// `v_med3_f32` = `max(min(a, b), min(max(a, b), c))` (HLSL `med3f`).
+    fn med3_f32(&mut self, a: u32, b: u32, c: u32) -> u32 {
+        let lo = self.fmin(a, b);
+        let hi = self.fmax(a, b);
+        let hi = self.fmin(hi, c);
+        self.fmax(lo, hi)
+    }
+
+    /// `v_perm_b32`: four byte selectors in `sel`; 0-3 pick bytes of `b`
+    /// (VSRC1), 4-7 bytes of `a` (VSRC0), 8-11 sign bits, 12 zero, 13+ all-ones.
+    /// Same table as the HLSL backend's `perm_b32`.
+    fn perm_b32(&mut self, a: u32, b: u32, sel: u32) -> u32 {
+        let uint_ty = self.uint_ty;
+        let bool_ty = self.bool_ty;
+        let mut acc = self.uint_const(0);
+        let c0 = self.uint_const(0);
+        let c3 = self.uint_const(3);
+        let c4 = self.uint_const(4);
+        let c8 = self.uint_const(8);
+        let c255 = self.uint_const(0xFF);
+        for i in 0..4u32 {
+            let shift = self.uint_const(8 * i);
+            let k = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[sel, shift]);
+            let k = self.tmp(uint_ty, OP_BITWISE_AND, &[k, c255]);
+            // byte from b (k<4) / a (4<=k<8): the byte offset is k (mod 4).
+            let off = self.tmp(uint_ty, OP_BITWISE_AND, &[k, c3]);
+            let off = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[off, c3]);
+            let bb = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[b, off]);
+            let bb = self.tmp(uint_ty, OP_BITWISE_AND, &[bb, c255]);
+            let ab = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[a, off]);
+            let ab = self.tmp(uint_ty, OP_BITWISE_AND, &[ab, c255]);
+            let lt4 = self.tmp(bool_ty, OP_U_LESS_THAN, &[k, c4]);
+            let low = self.tmp(uint_ty, OP_SELECT, &[lt4, bb, ab]);
+            // sign/constant classes 8..12.
+            let bit_ff = |em: &mut Self, v: u32, sh: u32| -> u32 {
+                let shc = em.uint_const(sh);
+                let x = em.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[v, shc]);
+                let one = em.uint_const(1);
+                let x = em.tmp(uint_ty, OP_BITWISE_AND, &[x, one]);
+                let zero = em.uint_const(0);
+                let nz = em.tmp(bool_ty, OP_I_NOT_EQUAL, &[x, zero]);
+                let ff = em.uint_const(0xFF);
+                em.tmp(uint_ty, OP_SELECT, &[nz, ff, zero])
+            };
+            let s8 = bit_ff(self, b, 15);
+            let s9 = bit_ff(self, b, 31);
+            let s10 = bit_ff(self, a, 15);
+            let s11 = bit_ff(self, a, 31);
+            let mut high = c255;
+            let mut pick = |em: &mut Self, n: u32, v: u32| {
+                let nc = em.uint_const(n);
+                let eq = em.tmp(bool_ty, OP_I_EQUAL, &[k, nc]);
+                let sel = em.tmp(uint_ty, OP_SELECT, &[eq, v, high]);
+                high = sel;
+            };
+            pick(self, 12, c0);
+            pick(self, 11, s11);
+            pick(self, 10, s10);
+            pick(self, 9, s9);
+            pick(self, 8, s8);
+            let lt8 = self.tmp(bool_ty, OP_U_LESS_THAN, &[k, c8]);
+            let byte = self.tmp(uint_ty, OP_SELECT, &[lt8, low, high]);
+            let byte = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[byte, shift]);
+            acc = self.tmp(uint_ty, OP_BITWISE_OR, &[acc, byte]);
+        }
+        acc
+    }
+
+    /// 64-bit unsigned type, declared on first use with `Capability Int64`.
+    fn uint64_ty(&mut self) -> u32 {
+        if self.u64_ty == 0 {
+            let id = self.alloc();
+            inst(&mut self.types_consts, OP_TYPE_INT, &[id, 64, 0]);
+            self.u64_ty = id;
+            self.need_int64 = true;
+        }
+        self.u64_ty
+    }
+
+    fn uint64_const(&mut self, v: u64) -> u32 {
+        let ty = self.uint64_ty();
+        let id = self.alloc();
+        inst(&mut self.types_consts, OP_CONSTANT, &[ty, id, v as u32, (v >> 32) as u32]);
+        id
+    }
+
+    /// `v_mul_hi_u32`: high 32 bits of the widened 64-bit product.
+    fn mul_hi_u32(&mut self, a: u32, b: u32) -> u32 {
+        let ty64 = self.uint64_ty();
+        let ua = self.tmp(ty64, OP_U_CONVERT, &[a]);
+        let ub = self.tmp(ty64, OP_U_CONVERT, &[b]);
+        let p = self.tmp(ty64, OP_IMUL, &[ua, ub]);
+        let sh = self.uint64_const(32);
+        let hi = self.tmp(ty64, OP_SHIFT_R_LOGICAL, &[p, sh]);
+        let ty = self.uint_ty;
+        self.tmp(ty, OP_U_CONVERT, &[hi])
     }
 
     fn vgpr_var(&mut self, n: u64) -> u32 {
@@ -881,12 +1059,6 @@ impl SpirvEm {
             self.unsupported(d, "SDWA/DPP in the bring-up backend");
             return Ok(false);
         }
-        // Narrow VertexIndex-indexed select pattern (scalar-element only): VOP3 carries
-        // an explicit lane selector and V_CMPX writes EXEC, so both stay unsupported.
-        if name == "v_cndmask_b32" && d.enc.name != "ENC_VOP2" {
-            self.unsupported(d, "valu");
-            return Ok(false);
-        }
         match d.enc.name {
             "ENC_SOPP" => match name.as_str() {
                 "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Ok(true),
@@ -1026,31 +1198,176 @@ impl SpirvEm {
         self.tmp(uint_ty, OP_BITCAST, &[fr])
     }
 
-    fn valu(&mut self, d: &Decoded, name: &str) {
-        // Narrow VertexIndex-indexed select pattern (scalar-element only): V_CMP_EQ_U32
-        // in VOPC form writes the VCC homes (sgpr 106/107). The VOPC encoding carries no
-        // VDST, so this must not fall through to the destination logic below.
-        if name == "v_cmp_eq_u32" {
-            if d.enc.name != "ENC_VOPC" {
+    /// `v_cmp_*`: one boolean per lane (single-lane bring-up model), written as
+    /// an all-ones/all-zero mask into the destination SGPR pair. Ordered float
+    /// forms are false on NaN, the `n`-prefixed forms true, matching the DXIL
+    /// backend's `float_compare`.
+    fn vopc(&mut self, d: &Decoded, rest: &str) {
+        if !matches!(d.enc.name, "ENC_VOPC" | "ENC_VOP3") {
+            self.unsupported(d, "valu");
+            return;
+        }
+        let Some((opn, ty)) = rest.rsplit_once('_') else {
+            self.unsupported(d, "op");
+            return;
+        };
+        let (_, ins) = Self::ops(d);
+        if ins.len() != 2 {
+            self.unsupported(d, "op");
+            return;
+        }
+        let (Some(a), Some(b)) = (self.read(d, &ins[0]), self.read(d, &ins[1])) else {
+            self.unsupported(d, "op");
+            return;
+        };
+        let cond = match ty {
+            "u32" | "i32" => {
+                let signed = ty == "i32";
+                let op = match opn {
+                    "eq" => OP_I_EQUAL,
+                    "ne" | "lg" => OP_I_NOT_EQUAL,
+                    "lt" => {
+                        if signed {
+                            OP_S_LESS_THAN
+                        } else {
+                            OP_U_LESS_THAN
+                        }
+                    }
+                    "le" => {
+                        if signed {
+                            OP_S_LESS_THAN_EQUAL
+                        } else {
+                            OP_U_LESS_THAN_EQUAL
+                        }
+                    }
+                    "gt" => {
+                        if signed {
+                            OP_S_GREATER_THAN
+                        } else {
+                            OP_U_GREATER_THAN
+                        }
+                    }
+                    "ge" => {
+                        if signed {
+                            OP_S_GREATER_THAN_EQUAL
+                        } else {
+                            OP_U_GREATER_THAN_EQUAL
+                        }
+                    }
+                    _ => {
+                        self.unsupported(d, "valu");
+                        return;
+                    }
+                };
+                self.tmp(self.bool_ty, op, &[a, b])
+            }
+            "f32" => {
+                if opn == "class" {
+                    self.fclass_cond(a, b)
+                } else {
+                    let fa = self.as_float(a);
+                    let fb = self.as_float(b);
+                    let op = match opn {
+                        "lt" => OP_FORD_LESS_THAN,
+                        "eq" => OP_FORD_EQUAL,
+                        "le" => OP_FORD_LESS_THAN_EQUAL,
+                        "gt" => OP_FORD_GREATER_THAN,
+                        "ge" => OP_FORD_GREATER_THAN_EQUAL,
+                        // Unordered forms, true when either operand is NaN.
+                        "ne" | "lg" => OP_FUNORD_NOT_EQUAL,
+                        "ngt" => OP_FUNORD_LESS_THAN_EQUAL,
+                        "nge" => OP_FUNORD_LESS_THAN,
+                        "nlt" => OP_FUNORD_GREATER_THAN_EQUAL,
+                        "nle" => OP_FUNORD_GREATER_THAN,
+                        "neq" => OP_FUNORD_NOT_EQUAL,
+                        "nlg" => OP_FUNORD_EQUAL,
+                        _ => {
+                            self.unsupported(d, "valu");
+                            return;
+                        }
+                    };
+                    self.tmp(self.bool_ty, op, &[fa, fb])
+                }
+            }
+            _ => {
                 self.unsupported(d, "valu");
                 return;
             }
-            let (_, ins) = Self::ops(d);
-            if ins.len() != 2 {
-                self.unsupported(d, "op");
-                return;
+        };
+        let all = self.uint_const(0xFFFF_FFFF);
+        let zero = self.uint_const(0);
+        let mask = self.tmp(self.uint_ty, OP_SELECT, &[cond, all, zero]);
+        match d.enc.name {
+            "ENC_VOPC" => {
+                // Single-wave bring-up: the lane bit lives in VCC lo (sgpr 106).
+                self.store_sgpr(106, mask);
+                self.store_sgpr(107, zero);
             }
-            let (Some(a), Some(b)) = (self.read(d, &ins[0]), self.read(d, &ins[1])) else {
-                self.unsupported(d, "op");
-                return;
-            };
-            let cmp = self.tmp(self.bool_ty, OP_I_EQUAL, &[a, b]);
-            let all = self.uint_const(0xFFFF_FFFF);
-            let zero = self.uint_const(0);
-            let mask = self.tmp(self.uint_ty, OP_SELECT, &[cmp, all, zero]);
-            // Single-wave bring-up: the lane bit lives in VCC lo (sgpr 106); hi stays 0.
-            self.store_sgpr(106, mask);
-            self.store_sgpr(107, zero);
+            _ => {
+                let dst = Self::field(d, "VDST");
+                if dst == 125 {
+                    // null destination: discarded.
+                } else if dst > 126 {
+                    self.unsupported(d, "sdst");
+                } else {
+                    self.store_sgpr(dst, mask);
+                    self.store_sgpr(dst + 1, zero);
+                }
+            }
+        }
+    }
+
+    /// `v_cmp_class_f32` condition: `(mask >> class(value)) & 1 != 0`, with the
+    /// RDNA class bits 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denorm, 5 -0,
+    /// 6 +0, 7 +denorm, 8 +normal, 9 +inf (DXIL `fclass`).
+    fn fclass_cond(&mut self, bits: u32, mask: u32) -> u32 {
+        let ut = self.uint_ty;
+        let bt = self.bool_ty;
+        let c0 = self.uint_const(0);
+        let c1 = self.uint_const(1);
+        let c2 = self.uint_const(2);
+        let c3 = self.uint_const(3);
+        let c4 = self.uint_const(4);
+        let c5 = self.uint_const(5);
+        let c6 = self.uint_const(6);
+        let c7 = self.uint_const(7);
+        let c8 = self.uint_const(8);
+        let c9 = self.uint_const(9);
+        let c23 = self.uint_const(23);
+        let c31 = self.uint_const(31);
+        let c255 = self.uint_const(0xFF);
+        let c_frac = self.uint_const(0x7F_FFFF);
+        let c_quiet = self.uint_const(0x40_0000);
+        let e = self.tmp(ut, OP_SHIFT_R_LOGICAL, &[bits, c23]);
+        let e = self.tmp(ut, OP_BITWISE_AND, &[e, c255]);
+        let m = self.tmp(ut, OP_BITWISE_AND, &[bits, c_frac]);
+        let s = self.tmp(ut, OP_SHIFT_R_LOGICAL, &[bits, c31]);
+        let n = self.tmp(bt, OP_I_NOT_EQUAL, &[s, c0]);
+        let mnz = self.tmp(bt, OP_I_NOT_EQUAL, &[m, c0]);
+        let q = self.tmp(ut, OP_BITWISE_AND, &[m, c_quiet]);
+        let qn = self.tmp(bt, OP_I_NOT_EQUAL, &[q, c0]);
+        let nanc = self.tmp(ut, OP_SELECT, &[qn, c1, c0]);
+        let infc = self.tmp(ut, OP_SELECT, &[n, c2, c9]);
+        let special = self.tmp(ut, OP_SELECT, &[mnz, nanc, infc]);
+        let zc = self.tmp(ut, OP_SELECT, &[n, c5, c6]);
+        let dc = self.tmp(ut, OP_SELECT, &[n, c4, c7]);
+        let zero = self.tmp(ut, OP_SELECT, &[mnz, dc, zc]);
+        let normal = self.tmp(ut, OP_SELECT, &[n, c3, c8]);
+        let ez = self.tmp(bt, OP_I_EQUAL, &[e, c0]);
+        let emx = self.tmp(bt, OP_I_EQUAL, &[e, c255]);
+        let r = self.tmp(ut, OP_SELECT, &[ez, zero, normal]);
+        let class = self.tmp(ut, OP_SELECT, &[emx, special, r]);
+        let bit = self.tmp(ut, OP_SHIFT_R_LOGICAL, &[mask, class]);
+        let bit = self.tmp(ut, OP_BITWISE_AND, &[bit, c1]);
+        self.tmp(bt, OP_I_NOT_EQUAL, &[bit, c0])
+    }
+
+    fn valu(&mut self, d: &Decoded, name: &str) {
+        // V_CMP/V_CMPX write a mask, not a register: VOPC has the implicit VCC
+        // pair, VOP3 an explicit SGPR-pair destination. Neither may fall through
+        // to the register-destination logic below.
+        if let Some(rest) = name.strip_prefix("v_cmp_") {
+            self.vopc(d, rest);
             return;
         }
         let (outs, ins) = Self::ops(d);
@@ -1091,11 +1408,11 @@ impl SpirvEm {
         let res: Option<u32> = match name {
             "v_mov_b32" | "v_mov_fed_b32" => Some(a),
             "v_not_b32" => Some(self.tmp(uint_ty, OP_NOT, &[a])),
-            // Codebase/GPU convention (lower.rs F32_COMPARES): VCC-true picks VSRC1.
+            // Codebase/GPU convention (lower.rs F32_COMPARES): mask-true picks
+            // VSRC1. VOP2 reads the implicit VCC (`c`), VOP3 the explicit SRC2.
             "v_cndmask_b32" => {
-                let vcc = self.load_sgpr(106);
                 let zero = self.uint_const(0);
-                let cond = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[vcc, zero]);
+                let cond = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[c, zero]);
                 Some(self.tmp(uint_ty, OP_SELECT, &[cond, b, a]))
             }
             "v_and_b32" => Some(self.tmp(uint_ty, OP_BITWISE_AND, &[a, b])),
@@ -1122,6 +1439,48 @@ impl SpirvEm {
             "v_sub_nc_u32" | "v_sub_u32" => Some(self.tmp(uint_ty, OP_ISUB, &[a, b])),
             "v_subrev_nc_u32" | "v_subrev_u32" => Some(self.tmp(uint_ty, OP_ISUB, &[b, a])),
             "v_mul_lo_u32" => Some(self.tmp(uint_ty, OP_IMUL, &[a, b])),
+            "v_mul_hi_u32" => Some(self.mul_hi_u32(a, b)),
+            "v_lshl_add_u32" => {
+                let m = self.tmp(uint_ty, OP_BITWISE_AND, &[b, c31]);
+                let sh = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[a, m]);
+                Some(self.tmp(uint_ty, OP_IADD, &[sh, c]))
+            }
+            "v_lshl_or_b32" => {
+                let m = self.tmp(uint_ty, OP_BITWISE_AND, &[b, c31]);
+                let sh = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[a, m]);
+                Some(self.tmp(uint_ty, OP_BITWISE_OR, &[sh, c]))
+            }
+            "v_or3_b32" => {
+                let x = self.tmp(uint_ty, OP_BITWISE_OR, &[a, b]);
+                Some(self.tmp(uint_ty, OP_BITWISE_OR, &[x, c]))
+            }
+            "v_add3_u32" => {
+                let x = self.tmp(uint_ty, OP_IADD, &[a, b]);
+                Some(self.tmp(uint_ty, OP_IADD, &[x, c]))
+            }
+            // `o = b & 31`, `w = c & 31`; width 0 yields 0 (HLSL `bfe_u`).
+            "v_bfe_u32" => {
+                let o = self.tmp(uint_ty, OP_BITWISE_AND, &[b, c31]);
+                let w = self.tmp(uint_ty, OP_BITWISE_AND, &[c, c31]);
+                let c32 = self.uint_const(32);
+                let zero = self.uint_const(0);
+                let sh = self.tmp(uint_ty, OP_ISUB, &[c32, w]);
+                let sh = self.tmp(uint_ty, OP_BITWISE_AND, &[sh, c31]);
+                let full = self.uint_const(0xFFFF_FFFF);
+                let mask = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[full, sh]);
+                let v = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[a, o]);
+                let v = self.tmp(uint_ty, OP_BITWISE_AND, &[v, mask]);
+                let nz = self.tmp(self.bool_ty, OP_I_NOT_EQUAL, &[w, zero]);
+                Some(self.tmp(uint_ty, OP_SELECT, &[nz, v, zero]))
+            }
+            // `(a & b) | (~a & c)` (HLSL `bfi`).
+            "v_bfi_b32" => {
+                let x = self.tmp(uint_ty, OP_BITWISE_AND, &[a, b]);
+                let na = self.tmp(uint_ty, OP_NOT, &[a]);
+                let y = self.tmp(uint_ty, OP_BITWISE_AND, &[na, c]);
+                Some(self.tmp(uint_ty, OP_BITWISE_OR, &[x, y]))
+            }
+            "v_perm_b32" => Some(self.perm_b32(a, b, c)),
             "v_min_u32" => Some(self.umin(a, b)),
             "v_max_u32" => Some(self.umax(a, b)),
             "v_add_f32" => {
@@ -1175,6 +1534,58 @@ impl SpirvEm {
                 let fa = self.tmp(float_ty, OP_BITCAST, &[a]);
                 let ir = self.tmp(int_ty, OP_CONVERT_F_TO_S, &[fa]);
                 Some(self.tmp(uint_ty, OP_BITCAST, &[ir]))
+            }
+            "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
+                let k = (name.as_bytes()[name.len() - 1] - b'0') as u32;
+                let x = if k == 3 {
+                    let c24 = self.uint_const(24);
+                    self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[a, c24])
+                } else {
+                    let shc = self.uint_const(8 * k);
+                    let c255 = self.uint_const(0xFF);
+                    let sh = self.tmp(uint_ty, OP_SHIFT_R_LOGICAL, &[a, shc]);
+                    self.tmp(uint_ty, OP_BITWISE_AND, &[sh, c255])
+                };
+                let fr = self.tmp(float_ty, OP_CONVERT_U_TO_F, &[x]);
+                Some(self.tmp(uint_ty, OP_BITCAST, &[fr]))
+            }
+            "v_rcp_f32" | "v_rcp_iflag_f32" => {
+                let fx = self.tmp(float_ty, OP_BITCAST, &[a]);
+                let one_bits = self.uint_const(0x3F80_0000);
+                let one = self.tmp(float_ty, OP_BITCAST, &[one_bits]);
+                let fr = self.tmp(float_ty, OP_FDIV, &[one, fx]);
+                Some(self.tmp(uint_ty, OP_BITCAST, &[fr]))
+            }
+            "v_rsq_f32" => Some(self.glsl_unary_f32(a, GLSL_INVERSE_SQRT)),
+            "v_sqrt_f32" => Some(self.glsl_unary_f32(a, GLSL_SQRT)),
+            "v_exp_f32" => Some(self.glsl_unary_f32(a, GLSL_EXP2)),
+            "v_log_f32" => Some(self.glsl_unary_f32(a, GLSL_LOG2)),
+            "v_trunc_f32" => Some(self.glsl_unary_f32(a, GLSL_TRUNC)),
+            "v_fract_f32" => Some(self.fract_f32(a)),
+            "v_med3_f32" => Some(self.med3_f32(a, b, c)),
+            // RDNA sin/cos take the angle in turns (HLSL backend: x * 2pi).
+            "v_sin_f32" | "v_cos_f32" => {
+                let fx = self.tmp(float_ty, OP_BITCAST, &[a]);
+                let tau_bits = self.uint_const(0x40C9_0FDB);
+                let tau = self.tmp(float_ty, OP_BITCAST, &[tau_bits]);
+                let x = self.tmp(float_ty, OP_FMUL, &[fx, tau]);
+                let op = if name == "v_sin_f32" { GLSL_SIN } else { GLSL_COS };
+                let xb = self.tmp(uint_ty, OP_BITCAST, &[x]);
+                Some(self.glsl_unary_f32(xb, op))
+            }
+            "v_readfirstlane_b32" => Some(a),
+            "v_fmac_f32" => {
+                // VOP2/VOP3: vdst = src0 * src1 + vdst(old).
+                let old = match &dst {
+                    Some(Dst::V(n)) => self.load_vgpr(*n),
+                    _ => self.uint_const(0),
+                };
+                let fa = self.tmp(float_ty, OP_BITCAST, &[a]);
+                let fb = self.tmp(float_ty, OP_BITCAST, &[b]);
+                let fc = self.tmp(float_ty, OP_BITCAST, &[old]);
+                let m = self.tmp(float_ty, OP_FMUL, &[fa, fb]);
+                let fr = self.tmp(float_ty, OP_FADD, &[m, fc]);
+                Some(self.tmp(uint_ty, OP_BITCAST, &[fr]))
             }
             _ => None,
         };
@@ -1459,12 +1870,22 @@ impl SpirvEm {
         let mut head: Vec<u32> = vec![0x0723_0203, 0x0001_0000, 0x584C_0001, 0, 0];
         let mut cap: Vec<u32> = Vec::new();
         inst(&mut cap, OP_CAPABILITY, &[CAP_SHADER]);
+        if self.need_int64 {
+            inst(&mut cap, OP_CAPABILITY, &[CAP_INT64]);
+        }
+        // GLSL.std.450 for the transcendental/rounding ops; always declared so
+        // the import section does not depend on usage order.
+        let mut imports: Vec<u32> = Vec::new();
+        let mut glsl_ops = vec![self.glsl_id];
+        glsl_ops.extend(string_words("GLSL.std.450"));
+        inst(&mut imports, OP_EXT_INST_IMPORT, &glsl_ops);
         let mut mem: Vec<u32> = Vec::new();
         inst(&mut mem, OP_MEMORY_MODEL, &[ADDR_LOGICAL, MEM_GLSL450]);
         let bound = self.next;
         head[3] = bound;
         let mut out = head;
         out.extend_from_slice(&cap);
+        out.extend_from_slice(&imports);
         out.extend_from_slice(&mem);
         out.extend_from_slice(&entry);
         out.extend_from_slice(&self.names);
@@ -2133,6 +2554,363 @@ mod tests {
                 "shipped SPIR-V path mentions {needle}"
             );
         }
+    }
+
+    // ---- M2.2 step-09: pure-register VALU coverage -------------------------
+
+    /// Translate a synthetic program with the blit interface and require every
+    /// instruction to translate.
+    fn translated(code: &[u8]) -> SpirvTranslation {
+        let t = SpirvVsBackend::translate_vs(code, &blit_vs(), true).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t
+    }
+
+    /// Position export + `s_endpgm`, so the module is a well-formed VS.
+    fn end_program() -> Vec<u8> {
+        let mut code = encode(
+            "EXP",
+            "ENC_EXP",
+            &[
+                ("TGT", 12),
+                ("EN", 1),
+                ("VSRC0", 0),
+                ("VSRC1", 1),
+                ("VSRC2", 2),
+                ("VSRC3", 3),
+                ("DONE", 1),
+            ],
+            None,
+        )
+        .unwrap();
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    /// The same optional `spirv-val` gate the other module tests use.
+    fn assert_valid_spirv(t: &SpirvTranslation, label: &str) {
+        let val = std::process::Command::new("spirv-val")
+            .arg("--version")
+            .output();
+        let Ok(which) = val else {
+            println!("spirv-val not available – skipping, structural checks gate");
+            return;
+        };
+        if !which.status.success() {
+            println!("spirv-val not available – skipping, structural checks gate");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-spirv-valu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spv = dir.join(format!("{label}.vert.spv"));
+        let bytes: Vec<u8> = t.words.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(&spv, &bytes).unwrap();
+        let out = std::process::Command::new("spirv-val")
+            .arg(&spv)
+            .output()
+            .expect("spawn spirv-val");
+        assert!(
+            out.status.success(),
+            "spirv-val failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// `v_fmac_f32` reads the destination register old value as the addend (it
+    /// is not a three-source VOP3 instruction): the OpFAdd's second operand must
+    /// be an OpLoad from the destination variable, never a constant.
+    #[test]
+    fn valu_fmac_f32_reads_the_destination_as_addend() {
+        let mut code = encode(
+            "V_MOV_B32",
+            "ENC_VOP1",
+            &[("VDST", 2), ("SRC0", 242)],
+            None,
+        )
+        .unwrap();
+        code.extend(
+            encode(
+                "V_FMAC_F32",
+                "ENC_VOP2",
+                &[("VDST", 2), ("SRC0", 256 + 1), ("VSRC1", 256 + 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        let (add_idx, addend) = ops
+            .iter()
+            .enumerate()
+            .find_map(|(i, (o, a))| (*o == OP_FADD && a.len() == 4).then(|| (i, a[3])))
+            .expect("no OpFAdd");
+        // The register model stores uint bits: the addend is a bitcast of the
+        // old destination load, not the load instruction itself.
+        let mut cur = addend;
+        let ptr = loop {
+            let (o, a) = ops
+                .iter()
+                .find(|(_, a)| a.len() >= 2 && a[1] == cur)
+                .expect("addend has no defining instruction");
+            match *o {
+                OP_BITCAST => cur = a[2],
+                OP_LOAD => break a[2],
+                other => panic!("addend is not a destination load (opcode {other})"),
+            }
+        };
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_VARIABLE && a.len() == 3 && a[1] == ptr && a[2] == STORAGE_FUNCTION),
+            "addend load is not a function-scope register"
+        );
+        assert!(
+            ops[..add_idx]
+                .iter()
+                .any(|(o, a)| *o == OP_STORE && a.first() == Some(&ptr)),
+            "destination old value was not written before the fmac"
+        );
+        assert_valid_spirv(&t, "fmac");
+    }
+
+    /// Unary float and byte-conversion families: rcp/rsq/sqrt/exp2/log2/sin/cos,
+    /// trunc, fract (x - floor(x) with the RDNA >=1 clamp), med3, ubyte0..3.
+    #[test]
+    fn valu_unary_float_and_ubyte_family_translates() {
+        let mut code = Vec::new();
+        for (dst, name) in [
+            (5u64, "V_RCP_F32"),
+            (6, "V_RCP_IFLAG_F32"),
+            (7, "V_RSQ_F32"),
+            (8, "V_SQRT_F32"),
+            (9, "V_EXP_F32"),
+            (10, "V_LOG_F32"),
+            (11, "V_SIN_F32"),
+            (12, "V_COS_F32"),
+            (13, "V_TRUNC_F32"),
+            (14, "V_FRACT_F32"),
+            (16, "V_CVT_F32_UBYTE0"),
+            (17, "V_CVT_F32_UBYTE1"),
+            (18, "V_CVT_F32_UBYTE2"),
+            (19, "V_CVT_F32_UBYTE3"),
+        ] {
+            code.extend(
+                encode(name, "ENC_VOP1", &[("VDST", dst), ("SRC0", 256 + 1)], None).unwrap(),
+            );
+        }
+        code.extend(
+            encode(
+                "V_MED3_F32",
+                "ENC_VOP3",
+                &[
+                    ("VDST", 15),
+                    ("SRC0", 256 + 1),
+                    ("SRC1", 256 + 2),
+                    ("SRC2", 256 + 3),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        let glsl: BTreeSet<u32> = ops
+            .iter()
+            .filter(|(o, a)| *o == OP_EXT_INST && a.len() >= 4)
+            .map(|(_, a)| a[3])
+            .collect();
+        for (name, n) in [
+            ("Sin", GLSL_SIN),
+            ("Cos", GLSL_COS),
+            ("Exp2", GLSL_EXP2),
+            ("Log2", GLSL_LOG2),
+            ("Sqrt", GLSL_SQRT),
+            ("InverseSqrt", GLSL_INVERSE_SQRT),
+            ("Trunc", GLSL_TRUNC),
+            ("Floor", GLSL_FLOOR),
+        ] {
+            assert!(glsl.contains(&n), "missing GLSL.std.450 {name}");
+        }
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_FDIV),
+            "v_rcp_f32 must divide 1.0 by the source"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_CONVERT_U_TO_F),
+            "v_cvt_f32_ubyte* must convert the extracted byte"
+        );
+        assert_valid_spirv(&t, "unary-float");
+    }
+
+    /// Integer VALU families: lshl_add/lshl_or/or3/add3, bfe, bfi, perm, mul_hi.
+    #[test]
+    fn valu_integer_family_translates() {
+        let tri = |code: &mut Vec<u8>, name: &str, dst: u64| {
+            code.extend(
+                encode(
+                    name,
+                    "ENC_VOP3",
+                    &[
+                        ("VDST", dst),
+                        ("SRC0", 256 + 1),
+                        ("SRC1", 256 + 2),
+                        ("SRC2", 256 + 3),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            );
+        };
+        let mut code = Vec::new();
+        for (dst, name) in [
+            (5u64, "V_LSHL_ADD_U32"),
+            (6, "V_LSHL_OR_B32"),
+            (7, "V_OR3_B32"),
+            (8, "V_ADD3_U32"),
+            (9, "V_BFE_U32"),
+            (10, "V_BFI_B32"),
+            (11, "V_PERM_B32"),
+        ] {
+            tri(&mut code, name, dst);
+        }
+        code.extend(
+            encode(
+                "V_MUL_HI_U32",
+                "ENC_VOP3",
+                &[("VDST", 12), ("SRC0", 256 + 1), ("SRC1", 256 + 2)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_CAPABILITY && a.as_slice() == [CAP_INT64]),
+            "v_mul_hi_u32 must declare Capability Int64"
+        );
+        assert!(
+            ops.iter().filter(|(o, _)| *o == OP_U_CONVERT).count() >= 3,
+            "v_mul_hi_u32 must widen both sources and narrow the result"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_IMUL),
+            "v_mul_hi_u32 must multiply the widened sources"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_SHIFT_L_LOGICAL),
+            "v_lshl_* must shift left"
+        );
+        assert_valid_spirv(&t, "integer");
+    }
+
+    /// `v_readfirstlane_b32` writes an SGPR: every VGPR is a scalar in this
+    /// model, so the value is a copy.
+    #[test]
+    fn valu_readfirstlane_copies_to_sgpr() {
+        let mut code =
+            encode("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 256 + 2)], None)
+                .unwrap();
+        code.extend(end_program());
+        let t = translated(&code);
+        // The copy, the position export and `s_endpgm`; nothing unsupported.
+        assert_eq!(t.instructions, 3, "{:?}", t.unsupported_why);
+        assert_valid_spirv(&t, "readfirstlane");
+    }
+
+    /// The VOPC/VOP3 compare family (u32/i32/f32, ordered and unordered forms)
+    /// and the VOP3 `v_cndmask_b32` with its explicit mask source.
+    #[test]
+    fn valu_compare_and_select_family_translates() {
+        let vopc = |name: &str, a: u64| {
+            encode(
+                name,
+                "ENC_VOPC",
+                &[("SRC0", a), ("VSRC1", 256 + 1)],
+                None,
+            )
+            .unwrap()
+        };
+        let mut code = Vec::new();
+        for name in [
+            "V_CMP_LT_U32",
+            "V_CMP_LE_U32",
+            "V_CMP_GT_U32",
+            "V_CMP_GE_U32",
+            "V_CMP_EQ_U32",
+            "V_CMP_NE_U32",
+            "V_CMP_LT_I32",
+            "V_CMP_EQ_F32",
+            "V_CMP_LE_F32",
+            "V_CMP_NGT_F32",
+            "V_CMP_LG_F32",
+        ] {
+            code.extend(vopc(name, 256 + 2));
+        }
+        // VOP3 forms write an explicit SGPR pair (VCC here).
+        code.extend(
+            encode(
+                "V_CMP_EQ_U32",
+                "ENC_VOP3",
+                &[("VDST", 106), ("SRC0", 256 + 2), ("SRC1", 256 + 3)],
+                None,
+            )
+            .unwrap(),
+        );
+        // class(v1) against +0 and +inf: mask 0x240 as a literal source.
+        code.extend(
+            encode(
+                "V_CMP_CLASS_F32",
+                "ENC_VOP3",
+                &[("VDST", 106), ("SRC0", 256 + 1), ("SRC1", 255)],
+                Some(0x240),
+            )
+            .unwrap(),
+        );
+        code.extend(
+            encode(
+                "V_CNDMASK_B32",
+                "ENC_VOP3",
+                &[
+                    ("VDST", 5),
+                    ("SRC0", 256 + 1),
+                    ("SRC1", 256 + 2),
+                    ("SRC2", 106),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        for (label, op) in [
+            ("u32 less-than", OP_U_LESS_THAN),
+            ("u32 less-or-equal", OP_U_LESS_THAN_EQUAL),
+            ("u32 greater", OP_U_GREATER_THAN),
+            ("u32 greater-or-equal", OP_U_GREATER_THAN_EQUAL),
+            ("i32 less-than", OP_S_LESS_THAN),
+            ("f32 ordered equal", OP_FORD_EQUAL),
+            ("f32 ordered less-or-equal", OP_FORD_LESS_THAN_EQUAL),
+            ("f32 unordered not-greater", OP_FUNORD_LESS_THAN_EQUAL),
+            ("f32 unordered not-equal", OP_FUNORD_NOT_EQUAL),
+        ] {
+            assert!(
+                ops.iter().any(|(o, _)| *o == op),
+                "missing {label} compare"
+            );
+        }
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_SHIFT_R_LOGICAL),
+            "v_cmp_class_f32 must test the class bit"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_SELECT),
+            "v_cndmask_b32 must select between the sources"
+        );
+        assert_valid_spirv(&t, "compare-select");
     }
 
     #[test]

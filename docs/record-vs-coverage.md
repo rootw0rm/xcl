@@ -110,8 +110,98 @@ records.** Three measurements support it.
 So the next coverage measurement should target the load/VALU reasons, not branches. Branch
 shapes stay visible in the sweep so a future decision can be re-made on data.
 
+## Pure-register VALU widening (step-09, 2026-11-27)
+
+The emitter now translates the self-contained VALU families the sweep named; every one of the
+39 in-scope reason kinds below is gone from the corpus. Same command and corpus as above
+(26,503 records, seed 1, release build):
+
+| outcome | records | share of all | share of VS |
+|---|---:|---:|---:|
+| non-VS | 24,267 | 91.6% | — |
+| reject | 1,204 | 4.5% | 53.8% |
+| incomplete | 899 | 3.4% | 40.2% |
+| complete | 133 | 0.5% | 5.9% |
+| all | 26,503 | 100% | (VS: 2,236) |
+
+Reason kinds fell 102 → 63. **123 records flipped incomplete → complete** (10 → 133); each
+had only in-scope reasons left. The proof is the reason table: every remaining reason's record
+count is byte-identical to the step-08 sweep, and no new kind appeared. A record that still hit
+any other blocker would have decremented that reason's count. Rejects are unchanged (1,204
+branch refusals); non-VS is unchanged.
+
+Top remaining reasons (records):
+
+```
+ 877  N branches are not supported ... (exec-mask branches, scc/vcc branches)
+ 833  s_load_dwordx4: encoding
+ 771  s_swappc_b64: salu
+ 390  s_buffer_load_dwordx4: encoding
+ 308  s_buffer_load_dwordx16: encoding
+ 237  buffer_load_dwordx4: encoding
+ 169  N branches are not supported ... (+ backward edges)
+ 137  s_buffer_load_dwordx8: encoding
+ 117  N branches are not supported ... (scc/vcc branches)
+ 109  s_buffer_load_dword: encoding
+  86  buffer_load_dword: encoding
+  68  s_mul_i32: salu
+  65  s_mul_hi_u32: salu
+```
+
+Translated families (semantics pinned by `gpu/recomp/emit.rs` / `dxil/lower_valu.rs`, one test
+per family through `translate_vs_spirv` plus `spirv-val`):
+
+- `v_fmac_f32` (VOP2/VOP3): `vdst = src0 * src1 + vdst(old)` — the test proves the addend is an
+  `OpLoad` of the destination variable, not a constant.
+- `v_cvt_f32_ubyte0..3`; `v_rcp_f32`/`v_rcp_iflag_f32` (`1.0/x`); `v_rsq_f32`, `v_sqrt_f32`
+  (GLSL.std.450 `InverseSqrt`/`Sqrt`); `v_exp_f32`/`v_log_f32` (**exp2/log2**); `v_sin_f32`/
+  `v_cos_f32` (input in turns, multiplied by 2π); `v_trunc_f32`; `v_fract_f32`
+  (`x - floor(x)` with the `>= 1.0` clamp); `v_med3_f32` (`max(min(a,b), min(max(a,b),c))`).
+- Integer/bit: `v_lshl_add_u32`, `v_lshl_or_b32`, `v_or3_b32`, `v_add3_u32`, `v_bfe_u32`,
+  `v_bfi_b32`, `v_perm_b32` (4/8-byte selector table incl. the sign/0/all-ones classes),
+  `v_mul_hi_u32` (widened 64-bit product; declares `Capability Int64`), `v_readfirstlane_b32`
+  (copy — every VGPR is a scalar in this model).
+- Compares: `v_cmp_{eq,ne,lt,le,gt,ge}_u32`, `v_cmp_{eq,ne,lt,le,gt,ge}_i32`,
+  `v_cmp_{lt,eq,le,gt,ge,lg}_f32` and their `n*` unordered forms; VOPC writes the VCC pair,
+  VOP3 the explicit `SDST` pair. `v_cmp_class_f32` emits the IEEE class index
+  (0 sNaN … 9 +inf) and tests the mask bit. `v_cndmask_b32` VOP3 uses its explicit `SRC2`
+  mask; VOP2 keeps the implicit VCC.
+
+Known approximations, documented not hidden: `v_rcp_iflag_f32` does not model the hardware
+denormal flush (same as the HLSL backend's `rcp`); `v_rcp`/`v_rsq` are exact division/sqrt
+rather than the hardware approximation; `v_mul_hi_u32` needs `shaderInt64` on the device.
+
+### Non-goals (unchanged, with evidence)
+
+- **SMEM/MUBUF/MTBUF/IMG/global/tbuffer loads.** The record path has no user data to feed them:
+  `record_vs_words(&[u8])` → `translate_vs_spirv(code, &vs, true)` passes only bytes + the S1
+  interface (`gpu/recomp/spirv.rs:124-147`); `VsInterface` has no `user_sgprs`
+  (`gpu/recomp/mod.rs:134-142`); `PsoRecord` stashes no root args (`hle/d3d12x_linux.rs:562-582`);
+  the Linux command list has `SetGraphicsRootSignature` but no
+  `SetGraphicsRoot32BitConstant`/`SetGraphicsRootDescriptorTable` (`:302-340`); `ReplayDraw`
+  has no user data (`vulkan_graphics.rs:751-767`). Zero-filled bindings would be fake success.
+- **Branches and `s_swappc_b64`.** The step-08 decision stands: with branches ignored, 0 of the
+  1,204 branch records complete.
+- **EXEC/VCC b64 mask ops** (`s_mov_b64`, `s_or_b64`, `s_and_saveexec_b64`, …) and `v_cmpx_*`:
+  the bring-up model has no per-lane masks.
+- **SDWA/DPP**, f16 value class (`v_fma_mix*`, `v_cvt_f16_f32`, `v_pack_b32_f16`), cube ops and
+  `v_add_co_ci_u32`: separate follow-ups; `s_setreg_imm32_b32` stays unsupported until the
+  emitter models the MODE register.
+
+### Next dominant self-contained family
+
+SALU/SOPC, the step-10 slice: `s_mul_i32` (68), `s_mul_hi_u32` (65), `s_lshl_b32` (17),
+`s_bfe_i32` (13), `s_lshr_b32` (8), `s_addk_i32` (3), `s_mulk_i32` (2), `s_addc_u32` (1),
+`s_bcnt1_i32_b32` (1), `s_ff1_i32_b32` (1), `s_bfe_u32` (1), `s_cmp_lg_u32` (1) = 181
+record-instances. It reads only SGPRs and is the largest remaining block that is not blocked on
+draw-time user data, control flow, or `MODE`.
+
 ## Follow-up
 
 `code-assist:xcl-first-frame:step-08:record-vs-branches` (task-1795794902-51cb) is resolved as
 the documented decision above; the classifier and its tests live in `gpu/recomp/spirv.rs`
 (`BranchFlow`, `branch_flow`). No behavior change beyond the reject-reason shape.
+
+Step-09 (`code-assist:xcl-first-frame:step-09:record-vs-valu`, commit on
+`m22-vs-valu-coverage`) implements the VALU slice above; the SALU/SOPC gap is queued as
+`code-assist:xcl-first-frame:step-10:record-vs-salu`.
