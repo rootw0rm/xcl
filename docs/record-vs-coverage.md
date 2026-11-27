@@ -425,11 +425,84 @@ All 4,298 remaining reason instances are the step-10 groups minus the SDWA and f
   (`v_cubema_f32`/`v_cubesc_f32`/`v_cubetc_f32`), `v_cmpx_*` EXEC writes 3, and the small VALU
   residual 4 (`v_add_co_ci_u32` 2, `v_mad_u32_u24` 1, `v_lshlrev_b64` 1).
 
-### Next dominant self-contained family
+## Cube ops and the small VALU residual (step-14, 2026-11-27)
 
-Cube ops (3, one record) and the small VALU residual (4, four records) are the next slice: they
-are pure VALU with no memory, mask or MODE involvement. b64/EXEC/VCC masks (27) still need the
-per-lane model, `s_setreg` (22) the MODE register and `v_cmpx_*` (3) the per-lane mask.
+The emitter now translates the seven measured instances step-13 left. Same command and corpus
+(26,503 records, seed 1, release):
+
+| outcome | records | share of all | share of VS |
+|---|---:|---:|---:|
+| non-VS | 24,267 | 91.6% | — |
+| reject | 1,204 | 4.5% | 53.8% |
+| incomplete | 899 | 3.4% | 40.2% |
+| complete | 133 | 0.5% | 5.9% |
+| all | 26,503 | 100% | (VS: 2,236) |
+
+Outcome counts are unchanged from step-13. **No record flipped complete**: the in-scope
+instances live in four records (`vs_stars_e84ed36d`, `.VS_Trail_Heightmap_Projected_f12c3583`,
+`VS_FoamDecals_bece4a5c`, `VS_Sheet_aff03a67`) that still fail on descriptor/global loads and
+b64/gate-control instructions. Reason kinds fell **39 → 33**; total reason instances fell
+**4,298 → 4,291 (−7)** — exactly the in-scope sum, no other reason's count changed and no new
+kind appeared:
+
+| reason | records (step-13 → step-14) |
+|---|---:|
+| `v_cubema_f32` | 1 → 0 |
+| `v_cubesc_f32` | 1 → 0 |
+| `v_cubetc_f32` | 1 → 0 |
+| `v_add_co_ci_u32` | 2 → 0 |
+| `v_mad_u32_u24` | 1 → 0 |
+| `v_lshlrev_b64` | 1 → 0 |
+| total | 7 → 0 |
+
+Translated semantics (`spirv::tests::valu_*` through `translate_vs_spirv` plus `spirv-val`,
+mirroring `gpu/recomp/emit.rs` and `gpu/dxil/lower_valu.rs`):
+
+- **Cube coordinates.** The major axis is the largest |coordinate| with z over y over x on
+  ties (`|z|>=|x| && |z|>=|y|`, else `|y|>=|x|`); ordered comparisons are false on NaN, as the
+  DXIL backend's `FOGe`. `v_cubema_f32` doubles the major coordinate, `v_cubesc_f32` /
+  `v_cubetc_f32` use the x/y sign to pick the face-space s/t (`cube_sc`/`cube_tc`), computed
+  on the bit patterns. The corpus reuses v10 as destination and third source; every source is
+  read before the destination store.
+- **`v_add_co_ci_u32`.** The carry-in is lane 0's bit of the mask pair — VCC (sgpr 106) for
+  VOP2, `SRC2`'s SGPR pair for the VOP3 SDST form. The sum is `a + b + carry`; carry-out is
+  `(a+b) < a || (sum) < (a+b)` and is written back to VCC or the explicit `SDST` pair as an
+  all-ones/zero mask (the same single-lane approximation as `v_cmp`).
+- **`v_mad_u32_u24`.** Both multiplicands are zero-extended from their low 24 bits, the product
+  is the low 32 bits, and the addend is the full 32-bit source.
+- **`v_lshlrev_b64`.** `src0 & 63` is the shift, `src1` a register pair assembled into a 64-bit
+  value, shifted with `Capability Int64`, and narrowed back into the destination pair. The
+  reader accepts VGPR/SGPR pairs, VCC and NULL only; 64-bit inline/literal forms stay refused
+  rather than guessing the hardware extension. The corpus's in-place `v[10:11] <<= 2` is safe
+  because both source halves are read before either destination half is stored.
+
+### `v_cmpx_*` decision (stays out)
+
+The three `v_cmpx_*` instances (2 `v_cmpx_le_f32`, 1 `v_cmpx_eq_u32`) live in two records that
+remain incomplete after this slice: `$VS_Trail_Heightmap_84f10edd` also needs descriptor loads,
+`s_swappc_b64`, `s_mov_b64`/`s_or_b64` and `s_getpc_b64`; `(VS_FlareMaskSingleStar_f6657ec3`
+also needs loads and `s_and_saveexec_b64`/`s_mov_b64`/`s_or_b64`. Translating them would flip
+nothing, and `v_cmpx_*` writes EXEC, which the bring-up backend does not model (the step-08
+control-flow decision). They stay with the per-lane-mask non-goal.
+
+### Residual after step-14
+
+All 4,291 remaining reason instances (record instances, overlapping, not the 899 incomplete
+records):
+
+- **Memory / descriptors — 2,263.** Unchanged; still gated on draw-time root arguments.
+- **Control flow — 1,976.** 1,204 branch records, 771 `s_swappc_b64`, 1 `s_getpc_b64`.
+- **Documented non-goals — 52.** b64/EXEC/VCC mask ops 27, `s_setreg_imm32_b32` 22,
+  `v_cmpx_*` EXEC writes 3.
+
+### Next gap
+
+No self-contained record-VS family remains. The next work is gated by earlier decisions:
+memory (2,263) on capturing draw-time root arguments/user SGPRs (Step 9 evidence; retail is at
+0 d3d12 calls), control flow and the 27 b64/EXEC/VCC mask ops on the per-lane/structured-control
+model the step-08 decision refused, and `s_setreg_imm32_b32` (22) on modeling MODE. Do not queue
+those without the trigger named in `plan.md`; a zero-filled binding or an unmodeled mask write
+would be fake success.
 
 ## Follow-up
 
@@ -445,6 +518,9 @@ follow-up. Step-11 (`code-assist:xcl-first-frame:step-11:record-vs-polish`, comm
 `m22-vs-polish`) is the help/shape/far-jump polish above. Step-12
 (`code-assist:xcl-first-frame:step-12:record-vs-sdwa`, commit on `m22-vs-sdwa-dpp`) implements
 the measured SDWA forms. Step-13 (`code-assist:xcl-first-frame:step-13:record-vs-f16`, commit on
-`m22-vs-f16`) implements the plain f16 value class; cube ops and the small VALU residual are
-queued as the next follow-up.
+`m22-vs-f16`) implements the plain f16 value class. Step-14
+(`code-assist:xcl-first-frame:step-14:record-vs-cube-residual`, commit on
+`m22-vs-cube-residual`) implements the cube ops and small VALU residual. The remaining families
+are the gated ones in "Next gap" above; no further record-VS widening task is queued until one
+of those triggers fires.
 

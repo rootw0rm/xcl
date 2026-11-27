@@ -915,6 +915,50 @@ impl SpirvEm {
         self.fmax(lo, hi)
     }
 
+    /// `v_cubema_f32` / `v_cubesc_f32` / `v_cubetc_f32`: the major axis is the
+    /// largest |coordinate| (z over y over x on ties); the result is that
+    /// axis' cube coordinate. Same table as the HLSL `cube_ma`/`cube_sc`/
+    /// `cube_tc` and the DXIL backend's `cube`.
+    fn cube_f32(&mut self, name: &str, a: u32, b: u32, c: u32) -> u32 {
+        let (ut, ft, bt) = (self.uint_ty, self.float_ty, self.bool_ty);
+        let sign = self.uint_const(0x8000_0000);
+        let mag = self.uint_const(0x7FFF_FFFF);
+        let (fx, fy, fz) = (self.as_float(a), self.as_float(b), self.as_float(c));
+        let axb = self.tmp(ut, OP_BITWISE_AND, &[a, mag]);
+        let ayb = self.tmp(ut, OP_BITWISE_AND, &[b, mag]);
+        let azb = self.tmp(ut, OP_BITWISE_AND, &[c, mag]);
+        let (ax, ay, az) = (self.as_float(axb), self.as_float(ayb), self.as_float(azb));
+        let zx = self.tmp(bt, OP_FORD_GREATER_THAN_EQUAL, &[az, ax]);
+        let zy = self.tmp(bt, OP_FORD_GREATER_THAN_EQUAL, &[az, ay]);
+        let zmaj = self.tmp(bt, OP_LOGICAL_AND, &[zx, zy]);
+        let ymaj = self.tmp(bt, OP_FORD_GREATER_THAN_EQUAL, &[ay, ax]);
+        let zerob = self.uint_const(0);
+        let zero = self.as_float(zerob);
+        let zneg = self.tmp(bt, OP_FORD_LESS_THAN, &[fz, zero]);
+        let yneg = self.tmp(bt, OP_FORD_LESS_THAN, &[fy, zero]);
+        let xneg = self.tmp(bt, OP_FORD_LESS_THAN, &[fx, zero]);
+        let nx = self.tmp(ut, OP_BITWISE_XOR, &[a, sign]);
+        let ny = self.tmp(ut, OP_BITWISE_XOR, &[b, sign]);
+        let nz = self.tmp(ut, OP_BITWISE_XOR, &[c, sign]);
+        let twob = self.uint_const(0x4000_0000);
+        let two = self.as_float(twob);
+        let mzb = self.tmp(ft, OP_FMUL, &[two, fz]);
+        let myb = self.tmp(ft, OP_FMUL, &[two, fy]);
+        let mxb = self.tmp(ft, OP_FMUL, &[two, fx]);
+        let (mz, my, mx) = (self.as_uint(mzb), self.as_uint(myb), self.as_uint(mxb));
+        let (zr, yr, xr) = match name {
+            "v_cubema_f32" => (mz, my, mx),
+            "v_cubesc_f32" => (
+                self.tmp(ut, OP_SELECT, &[zneg, nx, a]),
+                a,
+                self.tmp(ut, OP_SELECT, &[xneg, c, nz]),
+            ),
+            _ => (ny, self.tmp(ut, OP_SELECT, &[yneg, nz, c]), ny),
+        };
+        let r = self.tmp(ut, OP_SELECT, &[ymaj, yr, xr]);
+        self.tmp(ut, OP_SELECT, &[zmaj, zr, r])
+    }
+
     /// `v_perm_b32`: four byte selectors in `sel`; 0-3 pick bytes of `b`
     /// (VSRC1), 4-7 bytes of `a` (VSRC0), 8-11 sign bits, 12 zero, 13+ all-ones.
     /// Same table as the HLSL backend's `perm_b32`.
@@ -1363,6 +1407,31 @@ impl SpirvEm {
                 "OPR_EXEC" | "OPR_SDST_EXEC" => Some(self.load_sgpr(126)),
                 "OPR_SDST_M0" => Some(self.load_sgpr(124)),
                 "OPR_SSRC_SPECIAL_SCC" => Some(self.load_scc()),
+                _ => None,
+            },
+        }
+    }
+
+    /// Read a 64-bit VALU source as its low/high dwords. Only the forms whose
+    /// 64-bit value is unambiguous are accepted (a VGPR or SGPR pair, VCC, or
+    /// NULL); inline/literal 32-bit forms stay refused instead of guessing how
+    /// the hardware extends them.
+    fn read64(&mut self, d: &Decoded, o: &Operand) -> Option<(u32, u32)> {
+        match o.field {
+            Some(f) => {
+                let v = Self::field(d, f);
+                match v {
+                    0..=124 => Some((self.load_sgpr(v), self.load_sgpr(v + 1))),
+                    125 => {
+                        let zero = self.uint_const(0);
+                        Some((zero, zero))
+                    }
+                    256..=510 => Some((self.load_vgpr(v - 256), self.load_vgpr(v - 255))),
+                    _ => None,
+                }
+            }
+            None => match o.ty {
+                "OPR_VCC" => Some((self.load_sgpr(106), self.load_sgpr(107))),
                 _ => None,
             },
         }
@@ -1871,6 +1940,35 @@ impl SpirvEm {
         }
     }
 
+    /// Write a per-lane carry condition to the instruction's mask destination:
+    /// the implicit VCC pair for VOP2, the explicit SDST pair for the VOP3
+    /// SDST encodings. The bring-up model keeps one lane, so the whole dword
+    /// is all-ones/zero as in [`Self::vopc`].
+    fn store_mask_condition(&mut self, d: &Decoded, outs: &[&Operand], cond: u32) {
+        let all = self.uint_const(0xFFFF_FFFF);
+        let zero = self.uint_const(0);
+        let mask = self.tmp(self.uint_ty, OP_SELECT, &[cond, all, zero]);
+        let (lo, hi) = match outs.get(1) {
+            Some(o) => match o.field {
+                Some(f) => {
+                    let n = Self::field(d, f);
+                    (n, n + 1)
+                }
+                None => (106, 107),
+            },
+            None => (106, 107),
+        };
+        if lo == 125 {
+            return;
+        }
+        if lo > 126 {
+            self.unsupported(d, "sdst");
+            return;
+        }
+        self.store_sgpr(lo, mask);
+        self.store_sgpr(hi, zero);
+    }
+
     /// `v_cmp_class_f32` condition: `(mask >> class(value)) & 1 != 0`, with the
     /// RDNA class bits 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denorm, 5 -0,
     /// 6 +0, 7 +denorm, 8 +normal, 9 +inf (DXIL `fclass`).
@@ -1938,6 +2036,12 @@ impl SpirvEm {
         // to the register-destination logic below.
         if let Some(rest) = name.strip_prefix("v_cmp_") {
             self.vopc(d, rest);
+            return;
+        }
+        // 64-bit shifts read and write a register pair, which the scalar
+        // operand reader cannot express; they get their own arm.
+        if name == "v_lshlrev_b64" {
+            self.valu_lshlrev_b64(d);
             return;
         }
         let (outs, ins) = Self::ops(d);
@@ -2027,10 +2131,32 @@ impl SpirvEm {
             "v_add_nc_u32" | "v_add_u32" | "v_add_co_u32" => {
                 Some(self.tmp(uint_ty, OP_IADD, &[a, b]))
             }
+            // Carry-in is lane 0's bit of the mask pair (VCC for VOP2, SRC2
+            // for the VOP3 SDST form); carry-out goes back to that pair.
+            "v_add_co_ci_u32" => {
+                let one = self.uint_const(1);
+                let cin = self.tmp(uint_ty, OP_BITWISE_AND, &[c, one]);
+                let t = self.tmp(uint_ty, OP_IADD, &[a, b]);
+                let c1 = self.tmp(self.bool_ty, OP_U_LESS_THAN, &[t, a]);
+                let t2 = self.tmp(uint_ty, OP_IADD, &[t, cin]);
+                let c2 = self.tmp(self.bool_ty, OP_U_LESS_THAN, &[t2, t]);
+                let carry = self.tmp(self.bool_ty, OP_LOGICAL_OR, &[c1, c2]);
+                self.store_mask_condition(d, &outs, carry);
+                Some(t2)
+            }
             "v_sub_nc_u32" | "v_sub_u32" => Some(self.tmp(uint_ty, OP_ISUB, &[a, b])),
             "v_subrev_nc_u32" | "v_subrev_u32" => Some(self.tmp(uint_ty, OP_ISUB, &[b, a])),
             "v_mul_lo_u32" => Some(self.tmp(uint_ty, OP_IMUL, &[a, b])),
             "v_mul_hi_u32" => Some(self.mul_hi_u32(a, b)),
+            // The two multiplicands are zero-extended 24-bit values; the
+            // addend is the full 32-bit source.
+            "v_mad_u32_u24" => {
+                let mask = self.uint_const(0x00FF_FFFF);
+                let x = self.tmp(uint_ty, OP_BITWISE_AND, &[a, mask]);
+                let y = self.tmp(uint_ty, OP_BITWISE_AND, &[b, mask]);
+                let p = self.tmp(uint_ty, OP_IMUL, &[x, y]);
+                Some(self.tmp(uint_ty, OP_IADD, &[p, c]))
+            }
             "v_lshl_add_u32" => {
                 let m = self.tmp(uint_ty, OP_BITWISE_AND, &[b, c31]);
                 let sh = self.tmp(uint_ty, OP_SHIFT_L_LOGICAL, &[a, m]);
@@ -2222,6 +2348,7 @@ impl SpirvEm {
             "v_trunc_f32" => Some(self.glsl_unary_f32(a, GLSL_TRUNC)),
             "v_fract_f32" => Some(self.fract_f32(a)),
             "v_med3_f32" => Some(self.med3_f32(a, b, c)),
+            "v_cubema_f32" | "v_cubesc_f32" | "v_cubetc_f32" => Some(self.cube_f32(name, a, b, c)),
             // RDNA sin/cos take the angle in turns (HLSL backend: x * 2pi).
             "v_sin_f32" | "v_cos_f32" => {
                 let fx = self.tmp(float_ty, OP_BITCAST, &[a]);
@@ -2276,6 +2403,47 @@ impl SpirvEm {
             (Some(_), _) => {}
             (None, _) => self.unsupported(d, "valu"),
         }
+    }
+
+    /// `v_lshlrev_b64`: `vdst_pair = vsrc1_pair << (src0 & 63)`. Both
+    /// destination halves are written after every source is read, so the
+    /// corpus's in-place `v[10:11] <<= 2` is safe.
+    fn valu_lshlrev_b64(&mut self, d: &Decoded) {
+        let (outs, ins) = Self::ops(d);
+        if ins.len() != 2 {
+            self.unsupported(d, "op");
+            return;
+        }
+        let (Some(shift), Some((lo, hi))) = (self.read(d, ins[0]), self.read64(d, ins[1])) else {
+            self.unsupported(d, "op");
+            return;
+        };
+        let dst = match outs.first().and_then(|o| o.field) {
+            Some(f) => Self::field(d, f),
+            None => {
+                self.unsupported(d, "op");
+                return;
+            }
+        };
+        if dst > 254 {
+            self.unsupported(d, "sdst");
+            return;
+        }
+        let ty64 = self.uint64_ty();
+        let sh32 = self.uint64_const(32);
+        let lo64 = self.tmp(ty64, OP_U_CONVERT, &[lo]);
+        let hi64 = self.tmp(ty64, OP_U_CONVERT, &[hi]);
+        let hi64 = self.tmp(ty64, OP_SHIFT_L_LOGICAL, &[hi64, sh32]);
+        let v = self.tmp(ty64, OP_BITWISE_OR, &[lo64, hi64]);
+        let c63 = self.uint_const(63);
+        let sh = self.tmp(self.uint_ty, OP_BITWISE_AND, &[shift, c63]);
+        let sh64 = self.tmp(ty64, OP_U_CONVERT, &[sh]);
+        let r = self.tmp(ty64, OP_SHIFT_L_LOGICAL, &[v, sh64]);
+        let rlo = self.tmp(self.uint_ty, OP_U_CONVERT, &[r]);
+        let hi_out = self.tmp(ty64, OP_SHIFT_R_LOGICAL, &[r, sh32]);
+        let rhi = self.tmp(self.uint_ty, OP_U_CONVERT, &[hi_out]);
+        self.store_vgpr(dst, rlo);
+        self.store_vgpr(dst + 1, rhi);
     }
 
     fn export(&mut self, d: &Decoded) {
@@ -4707,5 +4875,238 @@ mod tests {
             "v_fma_mix_f32 must store the f32 fma result"
         );
         assert_valid_spirv(&t, "fma_mix");
+    }
+
+    // ---- M2.2 step-14: cube ops and the small VALU residual ---------------
+
+    /// `v_cubema_f32`/`v_cubetc_f32`/`v_cubesc_f32`: the major axis is the
+    /// largest |coordinate| (z ties over y over x), and the result is a select
+    /// chain over that axis. The corpus pattern reuses v10 as destination and
+    /// as the third source, so every source must be read before the write.
+    #[test]
+    fn valu_cube_family_selects_the_major_axis() {
+        let mut code = Vec::new();
+        for (dst, name) in [
+            (9u64, "V_CUBEMA_F32"),
+            (11, "V_CUBETC_F32"),
+            (10, "V_CUBESC_F32"),
+        ] {
+            code.extend(
+                encode(
+                    name,
+                    "ENC_VOP3",
+                    &[
+                        ("VDST", dst),
+                        ("SRC0", 256 + 12),
+                        ("SRC1", 256 + 13),
+                        ("SRC2", 256 + 10),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_CONSTANT && a.len() >= 3 && a[2] == 0x4000_0000),
+            "cubema must multiply the major coordinate by 2.0"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_FMUL),
+            "cubema must emit the 2x multiply"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|(o, _)| *o == OP_FORD_GREATER_THAN_EQUAL)
+                .count(),
+            9,
+            "each cube op tests z>=x, z>=y (major) and y>=x"
+        );
+        assert_eq!(
+            ops.iter().filter(|(o, _)| *o == OP_FORD_LESS_THAN).count(),
+            9,
+            "each cube op tests z<0, y<0 and x<0 face signs"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_XOR
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(0x8000_0000)),
+            "cubesc/cubetc negate coordinates by toggling the sign bit"
+        );
+        let selects = ops.iter().filter(|(o, a)| {
+            *o == OP_STORE && def(&ops, a[1]).is_some_and(|(d, _)| d == OP_SELECT)
+        });
+        assert_eq!(
+            selects.count(),
+            3,
+            "each cube op must store its major-axis select"
+        );
+        assert_valid_spirv(&t, "cube");
+    }
+
+    /// `v_add_co_ci_u32` reads the carry-in from bit 0 of the mask pair
+    /// (VCC for VOP2, SRC2 for the VOP3 SDST form), adds it, and writes the
+    /// carry-out back to the mask pair.
+    #[test]
+    fn valu_add_co_ci_takes_the_mask_bit_and_writes_carry_out() {
+        let mut code = encode(
+            "V_ADD_CO_CI_U32",
+            "ENC_VOP2",
+            &[("VDST", 5), ("SRC0", 256 + 1), ("VSRC1", 256 + 2)],
+            None,
+        )
+        .unwrap();
+        code.extend(
+            encode(
+                "V_ADD_CO_CI_U32",
+                "VOP3_SDST_ENC",
+                &[
+                    ("VDST", 7),
+                    ("SDST", 4),
+                    ("SRC0", 256 + 8),
+                    ("SRC1", 256 + 9),
+                    ("SRC2", 4),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert_eq!(
+            ops.iter()
+                .filter(|(o, a)| *o == OP_BITWISE_AND
+                    && a.len() == 4
+                    && const_value(&ops, a[3]) == Some(1))
+                .count(),
+            2,
+            "each add-co-ci must extract the lane-0 carry-in bit"
+        );
+        assert_eq!(
+            ops.iter().filter(|(o, _)| *o == OP_U_LESS_THAN).count(),
+            4,
+            "unsigned add carry needs both the a+b and +carry overflow tests"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|(o, a)| *o == OP_SELECT
+                    && (const_value(&ops, a[2]) == Some(0xFFFF_FFFF)
+                        || const_value(&ops, a[3]) == Some(0xFFFF_FFFF)))
+                .count(),
+            2,
+            "the VCC and SDST pairs must both receive an all-ones/zero mask"
+        );
+        assert_valid_spirv(&t, "add_co_ci");
+    }
+
+    /// `v_mad_u32_u24`: both multiplicands are the low 24 bits of their
+    /// source; the addend is the full 32-bit value.
+    #[test]
+    fn valu_mad_u32_u24_masks_both_24_bit_operands() {
+        let mut code = encode(
+            "V_MAD_U32_U24",
+            "ENC_VOP3",
+            &[
+                ("VDST", 6),
+                ("SRC0", 256 + 5),
+                ("SRC1", 256 + 6),
+                ("SRC2", 255),
+            ],
+            Some(0x3C6E_F35F),
+        )
+        .unwrap();
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert_eq!(
+            ops.iter()
+                .filter(|(o, a)| *o == OP_BITWISE_AND
+                    && a.len() == 4
+                    && const_value(&ops, a[3]) == Some(0x00FF_FFFF))
+                .count(),
+            2,
+            "both multiplicands must be zero-extended to 24 bits"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_IMUL),
+            "the product is a 32-bit multiply"
+        );
+        assert!(
+            ops.iter().any(|(o, _)| *o == OP_IADD),
+            "the 32-bit literal addend is added after the product"
+        );
+        assert_valid_spirv(&t, "mad_u24");
+    }
+
+    /// `v_lshlrev_b64` shifts the 64-bit src1 pair by `src0 & 63` and writes
+    /// both destination halves. The corpus form shifts `v[10:11]` in place.
+    #[test]
+    fn valu_lshlrev_b64_shifts_a_vgpr_pair() {
+        let mut code = encode(
+            "V_LSHLREV_B64",
+            "ENC_VOP3",
+            &[("VDST", 10), ("SRC0", 256 + 2), ("SRC1", 256 + 10)],
+            None,
+        )
+        .unwrap();
+        code.extend(end_program());
+        let t = translated(&code);
+        let ops = word_ops(&t.words);
+        assert!(
+            ops.iter()
+                .any(|(o, a)| *o == OP_CAPABILITY && a.as_slice() == [CAP_INT64]),
+            "v_lshlrev_b64 must declare Capability Int64"
+        );
+        assert!(
+            ops.iter().any(|(o, a)| *o == OP_BITWISE_AND
+                && a.len() == 4
+                && const_value(&ops, a[3]) == Some(63)),
+            "the shift amount is masked to 63"
+        );
+        // Two 64-bit shifts: assembling the pair shifts the high half into
+        // bits 63:32, then the value shift takes the masked 64-bit amount.
+        let shifts: Vec<&Vec<u32>> = ops
+            .iter()
+            .filter(|(o, a)| *o == OP_SHIFT_L_LOGICAL && a.len() == 4)
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(shifts.len(), 2, "pair assembly and the b64 shift");
+        assert!(
+            def(&ops, shifts[0][2]).is_some_and(|(d, _)| d == OP_U_CONVERT),
+            "the high half must be narrowed then shifted 32 bits"
+        );
+        assert!(
+            def(&ops, shifts[1][2]).is_some_and(|(d, _)| d == OP_BITWISE_OR),
+            "the b64 shift takes the assembled pair"
+        );
+        assert!(
+            def(&ops, shifts[1][3]).is_some_and(|(d, _)| d == OP_U_CONVERT),
+            "the b64 shift amount must be the widened masked value"
+        );
+        // Both halves are stored from the narrowed shift result.
+        let shifted_stores = ops
+            .iter()
+            .filter(|(o, a)| {
+                *o == OP_STORE && def(&ops, a[1]).is_some_and(|(d, _)| d == OP_U_CONVERT)
+            })
+            .filter(|(_, a)| {
+                let Some((OP_U_CONVERT, narrow)) = def(&ops, a[1]) else {
+                    return false;
+                };
+                def(&ops, narrow[2])
+                    .is_some_and(|(d, _)| matches!(d, OP_SHIFT_L_LOGICAL | OP_SHIFT_R_LOGICAL))
+            })
+            .map(|(_, a)| a[1])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shifted_stores.len(),
+            2,
+            "v_lshlrev_b64 must store both halves of the destination pair"
+        );
+        assert_valid_spirv(&t, "lshlrev_b64");
     }
 }
