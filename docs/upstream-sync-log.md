@@ -1896,3 +1896,69 @@ newest at the bottom.
   failed by design, 12 unique FAILs all D3D12.X GPU-only 0 non-GPU;
   retail fresh-root exit 139 SIGSEGV `+0x2237320` fault 0x0, 20
   called_stubs — frontier HOLDS.
+
+## 2026-11-27 — step-162 (task-1795744660-75d0): triage #2940 (window >2938), top now #2940
+
+- `upstream/main` = `8b957bec` (unchanged; `merge-base --is-ancestor
+  upstream/main HEAD` exit 0 — zero sync fallout, fully merged;
+  HEAD-in-upstream exit 1).
+- Batched `git ls-remote upstream 'refs/pull/*/head'` (per
+  mem-1795715658-5c18): 2406 refs (delta +1 vs step-161's 2405 — the
+  #2940 ref itself). Numbers >2938 present: 2940 only (29xx tail ends
+  at `refs/pull/2940/head`, zero 2941+; 300/302/303/304/306/308/309
+  hits are 2-3-digit artifacts). Sequential per mem-1795712765-78dc:
+  2932 MISSING (gap stands) / 2939 MISSING (gap stands — #2939 is the
+  issue number cited in #2940's message, "same XCL_PIPELINE_THREADS
+  slot (#2939)", not a PR ref) / 2940 FOUND on batched but sequential
+  first pass reported MISSING (rate-limit flake, same shape as
+  step-155; retry `ls-remote refs/pull/2939/head refs/pull/2940/head
+  refs/pull/2941/head` x3 returns only 2940 `ee919a64` every time) /
+  2941-3020 ALL MISSING → top now #2940. Sequential AND batched agree
+  after retry (batched delta +1 was the healthy signal per
+  mem-1795715658-5c18). Head fetched (`pr2940`, deleted after review).
+- Pins re-verified (zero drift, no force-push): #2907 `7575f671`
+  (`7575f6713c17507277b99e7db52177d319275078`) + #2913 `992ef508`
+  (`992ef508d5e93ebfd69864f482ecdf01e461f2b7`) match step-145 pins.
+  Old heads unchanged, all OPEN (is-ancestor vs `upstream/main` exit
+  1 each): #2929 `a87d3c2a` / #2930 `4e008ce5` (step-150 stays
+  pending) / #2931 `093a5fcd` / #2933 `2a318283` / #2934 `dac9681b`
+  / #2935 `b2a4ef48` (step-154 watch stays pending) / #2936
+  `cae11a79` / #2937 `c4f2a7f3` / #2938 `bc4252d5`. New head #2940
+  `ee919a64` OPEN (is-ancestor exit 1); base IS `upstream/main`
+  (`8b957bec`), single commit on top — no stacked-parent problem.
+  Commit time 2026-11-27 01:55:29 UTC (during/after the step-161
+  window) → genuine new arrival, not builder miss (per
+  mem-1795714025-21a1).
+- Triage (1 OPEN):
+  - #2940 SKIP, Windows-only (single commit `ee919a64` "Shaders: a
+    stale-blob probe the driver takes is not created a second time":
+    `crates/xcl/src/shaders.rs` +253/-34, single file). Every caller
+    hunk sits in `#[cfg(windows)]`-gated code on Linux: `struct
+    Pipelines` (`shaders.rs:1302`), `impl Pipelines`
+    (`:1513`/`:1516`), `fn precompile` (`:1793` vs the `not(windows)`
+    stub `:2046`), `make_with_cache_path` (uses
+    `windows::Win32::Graphics::Direct3D12::*` +
+    `recomp::dxc`/`recomp::pso` + live D3D12 device), and the GPU
+    reproducer test (stock-pipeline blob +16 bytes, ettehn's
+    1,418→1,402 case; `windows::...D3D12::*`, DXC, device-gated).
+    The new `build_with_blob`/`BlobBuild` helper + its 8
+    `build_with_blob_tests` are ungated pure generics, but porting
+    them alone lands a dead API with no caller: the sole production
+    caller is the Windows-gated `make_with_cache_path`, and Linux
+    has no `Pipelines` (`precompile` is the `not(windows)` stub) —
+    same dead-API category as #2933's `log.rs` hunk and same
+    Windows-only category as #2931. Functionally a D3D12
+    `CreateComputePipelineState` blob-cache correctness/perf fix
+    (successful stale probe = made with one native create, own blob
+    replaces stale; refused blob recompiled without it; over-cap
+    refused stays capped; over-cap taken is now made not capped) —
+    zero Linux behavioral effect (no native create on Linux).
+    Revisit if the Vulkan pipeline cache ever needs stale-blob
+    single-probe semantics. No Linux shape today.
+- Tasks filed: none (no keepers in window; #2929/#2930 already owned
+  by step-150 P4, S#-follow stack by step-154 P4). No overlap with
+  step-147 (#2926 dxil hunks) or step-148 (xuser twin test).
+- Gates: both checks 0 errors (22 lib / 28 lib-test warnings,
+  pre-existing); lib 787/0/1 threads=4 first try (no flake; matches
+  step-155-re-triage baseline 786+1 pin). Zero tree changes →
+  e2e/retail not re-run (step-145-critic precedent).
