@@ -1529,7 +1529,9 @@ impl Vfs {
         let visible = match &target {
             Target::Game { rel } => self.exists(rel),
             Target::Translated(path) => Path::new(path).exists(),
-            Target::Pass => Path::new(path).exists(),
+            // `Pass` probes use the host spelling (see `open_with` in the Linux
+            // hooks): a title backslash in a host-absolute path is a separator.
+            Target::Pass => Path::new(&path.replace('\\', "/")).exists(),
             Target::Reject(_) => false,
         };
         // Append rights may create a missing file, but cannot authorize truncating an

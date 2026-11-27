@@ -67,6 +67,12 @@ fn open_with(
     validate_access(access, disposition)?;
     let (decision, commit_rel, _write_guard) =
         v.open_decision_linux(path, access, disposition, flags);
+    // A title-supplied host-absolute path keeps the title's separators: the
+    // runtime absolves a folder (`XGameSave*` returns `/.../saves/<scid>`)
+    // and the title appends `\file`. Backslash is never a literal filename
+    // char to a Windows title, so the `Pass` arms below probe and open the
+    // slash spelling. Console spellings (UNC/device/drive/relative) never
+    // reach a successful host open either way.
     let already_existed = match &decision {
         Decision::CreateOverOriginal(_) => true,
         Decision::Use(path) | Decision::UseWithDisposition(path, _)
@@ -74,12 +80,12 @@ fn open_with(
         {
             Path::new(path).exists()
         }
-        Decision::Pass if disposition == vfs::CREATE_ALWAYS => Path::new(path).exists(),
+        Decision::Pass if disposition == vfs::CREATE_ALWAYS => Path::new(&path.replace('\\', "/")).exists(),
         _ => false,
     };
     let result = match decision {
         Decision::Fail(error) => Err(error),
-        Decision::Pass => open_host(path, access, disposition, flags, already_existed),
+        Decision::Pass => open_host(&path.replace('\\', "/"), access, disposition, flags, already_existed),
         Decision::Use(p) => open_host(&p, access, disposition, flags, already_existed),
         Decision::UseWithDisposition(p, disposition) => {
             open_host(&p, access, disposition, flags, already_existed)
@@ -239,7 +245,7 @@ mod tests {
     use crate::vfs::{
         Vfs, CREATE_ALWAYS, CREATE_NEW, ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY,
         ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND,
-        GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING, TRUNCATE_EXISTING,
+        GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS, OPEN_EXISTING, TRUNCATE_EXISTING,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -364,6 +370,37 @@ mod tests {
             b"original"
         );
         assert_eq!(tree_hash(&f.game), before);
+    }
+
+    #[test]
+    fn host_absolute_title_path_with_separators_opens_at_the_slash_spelling() {
+        let f = Fixture::new("savespell");
+        std::fs::create_dir_all(f.data.join("saves").join("test-scid")).unwrap();
+        // The runtime absolves a folder (`XGameSave*` returns `/.../saves/<scid>`)
+        // and the title appends `\file`: the host open must use the slash
+        // spelling, and later opens must see the same file.
+        let spelled = format!(
+            "{}\\slot0.sav",
+            f.data.join("saves").join("test-scid").to_string_lossy()
+        );
+        let mut w = open_with(&f.vfs, &spelled, GENERIC_WRITE, CREATE_ALWAYS, 0).unwrap();
+        w.file.write_all(b"progress").unwrap();
+        drop(w);
+        assert_eq!(
+            std::fs::read(f.data.join("saves").join("test-scid").join("slot0.sav")).unwrap(),
+            b"progress"
+        );
+        // The slash spelling is what later opens probe: read-only reopens see
+        // the file instead of failing access-denied on the raw spelling.
+        let mut r = open_with(&f.vfs, &spelled, GENERIC_READ, OPEN_EXISTING, 0).unwrap();
+        let mut got = Vec::new();
+        r.file.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"progress");
+        open_with(&f.vfs, &spelled, GENERIC_READ, OPEN_ALWAYS, 0).unwrap();
+        assert_eq!(
+            open_with(&f.vfs, &spelled, GENERIC_READ, CREATE_ALWAYS, 0).err(),
+            Some(ERROR_ACCESS_DENIED)
+        );
     }
 
     #[test]

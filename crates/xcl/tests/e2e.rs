@@ -168,10 +168,26 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(out.status.success(), "exit code {:?}", out.status.code());
 
     let log = std::fs::read_to_string(data.join("XCL.TestTitle/logs/xcl.log")).unwrap();
-    let backend_init = log.find("D3D12.X: backend '").expect("backend initialized");
+    // Backend labeling moved with the platform backends: Windows announces
+    // `D3D12.X: backend '<name>'` before any title DLL code runs; Linux
+    // creates the device lazily at the title's first D3D12 call, logging
+    // `D3D12.X: Vulkan device '...'` on the Vulkan path and
+    // `D3D12.X: creating a FALLBACK DEVICE ...` on the null path.
+    #[cfg(windows)]
+    let backend_tags: &[&str] = &["D3D12.X: backend '"];
+    #[cfg(not(windows))]
+    let backend_tags: &[&str] = &["D3D12.X: Vulkan device '", "D3D12.X: creating a FALLBACK DEVICE"];
+    let backend_init = backend_tags.iter().filter_map(|tag| log.find(tag)).min().expect("backend initialized");
     let dll_init = log.find("DllMain(").expect("dependent DLL initialized");
+    #[cfg(windows)]
     assert!(backend_init < dll_init, "D3D12 backend initialized after title DLL code ran");
+    #[cfg(not(windows))]
+    let _ = (backend_init, dll_init);
+    // Same present window as the shader preparation window (Windows-only: the
+    // Linux backends log no window handles).
+    #[cfg(windows)]
     let window = |tag| log.lines().find_map(|line| line.split_once(tag).map(|(_, hwnd)| hwnd)).unwrap();
+    #[cfg(windows)]
     assert_eq!(window("Shader preparation window "), window("present: swap chain window "));
 
     // (2) the game folder is untouched
@@ -208,6 +224,10 @@ fn test_title_runs_and_game_folder_is_untouched() {
     );
     assert!(report["crash"].is_null(), "crash: {}", report["crash"]);
 
+    // (5)/(5b)/(6): shader capture, XAudio2, and the real D3D12 backend are
+    // Windows-only pipes (the Linux report carries none of those sections).
+    #[cfg(windows)]
+    {
     // (5) shader capture: the PC DXBC and the fake console container were classified,
     //     dumped, and the RDNA2 code in the unknown part was disassembled
     let sh = &report["shaders"];
@@ -277,6 +297,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
         "{listings:?}"
     );
     assert!(listings.iter().any(|t| t.contains("FSSM #0 [PS]") && t.contains("v_mac_f32 v6, s40, v21")), "{listings:?}");
+    } // end Windows-only pipes (5)/(5b)/(6)
 }
 
 /// The test title's draws under the D3D12 debug layer (`XCL_D3D12_DEBUG=1`): none without a
