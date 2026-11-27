@@ -2493,7 +2493,8 @@ impl Em {
     /// (UAV at +1); FORMAT (word 1 [28:20]) selects the typed view (float/uint/sint).
     /// Sampler descriptors (S#, 4 dwords) hold the sampler heap index in BORDER_COLOR_PTR
     /// (word 3 [11:0]). Address layout with A16 (16-bit bias/coordinates/lod, 32-bit offset,
-    /// compare and gradients) as in AnyPS5's `componentShape` (GPL-2.0, ported 2026-11-20).
+    /// compare and gradients) as AnyPS5's `componentShape` describes it (read
+    /// as a reference for the hardware behaviour; no code taken).
     /// `float3 {t}_o{sfx}`: an MIMG texel offset (`o`, three 6-bit signed fields) in the texture
     /// coordinates of mip `level` – offset / that level's size (array layers do not move).
     fn texel_offset(&mut self, t: &str, dim: u64, o: &str, level: &str, sfx: &str) {
@@ -3503,7 +3504,7 @@ impl Em {
 
     /// 16-bit VALU (f16 / u16 / i16 / b16): sources are the low halves (VOP3 op_sel picks the
     /// high half per source), results go to the low half (op_sel[3]: high half) and the other
-    /// half is preserved – AnyPS5 `write16Bits` (GPL-2.0, ported 2026-11-20).
+    /// half is preserved, as AnyPS5's `write16Bits` describes it (reference only; no code taken).
     fn valu16(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let (outs, ins) = Self::ops(d);
         let m = Self::mods(d);

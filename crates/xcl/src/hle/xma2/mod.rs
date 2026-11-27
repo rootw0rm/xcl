@@ -8,7 +8,7 @@
 //! `libavcodec/sinewin_tablegen.h`, `libavutil/float_dsp.c`, and `libavutil/tx_template.c`
 //! (LGPL-2.1+, Copyright (c) 2005-2011 Balatoni Denes, Loren Merritt, Baptiste Coudurier,
 //! Benjamin Larsson, Ulion, Sascha Sommer, Reimar Döffinger, Lynne), adapted to safe Rust for
-//! XCL (GPL-2.0-only) on 2026-11-21.
+//! XCL on 2026-11-21.
 
 pub mod tables;
 
