@@ -1471,6 +1471,51 @@ pub unsafe extern "win64" fn wcrtomb(s: *mut u8, wc: u32, ps: *mut u32) -> usize
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// f32 math (CRT math slice): pure-Rust wrappers over the std `f32` intrinsics.
+// The game imports sinf/cosf/tanf/atan2f/powf/exp2f/log10f from
+// api-ms-win-crt-math-l1-1-0.dll / ucrtbase.dll; with no HLE they resolved to
+// auto-stubs whose integer thunk never sets xmm0 (Win64 float returns travel in
+// xmm0), so the SIMD loop at exe+0x1bce1xx consumed garbage. These return real
+// IEEE-754 values — NaN/±0/±inf and atan2 quadrants included, matching UCRT —
+// with no new deps and no Win APIs.
+// ---------------------------------------------------------------------------------------
+
+/// `float sinf(float)` — sine in radians.
+pub unsafe extern "win64" fn sinf(x: f32) -> f32 {
+    x.sin()
+}
+
+/// `float cosf(float)` — cosine in radians.
+pub unsafe extern "win64" fn cosf(x: f32) -> f32 {
+    x.cos()
+}
+
+/// `float tanf(float)` — tangent in radians.
+pub unsafe extern "win64" fn tanf(x: f32) -> f32 {
+    x.tan()
+}
+
+/// `float atan2f(float y, float x)` — quadrant-aware arctangent of `y/x`.
+pub unsafe extern "win64" fn atan2f(y: f32, x: f32) -> f32 {
+    y.atan2(x)
+}
+
+/// `float powf(float x, float y)` — `x` raised to `y`.
+pub unsafe extern "win64" fn powf(x: f32, y: f32) -> f32 {
+    x.powf(y)
+}
+
+/// `float exp2f(float x)` — 2 raised to `x`.
+pub unsafe extern "win64" fn exp2f(x: f32) -> f32 {
+    x.exp2()
+}
+
+/// `float log10f(float x)` — base-10 logarithm.
+pub unsafe extern "win64" fn log10f(x: f32) -> f32 {
+    x.log10()
+}
+
 /// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
 pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
@@ -3213,6 +3258,13 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("__stdio_common_vswprintf", __stdio_common_vswprintf as usize),
         ("__stdio_common_vsprintf_s", __stdio_common_vsprintf_s as usize),
         ("__stdio_common_vsprintf", __stdio_common_vsprintf as usize),
+        ("sinf", sinf as usize),
+        ("cosf", cosf as usize),
+        ("tanf", tanf as usize),
+        ("atan2f", atan2f as usize),
+        ("powf", powf as usize),
+        ("exp2f", exp2f as usize),
+        ("log10f", log10f as usize),
     ]
 }
 
@@ -4138,6 +4190,61 @@ mod tests {
                 19
             );
             assert_eq!(&mbu[..19], b"D:\\LocalDumps\\crash");
+        }
+    }
+
+    #[test]
+    fn f32_math_matches_reference() {
+        unsafe {
+            // Spot values against the f64 reference (tighter than the game's
+            // SIMD loop needs; the old stubs returned thunk garbage here).
+            for &x in &[0.5f32, 1.0, -1.0, 2.5, 100.0] {
+                let r = x as f64;
+                assert!((sinf(x) - r.sin() as f32).abs() < 1e-6, "sinf({x})");
+                assert!((cosf(x) - r.cos() as f32).abs() < 1e-6, "cosf({x})");
+                assert!((tanf(x) - r.tan() as f32).abs() < 1e-5, "tanf({x})");
+                assert!((exp2f(x) - r.exp2() as f32).abs() < 1e-4, "exp2f({x})");
+            }
+            for &x in &[0.5f32, 1.0, 2.5, 100.0, 1000.0] {
+                assert!((log10f(x) - (x as f64).log10() as f32).abs() < 1e-6, "log10f({x})");
+            }
+            for &(x, y) in &[(2.0f32, 10.0f32), (0.5, -2.0), (9.0, 0.5), (-2.0, 3.0)] {
+                assert!(
+                    (powf(x, y) - (x as f64).powf(y as f64) as f32).abs() < 1e-4,
+                    "powf({x}, {y})"
+                );
+            }
+            // atan2 quadrants + axes (radians).
+            use std::f32::consts::{FRAC_PI_2, PI};
+            assert!((atan2f(1.0, 1.0) - FRAC_PI_2 / 2.0).abs() < 1e-6);
+            assert!((atan2f(1.0, -1.0) - 3.0 * FRAC_PI_2 / 2.0).abs() < 1e-6);
+            assert!((atan2f(-1.0, -1.0) + 3.0 * FRAC_PI_2 / 2.0).abs() < 1e-6);
+            assert!((atan2f(-1.0, 1.0) + FRAC_PI_2 / 2.0).abs() < 1e-6);
+            assert!((atan2f(1.0, 0.0) - FRAC_PI_2).abs() < 1e-6);
+            assert!((atan2f(-1.0, 0.0) + FRAC_PI_2).abs() < 1e-6);
+            assert!((atan2f(0.0, -1.0) - PI).abs() < 1e-6);
+            assert!((atan2f(-0.0, -1.0) + PI).abs() < 1e-6);
+            assert_eq!(atan2f(0.0, 0.0), 0.0);
+            assert!(atan2f(f32::NAN, 1.0).is_nan());
+            // Zeros keep their sign; infinities/NaN follow IEEE-754 (as UCRT).
+            assert_eq!(sinf(0.0).to_bits(), 0.0f32.to_bits());
+            assert!(sinf(-0.0f32).is_sign_negative());
+            assert!(sinf(f32::INFINITY).is_nan() && sinf(f32::NEG_INFINITY).is_nan());
+            assert!(sinf(f32::NAN).is_nan());
+            assert_eq!(cosf(0.0), 1.0);
+            assert!(cosf(f32::INFINITY).is_nan());
+            assert_eq!(tanf(0.0), 0.0);
+            assert_eq!(exp2f(10.0), 1024.0);
+            assert_eq!(exp2f(f32::NEG_INFINITY), 0.0);
+            assert_eq!(exp2f(f32::INFINITY), f32::INFINITY);
+            assert!(exp2f(f32::NAN).is_nan());
+            assert!((log10f(1000.0) - 3.0).abs() < 1e-6);
+            assert_eq!(log10f(0.0), f32::NEG_INFINITY);
+            assert_eq!(log10f(f32::INFINITY), f32::INFINITY);
+            assert!(log10f(-1.0).is_nan());
+            assert_eq!(powf(2.0, 10.0), 1024.0);
+            assert_eq!(powf(0.0, 0.0), 1.0);
+            assert_eq!(powf(-1.0, f32::INFINITY), 1.0);
         }
     }
 }
