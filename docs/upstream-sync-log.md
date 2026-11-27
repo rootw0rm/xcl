@@ -2050,3 +2050,22 @@ newest at the bottom.
   xcl --test shaders_e2e` 14 passed / 0 failed (Linux refusal pins
   stand); fresh-root retail unchanged (exit 139,
   `game_scarlett_master.exe+0x2237320`, 2 called stubs).
+
+## 2026-11-28 — upstream/main 2c717a04: main ff'd, linux merge NOT attempted (criss-cross), content fully handled by ports
+
+- `main`: `81693f02` → `2c717a04` fast-forward (`git push . upstream/main:main`),
+  pushed to `origin/main`. Ancestor check passed at runtime.
+- `git merge-base --all HEAD upstream/main` = TWO bases (`81693f02`,
+  `b8b4135b`). `b8b4135b` (wave-size-from-header) sits in BOTH histories:
+  ancient in linux (via `71bb3ee6` ancestry, old sync) and re-landed in
+  upstream's rewritten history — classic force-push criss-cross. Per rule,
+  no merge attempted. `git merge-tree` on the pair confirms real
+  conflicts (`main.rs` pso-precompile help/dispatch vs linux's
+  `--record-vs`/disasm/shaders additions; `gpu/shader.rs`,
+  `shaders.rs`), partly against a synthesized virtual base — merging
+  would risk another `cd42bbae`. No ancestry merge is owed: the net
+  81693f02..2c717a04 delta is 4 files and ALL of it is already handled
+  on linux — wave hunks ported at `8676b135` (Step 32),
+  pso-precompile documented no-port above (Step 33).
+- Retry the ancestry merge only when `merge-base --all` prints ONE base;
+  until then, sync = ff `main` + triage net diff + port/no-port.
