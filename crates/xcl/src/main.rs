@@ -79,6 +79,7 @@ const RPF_USAGE: &str = "  xcl rpf <package.rpf> [--top N] [--find NAME] [--extr
       Use --probe only for header summaries, without --find, --extract, --out or --full.
 ";
 
+#[cfg(windows)]
 const REPLAY_USAGE: &str =
     "  xcl replay <capture folder> [--timeout S] [--repeat N] [--out NAME] [--debug] [--no-run]
              [--sub FROM=>TO||…] [--profile ps_6_7] [--split 0|1] [--loops]
@@ -87,6 +88,15 @@ const REPLAY_USAGE: &str =
       capture. --timeout: seconds the call may take (15); --no-run: translate and compile
       only; --debug: with the D3D12 debug layer. --sub: text substitutions in the translated
       HLSL; --loops: the passes of each loop of the pixel shader, per lane.
+";
+
+/// Replay needs the Windows D3D12/DXC path, so the block stays (the command is still listed
+/// for parity) but says why it cannot run here instead of advertising options that exit 2.
+#[cfg(not(windows))]
+const REPLAY_USAGE: &str =
+    "  xcl replay <capture folder> [--timeout S] [--repeat N] [--out NAME] [--debug] [--no-run]
+             [--sub FROM=>TO||…] [--profile ps_6_7] [--split 0|1] [--loops]
+      Not built on Linux: replay needs the Windows DXC/PSO (D3D12) path.
 ";
 
 const USAGES: &[(&str, &str)] = &[
@@ -132,6 +142,15 @@ fn main() {
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         #[cfg(windows)]
         Some("replay") if args.len() >= 2 => xcl::replay::run(&PathBuf::from(&args[1]), &args[2..]),
+        // No replay module on Linux (`lib.rs` gates it); answer the advertised command with
+        // the reason instead of the catch-all top-level help, for every argument shape.
+        #[cfg(not(windows))]
+        Some("replay") => {
+            eprintln!(
+                "xcl replay: not available on Linux (Windows-only D3D12 replay; see `xcl --help`)"
+            );
+            2
+        }
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0
