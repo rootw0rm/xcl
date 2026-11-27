@@ -303,3 +303,10 @@ class pool by hand stays fake-success. Reopen only with genuinely new
 evidence: a console-side trace showing the class-5 descriptor populated before
 this call, or the mechanism that is supposed to seed the pack-cache
 registration.
+
+Follow-up search done: `docs/retail-packcache-seeder.md` (task fix-01)
+enumerates the whole key/table writer set. The class-5 key is the zero
+default by construction (only classes 1 and 4 have non-zero templates), the
+kind table `0x1462fe860` is read-only with `[0] = 0`, and the `0x53525C0`
+table is the mount resolver, already seeded with `packroot:/` before this
+call. No seeder exists; no XCL input is named.
