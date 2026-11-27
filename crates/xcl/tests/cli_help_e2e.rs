@@ -84,6 +84,39 @@ fn run_separator_without_a_target_names_the_missing_operand() {
 }
 
 #[test]
+fn command_separator_names_the_operand_instead_of_taking_it_literally() {
+    for (command, operand) in [
+        ("inspect", "<file.exe|file.dll>"),
+        ("disasm", "<file>"),
+        ("shaders", "<file | folder | package.rpf>"),
+        ("rpf", "<package.rpf>"),
+    ] {
+        let out = xcl(&[command, "--"]);
+        assert_eq!(out.status.code(), Some(2), "xcl {command} --: {out:?}");
+        assert!(out.stdout.is_empty(), "xcl {command} --: {out:?}");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            missing_operand_message(command, operand),
+            "xcl {command} --"
+        );
+
+        // After the separator the next argument is the operand, not another option.
+        let out = xcl(&[command, "--", "/nonexistent/xcl-no-such-input"]);
+        assert_eq!(out.status.code(), Some(2), "xcl {command} -- <path>: {out:?}");
+        assert!(out.stdout.is_empty(), "xcl {command} -- <path>: {out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("/nonexistent/xcl-no-such-input"),
+            "xcl {command} -- <path> did not read the operand: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "xcl {command} -- <path> rejected its operand: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn help_and_error_controls_are_unchanged() {
     let help = xcl(&["--help"]);
     assert_eq!(help.status.code(), Some(0), "{help:?}");

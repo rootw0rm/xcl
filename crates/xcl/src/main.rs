@@ -137,15 +137,23 @@ fn main() {
         }
         // `xcl run -- …` starts with the argument separator, so there is no target before it.
         Some("run") => missing_operand("run", "<game folder | file.exe>"),
-        Some("inspect") if args.len() >= 2 => xcl::inspect::run(Path::new(&args[1]), &args[2..]),
-        Some("inspect") => missing_operand("inspect", "<file.exe|file.dll>"),
-        Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
-        Some("disasm") => missing_operand("disasm", "<file>"),
+        Some("inspect") => match operand_after_separator(&args[1..]) {
+            Some((target, rest)) => xcl::inspect::run(Path::new(target), rest),
+            None => missing_operand("inspect", "<file.exe|file.dll>"),
+        },
+        Some("disasm") => match operand_after_separator(&args[1..]) {
+            Some((target, rest)) => xcl::disasm::run(&PathBuf::from(target), rest),
+            None => missing_operand("disasm", "<file>"),
+        },
         Some("preflight") => preflight_command(&args[1..]),
-        Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
-        Some("shaders") => missing_operand("shaders", "<file | folder | package.rpf>"),
-        Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
-        Some("rpf") => missing_operand("rpf", "<package.rpf>"),
+        Some("shaders") => match operand_after_separator(&args[1..]) {
+            Some((target, rest)) => xcl::shaders::run(&PathBuf::from(target), rest),
+            None => missing_operand("shaders", "<file | folder | package.rpf>"),
+        },
+        Some("rpf") => match operand_after_separator(&args[1..]) {
+            Some((target, rest)) => xcl::rpf::run(&PathBuf::from(target), rest),
+            None => missing_operand("rpf", "<package.rpf>"),
+        },
         #[cfg(windows)]
         Some("replay") if args.len() >= 2 => xcl::replay::run(&PathBuf::from(&args[1]), &args[2..]),
         // No replay module on Linux (`lib.rs` gates it); answer the advertised command with
@@ -202,6 +210,20 @@ fn help(args: &[String]) -> i32 {
 fn missing_operand(command: &str, operand: &str) -> i32 {
     eprintln!("xcl {command}: missing {operand}; see xcl {command} --help");
     2
+}
+
+/// The operand and the options after it, skipping a leading `--` end-of-options marker.
+///
+/// These commands take their operand first, so the marker only ever shields that one
+/// word (`xcl inspect -- -weird-name.exe`); with nothing after it the operand is missing,
+/// not a file literally named `--`. `run` keeps its own `--` meaning (game arguments).
+fn operand_after_separator(args: &[String]) -> Option<(&str, &[String])> {
+    let args = match args.first().map(String::as_str) {
+        Some("--") => &args[1..],
+        _ => args,
+    };
+    let (operand, rest) = args.split_first()?;
+    Some((operand.as_str(), rest))
 }
 
 /// `xcl preflight [gpu]`: one optional `d3d12_adapter` value and nothing else. A flag or a
