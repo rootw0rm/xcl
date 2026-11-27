@@ -584,6 +584,12 @@ unsafe extern "win64" fn Device_CheckFeatureSupport(_t: *mut NullObj, feature: u
     if feature == 27 && !data.is_null() && size >= 12 {
         let tier = crate::state::config().raytracing_tier_override().unwrap_or(0);
         *((data as *mut u8).add(8) as *mut u32) = tier;
+        if size > 12 {
+            // oversized probe padding: zero it (4 KiB sanity cap — the title
+            // passes 16; a garbage size must not memset the address space)
+            let tail = ((size - 12) as usize).min(4096);
+            std::ptr::write_bytes((data as *mut u8).add(12), 0, tail);
+        }
     }
     S_OK
 }
@@ -2020,6 +2026,29 @@ mod tests {
                 }
                 None => crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan"),
             }
+        }
+    }
+
+    #[test]
+    fn null_check_feature_support_zeroes_options5_tail() {
+        // #10 XS slice: the null device's OPTIONS5 path must zero the tail
+        // past the 12-byte struct like the Vulkan one does — the title
+        // probes with a 16-byte struct filled with `0xAA`.
+        unsafe {
+            let this = std::ptr::null_mut();
+            let mut wide = [0xAAu8; 16];
+            assert_eq!(
+                Device_CheckFeatureSupport(this, 27, wide.as_mut_ptr() as *mut c_void, 16),
+                S_OK
+            );
+            assert_eq!(&wide[12..16], &[0, 0, 0, 0]);
+            // other features / short structs pass through untouched
+            let mut narrow = [0xAAu8; 8];
+            assert_eq!(
+                Device_CheckFeatureSupport(this, 7, narrow.as_mut_ptr() as *mut c_void, 8),
+                S_OK
+            );
+            assert_eq!(&narrow, &[0xAA; 8]);
         }
     }
 
