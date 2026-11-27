@@ -19,10 +19,10 @@
 //! `tests/testtitle/src/gpu.rs`, which reaches console slots by raw vtable
 //! index — the title has zero static d3d12 imports). Routed today: device
 //! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #11, Vulkan-list
-//! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148. Next unrouted slot: queue #30
-//! `PresentX` + device #78–#81 frame clock, consumer `present_x_frame`
-//! (`gpu.rs:312`) — the M1 first-frame gate, to route behind
-//! `XCL_VULKAN_BACKEND` (null stays default). No fake-success: the route must
+//! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, Vulkan-device frame clock
+//! 1d(i) #78–#81 (Linux twin + ancillary routing; queue #30 `PresentX`
+//! follows in 1d(ii)). Null stays default behind `XCL_VULKAN_BACKEND`:
+//! unrouted slots keep logging stubs. No fake-success: a routed slot must
 //! present a real frame or stay an honest logging stub.
 //
 //! Step-146 note (2026-11-27): re-verified at `46f7a172` — queue #30 and
@@ -59,6 +59,10 @@ pub enum Kind {
     /// without touching the headless default.
     VulkanDevice,
     CommandQueue,
+    /// A queue from a Vulkan device (1d): same vtable as [`Kind::CommandQueue`]
+    /// plus the routed queue #30 `PresentX` (1d(ii)); the null device keeps
+    /// plain queues with the logging stub (no default change).
+    VulkanQueue,
     CommandAllocator,
     CommandList,
     /// A command list from a Vulkan device (step 17): the graphics recording
@@ -86,7 +90,7 @@ impl Kind {
     fn iface(self) -> &'static str {
         match self {
             Kind::Device | Kind::VulkanDevice => "ID3D12Device",
-            Kind::CommandQueue => "ID3D12CommandQueue",
+            Kind::CommandQueue | Kind::VulkanQueue => "ID3D12CommandQueue",
             Kind::CommandAllocator => "ID3D12CommandAllocator",
             Kind::CommandList | Kind::VulkanList => "ID3D12GraphicsCommandList",
             Kind::Fence => "ID3D12Fence",
@@ -193,7 +197,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[74] = Device_RegisterPagePoolX as usize;
             v[75] = Device_UnregisterPagePoolX as usize;
         }
-        Kind::CommandQueue => {
+        Kind::CommandQueue | Kind::VulkanQueue => {
             v[10] = Ret_Void as usize; // ExecuteCommandLists
             v[14] = Queue_Signal as usize;
             v[15] = Ret_S_OK as usize; // Wait
@@ -239,6 +243,10 @@ fn vtable(kind: Kind) -> *const usize {
         v[13] = Vulkan_CheckFeatureSupport as usize;
         v[18] = Vulkan_CreateShaderResourceView as usize;
         v[73] = Vulkan_CreateCommandListX as usize;
+        v[78] = Vulkan_SetFrameIntervalX as usize; // 1d(i) frame clock
+        v[79] = Vulkan_ScheduleFrameEventX as usize;
+        v[80] = Vulkan_WaitFrameEventX as usize;
+        v[81] = Vulkan_GetFrameStatisticsX as usize;
     }
     if kind == Kind::VulkanList {
         v[7] = VulkanList_GetDevice as usize;
@@ -374,8 +382,10 @@ unsafe extern "win64" fn Hidden_ZeroDesc40(_t: *mut NullObj, ret: *mut u8) -> *m
 unsafe extern "win64" fn Device_GetNodeCount(_t: *mut NullObj) -> u32 {
     1
 }
-unsafe extern "win64" fn Device_CreateCommandQueue(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    out_obj(ppv, Kind::CommandQueue)
+unsafe extern "win64" fn Device_CreateCommandQueue(this: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    // 1d(i): a Vulkan device's queues route PresentX (1d(ii)); null keeps stubs.
+    let vk = !this.is_null() && (*this).kind == Kind::VulkanDevice;
+    out_obj(ppv, if vk { Kind::VulkanQueue } else { Kind::CommandQueue })
 }
 unsafe extern "win64" fn Device_CreateCommandAllocator(_t: *mut NullObj, _ty: u32, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     out_obj(ppv, Kind::CommandAllocator)
@@ -680,12 +690,13 @@ unsafe extern "win64" fn Device_CreatePlacedResourceX(
 
 /// `CreateCommandQueueX(desc[4], riid, out)`: `desc[0]` is the queue type (0x10 DMA).
 unsafe extern "win64" fn Device_CreateCommandQueueX(
-    _t: *mut NullObj,
+    this: *mut NullObj,
     _desc: *const u32,
     _riid: *const c_void,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
-    out_obj(ppv, Kind::CommandQueue)
+    let vk = !this.is_null() && (*this).kind == Kind::VulkanDevice;
+    out_obj(ppv, if vk { Kind::VulkanQueue } else { Kind::CommandQueue })
 }
 
 /// `CreateCommandListX(desc[4], allocator, state, riid, out)`.
@@ -768,6 +779,57 @@ unsafe extern "win64" fn Device_UnregisterPagePoolX(_t: *mut NullObj, pool: u64)
             S_OK
         }
         None => E_FAIL,
+    }
+}
+
+/// Frame clock slots on the Vulkan device (1d(i)): thin adapters over the
+/// Linux twin (`d3d12x_frame_linux`) with the title's ancillary handles routed
+/// at schedule time. Signatures mirror the title's raw vtable calls
+/// (`present_x_frame`), return codes the Windows twin's.
+
+// device #78 SetFrameIntervalX(output, length µs, periodicity, flags)
+unsafe extern "win64" fn Vulkan_SetFrameIntervalX(_t: *mut NullObj, _out: *mut c_void, len_us: u32, _per: u32, _fl: u32) -> HRESULT {
+    crate::hle::d3d12x_frame_linux::set_frame_interval(len_us)
+}
+
+// device #79 ScheduleFrameEventX(type, offset µs, ancillary, flags)
+unsafe extern "win64" fn Vulkan_ScheduleFrameEventX(_t: *mut NullObj, ty: u32, off_us: u32, block: *const u8, flags: u32) -> HRESULT {
+    // UNSCHEDULE = 1, like the Windows twin
+    let hr = crate::hle::d3d12x_frame_linux::register_ancillary(ty, block, flags & 1 != 0);
+    if hr != S_OK {
+        return hr;
+    }
+    crate::hle::d3d12x_frame_linux::schedule_frame_event(ty, off_us, flags)
+}
+
+// device #80 WaitFrameEventX(type, timeout ms, ancillary, flags, token in/out)
+unsafe extern "win64" fn Vulkan_WaitFrameEventX(_t: *mut NullObj, ty: u32, timeout_ms: u32, _block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
+    // the title may pass no token storage; the wait still paces the frame
+    let mut t = if token.is_null() { 0 } else { *token };
+    let hr = crate::hle::d3d12x_frame_linux::wait_frame_event(ty, timeout_ms, flags, &mut t);
+    if !token.is_null() {
+        *token = t;
+    }
+    hr
+}
+
+// device #81 GetFrameStatisticsX(token, type, count in/out, statistics)
+unsafe extern "win64" fn Vulkan_GetFrameStatisticsX(_t: *mut NullObj, token: u64, ty: u32, count: *mut u32, stats: *mut u8) -> HRESULT {
+    if count.is_null() || stats.is_null() {
+        return E_INVALIDARG;
+    }
+    match crate::hle::d3d12x_frame_linux::frame_statistics(token) {
+        Ok((origin, flip)) => {
+            *count = 1;
+            (stats as *mut u32).write_unaligned(ty);
+            (stats.add(0x10) as *mut i64).write_unaligned(origin);
+            (stats.add(0x18) as *mut i64).write_unaligned(flip);
+            S_OK
+        }
+        Err(e) => {
+            *count = 0;
+            e
+        }
     }
 }
 
@@ -1733,6 +1795,64 @@ mod tests {
                 }
                 None => crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan"),
             }
+        }
+    }
+
+    #[test]
+    fn vulkan_frame_clock_and_presentx_route_behind_the_backend() {
+        // 1d failing-first: device #78-81 frame clock + queue #30 PresentX route
+        // on Vulkan objects; the null device keeps logging stubs (no default change).
+        // No real GPU needed: the slots never touch the VulkanState pointer.
+        // The clock is one per process: take turns with the twin's own tests.
+        let _serial = crate::hle::d3d12x_frame_linux::CLOCK_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut ndev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&null_sel, None, &mut ndev), S_OK);
+            for i in [78usize, 79, 80, 81] {
+                let name = crate::stubs::info_of_stub(slot(ndev, i)).map(|s| s.name.as_str()).unwrap_or("");
+                assert_eq!(name, format!("ID3D12Device::#{i}"), "null slot {i} stays a stub");
+            }
+            let vd = new_obj(Kind::VulkanDevice);
+            let vdp = vd as *mut c_void;
+            type SetIv = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, u32) -> HRESULT;
+            let set: SetIv = std::mem::transmute(slot(vdp, 78));
+            assert_eq!(set(vdp, std::ptr::null_mut(), 16667, 1, 0), S_FALSE);
+            type Sched = unsafe extern "win64" fn(*mut c_void, u32, u32, *const u8, u32) -> HRESULT;
+            let sched: Sched = std::mem::transmute(slot(vdp, 79));
+            let hr = sched(vdp, 0, 0, std::ptr::null(), 0);
+            assert!(hr == S_FALSE || hr == 0x1000_0000, "{hr:#x}");
+            type Wait = unsafe extern "win64" fn(*mut c_void, u32, u32, *const u8, u32, *mut u64) -> HRESULT;
+            let wait: Wait = std::mem::transmute(slot(vdp, 80));
+            let mut token = 0u64;
+            let t0 = std::time::Instant::now();
+            let mut hr = S_FALSE;
+            while t0.elapsed() < std::time::Duration::from_secs(5) {
+                hr = wait(vdp, 0, 200, std::ptr::null(), 0, &mut token);
+                if hr == S_OK {
+                    break;
+                }
+                let _ = sched(vdp, 0, 0, std::ptr::null(), 0);
+            }
+            assert_eq!(hr, S_OK);
+            assert_ne!(token, 0);
+            // ancillary routing: a title event registered at schedule fires with type 1
+            let ev = crate::hle::kernelx_linux::CreateEventA(std::ptr::null(), 0, 0, std::ptr::null());
+            assert_ne!(ev, 0);
+            let list = [ev];
+            let mut signaled = -1i32;
+            let mut block = [0u8; 0x18];
+            block[..4].copy_from_slice(&1u32.to_le_bytes());
+            block[8..16].copy_from_slice(&(list.as_ptr() as usize).to_le_bytes());
+            block[16..24].copy_from_slice(&(&mut signaled as *mut i32 as usize).to_le_bytes());
+            let hr = sched(vdp, 1, 0, block.as_ptr(), 0);
+            assert!(hr == S_FALSE || hr == 0x1000_0000, "{hr:#x}");
+            let mut t1 = 0u64;
+            assert_eq!(wait(vdp, 1, 500, std::ptr::null(), 0, &mut t1), S_OK);
+            assert_eq!(crate::hle::kernelx_linux::WaitForSingleObject(ev, 0), 0);
+            let _ = sched(vdp, 1, 0, std::ptr::null(), 1); // unschedule
+            // queue #30 PresentX + #81 statistics follow in 1d(ii)
+            assert_eq!(set(vdp, std::ptr::null_mut(), 0, 0, 0), S_FALSE);
         }
     }
 

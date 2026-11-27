@@ -1,9 +1,11 @@
 //! Linux twin of the console frame clock (`hle/d3d12x/frame.rs` is Windows-only).
 //! Split 1a: the pure core — interval helpers plus token issuance and flip statistics.
 //! Split 1b: the schedule state machine (`set_frame_interval`,
-//! `schedule_frame_event`) plus the `signal_ancillary` honest stub. Split 1c
-//! (this): the `Condvar`/monotonic clock thread with `wait_frame_event`;
-//! device slots #78–#81 and queue #30 `PresentX` stay unrouted until 1d.
+//! `schedule_frame_event`) plus the `signal_ancillary` honest stub. Split 1c:
+//! the `Condvar`/monotonic clock thread with `wait_frame_event`. Split 1d(i):
+//! ancillary handle routing — `register_ancillary` remembers the schedule
+//! block's handles per type and the clock thread signals them at fire;
+//! device slots #78–#81 route here from `d3d12x_linux` (queue #30 follows).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -68,6 +70,10 @@ fn nanos() -> i64 {
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// Test-only serialization: the clock is one per process, so every test that
+/// drives it (this module's and `d3d12x_linux`'s 1d routing test) takes turns.
+#[cfg(test)]
+pub(crate) static CLOCK_SERIAL: Mutex<()> = Mutex::new(());
 static ISSUED: Mutex<Vec<(u64, i64)>> = Mutex::new(Vec::new()); // (token, origin ns)
 static FLIPPED: Mutex<Vec<(u64, i64, i64)>> = Mutex::new(Vec::new()); // (token, origin, flip)
 static LAST_ORIGIN: AtomicI64 = AtomicI64::new(0);
@@ -128,10 +134,8 @@ pub fn frame_statistics(token: u64) -> Result<(i64, i64), HRESULT> {
 }
 
 // --- Split 1c: `Condvar`/monotonic clock thread + `wait_frame_event`. ---
-// Unrouted (null default): device slots #78–#81 and queue #30 stay logging
-// stubs in `d3d12x_linux`, so this clock only runs once routed behind
-// `XCL_VULKAN_BACKEND` — no behavior change while unset. `PresentX` stays
-// stubbed until 1d.
+// Split 1d(i) routes device slots #78–#81 here (behind `XCL_VULKAN_BACKEND` —
+// no behavior change while unset); queue #30 `PresentX` follows in 1d(ii).
 
 const TYPES: usize = 3;
 /// What `schedule_frame_event` returns when it starts the clock.
@@ -247,6 +251,40 @@ pub fn signal_ancillary(count: usize) -> HRESULT {
     S_FALSE
 }
 
+/// Ancillary handles per frame-event type, registered at schedule time (1d):
+/// the clock thread signals each with `kernelx_linux::SetEvent` when the type
+/// fires; rescheduling replaces the set, unscheduling clears it.
+static ANCILLARY: Mutex<[Vec<usize>; TYPES]> = Mutex::new([Vec::new(), Vec::new(), Vec::new()]);
+
+/// Parse a schedule ancillary block (`{ u32 count; HANDLE* list @8;
+/// i32* signaled @0x10 }`, null = none) and remember its handles for `ty`.
+/// `E_INVALIDARG` when the count exceeds the console's 63-handle cap, like
+/// Windows. Linux trusts the title's block (no `/proc/self/maps` walk yet —
+/// `gpu::shader::readable` is windows-only); a garbage block faults like any
+/// other Linux slot instead of failing closed.
+pub fn register_ancillary(ty: u32, block: *const u8, unschedule: bool) -> HRESULT {
+    let mut handles = Vec::new();
+    if !block.is_null() {
+        let count = unsafe { (block as *const u32).read_unaligned() } as usize;
+        if count > 63 {
+            return E_INVALIDARG;
+        }
+        if count > 0 {
+            let list = unsafe { (block.add(8) as *const usize).read_unaligned() };
+            if list == 0 {
+                return E_INVALIDARG;
+            }
+            handles = (0..count)
+                .map(|i| unsafe { (list as *const usize).add(i).read_unaligned() })
+                .collect();
+        }
+    }
+    if (ty as usize) < TYPES {
+        ANCILLARY.lock().unwrap()[ty as usize] = if unschedule { Vec::new() } else { handles };
+    }
+    S_OK
+}
+
 /// Start the clock thread once: it sleeps on `CLOCK_WAKE` between schedules.
 fn ensure_clock_thread() {
     if !THREAD.swap(true, Ordering::SeqCst) {
@@ -311,12 +349,14 @@ fn clock_thread() {
                 continue;
             }
         }
+        let mut fired_aux = Vec::new();
         {
             let mut clock = CLOCK.lock().unwrap();
             if clock.generation != generation {
                 continue;
             }
             let mut origins = ORIGINS.lock().unwrap();
+            let aux = ANCILLARY.lock().unwrap();
             for (_, i) in due {
                 last[i] = first;
                 clock.fired[i] += 1;
@@ -327,9 +367,14 @@ fn clock_thread() {
                         origins.pop_front();
                     }
                 }
+                fired_aux.extend(aux[i].iter().copied());
             }
         }
         CLOCK_WAKE.notify_all();
+        // outside the clock lock: SetEvent takes the events lock
+        for h in fired_aux {
+            unsafe { crate::hle::kernelx_linux::SetEvent(h) };
+        }
     }
 }
 
@@ -391,9 +436,6 @@ pub fn wait_frame_event(ty: u32, timeout_ms: u32, flags: u32, token: &mut u64) -
 mod tests {
     use super::*;
 
-    /// The clock is one per process: the tests that drive it take turns.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     #[test]
     fn interval_helpers_match_the_windows_clock() {
         assert_eq!(parse_interval_override(None), None);
@@ -440,7 +482,7 @@ mod tests {
     /// 1b: the schedule state machine validates like Windows.
     #[test]
     fn schedule_validates_like_the_windows_clock() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = CLOCK_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(set_frame_interval(16000), E_INVALIDARG);
         assert_eq!(set_frame_interval(16667), S_FALSE);
         assert_eq!(schedule_frame_event(1, 0, 0), E_INVALIDARG, "type 1 needs the origin");
@@ -458,7 +500,7 @@ mod tests {
     /// apart with fresh tokens (mirrors the Windows `origin_events_...` test).
     #[test]
     fn origin_waits_pace_like_the_windows_clock() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = CLOCK_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(set_frame_interval(16667), S_FALSE);
         assert_eq!(wait_frame_event(0, 10, 0, &mut 0), E_INVALIDARG, "not scheduled");
         let hr = schedule_frame_event(0, 0, 0);
