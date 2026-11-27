@@ -393,7 +393,7 @@ impl RecompAgg {
         }
     }
 
-    fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode) {
+    fn add(&mut self, name: &str, code: &[u8], wave64: bool, keep: usize, mode: recomp::Mode) {
         // `XCL_RECOMP_ONLY=<hash>` (the hex prefix of an `XCL_DUMP_HLSL` file): that program alone
         if let Ok(only) = std::env::var("XCL_RECOMP_ONLY") {
             if format!("{:016x}", name_hash(name)) != only {
@@ -415,7 +415,6 @@ impl RecompAgg {
             }
         }
         self.programs += 1;
-        let wave64 = recomp::detect_wave64(code);
         self.wave32 += !wave64 as usize;
         let (label, profile) = match &mode {
             recomp::Mode::Vertex(_) => ("VS", "vs_6_6"),
@@ -674,7 +673,8 @@ impl Agg {
                 let mode = recomp::interface(blob, &sh, f).unwrap_or(recomp::Mode::Kernel);
                 for p in &f.programs {
                     let keep = self.keep;
-                    self.rc.add(&format!("{name} FSSM#{fi}"), &f.data[p.offset..p.offset + p.len], keep, mode.clone());
+                    let code = &f.data[p.offset..p.offset + p.len];
+                    self.rc.add(&format!("{name} FSSM#{fi}"), code, recomp::fssm_wave64(f, code), keep, mode.clone());
                     // `--example name=…`: FSSM header (up to the code) as dwords, once
                     if EXAMPLE_FOR.get().is_some_and(|w| w.starts_with("name=")) && !HEADER_SHOWN.swap(true, Ordering::Relaxed) {
                         let end = f.code.map(|c| c.0).unwrap_or(0x400).min(f.data.len()).min(0x800);
@@ -2534,6 +2534,20 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    /// The analysis takes a program's wave size from its FSSM header: a wave32 program that
+    /// never writes EXEC has nothing in its code to tell, and `detect_wave64` reads it as wave64.
+    #[test]
+    fn recomp_counts_the_wave_size_from_the_fssm_header() {
+        let mut f = fssm(&CODE, &[(6, 3)]);
+        f[0xD4..0xD8].copy_from_slice(&0x20u32.to_le_bytes());
+        let blob = sample(5, &[f]);
+        let mut a = Agg { recomp_on: true, ..Default::default() };
+        a.add("wave32-cs", &blob);
+        assert_eq!(a.rc.programs, 1);
+        assert_eq!(a.rc.wave32, 1, "the header says wave32; the code alone reads as wave64");
+        assert_eq!(a.rc.lanes[0], 1, "the program was translated: {:?}", a.rc.lanes);
     }
 
     /// A worker that panics is a panic in the sweep, not a timeout; one that is still working
