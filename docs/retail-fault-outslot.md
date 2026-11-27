@@ -201,11 +201,12 @@ The `0x29e5480` suspect is dead: not in any static vtable/table reference and
 not executed once in a full boot. Its `edx`-vs-key comparison belongs to some
 other producer, not this call.
 
-## Next (own task, no code yet)
+## Next — answered
 
-Find which check inside `0xfc2540` fails and why:
-`0x1fb2600` (at `0xfc263d`, consumes outer `+0x10/+0x18/+0x20`) or
-`0x8ec200` (at `0xfc2664`) — that is the missing-content producer the game
-expects before it will accept the record. Static reading of `0xfc2540`
-(`[inner+0x30]` zeroed at `0xfc25a9`, success store at `0xfc2507` never
-reached) narrows it to that init chain, not to `0x22372c0` itself.
+`docs/retail-inner-init.md` (fix-02) closes this: the header/table read
+`0x1fb2600` at `0xfc263d` returns 1, and the failure is the second gate
+`0x8ec200` at `0xfc2664`, which refuses because `0x140a34890` cannot
+register the class-5 zero key (`H[0x2e] = 0x0b` -> class 5) — the same
+refusal as `docs/retail-packcache-seeder.md`. No missing content producer
+remains on this chain; `[inner+0x30]` is simply never filled after the
+gate fails.
