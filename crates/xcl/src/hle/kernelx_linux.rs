@@ -6853,6 +6853,31 @@ pub unsafe extern "win64" fn WideCharToMultiByte(
     required_i32
 }
 
+/// `int GetUserDefaultGeoName(LPWSTR geoName, int cchGeoName)` — the user's two-letter
+/// ISO 3166 region name (`L"US"` + NUL, i.e. what a US console reports). No OS locale
+/// lookup: a fixed answer keeps the static Linux exe free of locale backends and is
+/// deterministic for the title's resource compare. Zero length (or a null buffer with
+/// zero length) is the size query and reports 3; otherwise the name is truncated to
+/// `cchGeoName` and the return is chars written excluding NUL, per the Win32 contract.
+pub unsafe extern "win64" fn GetUserDefaultGeoName(buf: *mut u16, len: i32) -> i32 {
+    const GEO: &[u16] = &[b'U' as u16, b'S' as u16];
+    const REQUIRED: i32 = 3; // "US" + NUL
+    if len == 0 {
+        set_error(ERROR_SUCCESS);
+        return REQUIRED;
+    }
+    if len < 0 || buf.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let cap = len as usize;
+    let n = GEO.len().min(cap.saturating_sub(1));
+    std::ptr::copy_nonoverlapping(GEO.as_ptr(), buf, n);
+    *buf.add(n) = 0;
+    set_error(ERROR_SUCCESS);
+    n as i32
+}
+
 // ---------------------------------------------------------------------------------------
 // Startup: command line, process heap, module file names (Phase C step 11b)
 // ---------------------------------------------------------------------------------------
@@ -9695,6 +9720,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("FormatMessageA", FormatMessageA as usize),
         ("MultiByteToWideChar", MultiByteToWideChar as usize),
         ("WideCharToMultiByte", WideCharToMultiByte as usize),
+        ("GetUserDefaultGeoName", GetUserDefaultGeoName as usize),
     ]
 }
 
@@ -13366,6 +13392,25 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(0, 1, &mut sibling), 1);
             assert!(page_home(sibling).is_none());
             assert_eq!(VirtualFree(home, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn user_default_geo_name_reports_us_two_letter_name() {
+        // Retail M1: the title calls `GetUserDefaultGeoName` just before the
+        // exe+0x2237320 abort; the generic stub returned 0 with an empty
+        // buffer and the NULL locale string fed the stage-2 object chain.
+        unsafe {
+            // Size query (null buffer or zero length) reports room for "US"+NUL.
+            assert_eq!(GetUserDefaultGeoName(std::ptr::null_mut(), 0), 3);
+            let mut probe = [0xCCCCu16; 1];
+            assert_eq!(GetUserDefaultGeoName(probe.as_mut_ptr(), 0), 3);
+            // Fill writes L"US"+NUL and returns chars written excluding NUL.
+            let mut buf = [0xCCCCu16; 4];
+            assert_eq!(GetUserDefaultGeoName(buf.as_mut_ptr(), buf.len() as i32), 2);
+            assert_eq!(&buf[..3], &['U' as u16, 'S' as u16, 0]);
+            // Wired into the KERNELX export table so kernel32/api-set imports resolve.
+            assert!(exports().iter().any(|(n, _)| *n == "GetUserDefaultGeoName"));
         }
     }
 
