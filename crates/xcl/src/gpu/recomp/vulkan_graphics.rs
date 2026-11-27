@@ -488,19 +488,52 @@ pub struct RecordPipelineSummary {
     pub fs_words: u32,
     /// True when the record bytes were rejected and the title triangle stood in.
     pub vs_fallback: bool,
+    /// S3 detail: the S1 interface summary plus `complete()` / `unsupported_why`
+    /// (or the reject reason), so the caller log says why it fell back.
+    pub vs_detail: String,
     /// The record's RTV count, echoed (render pass stays one attachment).
     pub rtv_count: u32,
 }
 
-pub fn build_record_pipeline(vs_bytes: &[u8], rtv_count: u32) -> Result<RecordPipelineSummary, String> {
-    let (vs_words, vs_fallback) = if vs_bytes.is_empty() {
-        (triangle_vs_spv(), true)
-    } else {
-        match super::spirv::record_vs_words(vs_bytes) {
-            Ok(t) if t.complete() => (t.words, false),
-            _ => (triangle_vs_spv(), true),
+/// M2 draw DXBC S3: shared VS resolve behind [`build_record_pipeline`] and
+/// [`execute_draw_ops`]: the S2 [`super::spirv::record_vs_words`] translation
+/// gated on `complete()` with the title-triangle fallback. The detail names
+/// the S1 interface (inputs/outputs/`attr_base`/params) and, on fallback,
+/// the backend's `unsupported_why`/error; fallbacks also `eprintln!` it.
+fn resolve_record_vs(vs_bytes: &[u8]) -> (Vec<u32>, bool, String) {
+    if vs_bytes.is_empty() {
+        return (triangle_vs_spv(), true, "empty VS bytes".into());
+    }
+    let iface = super::record_vs_interface(vs_bytes)
+        .map(|v| {
+            format!(
+                "inputs={} outputs={} attr_base={} params={}",
+                v.inputs.len(),
+                v.outputs.len(),
+                v.attr_base,
+                v.params.map(|p| p.len()).unwrap_or(0)
+            )
+        })
+        .unwrap_or_else(|| "no VS interface".into());
+    match super::spirv::record_vs_words(vs_bytes) {
+        Ok(t) if t.complete() => {
+            let n = t.words.len();
+            (t.words, false, format!("complete words={n} {iface}"))
         }
-    };
+        Ok(t) => {
+            let why: Vec<String> = t.unsupported_why.keys().cloned().collect();
+            eprintln!("vulkan: record vs falls back ({iface}; unsupported {why:?})");
+            (triangle_vs_spv(), true, format!("incomplete {iface} {why:?}"))
+        }
+        Err(e) => {
+            eprintln!("vulkan: record vs falls back ({iface}; {e})");
+            (triangle_vs_spv(), true, format!("reject {iface}; {e}"))
+        }
+    }
+}
+
+pub fn build_record_pipeline(vs_bytes: &[u8], rtv_count: u32) -> Result<RecordPipelineSummary, String> {
+    let (vs_words, vs_fallback, vs_detail) = resolve_record_vs(vs_bytes);
     let fs_words = green_fs_spv();
     unsafe {
         let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
@@ -683,6 +716,7 @@ pub fn build_record_pipeline(vs_bytes: &[u8], rtv_count: u32) -> Result<RecordPi
                     vs_words: vs_words.len() as u32,
                     fs_words: fs_words.len() as u32,
                     vs_fallback,
+                    vs_detail,
                     rtv_count,
                 })
             })();
@@ -761,14 +795,7 @@ pub fn execute_draw_ops(
     vs_bytes: &[u8],
     ops: &[ReplayDraw],
 ) -> Result<(OffscreenPixels, bool), String> {
-    let (vs_words, vs_fallback) = if vs_bytes.is_empty() {
-        (triangle_vs_spv(), true)
-    } else {
-        match super::spirv::record_vs_words(vs_bytes) {
-            Ok(t) if t.complete() => (t.words, false),
-            _ => (triangle_vs_spv(), true),
-        }
-    };
+    let (vs_words, vs_fallback, _) = resolve_record_vs(vs_bytes);
     let fs_words = green_fs_spv();
     let groups: Vec<ReplayDraw> = if ops.is_empty() {
         vec![ReplayDraw::default()]
@@ -2587,6 +2614,32 @@ mod tests {
         );
         assert!(record_vs_words(&[0xAAu8; 64]).is_err(), "garbage must fail closed");
         assert!(record_vs_words(&[]).is_err(), "empty bytes must fail closed");
+    }
+
+    #[test]
+    fn record_resolve_passes_interface_and_complete_through() {
+        // S3 wire: a console VS container resolves through the S1 interface
+        // to complete words (no fallback); the detail names the interface.
+        use crate::gpu::xbox::tests::{fssm, sample};
+        let blob = sample(1, &[fssm(&blit_code(), &[(4, 0)])]);
+        let (words, fallback, detail) = super::resolve_record_vs(&blob);
+        assert!(!fallback, "console container must translate, got {detail}");
+        assert!(detail.contains("complete"), "{detail}");
+        assert!(detail.contains("inputs="), "{detail}");
+        assert!(words.len() > 5 && words[0] == 0x0723_0203, "bad words");
+    }
+
+    #[test]
+    fn record_resolve_pc_dxbc_falls_back_by_design() {
+        // S3 keeps the fallback contract: PC DXBC (no console interface)
+        // and empty bytes fall back, and the detail says why.
+        use crate::gpu::xbox::tests::container;
+        let pc = container(&[(b"ISG1", &[0u8; 8])]);
+        let (_, fallback, detail) = super::resolve_record_vs(&pc);
+        assert!(fallback, "PC DXBC must keep the triangle fallback");
+        assert!(!detail.is_empty(), "fallback must say why");
+        let (_, fallback_empty, _) = super::resolve_record_vs(&[]);
+        assert!(fallback_empty, "empty bytes must fall back");
     }
 
     #[test]

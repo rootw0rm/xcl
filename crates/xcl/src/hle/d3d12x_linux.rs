@@ -898,9 +898,10 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
         };
         match crate::gpu::recomp::vulkan_graphics::build_record_pipeline(&bytes, r.pso_info.num_rtv) {
             Ok(sum) => crate::xlog_debug!(
-                "D3D12.X Execute: record pipeline built (vs {} words, fallback {})",
+                "D3D12.X Execute: record pipeline built (vs {} words, fallback {}: {})",
                 sum.vs_words,
-                sum.vs_fallback
+                sum.vs_fallback,
+                sum.vs_detail
             ),
             Err(e) if e.starts_with("no ") => {
                 crate::xlog_debug!("D3D12.X Execute: pipeline skipped ({e})");
