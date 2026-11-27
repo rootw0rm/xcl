@@ -1252,6 +1252,22 @@ mod tests {
     }
 
     #[test]
+    fn ws2_32_ordinal_115_is_a_contained_success_with_no_wsadata_write() {
+        // Retail `0x145a61172`: WSAStartup(MAKEWORD(2,0), &wsadata), then
+        // `test eax,eax` is the only consumer — the WSADATA is never read. The
+        // stub keeps the contained success (sockets are out of scope) but must
+        // not fabricate a WSADATA: leave the caller's buffer untouched.
+        let (addr, src) = resolve_inner("ws2_32.dll", &ImportName::Ordinal(115), 0);
+        assert_eq!(src, Source::Stub);
+        let info = stubs::info_of_stub(addr).expect("stub info registered");
+        assert_eq!(info.ret, 0);
+        let mut wsadata = [0xA5u8; 0x100];
+        let f: unsafe extern "win64" fn(u16, *mut u8) -> u64 = unsafe { std::mem::transmute(addr) };
+        assert_eq!(unsafe { f(2, wsadata.as_mut_ptr()) }, 0);
+        assert!(wsadata.iter().all(|&b| b == 0xA5), "the stub must not fabricate a WSADATA");
+    }
+
+    #[test]
     fn load_library_and_get_proc_address_contract() {
         let h = load_library("kernelx.dll").expect("HLE pseudo handle");
         assert!(modules::hle_name_by_handle(h).is_some());

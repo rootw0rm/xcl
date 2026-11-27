@@ -157,4 +157,45 @@ mod tests {
             assert!(crate::stubs::info_of_stub(slot4).is_some());
         }
     }
+
+    #[test]
+    fn slot_9_is_an_honest_e_notimpl_stub() {
+        // Retail `0x14592586a` calls slot 9 (RegisterDeviceCallback) and ignores
+        // the HRESULT; the token out-param is never read. E_NOTIMPL is therefore
+        // the honest answer, and a failed registration must leave the token alone.
+        unsafe {
+            let mut gi: *mut c_void = std::ptr::null_mut();
+            assert_eq!(GameInputCreate(&mut gi), S_OK);
+            let vt = *(gi as *const *const usize);
+            let slot9 = *vt.add(9);
+            let info = crate::stubs::info_of_stub(slot9).expect("slot 9 is a stub thunk");
+            assert_eq!(info.name, "IGameInput::#9");
+            assert_eq!(info.ret, E_NOTIMPL as u32 as u64);
+            let call: unsafe extern "win64" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                u32,
+                u32,
+                *mut c_void,
+                usize,
+                *mut u64,
+            ) -> u64 = std::mem::transmute(slot9);
+            let mut token: u64 = 0xDEAD_BEEF;
+            assert_eq!(
+                call(
+                    gi,
+                    std::ptr::null_mut(),
+                    0x4_0000,
+                    1,
+                    2,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut token,
+                ),
+                E_NOTIMPL as u32 as u64
+            );
+            assert_eq!(token, 0xDEAD_BEEF, "a failed registration must not write the token");
+        }
+    }
 }
