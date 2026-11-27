@@ -18,7 +18,9 @@
 //! Slot-routing queue (M1 step-88 inventory, K-D3D-06 order; callers in
 //! `tests/testtitle/src/gpu.rs`, which reaches console slots by raw vtable
 //! index — the title has zero static d3d12 imports). Routed today: device
-//! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #9 (Close) / #11, queue
+//! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #9 (Close) / #11 / #12 /
+//! #13 (draw counting) / #28 (BeginQuery) / #29 (EndQuery) / #30
+//! (ResolveQueryData) / #81 (DrawIndexedX), queue
 //! #10 (ExecuteCommandLists: null asserts the record, Vulkan submits), null + Vulkan-list
 //! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, null + Vulkan-device AS SRV
 //! #18, Vulkan-device frame clock
@@ -314,6 +316,15 @@ fn vtable(kind: Kind) -> *const usize {
         // M2 title-mem/streaming leg: PC CopyTextureRegion (slot 16) detiles a
         // placed title-memory texture into the readback buffer, same timing.
         v[16] = List_CopyTextureRegion as usize;
+        // M2 draw S5: PC DrawInstanced (12) / DrawIndexedInstanced (13) count
+        // draws for the #28/#29 occlusion queries; console slots #28 (Begin),
+        // #29 (End), #30 (Resolve) and DrawIndexedX #81 feed the same counter.
+        v[12] = List_NoteDraw as usize;
+        v[13] = List_NoteDraw as usize;
+        v[28] = List_BeginQuery as usize;
+        v[29] = List_EndQuery as usize;
+        v[30] = List_ResolveQueryData as usize;
+        v[81] = List_NoteDraw as usize;
         v[60] = VulList_CopyMemory as usize;
         v[61] = VulList_Fill32 as usize;
         v[69] = VulList_Write32Bottom as usize;
@@ -564,10 +575,23 @@ pub struct PsoRecord {
     pub dsv_format: u32,
 }
 
+/// A `CopyTextureRegion` from a committed render target stashed at record
+/// time: `Execute` fills it from the S4 offscreen pixels (record time is too
+/// early — the pixels only exist after the submit). Offsets/pitches come
+/// straight from the destination footprint.
+#[derive(Clone, Default)]
+pub struct PendingCopy {
+    pub dst: usize,
+    pub offset: u64,
+    pub pitch: u32,
+    pub height: u32,
+}
+
 /// List-bound draw state: the PSO bound at SetPipelineState plus its record,
 /// with the list-bound assembly S2 stores (root sig, render targets, index
-/// buffer, viewports/scissors, topology) and the S4 Close mark. Store-only;
-/// S3 interprets, S4 executes.
+/// buffer, viewports/scissors, topology), the S4 Close mark, the S5 draw
+/// counter + query snapshots/counts, and the S5 pending committed-RT copies.
+/// Store-only; S3 interprets, S4 executes, S5 resolves/reads back.
 #[derive(Clone, Default)]
 pub struct ListDrawRecord {
     pub pso: usize,
@@ -585,6 +609,10 @@ pub struct ListDrawRecord {
     pub viewports: Vec<u8>,
     pub scissors: Vec<u8>,
     pub closed: bool,
+    pub draws: u64,
+    pub query_start: [Option<u64>; 8],
+    pub query_counts: [u64; 8],
+    pub pending_copies: Vec<PendingCopy>,
 }
 
 fn pso_store() -> &'static Mutex<HashMap<usize, PsoRecord>> {
@@ -788,7 +816,12 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
         }
         EXECUTE_FLUSHES.fetch_add(1, Ordering::Relaxed);
         if !vk {
-            // null lists assert the record, no pixels.
+            // null lists assert the record, no pixels: drop any stashed
+            // committed-RT copies unwritten (the readback stays zero).
+            let mut ls = list_store().lock().unwrap();
+            if let Some(e) = ls.get_mut(&(l as usize)) {
+                e.pending_copies.clear();
+            }
             continue;
         }
         // Copy the VS bytes out from under the store lock (the title's
@@ -817,11 +850,121 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
         match crate::gpu::recomp::vulkan_graphics::execute_record_draw(&bytes) {
             Ok((px, fallback)) => {
                 crate::xlog_debug!("D3D12.X Execute: offscreen submit (fallback {fallback})");
-                *last_pixels_store().lock().unwrap() = Some(px);
+                *last_pixels_store().lock().unwrap() = Some(px.clone());
+                // S5 readback: fill the list's stashed committed-RT copies
+                // from the submit's pixels, then drop them.
+                let mut ls = list_store().lock().unwrap();
+                if let Some(e) = ls.get_mut(&(l as usize)) {
+                    for c in e.pending_copies.drain(..) {
+                        blit_execute_pixels(&px, &c);
+                    }
+                }
             }
             Err(e) if e.starts_with("no ") => crate::xlog_debug!("D3D12.X Execute: submit skipped ({e})"),
             Err(e) => crate::xlog_warn!("D3D12.X Execute: submit failed ({e})"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// M2 draw S5: query-resolve + readback. List slots #12/#13 (PC draws) and #81
+// (console DrawIndexedX) count draws; #28 (BeginQuery) snapshots the counter
+// and #29 (EndQuery) banks `(draws - snapshot) * SAMPLES_PER_DRAW` for its
+// index, so the title's nested occlusion shape resolves to outer = 2N,
+// inner = N, single = N. #30 (ResolveQueryData) writes the banked counts as
+// u64s into the results buffer's committed backing (unresolved indices read
+// 0, fail-closed). A CopyTextureRegion from a committed 2D RGBA8 render
+// target stashes a pending copy at record time; the S4 Execute flush above
+// fills it from the submit's pixels. Counting is API-level (both backends);
+// pixels land on Vulkan only — null readbacks stay zero.
+// ---------------------------------------------------------------------------------------
+
+/// Samples one counted draw contributes to a resolved occlusion query.
+pub const SAMPLES_PER_DRAW: u64 = 1024;
+
+/// Slots #12/#13/#81: one more draw on this list (extra call args ignored).
+unsafe extern "win64" fn List_NoteDraw(this: *mut NullObj) {
+    if !this.is_null() {
+        list_store().lock().unwrap().entry(this as usize).or_default().draws += 1;
+    }
+}
+
+/// List slot 28 `BeginQuery(heap, type, index)`: snapshot the draw counter.
+unsafe extern "win64" fn List_BeginQuery(this: *mut NullObj, _heap: *mut c_void, _ty: u32, index: u32) {
+    if this.is_null() {
+        return;
+    }
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    let draws = e.draws;
+    e.query_start[(index & 7) as usize] = Some(draws);
+}
+
+/// List slot 29 `EndQuery(heap, type, index)`: bank the samples drawn since
+/// the matching Begin (an unmatched End counts from zero, fail-closed).
+unsafe extern "win64" fn List_EndQuery(this: *mut NullObj, _heap: *mut c_void, _ty: u32, index: u32) {
+    if this.is_null() {
+        return;
+    }
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    let i = (index & 7) as usize;
+    let start = e.query_start[i].unwrap_or(0);
+    e.query_counts[i] = e.draws.saturating_sub(start).saturating_mul(SAMPLES_PER_DRAW);
+}
+
+/// List slot 30 `ResolveQueryData(heap, type, start, count, dst, dst_off)`:
+/// write the banked counts as u64s into the destination's committed backing.
+unsafe extern "win64" fn List_ResolveQueryData(
+    this: *mut NullObj,
+    _heap: *mut c_void,
+    _ty: u32,
+    start: u32,
+    count: u32,
+    dst: *mut NullObj,
+    dst_off: u64,
+) {
+    if this.is_null() || dst.is_null() {
+        return;
+    }
+    let counts = list_store().lock().unwrap().get(&(this as usize)).map(|r| r.query_counts).unwrap_or([0; 8]);
+    let (dp, dn) = resource_backing(dst);
+    if dp.is_null() {
+        return;
+    }
+    for i in 0..count.min(64) {
+        let idx = start.wrapping_add(i);
+        let v = if (idx as usize) < 8 { counts[idx as usize] } else { 0 };
+        let off = dst_off.wrapping_add(i as u64 * 8) as usize;
+        if off + 8 <= dn {
+            (dp.add(off) as *mut u64).write_unaligned(v);
+        }
+    }
+}
+
+/// Fill one stashed committed-RT copy from a submit's pixels: row-by-row into
+/// the destination footprint (pitch-aware, clamped to both shapes).
+unsafe fn blit_execute_pixels(px: &crate::gpu::recomp::vulkan_graphics::OffscreenPixels, c: &PendingCopy) {
+    if c.dst == 0 || px.rgba.is_empty() {
+        return;
+    }
+    let o = c.dst as *mut NullObj;
+    if (*o).kind != Kind::Resource && (*o).kind != Kind::PlacedResource {
+        return;
+    }
+    let (dp, dn) = resource_backing(o);
+    if dp.is_null() || c.pitch == 0 || c.height == 0 {
+        return;
+    }
+    let rows = (px.height as usize).min(c.height as usize);
+    let cols = (px.width as usize * 4).min(c.pitch as usize);
+    let src_pitch = px.width as usize * 4;
+    for y in 0..rows {
+        let off = c.offset as usize + y * c.pitch as usize;
+        if off + cols > dn || (y + 1) * src_pitch > px.rgba.len() {
+            break;
+        }
+        std::ptr::copy_nonoverlapping(px.rgba.as_ptr().add(y * src_pitch), dp.add(off), cols);
     }
 }
 
@@ -1585,11 +1728,12 @@ fn xg_computer(desc: &[u8; 0x38]) -> Option<*mut c_void> {
 /// the copy lands at once and `ExecuteCommandLists` stays a no-op — the same
 /// immediate semantics as the DMA `CopyBufferRegion`). Only the title's
 /// texture-readback shape is modelled: a whole-subresource (`box` null) RGBA8
-/// copy from a `PlacedResource` with no D3D12 flags into a buffer. Anything
-/// else (committed render targets, boxes, other formats) stays a silent no-op
-/// like the old stub.
+/// copy from a `PlacedResource` with no D3D12 flags detiles at record time;
+/// a whole-subresource RGBA8 copy from a committed render target stashes a
+/// pending copy that Execute fills from the S5 offscreen pixels. Anything
+/// else (boxes, other formats) stays a silent no-op like the old stub.
 unsafe extern "win64" fn List_CopyTextureRegion(
-    _t: *mut NullObj,
+    this: *mut NullObj,
     dst: *const u8,
     x: u32,
     y: u32,
@@ -1615,6 +1759,23 @@ unsafe extern "win64" fn List_CopyTextureRegion(
         return;
     }
     if (*sob).kind != Kind::PlacedResource {
+        // M2 draw S5: a committed 2D RGBA8 render target stashes a pending
+        // copy for Execute (the pixels only exist after the S4 submit);
+        // anything else stays a silent no-op like the old stub.
+        if (*sob).kind == Kind::Resource && !this.is_null() {
+            let sd = &(*sob).desc;
+            let is_rt = (sd.as_ptr() as *const u32).read_unaligned() == 3
+                && (sd.as_ptr().add(32) as *const u32).read_unaligned() == 28;
+            if is_rt {
+                let c = PendingCopy {
+                    dst: dob as usize,
+                    offset: (dst.add(16) as *const u64).read_unaligned(),
+                    pitch: (dst.add(40) as *const u32).read_unaligned(),
+                    height: (dst.add(32) as *const u32).read_unaligned(),
+                };
+                list_store().lock().unwrap().entry(this as usize).or_default().pending_copies.push(c);
+            }
+        }
         return;
     }
     if (dst.add(24) as *const u32).read_unaligned() != 28 {
@@ -2265,6 +2426,14 @@ mod tests {
 
     unsafe fn slot(obj: *mut c_void, i: usize) -> usize {
         *(*(obj as *const *const usize)).add(i)
+    }
+
+    /// S4/S5 draw tests share process globals (`EXECUTE_FLUSHES`,
+    /// `last_execute_pixels`): hold this across each test so their exact
+    /// delta asserts can't interleave under `--test-threads=N`.
+    fn draw_serial() -> &'static std::sync::Mutex<()> {
+        static S: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        S.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]
@@ -3522,6 +3691,7 @@ mod tests {
     #[test]
     fn draw_s4_execute_flushes_record_offscreen() {
         unsafe {
+            let _serial = draw_serial().lock().unwrap();
             let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
             let mut dev = std::ptr::null_mut();
             assert_eq!(create_device_for(&null_sel, None, &mut dev), S_OK);
@@ -3588,6 +3758,163 @@ mod tests {
                     let px = super::last_execute_pixels().expect("Vulkan Execute submits real pixels");
                     assert_eq!((px.width, px.height), (64, 64));
                     assert_eq!(px.rgba.len(), 64 * 64 * 4);
+                }
+            }
+        }
+    }
+
+    /// M2 draw S5 failing-first: list #28/#29 count draws and #30 writes the
+    /// occlusion counts into the results buffer, and a CopyTextureRegion from
+    /// a committed render target stashes a pending copy that Execute fills
+    /// from the S4 offscreen pixels (Map then reads green centre + blue
+    /// clear). Fails pre-S5: #28–#30 are stubs (counts stay 0) and the
+    /// committed-RT copy is a silent no-op (readback stays zero).
+    #[test]
+    fn draw_s5_query_resolve_and_readback() {
+        unsafe {
+            let _serial = draw_serial().lock().unwrap();
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&null_sel, None, &mut dev), S_OK);
+            type MkCommitted = unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: MkCommitted = std::mem::transmute(slot(dev, 27));
+            let buf_desc = |bytes: u64| {
+                // 8-aligned backing: approx_size reads Width with an aligned u64 load.
+                let mut s = [0u64; 7];
+                (s.as_mut_ptr() as *mut u32).write_unaligned(1); // BUFFER
+                (s.as_mut_ptr().byte_add(16) as *mut u64).write_unaligned(bytes);
+                s
+            };
+            let mut props_s = [0u64; 3];
+            (props_s.as_mut_ptr() as *mut u32).write_unaligned(3); // READBACK
+            let props = props_s.as_ptr() as *const c_void;
+            let bd = buf_desc(24);
+            let mut results = std::ptr::null_mut();
+            assert_eq!(mk(dev, props, 0, (&bd as *const u64) as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut results), S_OK);
+            type MkQ = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkq: MkQ = std::mem::transmute(slot(dev, 39));
+            let mut qh = std::ptr::null_mut();
+            assert_eq!(mkq(dev, std::ptr::null(), std::ptr::null(), &mut qh), S_OK);
+            type ListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let list_x: ListX = std::mem::transmute(slot(dev, 73));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            type Query = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32);
+            type Resolve = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64);
+            let (begin, end): (Query, Query) = (std::mem::transmute(slot(l, 28)), std::mem::transmute(slot(l, 29)));
+            let resolve: Resolve = std::mem::transmute(slot(l, 30));
+            type Draw = unsafe extern "win64" fn(*mut c_void, u32, u32, u32, u32);
+            let draw: Draw = std::mem::transmute(slot(l, 12));
+            // outer (0): two draws; single (2): one draw — like the title.
+            begin(l, qh, 0, 0);
+            draw(l, 3, 1, 0, 0);
+            draw(l, 3, 1, 0, 0);
+            end(l, qh, 0, 0);
+            begin(l, qh, 0, 2);
+            draw(l, 3, 1, 0, 0);
+            end(l, qh, 0, 2);
+            resolve(l, qh, 0, 0, 3, results, 0);
+            type Map = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let map: Map = std::mem::transmute(slot(results, 8));
+            let mut p = std::ptr::null_mut();
+            assert_eq!(map(results, 0, std::ptr::null(), &mut p), S_OK);
+            let counts = std::slice::from_raw_parts(p as *const u64, 3).to_vec();
+            assert_eq!(counts, [2048, 0, 1024], "query counts resolve from draw counts, got {counts:?}");
+            // Vulkan half: a stashed committed-RT copy lands the S4 pixels.
+            match acquire() {
+                None => crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan"),
+                Some(st) => {
+                    let vulkan_sel = Selection { backend: Backend::Vulkan, lane: None, reason: "test".into() };
+                    let mut vdev = std::ptr::null_mut();
+                    assert_eq!(create_device_for(&vulkan_sel, Some(st), &mut vdev), S_OK);
+                    let mk: MkCommitted = std::mem::transmute(slot(vdev, 27));
+                    let mut vresults = std::ptr::null_mut();
+                    assert_eq!(mk(vdev, props, 0, (&bd as *const u64) as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut vresults), S_OK);
+                    let mkq: MkQ = std::mem::transmute(slot(vdev, 39));
+                    let mut vqh = std::ptr::null_mut();
+                    assert_eq!(mkq(vdev, std::ptr::null(), std::ptr::null(), &mut vqh), S_OK);
+                    // committed 64x64 RGBA8 render target as the copy source.
+                    let mut td_s = [0u64; 7];
+                    (td_s.as_mut_ptr() as *mut u32).write_unaligned(3);
+                    (td_s.as_mut_ptr().byte_add(16) as *mut u64).write_unaligned(64);
+                    (td_s.as_mut_ptr().byte_add(24) as *mut u32).write_unaligned(64);
+                    (td_s.as_mut_ptr().byte_add(32) as *mut u32).write_unaligned(28);
+                    let td = (&td_s as *const u64) as *const u8;
+                    let mut def_s = [0u64; 3];
+                    (def_s.as_mut_ptr() as *mut u32).write_unaligned(1); // DEFAULT
+                    let def = def_s.as_ptr() as *const c_void;
+                    let mut rt = std::ptr::null_mut();
+                    assert_eq!(mk(vdev, def, 0, td, 0, std::ptr::null(), std::ptr::null(), &mut rt), S_OK);
+                    let rbd = buf_desc(256 * 64);
+                    let mut rb = std::ptr::null_mut();
+                    assert_eq!(mk(vdev, props, 0, (&rbd as *const u64) as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+                    let vs = vec![0xAAu8; 64];
+                    let ps = vec![0xBBu8; 64];
+                    let mut desc = vec![0u8; super::GFX_DESC_MIN];
+                    desc[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+                    desc[16..24].copy_from_slice(&(vs.len()).to_le_bytes());
+                    desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
+                    desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
+                    desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+                    type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+                    let pso_x: PsoX = std::mem::transmute(slot(vdev, 60));
+                    let mut pso = std::ptr::null_mut();
+                    assert_eq!(pso_x(vdev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut pso), S_OK);
+                    type MkQueue = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+                    let mkq2: MkQueue = std::mem::transmute(slot(vdev, 8));
+                    let mut vq = std::ptr::null_mut();
+                    assert_eq!(mkq2(vdev, std::ptr::null(), std::ptr::null(), &mut vq), S_OK);
+                    let list_x: ListX = std::mem::transmute(slot(vdev, 73));
+                    let mut vl = std::ptr::null_mut();
+                    assert_eq!(list_x(vdev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut vl), S_OK);
+                    type SetPso = unsafe extern "win64" fn(*mut c_void, *mut c_void);
+                    let set: SetPso = std::mem::transmute(slot(vl, 25));
+                    set(vl, pso);
+                    let (begin, end): (Query, Query) = (std::mem::transmute(slot(vl, 28)), std::mem::transmute(slot(vl, 29)));
+                    let resolve: Resolve = std::mem::transmute(slot(vl, 30));
+                    let draw: Draw = std::mem::transmute(slot(vl, 12));
+                    begin(vl, vqh, 0, 0);
+                    draw(vl, 3, 1, 0, 0);
+                    draw(vl, 3, 1, 0, 0);
+                    end(vl, vqh, 0, 0);
+                    resolve(vl, vqh, 0, 0, 1, vresults, 0);
+                    // stash the committed-RT → readback copy (record time).
+                    let mut dst_loc = [0u8; 48];
+                    (dst_loc.as_mut_ptr() as *mut usize).write_unaligned(rb as usize);
+                    (dst_loc.as_mut_ptr().add(8) as *mut u32).write_unaligned(1);
+                    (dst_loc.as_mut_ptr().add(16) as *mut u64).write_unaligned(0);
+                    (dst_loc.as_mut_ptr().add(24) as *mut u32).write_unaligned(28);
+                    (dst_loc.as_mut_ptr().add(28) as *mut u32).write_unaligned(64);
+                    (dst_loc.as_mut_ptr().add(32) as *mut u32).write_unaligned(64);
+                    (dst_loc.as_mut_ptr().add(36) as *mut u32).write_unaligned(1);
+                    (dst_loc.as_mut_ptr().add(40) as *mut u32).write_unaligned(256);
+                    let mut src_loc = [0u8; 24];
+                    (src_loc.as_mut_ptr() as *mut usize).write_unaligned(rt as usize);
+                    (src_loc.as_mut_ptr().add(8) as *mut u32).write_unaligned(0);
+                    (src_loc.as_mut_ptr().add(16) as *mut u32).write_unaligned(0);
+                    type CopyTex = unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u32, *const u8, *const u8);
+                    let copy_tex: CopyTex = std::mem::transmute(slot(vl, 16));
+                    copy_tex(vl, dst_loc.as_ptr(), 0, 0, 0, src_loc.as_ptr(), std::ptr::null());
+                    type Close = unsafe extern "win64" fn(*mut c_void) -> HRESULT;
+                    let close: Close = std::mem::transmute(slot(vl, 9));
+                    assert_eq!(close(vl), S_OK);
+                    type Exec = unsafe extern "win64" fn(*mut c_void, u32, *const *mut c_void);
+                    let exec: Exec = std::mem::transmute(slot(vq, 10));
+                    exec(vq, 1, &vl);
+                    let map: Map = std::mem::transmute(slot(vresults, 8));
+                    let mut p = std::ptr::null_mut();
+                    assert_eq!(map(vresults, 0, std::ptr::null(), &mut p), S_OK);
+                    assert_eq!((p as *const u64).read_unaligned(), 2048, "outer query counts its two draws");
+                    let map_rb: Map = std::mem::transmute(slot(rb, 8));
+                    let mut prb = std::ptr::null_mut();
+                    assert_eq!(map_rb(rb, 0, std::ptr::null(), &mut prb), S_OK);
+                    let at = |x: usize, y: usize| {
+                        let o = y * 256 + x * 4;
+                        let s = std::slice::from_raw_parts((prb as *const u8).add(o), 4);
+                        [s[0], s[1], s[2], s[3]]
+                    };
+                    assert_eq!(at(32, 32), [0, 255, 0, 255], "centre pixel is the S4 offscreen green");
+                    assert_eq!(at(1, 1), [0, 0, 255, 255], "corner pixel is the S4 offscreen clear");
                 }
             }
         }
