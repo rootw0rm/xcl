@@ -1,6 +1,7 @@
 //! `xcl <command> --help|-h` prints that command's usage block and exits 0.
 //!
 //! Every block is the one `xcl --help` prints, so the two cannot drift apart.
+//! A command with no operand names the missing operand instead of dumping the whole help.
 
 use std::process::{Command, Output};
 
@@ -36,6 +37,79 @@ fn block_of(help: &str, command: &str) -> String {
         .map(|i| i + 1)
         .unwrap_or(rest.len());
     rest[..end].to_string()
+}
+
+/// The operand each command's usage line requires.
+const MISSING_OPERAND: [(&str, &str); 5] = [
+    ("run", "<game folder | file.exe>"),
+    ("inspect", "<file.exe|file.dll>"),
+    ("disasm", "<file>"),
+    ("shaders", "<file | folder | package.rpf>"),
+    ("rpf", "<package.rpf>"),
+];
+
+fn missing_operand_message(command: &str, operand: &str) -> String {
+    format!("xcl {command}: missing {operand}; see xcl {command} --help\n")
+}
+
+#[test]
+fn missing_operand_is_named_on_stderr_instead_of_printing_the_help() {
+    for (command, operand) in MISSING_OPERAND {
+        let out = xcl(&[command]);
+        assert_eq!(out.status.code(), Some(2), "xcl {command}: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "help printed for xcl {command}: {out:?}"
+        );
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            missing_operand_message(command, operand),
+            "xcl {command}"
+        );
+    }
+}
+
+#[test]
+fn run_separator_without_a_target_names_the_missing_operand() {
+    for args in [&["run", "--"][..], &["run", "--", "foo"][..]] {
+        let out = xcl(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "help printed for {args:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            missing_operand_message("run", "<game folder | file.exe>"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn help_and_error_controls_are_unchanged() {
+    let help = xcl(&["--help"]);
+    assert_eq!(help.status.code(), Some(0), "{help:?}");
+    assert!(help.stderr.is_empty(), "{help:?}");
+
+    // An unknown command keeps the full-help answer.
+    let unknown = xcl(&["bogus"]);
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    assert!(unknown.stderr.is_empty(), "{unknown:?}");
+    assert_eq!(unknown.stdout, help.stdout, "{unknown:?}");
+
+    // A given target keeps its read error.
+    let unreadable = xcl(&["run", "/nonexistent/xcl-no-such-game"]);
+    assert_eq!(unreadable.status.code(), Some(2), "{unreadable:?}");
+    assert!(unreadable.stdout.is_empty(), "{unreadable:?}");
+    assert!(!unreadable.stderr.is_empty(), "{unreadable:?}");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn bare_invocation_prints_the_help() {
+    let bare = xcl(&[]);
+    let help = xcl(&["--help"]);
+    assert_eq!(bare.status.code(), Some(0), "{bare:?}");
+    assert!(bare.stderr.is_empty(), "{bare:?}");
+    assert_eq!(bare.stdout, help.stdout, "{bare:?}");
 }
 
 #[test]

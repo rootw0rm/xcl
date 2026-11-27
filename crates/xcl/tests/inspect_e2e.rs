@@ -4,14 +4,17 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
-fn inspect_missing_arguments_prints_help_and_exits_two() {
+fn inspect_missing_argument_names_the_operand_and_exits_two() {
     let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
         .arg("inspect")
         .output()
         .expect("spawn xcl inspect");
     assert_eq!(out.status.code(), Some(2));
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("xcl inspect <file.exe|file.dll> [--json]"));
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "xcl inspect: missing <file.exe|file.dll>; see xcl inspect --help\n"
+    );
 }
 
 #[test]

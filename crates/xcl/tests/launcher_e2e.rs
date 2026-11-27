@@ -38,15 +38,18 @@ fn unreadable_shader_pack_stops_launch_before_host_start() {
 }
 
 #[test]
-fn launcher_missing_target_argument_exits_code_two() {
+fn launcher_missing_target_argument_names_the_operand_and_exits_two() {
     let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
         .arg("run")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("Usage:"));
-    assert!(text.contains("xcl run"));
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        text,
+        "xcl run: missing <game folder | file.exe>; see xcl run --help\n"
+    );
 }
 
 #[test]

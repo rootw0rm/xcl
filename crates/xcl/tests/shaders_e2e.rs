@@ -505,14 +505,17 @@ fn shaders_direct_hash_without_a_match_is_an_error() {
 }
 
 #[test]
-fn shaders_missing_arguments_prints_help_and_exits_two() {
+fn shaders_missing_argument_names_the_operand_and_exits_two() {
     let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
         .arg("shaders")
         .output()
         .expect("spawn xcl shaders");
     assert_eq!(output.status.code(), Some(2), "{output:?}");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("xcl shaders <file | folder | package.rpf>"), "{stdout}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "xcl shaders: missing <file | folder | package.rpf>; see xcl shaders --help\n"
+    );
 }
 
 #[test]
