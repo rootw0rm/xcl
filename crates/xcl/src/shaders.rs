@@ -959,6 +959,22 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             other => return Err(crate::cli::Parser::unexpected(other)),
         }
     }
+    // The run below dispatches on the first active mode, so a second one would be silently
+    // dropped: reject the combination instead of running only half of what was asked.
+    let modes: Vec<&str> = [
+        ("--export-hlsl", opts.export_hlsl.is_some()),
+        ("--measure-pso", opts.measure_pso.is_some()),
+        ("--precompile", opts.precompile),
+        ("--record-vs", opts.record_vs),
+        ("--direct", opts.direct),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(name, _)| name)
+    .collect();
+    if let [first, second, ..] = modes.as_slice() {
+        return Err(format!("{first} and {second} are exclusive modes; run one mode per invocation"));
+    }
     Ok(opts)
 }
 
@@ -3039,8 +3055,13 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     let only_hash = opts.hash;
     let dump_dir = opts.dump.as_ref();
     if let Some(d) = dump_dir {
-        let _ = std::fs::create_dir_all(d);
+        if let Err(e) = std::fs::create_dir_all(d) {
+            eprintln!("xcl shaders --direct: cannot create {}: {e}", d.display());
+            return 2;
+        }
     }
+    let matched = AtomicUsize::new(0);
+    let dump_errors = AtomicUsize::new(0);
     let (order, want, max_bytes) = if only_hash.is_some() { ((0..input.len()).collect(), usize::MAX, 0) } else { (order, want, max_bytes) };
     // translator panics are counted, not printed (`--trace` keeps the messages)
     if !trace {
@@ -3057,8 +3078,11 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                 }
                 let (name, Some(blob)) = input.get(ri) else { continue };
                 let blob_hash = crate::gpu::shader::fnv64(&blob);
-                if only_hash.is_some_and(|h| h != blob_hash) {
-                    continue;
+                if let Some(h) = only_hash {
+                    if h != blob_hash {
+                        continue;
+                    }
+                    matched.fetch_add(1, Ordering::Relaxed);
                 }
                 let Some(sh) = xbox::parse(&blob) else { continue };
                 for (fi, f) in sh.fssm.iter().enumerate() {
@@ -3109,7 +3133,11 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                         }
                         let dump = |suffix: &str, bytes: &[u8]| {
                             if let Some(d) = &dump_dir {
-                                let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
+                                let path = d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset));
+                                if let Err(e) = std::fs::write(&path, bytes) {
+                                    dump_errors.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("xcl shaders --direct: {}: {e}", path.display());
+                                }
                             }
                         };
                         dump("guest.bin", code);
@@ -3143,6 +3171,16 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
         }
     });
     let mut results = results.into_inner().unwrap();
+    if let Some(h) = only_hash {
+        if matched.load(Ordering::Relaxed) == 0 {
+            eprintln!("xcl shaders --direct: record {h:016x} not found");
+            return 2;
+        }
+        if results.is_empty() {
+            eprintln!("xcl shaders --direct: record {h:016x} has no console programs");
+            return 2;
+        }
+    }
     results.sort_by(|a, b| a.0.cmp(&b.0));
     let mut rep = Report::default();
     for (name, s) in &results {
@@ -3160,6 +3198,10 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
         }
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    if dump_errors.load(Ordering::Relaxed) > 0 {
+        eprintln!("xcl shaders --direct: {} dump file(s) could not be written", dump_errors.load(Ordering::Relaxed));
+        return 2;
     }
     0
 }

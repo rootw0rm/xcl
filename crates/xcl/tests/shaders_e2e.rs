@@ -283,6 +283,82 @@ fn shaders_single_file_runs_the_requested_sweep_modes() {
 }
 
 #[test]
+fn shaders_rejects_two_exclusive_modes() {
+    let dir = TempDir::new("mode-conflict");
+    let file = dir.path().join("ps.bin");
+    std::fs::write(&file, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    let cases: &[&[&str]] = &[
+        &["--direct", "--record-vs"],
+        &["--precompile", "--direct"],
+        &["--export-hlsl", "out", "--measure-pso", "CAFE"],
+        &["--record-vs", "--measure-pso", "CAFE"],
+    ];
+    for args in cases {
+        let out = run_shaders(&file, args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("xcl shaders:"), "args {args:?}: {stderr}");
+        assert!(stderr.contains("exclusive modes"), "args {args:?}: {stderr}");
+        assert!(stderr.contains("run one mode per invocation"), "args {args:?}: {stderr}");
+    }
+
+    // One mode alone still runs.
+    let one = run_shaders(&file, &["--direct", "--sample", "1"]);
+    assert!(one.status.success(), "{one:?}");
+    assert!(String::from_utf8_lossy(&one.stdout).contains("direct DXIL coverage"), "{one:?}");
+}
+
+#[test]
+fn shaders_direct_reports_an_unusable_dump_directory() {
+    let dir = TempDir::new("dump-fail");
+    let file = dir.path().join("ps.bin");
+    std::fs::write(&file, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"a file, not a directory").unwrap();
+    let dump = blocker.join("sub");
+
+    let out = run_shaders(&file, &["--direct", "--sample", "1", "--dump", dump.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty(), "unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("xcl shaders --direct: cannot create"), "{stderr}");
+}
+
+#[test]
+fn shaders_direct_hash_without_a_match_is_an_error() {
+    let dir = TempDir::new("hash-miss");
+    let file = dir.path().join("ps.bin");
+    let blob = xbox_shader(0, &[fssm(&CODE, &[(5, 1)])]);
+    let hash = format!("{:016x}", xcl::gpu::shader::fnv64(&blob));
+    std::fs::write(&file, &blob).unwrap();
+
+    let dump = dir.path().join("dump");
+    let hit = run_shaders(&file, &["--direct", "--hash", &hash, "--dump", dump.to_str().unwrap()]);
+    assert!(hit.status.success(), "{hit:?}");
+    let text = String::from_utf8_lossy(&hit.stdout);
+    assert!(text.starts_with("1 programs from"), "{text}");
+    assert!(std::fs::read_dir(&dump).unwrap().next().is_some(), "no files in {}", dump.display());
+
+    let miss = run_shaders(&file, &["--direct", "--hash", "0xdeadbeefdeadbeef"]);
+    assert_eq!(miss.status.code(), Some(2), "{miss:?}");
+    assert!(miss.stdout.is_empty(), "unexpected stdout {:?}", String::from_utf8_lossy(&miss.stdout));
+    let stderr = String::from_utf8_lossy(&miss.stderr);
+    assert!(stderr.contains("record deadbeefdeadbeef not found"), "{stderr}");
+
+    // A record that exists but carries no console program cannot satisfy the request either.
+    let plain = dir.path().join("plain.bin");
+    std::fs::write(&plain, b"not a shader").unwrap();
+    let plain_hash = format!("{:016x}", xcl::gpu::shader::fnv64(b"not a shader"));
+    let unusable = run_shaders(&plain, &["--direct", "--hash", &plain_hash]);
+    assert_eq!(unusable.status.code(), Some(2), "{unusable:?}");
+    assert!(unusable.stdout.is_empty(), "unexpected stdout {:?}", String::from_utf8_lossy(&unusable.stdout));
+    let stderr = String::from_utf8_lossy(&unusable.stderr);
+    assert!(stderr.contains("has no console programs"), "{stderr}");
+}
+
+#[test]
 fn shaders_missing_arguments_prints_help_and_exits_two() {
     let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
         .arg("shaders")
