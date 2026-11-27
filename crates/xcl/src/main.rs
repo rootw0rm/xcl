@@ -127,12 +127,7 @@ fn main() {
         }
         Some("inspect") if args.len() >= 2 => xcl::inspect::run(Path::new(&args[1]), &args[2..]),
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
-        Some("preflight") => {
-            let setting = args.get(1).map(String::as_str).unwrap_or("auto");
-            let checks = xcl::preflight::run(setting);
-            xcl::preflight::print(&checks);
-            xcl::preflight::exit_code(&checks)
-        }
+        Some("preflight") => preflight_command(&args[1..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         #[cfg(windows)]
@@ -175,6 +170,31 @@ fn help(args: &[String]) -> i32 {
     } else {
         2
     }
+}
+
+/// `xcl preflight [gpu]`: one optional `d3d12_adapter` value and nothing else. A flag or a
+/// second positional is a usage error, like `inspect`/`disasm`, instead of being dropped or
+/// probed as the setting.
+fn preflight_command(args: &[String]) -> i32 {
+    let setting = match args.first() {
+        None => "auto",
+        Some(value) if value.starts_with('-') => {
+            eprintln!("xcl preflight: unknown option: {value}; see `xcl --help`");
+            return 2;
+        }
+        Some(value) => value.as_str(),
+    };
+    if let Some(extra) = args.get(1) {
+        if extra.starts_with('-') {
+            eprintln!("xcl preflight: unknown option: {extra}; see `xcl --help`");
+        } else {
+            eprintln!("xcl preflight: unexpected argument: {extra}; see `xcl --help`");
+        }
+        return 2;
+    }
+    let checks = xcl::preflight::run(setting);
+    xcl::preflight::print(&checks);
+    xcl::preflight::exit_code(&checks)
 }
 
 #[cfg(windows)]
