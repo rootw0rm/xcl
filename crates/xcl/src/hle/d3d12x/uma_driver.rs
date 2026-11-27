@@ -77,10 +77,13 @@ unsafe fn written_pages(base: usize, size: usize) -> Result<Vec<(usize, Vec<u8>)
     Ok(out)
 }
 
-/// Reserves every free stretch of 1 GiB or more (but its first 256 MiB, room for the driver's own
-/// small mappings) outside `[hole, hole + len)`.
+/// Reserves every free stretch the window's `len` fits in (1 GiB or more for a larger window; but
+/// its first 256 MiB, or less than half the window, room for the driver's own small mappings)
+/// outside `[hole, hole + len)`. A window under 1 GiB (512 MB with the 16-window layout) found a
+/// stretch between its size and 1 GiB unreserved, and the driver mapped its heap there.
 unsafe fn groom(hole: usize, len: usize) -> Vec<usize> {
     let (top, mut a, mut got) = (0x7FFF_FFFE_0000usize, 0x1_0000usize, Vec::new());
+    let (least, margin) = (len.min(1 << 30), (256usize << 20).min(len / 2) & !0xFFFF);
     while a < top {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         if VirtualQuery(a as *const c_void, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
@@ -88,10 +91,10 @@ unsafe fn groom(hole: usize, len: usize) -> Vec<usize> {
         }
         let (base, end) = (m.BaseAddress as usize, (m.BaseAddress as usize + m.RegionSize).min(top));
         a = end;
-        if m.State != MEM_FREE || m.RegionSize < 1 << 30 {
+        if m.State != MEM_FREE || m.RegionSize < least {
             continue;
         }
-        let s = ((base + 0xFFFF) & !0xFFFF) + (256 << 20);
+        let s = ((base + 0xFFFF) & !0xFFFF) + margin;
         for (s, e) in [(s, end.min(hole)), (s.max(hole + len), end)] {
             let mut s = s;
             while s < e {
@@ -301,5 +304,48 @@ mod tests {
         assert_eq!(output.status.code(), Some(CODE), "{transcript}");
         assert!(transcript.contains("coherent window could not be restored"), "{transcript}");
         assert!(!transcript.contains("continued after failed restore"), "{transcript}");
+    }
+
+    /// Grooming for a window under 1 GiB (512 MB, as XCL makes the coherent window before a title's
+    /// size is known) leaves it no free stretch but its own hole: a window-sized reservation lands
+    /// there, not in a 768 MB stretch between two other reservations below it. Run in a process of
+    /// its own: while grooming, no other thread could reserve more than the margins.
+    #[test]
+    fn grooming_leaves_a_window_under_1_gib_only_its_hole() {
+        use super::*;
+        const MEM_TOP_DOWN: u32 = 0x0010_0000;
+        const LEN: usize = 512 << 20;
+        if std::env::var_os("XCL_TEST_GROOM_SMALL").is_some() {
+            unsafe {
+                let reserve = |at: usize, n: usize, flags: u32| VirtualAlloc(at as *const c_void, n, MEM_RESERVE | flags, PAGE_NOACCESS) as usize;
+                // the window's place, high up; held while the stretch below is made
+                let hole = reserve(0, LEN, MEM_TOP_DOWN);
+                assert_ne!(hole, 0);
+                // a free stretch of 768 MB between two reservations, below the hole
+                let probe = reserve(0, 2 << 30, 0);
+                assert!(probe != 0 && probe < hole);
+                VirtualFree(probe as *mut c_void, 0, MEM_RELEASE);
+                let (low, high) = (reserve(probe, 256 << 20, 0), reserve(probe + (1024 << 20), 256 << 20, 0));
+                assert!(low == probe && high == probe + (1024 << 20));
+                VirtualFree(hole as *mut c_void, 0, MEM_RELEASE);
+                let got = groom(hole, LEN);
+                let p = reserve(0, LEN, 0);
+                ungroom(got);
+                for a in [p, low, high] {
+                    if a != 0 {
+                        VirtualFree(a as *mut c_void, 0, MEM_RELEASE);
+                    }
+                }
+                println!("window reservation at {p:#x}, hole {hole:#x}, stretch {:#x}..{:#x}", probe + (256 << 20), probe + (1024 << 20));
+                std::process::exit(if p == hole { 0 } else { 1 });
+            }
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hle::d3d12x::uma_driver::tests::grooming_leaves_a_window_under_1_gib_only_its_hole", "--nocapture"])
+            .env("XCL_TEST_GROOM_SMALL", "1")
+            .output()
+            .unwrap();
+        let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.status.code(), Some(0), "{transcript}");
     }
 }
