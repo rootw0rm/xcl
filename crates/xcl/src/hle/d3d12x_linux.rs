@@ -333,6 +333,7 @@ fn vtable(kind: Kind) -> *const usize {
         v[72] = VulList_Wait64 as usize;
         v[89] = VulList_Write64Top as usize;
         v[93] = VulList_Kickoff as usize;
+        v[94] = List_RSSetDepthBiasX as usize; // S6 dynamic depth bias
     }
     if kind == Kind::VulkanList || kind == Kind::CommandList {
         v[146] = Ret_Void as usize; // UAV barrier (single queue: already coherent)
@@ -561,8 +562,10 @@ pub const GFX_RTV_OFF: usize = 576;
 pub const GFX_DSV_OFF: usize = 608;
 pub const GFX_DESC_MIN: usize = 644;
 
-/// Draw-relevant PSO bytes stashed at creation.
-#[derive(Clone, Default)]
+/// Draw-relevant PSO bytes stashed at creation. `rt0_mask` is the RT0 color
+/// write mask (see [`ReplayDraw`]); `static_bias` is the rasterizer's baked
+/// depth bias triple (bias, clamp, slope).
+#[derive(Clone)]
 pub struct PsoRecord {
     pub vs_ptr: usize,
     pub vs_len: usize,
@@ -573,6 +576,28 @@ pub struct PsoRecord {
     pub num_rtv: u32,
     pub rtv_formats: [u32; 8],
     pub dsv_format: u32,
+    pub rt0_mask: u8,
+    pub static_bias: [f32; 3],
+}
+
+impl Default for PsoRecord {
+    /// A record that never saw creation bytes binds everything (full mask,
+    /// no bias) — the S4/S5 unit shapes.
+    fn default() -> Self {
+        Self {
+            vs_ptr: 0,
+            vs_len: 0,
+            ps_ptr: 0,
+            ps_len: 0,
+            blend: Vec::new(),
+            raster: Vec::new(),
+            num_rtv: 0,
+            rtv_formats: [0; 8],
+            dsv_format: 0,
+            rt0_mask: 0xF,
+            static_bias: [0.0; 3],
+        }
+    }
 }
 
 /// A `CopyTextureRegion` from a committed render target stashed at record
@@ -587,11 +612,32 @@ pub struct PendingCopy {
     pub height: u32,
 }
 
+/// One counted draw's replay state (M2 draw S6): the list state snapshotted
+/// at `List_NoteDraw` so Execute replays each draw group with its own
+/// viewport/scissor, bound-PSO blend mask, and effective depth bias instead
+/// of one full-target draw. Query banking stays per draw call at record time
+/// (S5); the groups only drive pixels.
+#[derive(Clone, Default)]
+pub struct DrawOp {
+    pub viewport: [f32; 6],
+    pub has_viewport: bool,
+    pub scissor: [i32; 4],
+    pub has_scissor: bool,
+    pub pso: usize,
+    pub rt0_mask: u8,
+    pub topology: u32,
+    pub depth_test: bool,
+    pub depth_bias: f32,
+    pub depth_slope: f32,
+    pub depth_clamp: f32,
+}
+
 /// List-bound draw state: the PSO bound at SetPipelineState plus its record,
 /// with the list-bound assembly S2 stores (root sig, render targets, index
 /// buffer, viewports/scissors, topology), the S4 Close mark, the S5 draw
-/// counter + query snapshots/counts, and the S5 pending committed-RT copies.
-/// Store-only; S3 interprets, S4 executes, S5 resolves/reads back.
+/// counter + query snapshots/counts + pending committed-RT copies, and the S6
+/// per-draw groups + bias state (dynamic #94 override over the bound PSO's
+/// static triple). Store-only; S3 interprets, S4 executes, S5 resolves/reads back.
 #[derive(Clone, Default)]
 pub struct ListDrawRecord {
     pub pso: usize,
@@ -613,6 +659,9 @@ pub struct ListDrawRecord {
     pub query_start: [Option<u64>; 8],
     pub query_counts: [u64; 8],
     pub pending_copies: Vec<PendingCopy>,
+    pub ops: Vec<DrawOp>,
+    pub dyn_bias: Option<[f32; 3]>,
+    pub static_bias: [f32; 3],
 }
 
 fn pso_store() -> &'static Mutex<HashMap<usize, PsoRecord>> {
@@ -655,11 +704,23 @@ pub unsafe fn record_graphics_pso(obj: *mut NullObj, desc: *const u8) {
         *f = *(desc.add(GFX_RTV_OFF + 4 * i) as *const u32);
     }
     r.dsv_format = *(desc.add(GFX_DSV_OFF) as *const u32);
+    // RT0 write mask: byte 36 of RT0 in the blend desc (blend + 8 + 36).
+    r.rt0_mask = if r.blend.len() > 44 { r.blend[44] } else { 0xF };
+    // Rasterizer static bias triple: DepthBias i32 @12, DepthBiasClamp f32
+    // @16, SlopeScaledDepthBias f32 @20 of D3D12_RASTERIZER_DESC.
+    if r.raster.len() >= 24 {
+        r.static_bias = [
+            i32::from_le_bytes([r.raster[12], r.raster[13], r.raster[14], r.raster[15]]) as f32,
+            f32::from_le_bytes([r.raster[16], r.raster[17], r.raster[18], r.raster[19]]),
+            f32::from_le_bytes([r.raster[20], r.raster[21], r.raster[22], r.raster[23]]),
+        ];
+    }
     pso_store().lock().unwrap().insert(obj as usize, r);
 }
 
 /// List slot 25 `SetPipelineState(pso)`: bind the PSO's record to this list,
-/// preserving any S2 state already stored (order-independent).
+/// preserving any S2 state already stored (order-independent). A fresh PSO
+/// brings its own static bias and clears any dynamic #94 override.
 unsafe extern "win64" fn List_SetPipelineState(this: *mut NullObj, pso: *mut c_void) {
     if this.is_null() {
         return;
@@ -668,6 +729,8 @@ unsafe extern "win64" fn List_SetPipelineState(this: *mut NullObj, pso: *mut c_v
     let mut ls = list_store().lock().unwrap();
     let e = ls.entry(this as usize).or_default();
     e.pso = pso as usize;
+    e.static_bias = info.static_bias;
+    e.dyn_bias = None;
     e.pso_info = info;
 }
 
@@ -761,10 +824,11 @@ unsafe extern "win64" fn List_RSSetScissorRects(this: *mut NullObj, n: u32, rect
 // ---------------------------------------------------------------------------------------
 // M2 draw S4: Close/Execute flush. List slot 9 `Close` marks the list; queue
 // slot 10 `ExecuteCommandLists` flushes each listed record — null queues
-// assert the record exists and stop there (no pixels), Vulkan queues run the
-// S3 pipeline build and then a real offscreen submit whose pixels wait for
-// the S5 readback. A list with no bound PSO is skipped with a debug line
-// (fail-closed); missing-Vulkan (`"no ..."`) errors skip the same way.
+// assert the record exists and stop there (no pixels), Vulkan queues replay
+// the S6 per-draw groups (viewports, blend variants, depth bias) through one
+// offscreen submit whose pixels wait for the S5 readback. A list with no
+// bound PSO is skipped with a debug line (fail-closed); missing-Vulkan
+// (`"no ..."`) errors skip the same way.
 // ---------------------------------------------------------------------------------------
 
 static EXECUTE_FLUSHES: AtomicU64 = AtomicU64::new(0);
@@ -847,9 +911,24 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
                 continue;
             }
         }
-        match crate::gpu::recomp::vulkan_graphics::execute_record_draw(&bytes) {
+        // S6: replay each counted draw group (viewport, blend mask, depth
+        // bias) in list order; an empty group list replays the S4 single draw.
+        let groups: Vec<crate::gpu::recomp::vulkan_graphics::ReplayDraw> = r
+            .ops
+            .iter()
+            .map(|o| crate::gpu::recomp::vulkan_graphics::ReplayDraw {
+                viewport: o.viewport,
+                scissor: o.has_scissor.then_some(o.scissor),
+                rt0_mask: o.rt0_mask,
+                depth_test: o.depth_test,
+                depth_bias: o.depth_bias,
+                depth_slope: o.depth_slope,
+                depth_clamp: o.depth_clamp,
+            })
+            .collect();
+        match crate::gpu::recomp::vulkan_graphics::execute_draw_ops(&bytes, &groups) {
             Ok((px, fallback)) => {
-                crate::xlog_debug!("D3D12.X Execute: offscreen submit (fallback {fallback})");
+                crate::xlog_debug!("D3D12.X Execute: offscreen submit ({} groups, fallback {fallback})", groups.len());
                 *last_pixels_store().lock().unwrap() = Some(px.clone());
                 // S5 readback: fill the list's stashed committed-RT copies
                 // from the submit's pixels, then drop them.
@@ -883,10 +962,47 @@ unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u3
 pub const SAMPLES_PER_DRAW: u64 = 1024;
 
 /// Slots #12/#13/#81: one more draw on this list (extra call args ignored).
+/// Snapshots one S6 replay group: the current viewport/scissor (or
+/// full-target defaults), bound-PSO blend mask, and effective depth bias.
 unsafe extern "win64" fn List_NoteDraw(this: *mut NullObj) {
-    if !this.is_null() {
-        list_store().lock().unwrap().entry(this as usize).or_default().draws += 1;
+    if this.is_null() {
+        return;
     }
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    e.draws += 1;
+    let mut op = DrawOp {
+        viewport: [0.0, 0.0, 64.0, 64.0, 0.0, 1.0],
+        scissor: [0, 0, 64, 64],
+        pso: e.pso,
+        rt0_mask: e.pso_info.rt0_mask,
+        topology: e.topology,
+        depth_test: e.has_dsv,
+        ..DrawOp::default()
+    };
+    if e.viewports.len() >= 24 {
+        let f = |o: usize| f32::from_le_bytes([e.viewports[o], e.viewports[o + 1], e.viewports[o + 2], e.viewports[o + 3]]);
+        op.viewport = [f(0), f(4), f(8), f(12), f(16), f(20)];
+        op.has_viewport = true;
+    }
+    if e.scissors.len() >= 16 {
+        let i = |o: usize| i32::from_le_bytes([e.scissors[o], e.scissors[o + 1], e.scissors[o + 2], e.scissors[o + 3]]);
+        op.scissor = [i(0), i(4), i(8), i(12)];
+        op.has_scissor = true;
+    }
+    let b = e.dyn_bias.unwrap_or(e.static_bias);
+    (op.depth_bias, op.depth_slope, op.depth_clamp) = (b[0], b[1], b[2]);
+    e.ops.push(op);
+}
+
+/// List slot 94 `RSSetDepthBiasX(bias, slope, clamp)`: stash the dynamic
+/// depth-bias override; the next SetPipelineState clears it (a fresh PSO
+/// brings its own static bias).
+unsafe extern "win64" fn List_RSSetDepthBiasX(this: *mut NullObj, bias: f32, slope: f32, clamp: f32) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().dyn_bias = Some([bias, slope, clamp]);
 }
 
 /// List slot 28 `BeginQuery(heap, type, index)`: snapshot the draw counter.
@@ -1550,7 +1666,14 @@ unsafe extern "win64" fn Device_CreateDerivedPipelineStateX(
         2 if !_base.is_null() => {
             let hr = out_obj(ppv, Kind::PipelineState);
             if hr == S_OK && !ppv.is_null() && !(*ppv).is_null() {
-                let base = pso_store().lock().unwrap().get(&(_base as usize)).cloned().unwrap_or_default();
+                let mut base = pso_store().lock().unwrap().get(&(_base as usize)).cloned().unwrap_or_default();
+                // the patch carries a full D3D12_BLEND_DESC at +4: RT0's
+                // write mask sits at +4+44 (see record_graphics_pso).
+                let patch_len = 0x14Cusize;
+                let bytes = std::slice::from_raw_parts(patch, patch_len.min(4096));
+                if bytes.len() > 4 + 44 {
+                    base.rt0_mask = bytes[4 + 44];
+                }
                 pso_store().lock().unwrap().insert(*ppv as usize, base);
             }
             hr
@@ -2588,9 +2711,16 @@ mod tests {
             assert!(!pso.is_null());
             type DerivedX = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, *const u8, *const c_void, *mut *mut c_void) -> HRESULT;
             let derive: DerivedX = std::mem::transmute(slot(dev, 55));
+            // a real console blend patch is a full D3D12_BLEND_DESC at +4
+            // (the S6 replay reads RT0's write mask from it — short probes
+            // would over-read, so the patch must be well-formed).
+            let mut patch = vec![0u8; 0x14C];
+            patch[0] = 2;
+            patch[4 + 44] = 0xF;
             let mut d2 = std::ptr::null_mut();
-            assert_eq!(derive(dev, pso, 1, [2u8].as_ptr(), std::ptr::null(), &mut d2), S_OK);
+            assert_eq!(derive(dev, pso, 1, patch.as_ptr(), std::ptr::null(), &mut d2), S_OK);
             assert!(!d2.is_null());
+            assert_eq!(super::pso_record_for(d2 as usize).map(|r| r.rt0_mask), Some(0xF));
             assert!(derive(dev, pso, 1, [4u8].as_ptr(), std::ptr::null(), &mut d2) < 0);
             // serialize refuses, extension #47 stays S_OK, pools register once
             let ser: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(slot(dev, 56));
@@ -3655,6 +3785,7 @@ mod tests {
             desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
             desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
             desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+            desc[super::GFX_BLEND_OFF + 44] = 0xF; // RT0 full write mask
             desc[super::GFX_RTV_OFF..super::GFX_RTV_OFF + 4].copy_from_slice(&28u32.to_le_bytes());
             type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
             let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
@@ -3703,6 +3834,7 @@ mod tests {
             desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
             desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
             desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+            desc[super::GFX_BLEND_OFF + 44] = 0xF; // RT0 full write mask
             type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
             let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
             let mut pso = std::ptr::null_mut();
@@ -3856,6 +3988,7 @@ mod tests {
                     desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
                     desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
                     desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+                    desc[super::GFX_BLEND_OFF + 44] = 0xF; // RT0 full write mask
                     type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
                     let pso_x: PsoX = std::mem::transmute(slot(vdev, 60));
                     let mut pso = std::ptr::null_mut();
@@ -3917,6 +4050,309 @@ mod tests {
                     assert_eq!(at(1, 1), [0, 0, 255, 255], "corner pixel is the S4 offscreen clear");
                 }
             }
+        }
+    }
+
+    /// M2 draw S6 failing-first: per-draw state replay at execute time —
+    /// viewports/quadrants, derived-PSO blend, and depth bias (#94). A list
+    /// drawing the title's shape (TL-half with the green-only derived PSO,
+    /// then full with the base PSO, then a TR indexed draw) reads back cyan
+    /// TL / green centre+TR / blue corner; a depth list replaying the title's
+    /// six bias steps reads back blue/green/green/blue/green/blue. Query
+    /// banking stays per draw call (S5 shape) under the replay. Fails pre-S6:
+    /// Execute runs one full-viewport full-mask draw with no depth, so the TL
+    /// quadrant comes back green and the no-bias pixels come back green.
+    #[test]
+    fn draw_s6_per_draw_state_replay() {
+        unsafe {
+            let _serial = draw_serial().lock().unwrap();
+            // Null half: occlusion banking is unchanged by the replay (one
+            // banked group per draw call — the title's nested shape).
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&null_sel, None, &mut dev), S_OK);
+            type MkCommitted = unsafe extern "win64" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mk: MkCommitted = std::mem::transmute(slot(dev, 27));
+            let buf_desc = |bytes: u64| {
+                let mut s = [0u64; 7];
+                (s.as_mut_ptr() as *mut u32).write_unaligned(1); // BUFFER
+                (s.as_mut_ptr().byte_add(16) as *mut u64).write_unaligned(bytes);
+                s
+            };
+            let mut props_s = [0u64; 3];
+            (props_s.as_mut_ptr() as *mut u32).write_unaligned(3); // READBACK
+            let props = props_s.as_ptr() as *const c_void;
+            let bd = buf_desc(24);
+            let mut results = std::ptr::null_mut();
+            assert_eq!(mk(dev, props, 0, (&bd as *const u64) as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut results), S_OK);
+            type MkQ = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkq: MkQ = std::mem::transmute(slot(dev, 39));
+            let mut qh = std::ptr::null_mut();
+            assert_eq!(mkq(dev, std::ptr::null(), std::ptr::null(), &mut qh), S_OK);
+            type ListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let list_x: ListX = std::mem::transmute(slot(dev, 73));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            type Query = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32);
+            type Resolve = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64);
+            let (begin, end): (Query, Query) = (std::mem::transmute(slot(l, 28)), std::mem::transmute(slot(l, 29)));
+            let resolve: Resolve = std::mem::transmute(slot(l, 30));
+            type Draw = unsafe extern "win64" fn(*mut c_void, u32, u32, u32, u32);
+            let draw: Draw = std::mem::transmute(slot(l, 12));
+            begin(l, qh, 0, 0);
+            draw(l, 3, 1, 0, 0);
+            draw(l, 3, 1, 0, 0);
+            end(l, qh, 0, 0);
+            resolve(l, qh, 0, 0, 1, results, 0);
+            type Map = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let map: Map = std::mem::transmute(slot(results, 8));
+            let mut p = std::ptr::null_mut();
+            assert_eq!(map(results, 0, std::ptr::null(), &mut p), S_OK);
+            assert_eq!((p as *const u64).read_unaligned(), 2048, "per-draw-group banking: two draws bank 2N");
+            // White-box: each counted draw snapshots one replay group —
+            // viewport, bound-PSO blend mask, and effective depth bias.
+            type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
+            let mut bdesc = vec![0u8; super::GFX_DESC_MIN];
+            bdesc[super::GFX_BLEND_OFF + 44] = 0xF;
+            let mut base = std::ptr::null_mut();
+            assert_eq!(pso_x(dev, bdesc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut base), S_OK);
+            type DerivedX = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, *const u8, *const c_void, *mut *mut c_void) -> HRESULT;
+            let derive: DerivedX = std::mem::transmute(slot(dev, 55));
+            let mut patch = vec![0u8; 0x14C];
+            patch[0] = 2;
+            patch[4 + 44] = 0xA;
+            let mut green_only = std::ptr::null_mut();
+            assert_eq!(derive(dev, base, 1, patch.as_ptr(), std::ptr::null(), &mut green_only), S_OK);
+            assert_eq!(super::pso_record_for(green_only as usize).map(|r| r.rt0_mask), Some(0xA));
+            let mut sdesc = bdesc.clone();
+            sdesc[super::GFX_RASTER_OFF + 12..super::GFX_RASTER_OFF + 16].copy_from_slice(&(-1000i32).to_le_bytes());
+            let mut static_pso = std::ptr::null_mut();
+            assert_eq!(pso_x(dev, sdesc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut static_pso), S_OK);
+            assert_eq!(super::pso_record_for(static_pso as usize).map(|r| r.static_bias), Some([-1000.0, 0.0, 0.0]));
+            let mut l2 = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l2), S_OK);
+            type SetPso = unsafe extern "win64" fn(*mut c_void, *mut c_void);
+            let set_pso: SetPso = std::mem::transmute(slot(l2, 25));
+            type Vp = unsafe extern "win64" fn(*mut c_void, u32, *const u8);
+            let set_vp: Vp = std::mem::transmute(slot(l2, 21));
+            type SetDepthBiasX = unsafe extern "win64" fn(*mut c_void, f32, f32, f32);
+            let set_bias: SetDepthBiasX = std::mem::transmute(slot(l2, 94));
+            let vp = |x: f32, y: f32, w: f32, h: f32| {
+                let mut v = [0u8; 24];
+                v[0..4].copy_from_slice(&x.to_le_bytes());
+                v[4..8].copy_from_slice(&y.to_le_bytes());
+                v[8..12].copy_from_slice(&w.to_le_bytes());
+                v[12..16].copy_from_slice(&h.to_le_bytes());
+                v[16..20].copy_from_slice(&0f32.to_le_bytes());
+                v[20..24].copy_from_slice(&1f32.to_le_bytes());
+                v
+            };
+            let tl = vp(0.0, 0.0, 32.0, 32.0);
+            set_pso(l2, base);
+            set_vp(l2, 1, tl.as_ptr());
+            draw(l2, 3, 1, 0, 0);
+            let tr = vp(32.0, 0.0, 32.0, 32.0);
+            set_pso(l2, green_only);
+            set_vp(l2, 1, tr.as_ptr());
+            draw(l2, 3, 1, 0, 0);
+            set_bias(l2, -1000.5, 0.0, 0.0);
+            draw(l2, 3, 1, 0, 0);
+            set_pso(l2, static_pso);
+            draw(l2, 3, 1, 0, 0);
+            set_pso(l2, base);
+            draw(l2, 3, 1, 0, 0);
+            let ops = super::list_record_for(l2 as usize).map(|r| r.ops).unwrap_or_default();
+            assert_eq!(ops.len(), 5, "one group per draw call");
+            assert!((ops[0].viewport, ops[0].rt0_mask, ops[0].has_viewport) == ([0.0, 0.0, 32.0, 32.0, 0.0, 1.0], 0xF, true));
+            assert!((ops[1].viewport[0], ops[1].rt0_mask) == (32.0, 0xA), "derived PSO mask rides the group");
+            assert!(!ops[0].depth_test && (ops[0].depth_bias, ops[0].depth_slope, ops[0].depth_clamp) == (0.0, 0.0, 0.0));
+            assert_eq!(ops[2].depth_bias, -1000.5, "dynamic #94 override");
+            assert_eq!(ops[3].depth_bias, -1000.0, "fresh static-PSO bind clears the override");
+            assert_eq!(ops[4].depth_bias, 0.0, "zero-PSO bind carries no bias");
+            // Vulkan halves need a device; without one there is nothing to replay.
+            let st = match acquire() {
+                None => {
+                    crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan");
+                    return;
+                }
+                Some(st) => st,
+            };
+            let vulkan_sel = Selection { backend: Backend::Vulkan, lane: None, reason: "test".into() };
+            let mut vdev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&vulkan_sel, Some(st), &mut vdev), S_OK);
+            let mk: MkCommitted = std::mem::transmute(slot(vdev, 27));
+            // committed 64x64 RGBA8 render target as the copy source.
+            let mut td_s = [0u64; 7];
+            (td_s.as_mut_ptr() as *mut u32).write_unaligned(3);
+            (td_s.as_mut_ptr().byte_add(16) as *mut u64).write_unaligned(64);
+            (td_s.as_mut_ptr().byte_add(24) as *mut u32).write_unaligned(64);
+            (td_s.as_mut_ptr().byte_add(32) as *mut u32).write_unaligned(28);
+            let td = (&td_s as *const u64) as *const u8;
+            let mut def_s = [0u64; 3];
+            (def_s.as_mut_ptr() as *mut u32).write_unaligned(1); // DEFAULT
+            let def = def_s.as_ptr() as *const c_void;
+            let mut rt = std::ptr::null_mut();
+            assert_eq!(mk(vdev, def, 0, td, 0, std::ptr::null(), std::ptr::null(), &mut rt), S_OK);
+            let rbd = buf_desc(256 * 64);
+            let mut rb = std::ptr::null_mut();
+            assert_eq!(mk(vdev, props, 0, (&rbd as *const u64) as *const u8, 0, std::ptr::null(), std::ptr::null(), &mut rb), S_OK);
+            // base PSO (full write mask) + green-only derived PSO (#55 blend patch).
+            // (Slot type aliases come from the null half above; only the
+            // bindings are re-made for the Vulkan device/list.)
+            let vs = vec![0xAAu8; 64];
+            let ps = vec![0xBBu8; 64];
+            let mut desc = vec![0u8; super::GFX_DESC_MIN];
+            desc[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+            desc[16..24].copy_from_slice(&(vs.len()).to_le_bytes());
+            desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
+            desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
+            desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+            desc[super::GFX_BLEND_OFF + 44] = 0xF; // RT0 full write mask
+            let pso_x: PsoX = std::mem::transmute(slot(vdev, 60));
+            let mut pso = std::ptr::null_mut();
+            assert_eq!(pso_x(vdev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut pso), S_OK);
+            let derive: DerivedX = std::mem::transmute(slot(vdev, 55));
+            let mut patch = vec![0u8; 0x14C];
+            patch[0] = 2;
+            patch[4 + 44] = 0xA; // derived RT0 mask: green + alpha only
+            let mut derived = std::ptr::null_mut();
+            assert_eq!(derive(vdev, pso, 1, patch.as_ptr(), std::ptr::null(), &mut derived), S_OK);
+            type MkQueue = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkq2: MkQueue = std::mem::transmute(slot(vdev, 8));
+            let mut vq = std::ptr::null_mut();
+            assert_eq!(mkq2(vdev, std::ptr::null(), std::ptr::null(), &mut vq), S_OK);
+            let list_x: ListX = std::mem::transmute(slot(vdev, 73));
+            let mut vl = std::ptr::null_mut();
+            assert_eq!(list_x(vdev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut vl), S_OK);
+            let set: SetPso = std::mem::transmute(slot(vl, 25));
+            let set_vp: Vp = std::mem::transmute(slot(vl, 21));
+            let vp = |x: f32, y: f32, w: f32, h: f32| {
+                let mut v = [0u8; 24];
+                v[0..4].copy_from_slice(&x.to_le_bytes());
+                v[4..8].copy_from_slice(&y.to_le_bytes());
+                v[8..12].copy_from_slice(&w.to_le_bytes());
+                v[12..16].copy_from_slice(&h.to_le_bytes());
+                v[16..20].copy_from_slice(&0f32.to_le_bytes());
+                v[20..24].copy_from_slice(&1f32.to_le_bytes());
+                v
+            };
+            let draw: Draw = std::mem::transmute(slot(vl, 12));
+            type DrawIndexedX = unsafe extern "win64" fn(*mut c_void, u64, u32, u32, u32);
+            let draw_idx: DrawIndexedX = std::mem::transmute(slot(vl, 81));
+            // the title's shape: TL-half derived, full base, TR indexed.
+            let tl = vp(0.0, 0.0, 32.0, 32.0);
+            set(vl, derived);
+            set_vp(vl, 1, tl.as_ptr());
+            draw(vl, 3, 1, 0, 0);
+            let full = vp(0.0, 0.0, 64.0, 64.0);
+            set(vl, pso);
+            set_vp(vl, 1, full.as_ptr());
+            draw(vl, 3, 1, 0, 0);
+            let tr = vp(32.0, 0.0, 32.0, 32.0);
+            set_vp(vl, 1, tr.as_ptr());
+            draw_idx(vl, 0, 0, 3, 0);
+            let mut dst_loc = [0u8; 48];
+            (dst_loc.as_mut_ptr() as *mut usize).write_unaligned(rb as usize);
+            (dst_loc.as_mut_ptr().add(8) as *mut u32).write_unaligned(1);
+            (dst_loc.as_mut_ptr().add(16) as *mut u64).write_unaligned(0);
+            (dst_loc.as_mut_ptr().add(24) as *mut u32).write_unaligned(28);
+            (dst_loc.as_mut_ptr().add(28) as *mut u32).write_unaligned(64);
+            (dst_loc.as_mut_ptr().add(32) as *mut u32).write_unaligned(64);
+            (dst_loc.as_mut_ptr().add(36) as *mut u32).write_unaligned(1);
+            (dst_loc.as_mut_ptr().add(40) as *mut u32).write_unaligned(256);
+            let mut src_loc = [0u8; 24];
+            (src_loc.as_mut_ptr() as *mut usize).write_unaligned(rt as usize);
+            (src_loc.as_mut_ptr().add(8) as *mut u32).write_unaligned(0);
+            (src_loc.as_mut_ptr().add(16) as *mut u32).write_unaligned(0);
+            type CopyTex = unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u32, *const u8, *const u8);
+            let copy_tex: CopyTex = std::mem::transmute(slot(vl, 16));
+            copy_tex(vl, dst_loc.as_ptr(), 0, 0, 0, src_loc.as_ptr(), std::ptr::null());
+            type Close = unsafe extern "win64" fn(*mut c_void) -> HRESULT;
+            let close: Close = std::mem::transmute(slot(vl, 9));
+            assert_eq!(close(vl), S_OK);
+            type Exec = unsafe extern "win64" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: Exec = std::mem::transmute(slot(vq, 10));
+            exec(vq, 1, &vl);
+            let map_rb: Map = std::mem::transmute(slot(rb, 8));
+            let mut prb = std::ptr::null_mut();
+            assert_eq!(map_rb(rb, 0, std::ptr::null(), &mut prb), S_OK);
+            let at = |x: usize, y: usize| {
+                let o = y * 256 + x * 4;
+                let s = std::slice::from_raw_parts((prb as *const u8).add(o), 4);
+                [s[0], s[1], s[2], s[3]]
+            };
+            assert_eq!(at(16, 16), [0, 255, 255, 255], "TL quadrant is the derived green-only draw over blue");
+            assert_eq!(at(32, 32), [0, 255, 0, 255], "centre is the full base draw");
+            assert_eq!(at(48, 16), [0, 255, 0, 255], "TR quadrant is the indexed draw");
+            assert_eq!(at(1, 1), [0, 0, 255, 255], "corner keeps the clear");
+            // Depth half: the title's six bias steps (no-bias / -1000.5 /
+            // persists-across-KickoffX / reset-to-0 / static -1000 / zero PSO).
+            let mut vl2 = std::ptr::null_mut();
+            assert_eq!(list_x(vdev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut vl2), S_OK);
+            let mut zero_desc = vec![0u8; super::GFX_DESC_MIN];
+            zero_desc[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+            zero_desc[16..24].copy_from_slice(&(vs.len()).to_le_bytes());
+            zero_desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
+            zero_desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
+            zero_desc[super::GFX_BLEND_OFF + 44] = 0xF; // RT0 full write mask
+            let mut zero_pso = std::ptr::null_mut();
+            assert_eq!(pso_x(vdev, zero_desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut zero_pso), S_OK);
+            let mut static_desc = zero_desc.clone();
+            static_desc[super::GFX_RASTER_OFF + 12..super::GFX_RASTER_OFF + 16].copy_from_slice(&(-1000i32).to_le_bytes());
+            let mut static_pso = std::ptr::null_mut();
+            assert_eq!(pso_x(vdev, static_desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut static_pso), S_OK);
+            type OmRt = unsafe extern "win64" fn(*mut c_void, u32, *const usize, u32, *const usize);
+            let om: OmRt = std::mem::transmute(slot(vl2, 50));
+            let (rtv, dsv) = (0x1000usize, 0x3000usize);
+            om(vl2, 1, &rtv, 0, &dsv);
+            let set2: SetPso = std::mem::transmute(slot(vl2, 25));
+            let set_vp2: Vp = std::mem::transmute(slot(vl2, 21));
+            let draw2: Draw = std::mem::transmute(slot(vl2, 12));
+            let set_bias: SetDepthBiasX = std::mem::transmute(slot(vl2, 94));
+            type KickoffX = unsafe extern "win64" fn(*mut c_void);
+            let kickoff: KickoffX = std::mem::transmute(slot(vl2, 93));
+            let q1 = vp(0.0, 0.0, 32.0, 32.0);
+            set2(vl2, zero_pso);
+            set_vp2(vl2, 1, q1.as_ptr());
+            draw2(vl2, 3, 1, 0, 0);
+            let q2 = vp(32.0, 0.0, 32.0, 32.0);
+            set_bias(vl2, -1000.5, 0.0, 0.0);
+            set_vp2(vl2, 1, q2.as_ptr());
+            draw2(vl2, 3, 1, 0, 0);
+            kickoff(vl2);
+            let q3 = vp(32.0, 32.0, 32.0, 32.0);
+            set_vp2(vl2, 1, q3.as_ptr());
+            draw2(vl2, 3, 1, 0, 0);
+            let q4 = vp(16.0, 32.0, 16.0, 16.0);
+            set_bias(vl2, 0.0, 0.0, 0.0);
+            set_vp2(vl2, 1, q4.as_ptr());
+            draw2(vl2, 3, 1, 0, 0);
+            let q5 = vp(0.0, 32.0, 16.0, 32.0);
+            set2(vl2, static_pso);
+            set_vp2(vl2, 1, q5.as_ptr());
+            draw2(vl2, 3, 1, 0, 0);
+            let q6 = vp(0.0, 0.0, 16.0, 16.0);
+            set2(vl2, zero_pso);
+            set_vp2(vl2, 1, q6.as_ptr());
+            draw2(vl2, 3, 1, 0, 0);
+            copy_tex(vl2, dst_loc.as_ptr(), 0, 0, 0, src_loc.as_ptr(), std::ptr::null());
+            let close2: Close = std::mem::transmute(slot(vl2, 9));
+            assert_eq!(close2(vl2), S_OK);
+            exec(vq, 1, &vl2);
+            let mut prb2 = std::ptr::null_mut();
+            assert_eq!(map_rb(rb, 0, std::ptr::null(), &mut prb2), S_OK);
+            let at2 = |x: usize, y: usize| {
+                let o = y * 256 + x * 4;
+                let s = std::slice::from_raw_parts((prb2 as *const u8).add(o), 4);
+                [s[0], s[1], s[2], s[3]]
+            };
+            assert_eq!(at2(20, 20), [0, 0, 255, 255], "no bias rejects at z == clear");
+            assert_eq!(at2(48, 16), [0, 255, 0, 255], "dynamic bias passes");
+            assert_eq!(at2(48, 48), [0, 255, 0, 255], "bias persists across KickoffX");
+            assert_eq!(at2(24, 48), [0, 0, 255, 255], "reset bias rejects again");
+            assert_eq!(at2(8, 48), [0, 255, 0, 255], "static PSO bias passes");
+            assert_eq!(at2(8, 8), [0, 0, 255, 255], "zero PSO bias does not leak");
         }
     }
 

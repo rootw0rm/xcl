@@ -287,6 +287,110 @@ pub fn triangle_vs_spv() -> Vec<u32> {
     out
 }
 
+/// Hand-assembled depth-tested title-triangle vertex shader words: the same
+/// `VertexIndex` triangle as [`triangle_vs_spv`] but emitting `z = 0.5`
+/// (the title's depth-bias leg draws at `z = 0.5` against a clear of `0.5`).
+/// The S6 replay uses this variant for depth-tested lists: with `z = 0` any
+/// negative bias would push the fragment below `0.0` (clipped, never passing),
+/// while `0.5 - bias` stays in range exactly like the title's own scene.
+/// No compiler, no process spawn on any path.
+pub fn triangle_vs_spv_z05() -> Vec<u32> {
+    let void_ty = 1u32;
+    let float_ty = 2u32;
+    let v4float_ty = 3u32;
+    let uint_ty = 4u32;
+    let bool_ty = 5u32;
+    let ptr_in_uint = 6u32;
+    let ptr_out_v4 = 7u32;
+    let func_ty = 8u32;
+    let func = 9u32;
+    let vid_var = 10u32;
+    let pos_var = 11u32;
+    let label = 12u32;
+    let f_m05 = 13u32;
+    let f_0 = 14u32;
+    let f_05 = 15u32;
+    let f_1 = 16u32;
+    let u_0 = 17u32;
+    let u_1 = 18u32;
+    let vid = 19u32;
+    let is0 = 20u32;
+    let is1 = 21u32;
+    let tx = 22u32;
+    let x = 23u32;
+    let y = 24u32;
+    let pos = 25u32;
+    let bound = 26u32;
+    let mut out = vec![0x0723_0203, 0x0001_0000, 0x584C_0002, bound, 0];
+    inst(&mut out, OP_CAPABILITY, &[CAP_SHADER]);
+    inst(&mut out, OP_MEMORY_MODEL, &[ADDR_LOGICAL, MEM_GLSL450]);
+    let mut ep = vec![EXEC_MODEL_VERTEX, func];
+    ep.extend(string_words("main"));
+    ep.extend([vid_var, pos_var]);
+    inst(&mut out, OP_ENTRY_POINT, &ep);
+    inst(
+        &mut out,
+        OP_DECORATE,
+        &[vid_var, DECOR_BUILTIN, BUILTIN_VERTEX_INDEX],
+    );
+    inst(
+        &mut out,
+        OP_DECORATE,
+        &[pos_var, DECOR_BUILTIN, BUILTIN_POSITION],
+    );
+    inst(&mut out, OP_TYPE_VOID, &[void_ty]);
+    inst(&mut out, OP_TYPE_FLOAT, &[float_ty, 32]);
+    inst(&mut out, OP_TYPE_VECTOR, &[v4float_ty, float_ty, 4]);
+    inst(&mut out, OP_TYPE_INT, &[uint_ty, 32, 0]);
+    inst(&mut out, OP_TYPE_BOOL, &[bool_ty]);
+    inst(
+        &mut out,
+        OP_TYPE_POINTER,
+        &[ptr_in_uint, STORAGE_INPUT, uint_ty],
+    );
+    inst(
+        &mut out,
+        OP_TYPE_POINTER,
+        &[ptr_out_v4, STORAGE_OUTPUT, v4float_ty],
+    );
+    inst(&mut out, OP_TYPE_FUNCTION, &[func_ty, void_ty]);
+    inst(&mut out, OP_CONSTANT, &[float_ty, f_m05, 0xBF00_0000]);
+    inst(&mut out, OP_CONSTANT, &[float_ty, f_0, 0x0000_0000]);
+    inst(&mut out, OP_CONSTANT, &[float_ty, f_05, 0x3F00_0000]);
+    inst(&mut out, OP_CONSTANT, &[float_ty, f_1, 0x3F80_0000]);
+    inst(&mut out, OP_CONSTANT, &[uint_ty, u_0, 0]);
+    inst(&mut out, OP_CONSTANT, &[uint_ty, u_1, 1]);
+    inst(
+        &mut out,
+        OP_VARIABLE,
+        &[ptr_in_uint, vid_var, STORAGE_INPUT],
+    );
+    inst(
+        &mut out,
+        OP_VARIABLE,
+        &[ptr_out_v4, pos_var, STORAGE_OUTPUT],
+    );
+    inst(&mut out, OP_FUNCTION, &[void_ty, func, 0, func_ty]);
+    inst(&mut out, OP_LABEL, &[label]);
+    inst(&mut out, OP_LOAD, &[uint_ty, vid, vid_var]);
+    inst(&mut out, OP_I_EQUAL, &[bool_ty, is0, vid, u_0]);
+    inst(&mut out, OP_I_EQUAL, &[bool_ty, is1, vid, u_1]);
+    // Scalar two-way picks (a vector `OpSelect` would need a vector
+    // condition): x = is0 ? -0.5 : (is1 ? 0.0 : 0.5),
+    // y = is1 ? 0.5 : -0.5, then one composite to `Position` with z = 0.5.
+    inst(&mut out, OP_SELECT, &[float_ty, tx, is1, f_0, f_05]);
+    inst(&mut out, OP_SELECT, &[float_ty, x, is0, f_m05, tx]);
+    inst(&mut out, OP_SELECT, &[float_ty, y, is1, f_05, f_m05]);
+    inst(
+        &mut out,
+        OP_COMPOSITE_CONSTRUCT,
+        &[v4float_ty, pos, x, y, f_05, f_1],
+    );
+    inst(&mut out, OP_STORE, &[pos_var, pos]);
+    inst(&mut out, OP_RETURN, &[]);
+    inst(&mut out, OP_FUNCTION_END, &[]);
+    out
+}
 /// Hand-assembled constant-green fragment shader words: Fragment `main`
 /// writing `vec4(0, 1, 0, 1)` to location 0, no inputs. Same shape as
 /// [`trivial_fs_spv`] but input-free so the `VertexIndex` triangle needs no
@@ -597,6 +701,66 @@ pub fn build_record_pipeline(vs_bytes: &[u8], rtv_count: u32) -> Result<RecordPi
 /// Returns the pixels plus the fallback flag. S5 reads these back; missing
 /// Vulkan/device errors start with `"no "`.
 pub fn execute_record_draw(vs_bytes: &[u8]) -> Result<(OffscreenPixels, bool), String> {
+    execute_draw_ops(vs_bytes, &[])
+}
+
+/// M2 draw S6: one recorded draw call's replay state. Viewport/scissor are in
+/// D3D convention (viewport `y` is the top, `min_depth`/`max_depth` as bound);
+/// the replay flips `y` with a negative-height Vulkan viewport so D3D's
+/// top-left quadrant lands top-left. `rt0_mask` is the D3D12 write mask
+/// (`RED = 1, GREEN = 2, BLUE = 4, ALPHA = 8` — the same bit order as
+/// `VkColorComponentFlags`); the title's derived PSO passes green+alpha only.
+#[derive(Debug, Clone)]
+pub struct ReplayDraw {
+    /// `[x, y, w, h, min_depth, max_depth]`; `w <= 0 || h <= 0` skips the group.
+    pub viewport: [f32; 6],
+    /// D3D scissor `[left, top, right, bottom]`; `None` clips to the viewport.
+    pub scissor: Option<[i32; 4]>,
+    /// RT0 color write mask; `0xF` is the full title-triangle draw.
+    pub rt0_mask: u8,
+    /// Whether the list bound a DSV (the title's depth-bias leg does).
+    pub depth_test: bool,
+    /// Effective depth bias (dynamic #94 override, else the PSO static bias).
+    pub depth_bias: f32,
+    /// Effective slope-scaled bias.
+    pub depth_slope: f32,
+    /// Effective bias clamp.
+    pub depth_clamp: f32,
+}
+
+impl Default for ReplayDraw {
+    /// The S4 single-draw shape: full target, full mask, no depth.
+    fn default() -> Self {
+        Self {
+            viewport: [0.0, 0.0, IMAGE_W as f32, IMAGE_H as f32, 0.0, 1.0],
+            scissor: None,
+            rt0_mask: 0xF,
+            depth_test: false,
+            depth_bias: 0.0,
+            depth_slope: 0.0,
+            depth_clamp: 0.0,
+        }
+    }
+}
+
+/// M2 draw S6: replay recorded draw groups into the 64×64 offscreen image —
+/// one render pass, one `cmd_draw` per group with dynamic viewport/scissor
+/// and a per-group pipeline variant (blend mask × depth+bias). An empty group
+/// list replays the S4 single full-target draw. `vs_bytes` takes the same
+/// translate-or-fallback path as [`execute_record_draw`] (one VS per list;
+/// per-group VS waits for real DXBC translation).
+///
+/// Depth (only when a group binds a DSV): a `D32_SFLOAT` attachment cleared
+/// to `0.5` with `LESS`, and the [`triangle_vs_spv_z05`] triangle, so the
+/// replay mirrors the title's own `z == clear` construction (its bias leg
+/// draws at `z = 0.5` against a `0.5` clear); native `depthBias` then flips
+/// the comparison exactly the way the bias steps construct it. (With `z = 0`
+/// any negative bias would push the fragment below `0.0`, where it clips
+/// and can never pass.)
+pub fn execute_draw_ops(
+    vs_bytes: &[u8],
+    ops: &[ReplayDraw],
+) -> Result<(OffscreenPixels, bool), String> {
     let (vs_words, vs_fallback) = if vs_bytes.is_empty() {
         (triangle_vs_spv(), true)
     } else {
@@ -606,7 +770,13 @@ pub fn execute_record_draw(vs_bytes: &[u8]) -> Result<(OffscreenPixels, bool), S
         }
     };
     let fs_words = green_fs_spv();
-    draw_triangle_offscreen(&vs_words, &fs_words).map(|p| (p, vs_fallback))
+    let groups: Vec<ReplayDraw> = if ops.is_empty() {
+        vec![ReplayDraw::default()]
+    } else {
+        ops.to_vec()
+    };
+    let want_depth = groups.iter().any(|g| g.depth_test);
+    draw_groups_offscreen(&vs_words, &fs_words, &groups, want_depth).map(|p| (p, vs_fallback))
 }
 
 /// Shared offscreen draw behind [`draw_offscreen`] and [`draw_triangle_offscreen`]:
@@ -1165,6 +1335,676 @@ pub fn draw_offscreen(vs_words: &[u32], positions: &[[f32; 4]]) -> Result<Offscr
     }
     let fs_words = trivial_fs_spv();
     draw_common(vs_words, &fs_words, Some(positions), CLEAR, "graphics")
+}
+
+/// M2 draw S6 worker behind [`execute_draw_ops`]: the same 64×64 offscreen
+/// shape as [`draw_common`] (color image cleared to [`TRIANGLE_CLEAR`] blue,
+/// bare 3-vertex draws, host readback) but with one draw per group, dynamic
+/// viewport/scissor, and per-group pipeline variants. With `want_depth` the
+/// pass gains a `D32_SFLOAT` attachment cleared to `0.5` (`LESS`, writes on)
+/// and draws the [`triangle_vs_spv_z05`] triangle, mirroring the title's
+/// `z == clear` bias-leg construction so native `depthBias` flips the
+/// comparison. Same contract as the other offscreen draws: one submit, 5 s
+/// fence wait, `"no "`-prefixed missing-device errors.
+fn draw_groups_offscreen(
+    vs_words: &[u32],
+    fs_words: &[u32],
+    groups: &[ReplayDraw],
+    want_depth: bool,
+) -> Result<OffscreenPixels, String> {
+    unsafe {
+        let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
+        let app = CString::new("xcl").unwrap();
+        let app_info = ash::vk::ApplicationInfo::default()
+            .application_name(&app)
+            .api_version(ash::vk::make_api_version(0, 1, 3, 0));
+        let create = ash::vk::InstanceCreateInfo::default().application_info(&app_info);
+        let instance = entry
+            .create_instance(&create, None)
+            .map_err(|e| format!("no Vulkan: create_instance: {e}"))?;
+        let (phys, qfi, name, _subgroup) = match pick_graphics_device(&instance) {
+            Ok(v) => v,
+            Err(e) => {
+                instance.destroy_instance(None);
+                return Err(e);
+            }
+        };
+        eprintln!("vulkan: headless draw-groups on {name}");
+        let fmt = ash::vk::Format::R8G8B8A8_UNORM;
+        let fmt_props = instance.get_physical_device_format_properties(phys, fmt);
+        let need = ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | ash::vk::FormatFeatureFlags::TRANSFER_SRC;
+        if !fmt_props.optimal_tiling_features.contains(need) {
+            instance.destroy_instance(None);
+            return Err("no device: R8G8B8A8_UNORM lacks color-attachment+transfer-src".into());
+        }
+        let dfmt = ash::vk::Format::D32_SFLOAT;
+        if want_depth {
+            let dprops = instance.get_physical_device_format_properties(phys, dfmt);
+            if !dprops
+                .optimal_tiling_features
+                .contains(ash::vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+            {
+                instance.destroy_instance(None);
+                return Err("no device: D32_SFLOAT lacks depth-stencil-attachment".into());
+            }
+        }
+        let run = || -> Result<OffscreenPixels, String> {
+            let prio = [1.0f32];
+            let queue_info = ash::vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(qfi)
+                .queue_priorities(&prio);
+            let dev_info = ash::vk::DeviceCreateInfo::default()
+                .queue_create_infos(std::slice::from_ref(&queue_info));
+            let device = instance
+                .create_device(phys, &dev_info, None)
+                .map_err(|e| format!("create_device: {e}"))?;
+            let queue = device.get_device_queue(qfi, 0);
+            struct Scope<'a> {
+                device: &'a ash::Device,
+                img: Option<ash::vk::Image>,
+                img_mem: Option<ash::vk::DeviceMemory>,
+                view: Option<ash::vk::ImageView>,
+                dimg: Option<ash::vk::Image>,
+                dimg_mem: Option<ash::vk::DeviceMemory>,
+                dview: Option<ash::vk::ImageView>,
+                rp: Option<ash::vk::RenderPass>,
+                fbo: Option<ash::vk::Framebuffer>,
+                layout: Option<ash::vk::PipelineLayout>,
+                vs_mod: Option<ash::vk::ShaderModule>,
+                fs_mod: Option<ash::vk::ShaderModule>,
+                pipes: Vec<ash::vk::Pipeline>,
+                pool: Option<ash::vk::CommandPool>,
+                rbuf: Option<ash::vk::Buffer>,
+                rbuf_mem: Option<ash::vk::DeviceMemory>,
+                fence: Option<ash::vk::Fence>,
+            }
+            impl Drop for Scope<'_> {
+                fn drop(&mut self) {
+                    let d = self.device;
+                    unsafe {
+                        if let Some(f) = self.fence.take() {
+                            d.destroy_fence(f, None);
+                        }
+                        if let Some(p) = self.pool.take() {
+                            d.destroy_command_pool(p, None);
+                        }
+                        for p in self.pipes.drain(..) {
+                            d.destroy_pipeline(p, None);
+                        }
+                        if let Some(m) = self.fs_mod.take() {
+                            d.destroy_shader_module(m, None);
+                        }
+                        if let Some(m) = self.vs_mod.take() {
+                            d.destroy_shader_module(m, None);
+                        }
+                        if let Some(l) = self.layout.take() {
+                            d.destroy_pipeline_layout(l, None);
+                        }
+                        if let Some(f) = self.fbo.take() {
+                            d.destroy_framebuffer(f, None);
+                        }
+                        if let Some(r) = self.rp.take() {
+                            d.destroy_render_pass(r, None);
+                        }
+                        if let Some(v) = self.view.take() {
+                            d.destroy_image_view(v, None);
+                        }
+                        if let Some(i) = self.img.take() {
+                            d.destroy_image(i, None);
+                        }
+                        if let Some(m) = self.img_mem.take() {
+                            d.free_memory(m, None);
+                        }
+                        if let Some(v) = self.dview.take() {
+                            d.destroy_image_view(v, None);
+                        }
+                        if let Some(i) = self.dimg.take() {
+                            d.destroy_image(i, None);
+                        }
+                        if let Some(m) = self.dimg_mem.take() {
+                            d.free_memory(m, None);
+                        }
+                        if let Some(b) = self.rbuf.take() {
+                            d.destroy_buffer(b, None);
+                        }
+                        if let Some(m) = self.rbuf_mem.take() {
+                            d.free_memory(m, None);
+                        }
+                    }
+                }
+            }
+            let out = (|| -> Result<OffscreenPixels, String> {
+                let mut scope = Scope {
+                    device: &device,
+                    img: None,
+                    img_mem: None,
+                    view: None,
+                    dimg: None,
+                    dimg_mem: None,
+                    dview: None,
+                    rp: None,
+                    fbo: None,
+                    layout: None,
+                    vs_mod: None,
+                    fs_mod: None,
+                    pipes: Vec::new(),
+                    pool: None,
+                    rbuf: None,
+                    rbuf_mem: None,
+                    fence: None,
+                };
+                let d = scope.device;
+                let mem_props = instance.get_physical_device_memory_properties(phys);
+                let host_coherent = ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | ash::vk::MemoryPropertyFlags::HOST_COHERENT;
+                let img_info = ash::vk::ImageCreateInfo::default()
+                    .image_type(ash::vk::ImageType::TYPE_2D)
+                    .format(fmt)
+                    .extent(ash::vk::Extent3D {
+                        width: IMAGE_W,
+                        height: IMAGE_H,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(ash::vk::SampleCountFlags::TYPE_1)
+                    .tiling(ash::vk::ImageTiling::OPTIMAL)
+                    .usage(
+                        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+                            | ash::vk::ImageUsageFlags::TRANSFER_SRC,
+                    )
+                    .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(ash::vk::ImageLayout::UNDEFINED);
+                let img = d
+                    .create_image(&img_info, None)
+                    .map_err(|e| format!("create_image: {e}"))?;
+                scope.img = Some(img);
+                let ireq = d.get_image_memory_requirements(img);
+                let idev_local = ash::vk::MemoryPropertyFlags::DEVICE_LOCAL;
+                let imem_idx = find_memory_type(&mem_props, ireq.memory_type_bits, idev_local)
+                    .or_else(|| {
+                        (0..mem_props.memory_type_count)
+                            .find(|i| ireq.memory_type_bits & (1 << i) != 0)
+                    })
+                    .ok_or_else(|| "no image memory type".to_string())?;
+                let ialloc = ash::vk::MemoryAllocateInfo::default()
+                    .allocation_size(ireq.size)
+                    .memory_type_index(imem_idx);
+                let imem = d
+                    .allocate_memory(&ialloc, None)
+                    .map_err(|e| format!("allocate_memory(image): {e}"))?;
+                scope.img_mem = Some(imem);
+                d.bind_image_memory(img, imem, 0)
+                    .map_err(|e| format!("bind_image_memory: {e}"))?;
+                let view_info = ash::vk::ImageViewCreateInfo::default()
+                    .image(img)
+                    .view_type(ash::vk::ImageViewType::TYPE_2D)
+                    .format(fmt)
+                    .subresource_range(ash::vk::ImageSubresourceRange {
+                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                let view = d
+                    .create_image_view(&view_info, None)
+                    .map_err(|e| format!("create_image_view: {e}"))?;
+                scope.view = Some(view);
+                // Depth image for the depth-tested groups (cleared to 0.0 so
+                // the z = 0 fallback triangle sits exactly at the clear).
+                if want_depth {
+                    let dinfo = ash::vk::ImageCreateInfo::default()
+                        .image_type(ash::vk::ImageType::TYPE_2D)
+                        .format(dfmt)
+                        .extent(ash::vk::Extent3D {
+                            width: IMAGE_W,
+                            height: IMAGE_H,
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(ash::vk::SampleCountFlags::TYPE_1)
+                        .tiling(ash::vk::ImageTiling::OPTIMAL)
+                        .usage(ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                        .sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
+                        .initial_layout(ash::vk::ImageLayout::UNDEFINED);
+                    let dimg = d
+                        .create_image(&dinfo, None)
+                        .map_err(|e| format!("create_image(depth): {e}"))?;
+                    scope.dimg = Some(dimg);
+                    let dreq = d.get_image_memory_requirements(dimg);
+                    let dmem_idx = find_memory_type(&mem_props, dreq.memory_type_bits, idev_local)
+                        .or_else(|| {
+                            (0..mem_props.memory_type_count)
+                                .find(|i| dreq.memory_type_bits & (1 << i) != 0)
+                        })
+                        .ok_or_else(|| "no depth memory type".to_string())?;
+                    let dalloc = ash::vk::MemoryAllocateInfo::default()
+                        .allocation_size(dreq.size)
+                        .memory_type_index(dmem_idx);
+                    let dmem = d
+                        .allocate_memory(&dalloc, None)
+                        .map_err(|e| format!("allocate_memory(depth): {e}"))?;
+                    scope.dimg_mem = Some(dmem);
+                    d.bind_image_memory(dimg, dmem, 0)
+                        .map_err(|e| format!("bind_image_memory(depth): {e}"))?;
+                    let dview_info = ash::vk::ImageViewCreateInfo::default()
+                        .image(dimg)
+                        .view_type(ash::vk::ImageViewType::TYPE_2D)
+                        .format(dfmt)
+                        .subresource_range(ash::vk::ImageSubresourceRange {
+                            aspect_mask: ash::vk::ImageAspectFlags::DEPTH,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        });
+                    let dview = d
+                        .create_image_view(&dview_info, None)
+                        .map_err(|e| format!("create_image_view(depth): {e}"))?;
+                    scope.dview = Some(dview);
+                }
+                // Render pass: clear color (+ depth), store color for transfer.
+                let attach = ash::vk::AttachmentDescription {
+                    format: fmt,
+                    samples: ash::vk::SampleCountFlags::TYPE_1,
+                    load_op: ash::vk::AttachmentLoadOp::CLEAR,
+                    store_op: ash::vk::AttachmentStoreOp::STORE,
+                    stencil_load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: ash::vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: ash::vk::ImageLayout::UNDEFINED,
+                    final_layout: ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ..Default::default()
+                };
+                let color_ref = ash::vk::AttachmentReference {
+                    attachment: 0,
+                    layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                };
+                let depth_attach = ash::vk::AttachmentDescription {
+                    format: dfmt,
+                    samples: ash::vk::SampleCountFlags::TYPE_1,
+                    load_op: ash::vk::AttachmentLoadOp::CLEAR,
+                    store_op: ash::vk::AttachmentStoreOp::DONT_CARE,
+                    stencil_load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: ash::vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: ash::vk::ImageLayout::UNDEFINED,
+                    final_layout: ash::vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    ..Default::default()
+                };
+                let depth_ref = ash::vk::AttachmentReference {
+                    attachment: 1,
+                    layout: ash::vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                };
+                let attaches: Vec<ash::vk::AttachmentDescription> =
+                    if want_depth { vec![attach, depth_attach] } else { vec![attach] };
+                let mut subpass = ash::vk::SubpassDescription::default()
+                    .pipeline_bind_point(ash::vk::PipelineBindPoint::GRAPHICS)
+                    .color_attachments(std::slice::from_ref(&color_ref));
+                if want_depth {
+                    subpass = subpass.depth_stencil_attachment(&depth_ref);
+                }
+                let rp_info = ash::vk::RenderPassCreateInfo::default()
+                    .attachments(&attaches)
+                    .subpasses(std::slice::from_ref(&subpass));
+                let rp = d
+                    .create_render_pass(&rp_info, None)
+                    .map_err(|e| format!("create_render_pass(groups): {e}"))?;
+                scope.rp = Some(rp);
+                let fbo_views: Vec<ash::vk::ImageView> = if want_depth {
+                    vec![view, scope.dview.unwrap()]
+                } else {
+                    vec![view]
+                };
+                let fbo_info = ash::vk::FramebufferCreateInfo::default()
+                    .render_pass(rp)
+                    .attachments(&fbo_views)
+                    .width(IMAGE_W)
+                    .height(IMAGE_H)
+                    .layers(1);
+                let fbo = d
+                    .create_framebuffer(&fbo_info, None)
+                    .map_err(|e| format!("create_framebuffer(groups): {e}"))?;
+                scope.fbo = Some(fbo);
+                let layout_info = ash::vk::PipelineLayoutCreateInfo::default();
+                let layout = d
+                    .create_pipeline_layout(&layout_info, None)
+                    .map_err(|e| format!("create_pipeline_layout(groups): {e}"))?;
+                scope.layout = Some(layout);
+                // Depth-tested replay draws the z = 0.5 triangle (see the
+                // worker docs); anything else uses the caller's words.
+                let z05;
+                let vs_use: &[u32] = if want_depth {
+                    z05 = triangle_vs_spv_z05();
+                    &z05
+                } else {
+                    vs_words
+                };
+                let vs_info = ash::vk::ShaderModuleCreateInfo::default().code(vs_use);
+                let vs_mod = d
+                    .create_shader_module(&vs_info, None)
+                    .map_err(|e| format!("create_shader_module(groups vs): {e}"))?;
+                scope.vs_mod = Some(vs_mod);
+                let fs_info = ash::vk::ShaderModuleCreateInfo::default().code(fs_words);
+                let fs_mod = d
+                    .create_shader_module(&fs_info, None)
+                    .map_err(|e| format!("create_shader_module(groups fs): {e}"))?;
+                scope.fs_mod = Some(fs_mod);
+                let entry_name = CString::new("main").unwrap();
+                let vs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
+                    .stage(ash::vk::ShaderStageFlags::VERTEX)
+                    .module(vs_mod)
+                    .name(&entry_name);
+                let fs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
+                    .stage(ash::vk::ShaderStageFlags::FRAGMENT)
+                    .module(fs_mod)
+                    .name(&entry_name);
+                let stages = [vs_stage, fs_stage];
+                let vi_info = ash::vk::PipelineVertexInputStateCreateInfo::default();
+                let ia_info = ash::vk::PipelineInputAssemblyStateCreateInfo::default()
+                    .topology(ash::vk::PrimitiveTopology::TRIANGLE_LIST);
+                // Static dummies: the dynamic state below overrides them per group.
+                let vp_full = ash::vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: IMAGE_W as f32,
+                    height: IMAGE_H as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                let sc_full = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x: 0, y: 0 },
+                    extent: ash::vk::Extent2D {
+                        width: IMAGE_W,
+                        height: IMAGE_H,
+                    },
+                };
+                let vp_info = ash::vk::PipelineViewportStateCreateInfo::default()
+                    .viewports(std::slice::from_ref(&vp_full))
+                    .scissors(std::slice::from_ref(&sc_full));
+                let dyn_states = [
+                    ash::vk::DynamicState::VIEWPORT,
+                    ash::vk::DynamicState::SCISSOR,
+                ];
+                let dyn_info =
+                    ash::vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+                let ms_info = ash::vk::PipelineMultisampleStateCreateInfo::default()
+                    .rasterization_samples(ash::vk::SampleCountFlags::TYPE_1);
+                // Per-group pipeline variant: (mask, depth, bias, slope, clamp).
+                let mut variants: Vec<((u8, bool, u32, u32, u32), ash::vk::Pipeline)> = Vec::new();
+                let mut pipeline_for = |mask: u8,
+                                        depth: bool,
+                                        bias: f32,
+                                        slope: f32,
+                                        clamp: f32|
+                 -> Result<ash::vk::Pipeline, String> {
+                    let key = (mask, depth, bias.to_bits(), slope.to_bits(), clamp.to_bits());
+                    if let Some((_, p)) = variants.iter().find(|(k, _)| *k == key) {
+                        return Ok(*p);
+                    }
+                    let biased = depth && (bias != 0.0 || slope != 0.0);
+                    let rs_info = ash::vk::PipelineRasterizationStateCreateInfo::default()
+                        .polygon_mode(ash::vk::PolygonMode::FILL)
+                        .cull_mode(ash::vk::CullModeFlags::NONE)
+                        .front_face(ash::vk::FrontFace::COUNTER_CLOCKWISE)
+                        .depth_bias_enable(biased)
+                        .depth_bias_constant_factor(bias)
+                        .depth_bias_slope_factor(slope)
+                        .depth_bias_clamp(clamp)
+                        .line_width(1.0);
+                    let ds_info = ash::vk::PipelineDepthStencilStateCreateInfo::default()
+                        .depth_test_enable(depth)
+                        .depth_write_enable(depth)
+                        .depth_compare_op(ash::vk::CompareOp::LESS)
+                        .depth_bounds_test_enable(false)
+                        .stencil_test_enable(false);
+                    let blend_attach =
+                        ash::vk::PipelineColorBlendAttachmentState::default().color_write_mask(
+                            ash::vk::ColorComponentFlags::from_raw((mask & 0xF) as u32),
+                        );
+                    let cb_info = ash::vk::PipelineColorBlendStateCreateInfo::default()
+                        .attachments(std::slice::from_ref(&blend_attach));
+                    let pipe_info = ash::vk::GraphicsPipelineCreateInfo::default()
+                        .stages(&stages)
+                        .vertex_input_state(&vi_info)
+                        .input_assembly_state(&ia_info)
+                        .viewport_state(&vp_info)
+                        .rasterization_state(&rs_info)
+                        .multisample_state(&ms_info)
+                        .depth_stencil_state(&ds_info)
+                        .color_blend_state(&cb_info)
+                        .dynamic_state(&dyn_info)
+                        .layout(layout)
+                        .render_pass(rp)
+                        .subpass(0);
+                    let pipes = d
+                        .create_graphics_pipelines(
+                            ash::vk::PipelineCache::null(),
+                            &[pipe_info],
+                            None,
+                        )
+                        .map_err(|e| format!("create_graphics_pipelines(groups): {e:?}"))?;
+                    variants.push((key, pipes[0]));
+                    scope.pipes.push(pipes[0]);
+                    Ok(pipes[0])
+                };
+                // Readback buffer (host-visible + coherent so the fence wait
+                // publishes the copy).
+                let rbytes = (IMAGE_W * IMAGE_H * 4) as u64;
+                let rbuf_info = ash::vk::BufferCreateInfo::default()
+                    .size(rbytes)
+                    .usage(ash::vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(ash::vk::SharingMode::EXCLUSIVE);
+                let rbuf = d
+                    .create_buffer(&rbuf_info, None)
+                    .map_err(|e| format!("create_buffer(readback): {e}"))?;
+                scope.rbuf = Some(rbuf);
+                let rreq = d.get_buffer_memory_requirements(rbuf);
+                let rmem_idx = find_memory_type(&mem_props, rreq.memory_type_bits, host_coherent)
+                    .ok_or_else(|| "no host-visible coherent memory type".to_string())?;
+                let ralloc = ash::vk::MemoryAllocateInfo::default()
+                    .allocation_size(rreq.size)
+                    .memory_type_index(rmem_idx);
+                let rmem = d
+                    .allocate_memory(&ralloc, None)
+                    .map_err(|e| format!("allocate_memory(readback): {e}"))?;
+                scope.rbuf_mem = Some(rmem);
+                d.bind_buffer_memory(rbuf, rmem, 0)
+                    .map_err(|e| format!("bind_buffer_memory(readback): {e}"))?;
+                // Record: clear, one draw per group, barrier, copy out.
+                let pool_info = ash::vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(qfi)
+                    .flags(ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+                let pool = d
+                    .create_command_pool(&pool_info, None)
+                    .map_err(|e| format!("create_command_pool: {e}"))?;
+                scope.pool = Some(pool);
+                let cmd_alloc = ash::vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(ash::vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1);
+                let cmds = d
+                    .allocate_command_buffers(&cmd_alloc)
+                    .map_err(|e| format!("allocate_command_buffers: {e}"))?;
+                let begin = ash::vk::CommandBufferBeginInfo::default()
+                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                d.begin_command_buffer(cmds[0], &begin)
+                    .map_err(|e| format!("begin_command_buffer: {e}"))?;
+                let color_clear = ash::vk::ClearValue {
+                    color: ash::vk::ClearColorValue {
+                        float32: TRIANGLE_CLEAR,
+                    },
+                };
+                let clears: Vec<ash::vk::ClearValue> = if want_depth {
+                    vec![
+                        color_clear,
+                        ash::vk::ClearValue {
+                            depth_stencil: ash::vk::ClearDepthStencilValue {
+                                depth: 0.5,
+                                stencil: 0,
+                            },
+                        },
+                    ]
+                } else {
+                    vec![color_clear]
+                };
+                let rp_begin = ash::vk::RenderPassBeginInfo::default()
+                    .render_pass(rp)
+                    .framebuffer(fbo)
+                    .render_area(ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D { x: 0, y: 0 },
+                        extent: ash::vk::Extent2D {
+                            width: IMAGE_W,
+                            height: IMAGE_H,
+                        },
+                    })
+                    .clear_values(&clears);
+                d.cmd_begin_render_pass(cmds[0], &rp_begin, ash::vk::SubpassContents::INLINE);
+                for g in groups {
+                    let (vx, vy, vw, vh, vmin, vmax) = (
+                        g.viewport[0],
+                        g.viewport[1],
+                        g.viewport[2],
+                        g.viewport[3],
+                        g.viewport[4],
+                        g.viewport[5],
+                    );
+                    if !(vw.is_finite() && vh.is_finite()) || vw <= 0.0 || vh <= 0.0 {
+                        continue;
+                    }
+                    let (sx0, sy0, sx1, sy1) = match g.scissor {
+                        Some(s) => (s[0], s[1], s[2], s[3]),
+                        None => (
+                            vx.floor() as i32,
+                            vy.floor() as i32,
+                            (vx + vw).ceil() as i32,
+                            (vy + vh).ceil() as i32,
+                        ),
+                    };
+                    let (cx0, cy0) = (sx0.clamp(0, IMAGE_W as i32), sy0.clamp(0, IMAGE_H as i32));
+                    let (cx1, cy1) = (sx1.clamp(0, IMAGE_W as i32), sy1.clamp(0, IMAGE_H as i32));
+                    if cx1 <= cx0 || cy1 <= cy0 {
+                        continue;
+                    }
+                    let eff_depth = want_depth && g.depth_test;
+                    let pipe =
+                        pipeline_for(g.rt0_mask, eff_depth, g.depth_bias, g.depth_slope, g.depth_clamp)?;
+                    d.cmd_bind_pipeline(cmds[0], ash::vk::PipelineBindPoint::GRAPHICS, pipe);
+                    // D3D viewports address y-down: negative-height Vulkan
+                    // viewport lands the title's top-left quadrant top-left.
+                    d.cmd_set_viewport(
+                        cmds[0],
+                        0,
+                        &[ash::vk::Viewport {
+                            x: vx,
+                            y: vy + vh,
+                            width: vw,
+                            height: -vh,
+                            min_depth: vmin,
+                            max_depth: vmax,
+                        }],
+                    );
+                    d.cmd_set_scissor(
+                        cmds[0],
+                        0,
+                        &[ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D { x: cx0, y: cy0 },
+                            extent: ash::vk::Extent2D {
+                                width: (cx1 - cx0) as u32,
+                                height: (cy1 - cy0) as u32,
+                            },
+                        }],
+                    );
+                    d.cmd_draw(cmds[0], 3, 1, 0, 0);
+                }
+                d.cmd_end_render_pass(cmds[0]);
+                let barrier = ash::vk::ImageMemoryBarrier::default()
+                    .src_access_mask(ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+                    .image(img)
+                    .subresource_range(ash::vk::ImageSubresourceRange {
+                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                d.cmd_pipeline_barrier(
+                    cmds[0],
+                    ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                let region = ash::vk::BufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: ash::vk::ImageSubresourceLayers {
+                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: ash::vk::Offset3D { x: 0, y: 0, z: 0 },
+                    image_extent: ash::vk::Extent3D {
+                        width: IMAGE_W,
+                        height: IMAGE_H,
+                        depth: 1,
+                    },
+                };
+                d.cmd_copy_image_to_buffer(
+                    cmds[0],
+                    img,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    rbuf,
+                    &[region],
+                );
+                d.end_command_buffer(cmds[0])
+                    .map_err(|e| format!("end_command_buffer: {e}"))?;
+                let fence_info = ash::vk::FenceCreateInfo::default();
+                let fence = d
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| format!("create_fence: {e}"))?;
+                scope.fence = Some(fence);
+                let submit =
+                    ash::vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmds[0]));
+                d.queue_submit(queue, &[submit], fence)
+                    .map_err(|e| format!("queue_submit: {e}"))?;
+                let waited = d.wait_for_fences(&[fence], true, 5_000_000_000);
+                if waited.is_ok() {
+                    let src = d
+                        .map_memory(rmem, 0, rbytes, ash::vk::MemoryMapFlags::empty())
+                        .map_err(|e| format!("map_memory(readback): {e}"))?
+                        as *const u8;
+                    let mut v = vec![0u8; rbytes as usize];
+                    std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), v.len());
+                    d.unmap_memory(rmem);
+                    Ok(OffscreenPixels {
+                        width: IMAGE_W,
+                        height: IMAGE_H,
+                        rgba: v,
+                    })
+                } else {
+                    Err(format!("wait_for_fences: {waited:?}"))
+                }
+                // `scope` drops here and destroys every handle above; `device`
+                // is destroyed by the outer closure below.
+            })();
+            device.destroy_device(None);
+            out
+        };
+        let out = run();
+        instance.destroy_instance(None);
+        out
+    }
 }
 
 #[cfg(test)]
