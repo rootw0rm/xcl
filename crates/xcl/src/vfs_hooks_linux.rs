@@ -962,8 +962,8 @@ mod tests {
         );
 
         // Retiring a source after a VFS move keeps the existing move policy:
-        // a read-only original still retires through `Vfs::delete_file`.
-        assert_eq!(v.delete_file("data\\readonly-move.txt"), Ok(()));
+        // a read-only original still retires through `Vfs::remove_moved_file`.
+        assert_eq!(v.remove_moved_file("data\\readonly-move.txt"), Ok(()));
         assert!(v.is_whiteout("data\\readonly-move.txt"));
 
         // Restore attributes so fixture cleanup never trips on readonly files.

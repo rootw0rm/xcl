@@ -5513,7 +5513,7 @@ fn move_impl(src: &str, dst: &str, replace: bool) -> Result<(), u32> {
         if in_overlay {
             if std::fs::rename(&rs, &rd).is_ok() {
                 v.commit_write(dr);
-                let _ = v.delete_file(sr);
+                let _ = v.remove_moved_file(sr);
                 return Ok(());
             }
         }
@@ -5524,7 +5524,7 @@ fn move_impl(src: &str, dst: &str, replace: bool) -> Result<(), u32> {
         v.commit_write(dr);
     }
     if let Some(sr) = &srel {
-        let _ = v.delete_file(sr);
+        let _ = v.remove_moved_file(sr);
     } else if matches!(s_target, Target::Translated(_)) {
         let _ = std::fs::remove_file(&rs);
     }

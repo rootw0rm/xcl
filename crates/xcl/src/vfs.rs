@@ -1558,6 +1558,14 @@ impl Vfs {
     }
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
+        self.remove_file_entry(rel, false)
+    }
+
+    pub fn remove_moved_file(&self, rel: &str) -> Result<(), u32> {
+        self.remove_file_entry(rel, true)
+    }
+
+    fn remove_file_entry(&self, rel: &str, ignore_readonly: bool) -> Result<(), u32> {
         let _guard = self.write_lock.lock().unwrap();
         // Upstream #1560: a traversal rel is FILE_NOT_FOUND before probing the host.
         let Some(rel_clean) = clean_rel(rel) else {
@@ -1569,19 +1577,21 @@ impl Vfs {
         let ov = self.checked_overlay_path(&rel_clean)?;
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
-            if meta.is_dir() {
+            // Upstream #2982 (#2945): std::fs::remove_file deletes read-only
+            // files; DeleteFileW does not. The move path retires through
+            // remove_moved_file, which skips the check, because MoveFileW
+            // moves read-only files.
+            if meta.is_dir() || (!ignore_readonly && meta.permissions().readonly()) {
                 return Err(ERROR_ACCESS_DENIED);
             }
             std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
             self.commit_overlay_removal_unlocked(&rel_clean);
             return Ok(());
         }
-        // Upstream #2809: hiding the original goes through the shared
-        // whiteout helper. An explicit delete keeps the existing
-        // delete policy (no readonly check here — the DeleteFile entry
-        // point applies it); retiring a source after a VFS move already
-        // published the new name and uses this same path.
-        self.whiteout_original_file_unlocked(&rel_clean, false)
+        // Upstream #2809 + #2982: hiding the original goes through the shared
+        // whiteout helper; a delete checks readonly, a move retire keeps the
+        // existing move policy (no readonly check).
+        self.whiteout_original_file_unlocked(&rel_clean, !ignore_readonly)
     }
 
     /// Upstream #2809: hide a game-original file behind a whiteout, refusing
@@ -2778,6 +2788,45 @@ mod tests {
         std::fs::write(&ov_file, b"hi").unwrap();
         assert_eq!(v.remove_dir("data\\ov_only.txt"), Err(ERROR_DIRECTORY));
         assert!(v.visible_in_overlay("data\\ov_only.txt"));
+    }
+
+    #[test]
+    fn delete_file_refuses_readonly_but_move_still_retires() {
+        // Linux twin of upstream #2982 (#2945): DeleteFileW refuses a
+        // read-only file while MoveFileW moves one, so `delete_file`
+        // checks the attribute and `remove_moved_file` skips it.
+        let f = Fixture::new("readonly_delete");
+        let v = &f.vfs;
+        let set_readonly = |p: &Path, ro: bool| {
+            let mut perm = std::fs::metadata(p).unwrap().permissions();
+            perm.set_readonly(ro);
+            std::fs::set_permissions(p, perm).unwrap();
+        };
+
+        // A read-only original is refused: no whiteout, still visible.
+        let orig = f.game().join("data").join("hello.txt");
+        set_readonly(&orig, true);
+        assert_eq!(v.delete_file("data\\hello.txt"), Err(ERROR_ACCESS_DENIED));
+        assert!(!v.is_whiteout("data\\hello.txt"));
+        assert!(v.exists("data\\hello.txt"));
+
+        // A read-only overlay file is refused and kept.
+        let ov = v.prepare_write("data\\ro_overlay.txt", false).unwrap();
+        std::fs::write(&ov, b"overlay").unwrap();
+        set_readonly(Path::new(&ov), true);
+        assert_eq!(v.delete_file("data\\ro_overlay.txt"), Err(ERROR_ACCESS_DENIED));
+        assert!(v.visible_in_overlay("data\\ro_overlay.txt"));
+        assert_eq!(std::fs::read(&ov).unwrap(), b"overlay");
+
+        // A move still removes a read-only source, as MoveFileW does.
+        assert_eq!(v.remove_moved_file("data\\hello.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\hello.txt"));
+
+        // Writable files are still deleted.
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+
+        set_readonly(&orig, false);
+        set_readonly(Path::new(&ov), false);
     }
 
     #[test]

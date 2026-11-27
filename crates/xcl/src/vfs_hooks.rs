@@ -894,7 +894,7 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                 if let Some(dr) = &drel {
                     v.commit_write(dr);
                 }
-                v.delete_file(sr).or_else(|e| if e == vfs::ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(e) })?;
+                v.remove_moved_file(sr).or_else(|e| if e == vfs::ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(e) })?;
                 Ok(())
             }
             None => {
