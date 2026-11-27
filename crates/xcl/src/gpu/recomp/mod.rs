@@ -559,6 +559,22 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
     }
 }
 
+/// M2 draw DXBC S1: the VS interface for stashed record bytes. A console VS
+/// container (`xbox::parse`) yields its DXBC signatures + FSSM table interface
+/// (`interface`: `attr_base` 4, `vs_output_table` params); anything else (PC
+/// DXBC `vs_5_0`, empty, garbage) is None and the caller keeps today's
+/// triangle fallback. No translate, no backend: S2+ consumes this.
+pub fn record_vs_interface(blob: &[u8]) -> Option<VsInterface> {
+    let sh = super::xbox::parse(blob)?;
+    if sh.stage != "VS" {
+        return None;
+    }
+    sh.fssm.iter().find_map(|f| match interface(blob, &sh, f) {
+        Some(Mode::Vertex(vs)) => Some(vs),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub mode: Mode,
@@ -1786,6 +1802,29 @@ mod attribute_tests {
         assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
+    }
+}
+
+#[cfg(test)]
+mod record_interface_tests {
+    use super::record_vs_interface;
+
+    /// PC DXBC (no XDAT) is not a console container → None (today's triangle
+    /// fallback preserved).
+    #[test]
+    fn pc_dxbc_has_no_vs_interface() {
+        let pc = crate::gpu::xbox::tests::container(&[(b"ISG1", &[0u8; 8])]);
+        assert!(record_vs_interface(&pc).is_none());
+        assert!(record_vs_interface(&[]).is_none());
+        assert!(record_vs_interface(b"random").is_none());
+    }
+
+    #[test]
+    fn console_vs_container_yields_attr_base_4() {
+        let code = [0x01u8, 0x03, 0x80, 0xbe, 0x01, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf];
+        let blob = crate::gpu::xbox::tests::sample(1, &[crate::gpu::xbox::tests::fssm(&code, &[(4, 0)])]);
+        let vs = record_vs_interface(&blob).expect("console VS must yield an interface");
+        assert_eq!(vs.attr_base, 4);
     }
 }
 
