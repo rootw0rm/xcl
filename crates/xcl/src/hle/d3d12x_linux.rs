@@ -3369,6 +3369,53 @@ mod tests {
         }
     }
 
+    /// M2 draw S3 failing-first: graphics pipeline + render pass build from the
+    /// stashed record's VS bytes (offscreen, no execute). Garbage (PC
+    /// DXBC-class) bytes fall back to the title triangle VS; PS is always
+    /// const-green. Fails pre-S3: the builder symbols are absent.
+    #[test]
+    fn draw_s3_record_pipeline_builds_pre_execute() {
+        use crate::gpu::recomp::vulkan_graphics::{build_record_pipeline, green_fs_spv};
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            // non-blit VS bytes the backend rejects (kept alive past the build)
+            let vs = vec![0xAAu8; 64];
+            let ps = vec![0xBBu8; 64];
+            let mut desc = vec![0u8; super::GFX_DESC_MIN];
+            desc[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+            desc[16..24].copy_from_slice(&(vs.len()).to_le_bytes());
+            desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
+            desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
+            desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+            desc[super::GFX_RTV_OFF..super::GFX_RTV_OFF + 4].copy_from_slice(&28u32.to_le_bytes());
+            type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
+            let mut pso = std::ptr::null_mut();
+            assert_eq!(pso_x(dev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut pso), S_OK);
+            type ListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let list_x: ListX = std::mem::transmute(slot(dev, 73));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            type SetPso = unsafe extern "win64" fn(*mut c_void, *mut c_void);
+            let set: SetPso = std::mem::transmute(slot(l, 25));
+            set(l, pso);
+            let r = super::list_record_for(l as usize).expect("S3 builds from the stashed record");
+            let bytes = std::slice::from_raw_parts(r.pso_info.vs_ptr as *const u8, r.pso_info.vs_len);
+            let sum = match build_record_pipeline(bytes, r.pso_info.num_rtv) {
+                Ok(s) => s,
+                Err(e) if e.starts_with("no ") => {
+                    crate::gpu::recomp::vulkan_runner::skip_test("no GPU");
+                    return;
+                }
+                Err(e) => panic!("build_record_pipeline failed: {e}"),
+            };
+            assert!(sum.vs_fallback, "garbage VS bytes must take the triangle fallback");
+            assert_eq!(sum.fs_words as usize, green_fs_spv().len(), "PS is always const-green");
+            assert_eq!((sum.rtv_count, r.pso_info.num_rtv), (1, 1));
+        }
+    }
+
     /// Calls `f(this)` (Win64) the way console code does, with a writable pointer left in rdx.    #[cfg(all(target_arch = "x86_64", windows))]
     unsafe fn call_with_rdx(f: usize, this: *mut c_void, rdx: *mut u64) -> u64 {
         let ret: u64;

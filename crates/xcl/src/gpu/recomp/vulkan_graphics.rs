@@ -366,6 +366,231 @@ pub fn draw_triangle_offscreen(
     draw_common(vs_words, fs_words, None, TRIANGLE_CLEAR, "triangle")
 }
 
+/// M2 draw S3: graphics pipeline + render pass built from a stashed record's
+/// VS bytes — offscreen, no execute (S4 submits).
+///
+/// VS path: [`record_vs_words`](super::spirv::record_vs_words) through the
+/// in-process SPIR-V backend; empty bytes or anything the backend rejects
+/// (PC DXBC, non-blit) falls back to [`triangle_vs_spv`]. PS path: always
+/// [`green_fs_spv`] (const-green bring-up; the record's PS bytes stay stashed
+/// for S4). One 64×64 `R8G8B8A8_UNORM` color attachment (multi-RTV waits for
+/// S4; `rtv_count` is echoed in the summary only). No command pool, no
+/// submit, no fence — nothing executes. Missing Vulkan/device errors start
+/// with `"no "`; anything else is fail-closed.
+pub struct RecordPipelineSummary {
+    /// VS word count actually fed to `create_shader_module`.
+    pub vs_words: u32,
+    /// FS word count actually fed to `create_shader_module`.
+    pub fs_words: u32,
+    /// True when the record bytes were rejected and the title triangle stood in.
+    pub vs_fallback: bool,
+    /// The record's RTV count, echoed (render pass stays one attachment).
+    pub rtv_count: u32,
+}
+
+pub fn build_record_pipeline(vs_bytes: &[u8], rtv_count: u32) -> Result<RecordPipelineSummary, String> {
+    let (vs_words, vs_fallback) = if vs_bytes.is_empty() {
+        (triangle_vs_spv(), true)
+    } else {
+        match super::spirv::record_vs_words(vs_bytes) {
+            Ok(t) if t.complete() => (t.words, false),
+            _ => (triangle_vs_spv(), true),
+        }
+    };
+    let fs_words = green_fs_spv();
+    unsafe {
+        let entry = ash::Entry::load().map_err(|e| format!("no Vulkan: Entry::load: {e}"))?;
+        let app = CString::new("xcl").unwrap();
+        let app_info = ash::vk::ApplicationInfo::default()
+            .application_name(&app)
+            .api_version(ash::vk::make_api_version(0, 1, 3, 0));
+        let create = ash::vk::InstanceCreateInfo::default().application_info(&app_info);
+        let instance = entry
+            .create_instance(&create, None)
+            .map_err(|e| format!("no Vulkan: create_instance: {e}"))?;
+        let (phys, qfi, _name, _subgroup) = match pick_graphics_device(&instance) {
+            Ok(v) => v,
+            Err(e) => {
+                instance.destroy_instance(None);
+                return Err(e);
+            }
+        };
+        let fmt = ash::vk::Format::R8G8B8A8_UNORM;
+        let fmt_props = instance.get_physical_device_format_properties(phys, fmt);
+        let need = ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | ash::vk::FormatFeatureFlags::TRANSFER_SRC;
+        if !fmt_props.optimal_tiling_features.contains(need) {
+            instance.destroy_instance(None);
+            return Err("no device: R8G8B8A8_UNORM lacks color-attachment+transfer-src".into());
+        }
+        struct Scope<'a> {
+            device: &'a ash::Device,
+            vs_mod: Option<ash::vk::ShaderModule>,
+            fs_mod: Option<ash::vk::ShaderModule>,
+            layout: Option<ash::vk::PipelineLayout>,
+            rp: Option<ash::vk::RenderPass>,
+            pipe: Option<ash::vk::Pipeline>,
+        }
+        impl Drop for Scope<'_> {
+            fn drop(&mut self) {
+                let d = self.device;
+                unsafe {
+                    if let Some(p) = self.pipe.take() {
+                        d.destroy_pipeline(p, None);
+                    }
+                    if let Some(m) = self.fs_mod.take() {
+                        d.destroy_shader_module(m, None);
+                    }
+                    if let Some(m) = self.vs_mod.take() {
+                        d.destroy_shader_module(m, None);
+                    }
+                    if let Some(l) = self.layout.take() {
+                        d.destroy_pipeline_layout(l, None);
+                    }
+                    if let Some(r) = self.rp.take() {
+                        d.destroy_render_pass(r, None);
+                    }
+                }
+            }
+        }
+        let out = (|| -> Result<RecordPipelineSummary, String> {
+            let prio = [1.0f32];
+            let queue_info = ash::vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(qfi)
+                .queue_priorities(&prio);
+            let dev_info = ash::vk::DeviceCreateInfo::default()
+                .queue_create_infos(std::slice::from_ref(&queue_info));
+            let device = instance
+                .create_device(phys, &dev_info, None)
+                .map_err(|e| format!("create_device: {e}"))?;
+            let mut scope = Scope {
+                device: &device,
+                vs_mod: None,
+                fs_mod: None,
+                layout: None,
+                rp: None,
+                pipe: None,
+            };
+            let out = (|| -> Result<RecordPipelineSummary, String> {
+                let d = scope.device;
+                let vs_info = ash::vk::ShaderModuleCreateInfo::default().code(&vs_words);
+                scope.vs_mod = Some(
+                    d.create_shader_module(&vs_info, None)
+                        .map_err(|e| format!("create_shader_module(record vs): {e}"))?,
+                );
+                let fs_info = ash::vk::ShaderModuleCreateInfo::default().code(&fs_words);
+                scope.fs_mod = Some(
+                    d.create_shader_module(&fs_info, None)
+                        .map_err(|e| format!("create_shader_module(record fs): {e}"))?,
+                );
+                let layout_info = ash::vk::PipelineLayoutCreateInfo::default();
+                scope.layout = Some(
+                    d.create_pipeline_layout(&layout_info, None)
+                        .map_err(|e| format!("create_pipeline_layout(record): {e}"))?,
+                );
+                let attach = ash::vk::AttachmentDescription {
+                    format: fmt,
+                    samples: ash::vk::SampleCountFlags::TYPE_1,
+                    load_op: ash::vk::AttachmentLoadOp::CLEAR,
+                    store_op: ash::vk::AttachmentStoreOp::STORE,
+                    stencil_load_op: ash::vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: ash::vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: ash::vk::ImageLayout::UNDEFINED,
+                    final_layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    ..Default::default()
+                };
+                let color_ref = ash::vk::AttachmentReference {
+                    attachment: 0,
+                    layout: ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                };
+                let subpass = ash::vk::SubpassDescription::default()
+                    .pipeline_bind_point(ash::vk::PipelineBindPoint::GRAPHICS)
+                    .color_attachments(std::slice::from_ref(&color_ref));
+                let rp_info = ash::vk::RenderPassCreateInfo::default()
+                    .attachments(std::slice::from_ref(&attach))
+                    .subpasses(std::slice::from_ref(&subpass));
+                scope.rp = Some(
+                    d.create_render_pass(&rp_info, None)
+                        .map_err(|e| format!("create_render_pass(record): {e}"))?,
+                );
+                let entry_name = CString::new("main").unwrap();
+                let vs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
+                    .stage(ash::vk::ShaderStageFlags::VERTEX)
+                    .module(scope.vs_mod.unwrap())
+                    .name(&entry_name);
+                let fs_stage = ash::vk::PipelineShaderStageCreateInfo::default()
+                    .stage(ash::vk::ShaderStageFlags::FRAGMENT)
+                    .module(scope.fs_mod.unwrap())
+                    .name(&entry_name);
+                let stages = [vs_stage, fs_stage];
+                let vi_info = ash::vk::PipelineVertexInputStateCreateInfo::default();
+                let ia_info = ash::vk::PipelineInputAssemblyStateCreateInfo::default()
+                    .topology(ash::vk::PrimitiveTopology::TRIANGLE_LIST);
+                let vp = ash::vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: IMAGE_W as f32,
+                    height: IMAGE_H as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                let scissor = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D { x: 0, y: 0 },
+                    extent: ash::vk::Extent2D {
+                        width: IMAGE_W,
+                        height: IMAGE_H,
+                    },
+                };
+                let vp_info = ash::vk::PipelineViewportStateCreateInfo::default()
+                    .viewports(std::slice::from_ref(&vp))
+                    .scissors(std::slice::from_ref(&scissor));
+                let rs_info = ash::vk::PipelineRasterizationStateCreateInfo::default()
+                    .polygon_mode(ash::vk::PolygonMode::FILL)
+                    .cull_mode(ash::vk::CullModeFlags::NONE)
+                    .front_face(ash::vk::FrontFace::COUNTER_CLOCKWISE)
+                    .line_width(1.0);
+                let ms_info = ash::vk::PipelineMultisampleStateCreateInfo::default()
+                    .rasterization_samples(ash::vk::SampleCountFlags::TYPE_1);
+                let blend_attach = ash::vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(
+                        ash::vk::ColorComponentFlags::R
+                            | ash::vk::ColorComponentFlags::G
+                            | ash::vk::ColorComponentFlags::B
+                            | ash::vk::ColorComponentFlags::A,
+                    );
+                let cb_info = ash::vk::PipelineColorBlendStateCreateInfo::default()
+                    .attachments(std::slice::from_ref(&blend_attach));
+                let pipe_info = ash::vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&stages)
+                    .vertex_input_state(&vi_info)
+                    .input_assembly_state(&ia_info)
+                    .viewport_state(&vp_info)
+                    .rasterization_state(&rs_info)
+                    .multisample_state(&ms_info)
+                    .color_blend_state(&cb_info)
+                    .layout(scope.layout.unwrap())
+                    .render_pass(scope.rp.unwrap())
+                    .subpass(0);
+                let pipes = d
+                    .create_graphics_pipelines(ash::vk::PipelineCache::null(), &[pipe_info], None)
+                    .map_err(|e| format!("create_graphics_pipelines(record): {e:?}"))?;
+                scope.pipe = Some(pipes[0]);
+                Ok(RecordPipelineSummary {
+                    vs_words: vs_words.len() as u32,
+                    fs_words: fs_words.len() as u32,
+                    vs_fallback,
+                    rtv_count,
+                })
+            })();
+            drop(scope);
+            device.destroy_device(None);
+            out
+        })();
+        instance.destroy_instance(None);
+        out
+    }
+}
+
 /// Shared offscreen draw behind [`draw_offscreen`] and [`draw_triangle_offscreen`]:
 /// 64×64 `R8G8B8A8_UNORM` image + render pass (cleared to `clear_color`) +
 /// framebuffer, graphics pipeline from `vs_words` + `fs_words`, one draw, then
