@@ -337,6 +337,13 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         }
     }
 
+    // Linux has no shader preparation yet (Phase D), but a pack the title ships must be
+    // readable before the host starts; Windows fails the same way in `prepare_for_launch`.
+    if let Err(e) = crate::shaders::validate_shader_inputs(&root) {
+        eprintln!("xcl: {e}");
+        return 2;
+    }
+
     // The game reads its exe + args through GetCommandLineW (mingw __getmainargs
     // parses it into argc/argv); remember what the user passed before entering the host.
     crate::hle::kernelx_linux::set_game_args(args);

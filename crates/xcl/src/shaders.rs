@@ -1746,17 +1746,26 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The title's shader pack, when it ships one, validated: RPF9 magic and at least one
+/// readable record — returned so the Windows preparation need not read the pack twice.
+/// The Linux launcher has no shader preparation yet (Phase D) but calls this before the
+/// host so a corrupt pack fails the launch instead of being ignored.
+pub(crate) fn validate_shader_inputs(root: &Path) -> Result<Option<(Vec<u8>, Vec<pack::Record>)>, String> {
+    let pack = root.join("shaders.rpf");
+    if !pack.try_exists().map_err(|e| e.to_string())? { return Ok(None); }
+    let data = std::fs::read(&pack).map_err(|e| format!("Reading {}: {e}", pack.display()))?;
+    if !data.starts_with(pack::RPF9_MAGIC) { return Err(format!("Unrecognized shader pack: {}", pack.display())); }
+    let records = pack::scan(&data, 0x40);
+    if records.is_empty() { return Err(format!("No readable shader records in {}", pack.display())); }
+    Ok(Some((data, records)))
+}
+
 // Windows-only (DXC pipeline cache + D3D12 device); Linux gets its own
 // preparation when the SPIR-V backend lands (Phase D).
 #[cfg(windows)]
 pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
     let mut inputs = Vec::new();
-    let pack = root.join("shaders.rpf");
-    if pack.try_exists().map_err(|e| e.to_string())? {
-        let data = std::fs::read(&pack).map_err(|e| format!("Reading {}: {e}", pack.display()))?;
-        if !data.starts_with(pack::RPF9_MAGIC) { return Err(format!("Unrecognized shader pack: {}", pack.display())); }
-        let records = pack::scan(&data, 0x40);
-        if records.is_empty() { return Err(format!("No readable shader records in {}", pack.display())); }
+    if let Some((data, records)) = validate_shader_inputs(root)? {
         inputs.push(Input::Pack { data, records });
     }
     let loose = root.join("shaders");
