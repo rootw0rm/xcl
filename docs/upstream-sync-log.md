@@ -1962,3 +1962,30 @@ newest at the bottom.
   pre-existing); lib 787/0/1 threads=4 first try (no flake; matches
   step-155-re-triage baseline 786+1 pin). Zero tree changes →
   e2e/retail not re-run (step-145-critic precedent).
+
+## 2026-11-27 — manual sync + port pass (#2978–#3001 window)
+
+- `upstream/main` = `623d02e4`, already merged (`linux` contains it;
+  `main` == `upstream/main`, 0/0). ZERO sync fallout — nothing to merge.
+- Window triage (live heads fetched as `prN-head`, all 20 still open,
+  three parallel slices, per-PR diff vs merge-base): **zero PORTs**
+  under the M1/M2-or-Linux-bug rule. Every candidate serves Windows-only
+  paths, test/CI/docs-only areas, or duplicates linux's own landed work
+  (carve-out `gfx_alloc_window0` vs #2991 grooming; placed-buffer
+  unification vs #2985 pools; translator source-hash key vs #2998 lazy
+  DXIL hashing; no-device handling absent vs #2983).
+- Keepers archived in `/home/anon/xcl-notes/upstream-prs/` (PR numbers
+  only, verbatim hunks): #2982 → `keep-vfs-host.md` (delete/read-only
+  split `remove_file_entry` + `remove_moved_file`; reconcile vs tip
+  before porting); #2958/#2983 → `keep-launcher-report.md`
+  (`LaunchPreparationStatus::{Prepared, SkippedNoDevice}` shaders half);
+  K-D3D-64 (#2985, pooled small fallbacks + `Arc<Texture>` dedup),
+  K-D3D-65 (#2987, `XCL_SPARSE_SYSMEM` sysmem tiles), K-D3D-66 (#2989,
+  `release_after_upload_wait` ManuallyDrop retain), K-D3D-67 (#3000,
+  `view_desc_key` pad-zeroing) → `keep-d3d12-behavior.md`.
+- Skips (no notes owed): tests-only #2978/#2979/#2981/#2986, scripts
+  #2980, docs #2984/#2999, Windows-only #2993/#2994/#2997/#3001,
+  perf/M4 #2988/#2998.
+- Gates: no tree changes → checks/lib/e2e/retail not re-run
+  (tip `030f0a1b` holders stand: lib 820/0/1, Vulkan e2e 5/0,
+  retail HOLDS).
