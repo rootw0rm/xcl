@@ -99,6 +99,17 @@ fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
     assert!(text.contains("top 3 mnemonics"), "{text}");
     assert!(text.contains("recompiler (kernel mode): programs 1, fully translated 1 (100.0%), translation errors 0"), "{text}");
 
+    // Plain --recomp JSON reports the same translation without a DXC request (all platforms).
+    let recomp_out = run_shaders(&file, &["--json", "--recomp"]);
+    assert!(recomp_out.status.success(), "{recomp_out:?}");
+    let recomp: serde_json::Value = serde_json::from_slice(&recomp_out.stdout).unwrap();
+    let rr = &recomp["recomp"];
+    assert_eq!(rr["programs"], 1, "{recomp}");
+    assert_eq!(rr["complete"], 1, "{recomp}");
+    assert_eq!(rr["translate_errors"], 0, "{recomp}");
+    assert!(rr["hlsl_bytes"].as_u64().unwrap() > 0, "{recomp}");
+    assert!(rr["dxc_compiled"].is_null(), "{recomp}");
+
     // --top 1 limits the printed mnemonic table
     let top_out = run_shaders(&file, &["--top", "1"]);
     assert!(top_out.status.success(), "{top_out:?}");
@@ -112,9 +123,19 @@ fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
         .collect();
     assert_eq!(ranked_lines.len(), 1, "{top_text}");
 
-    // --json --recomp --compile 1
+    // --json --recomp --compile 1: translation is counted everywhere; DXC is Windows-only.
     let json_out = run_shaders(&file, &["--json", "--recomp", "--compile", "1"]);
+    #[cfg(windows)]
     assert!(json_out.status.success(), "{json_out:?}");
+    #[cfg(not(windows))]
+    {
+        // Honest refusal: the analysis JSON is still printed, and the command fails with a
+        // message naming DXC as Windows-only instead of claiming a compile it did not do.
+        assert_eq!(json_out.status.code(), Some(2), "{json_out:?}");
+        let stderr = String::from_utf8_lossy(&json_out.stderr);
+        assert!(stderr.contains("DXC is Windows-only"), "{stderr}");
+        assert!(stderr.contains("Phase D"), "{stderr}");
+    }
     let json: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
     assert_eq!(json["source"], "single file");
     assert_eq!(json["shaders"], 1);
@@ -134,8 +155,16 @@ fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
     assert_eq!(rc["complete"], 1, "{json}");
     assert_eq!(rc["translate_errors"], 0, "{json}");
     assert!(rc["hlsl_bytes"].as_u64().unwrap() > 0, "{json}");
-    assert_eq!(rc["dxc_compiled"], 1, "{json}");
-    assert_eq!(rc["dxc_failed"].as_array().unwrap().len(), 0, "{json}");
+    #[cfg(windows)]
+    {
+        assert_eq!(rc["dxc_compiled"], 1, "{json}");
+        assert_eq!(rc["dxc_failed"].as_array().unwrap().len(), 0, "{json}");
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(rc["dxc_compiled"].is_null(), "{json}"); // no compile ran: no false success
+        assert!(rc["dxc_failed"].is_null(), "{json}");
+    }
 }
 
 #[test]
