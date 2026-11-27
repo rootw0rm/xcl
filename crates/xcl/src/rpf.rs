@@ -159,6 +159,9 @@ fn parse_args(args: &[String]) -> Result<RpfOptions, String> {
             return Err(format!("--probe cannot be combined with {conflict}"));
         }
     }
+    if opts.out.is_some() && opts.extract.is_none() {
+        return Err("--out requires --extract".into());
+    }
     Ok(opts)
 }
 
@@ -208,6 +211,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if recs.is_empty() {
         println!("{}: {:.1} MB, no records with plain names", path.display(), data.len() as f64 / 1048576.0);
         crate::rpf_probe::summarize(&data, top);
+        if let Some(fragment) = &extract {
+            eprintln!("xcl rpf: no record matched {fragment}");
+            return 2;
+        }
         return 0;
     }
     let (csum, usum): (usize, usize) = recs.iter().fold((0, 0), |a, r| (a.0 + r.csize, a.1 + r.usize));
@@ -274,8 +281,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let mut m: Vec<_> = by_magic.into_iter().collect();
     m.sort_by(|a, b| b.1.cmp(&a.1));
     println!("data signatures (from a sample): {}", m.iter().take(12).map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", "));
-    if extract.is_some() {
+    if let Some(fragment) = &extract {
         println!("extracted {extracted} to {}", out.display());
+        if extracted == 0 && extraction_errors == 0 {
+            eprintln!("xcl rpf: no record matched {fragment}");
+            return 2;
+        }
     }
     if extraction_errors == 0 { 0 } else { 2 }
 }
@@ -425,6 +436,58 @@ mod tests {
         std::fs::write(&archive, data).unwrap();
 
         let args = vec!["--extract".into(), name.into(), "--out".into(), out.to_string_lossy().into_owned()];
+        assert_eq!(run(&archive, &args), 2);
+        assert!(!out.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extraction_of_a_missing_fragment_is_an_error() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-rpf-nomatch-{}-{nonce}", std::process::id()));
+        let archive = root.join("synthetic.rpf");
+        let out = root.join("out");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut data = b"9FPR".to_vec();
+        data.resize(0x40, 0);
+        data.extend(record("PS_Present", b"payload"));
+        std::fs::write(&archive, data).unwrap();
+
+        let args = vec!["--extract".into(), "PS_Missing".into(), "--out".into(), out.to_string_lossy().into_owned()];
+        assert_eq!(run(&archive, &args), 2);
+        assert!(!out.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn out_without_extract_is_rejected() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-rpf-outonly-{}-{nonce}", std::process::id()));
+        let archive = root.join("synthetic.rpf");
+        let out = root.join("out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&archive, b"9FPR").unwrap();
+
+        let args = vec!["--out".into(), out.to_string_lossy().into_owned()];
+        assert_eq!(run(&archive, &args), 2);
+        assert!(!out.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extraction_from_an_archive_without_plain_records_is_an_error() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-rpf-norecords-{}-{nonce}", std::process::id()));
+        let archive = root.join("plain.rpf");
+        let out = root.join("out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&archive, b"9FPR").unwrap();
+
+        let args = vec!["--extract".into(), "zzznomatch".into(), "--out".into(), out.to_string_lossy().into_owned()];
         assert_eq!(run(&archive, &args), 2);
         assert!(!out.exists());
 
