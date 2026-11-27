@@ -591,6 +591,24 @@ pub fn build_record_pipeline(vs_bytes: &[u8], rtv_count: u32) -> Result<RecordPi
     }
 }
 
+/// M2 draw S4: real pixels for a stashed record — resolve the VS words like
+/// [`build_record_pipeline`] (empty/rejected bytes fall back to the title
+/// triangle), pair with const-green FS, and draw the bare triangle offscreen.
+/// Returns the pixels plus the fallback flag. S5 reads these back; missing
+/// Vulkan/device errors start with `"no "`.
+pub fn execute_record_draw(vs_bytes: &[u8]) -> Result<(OffscreenPixels, bool), String> {
+    let (vs_words, vs_fallback) = if vs_bytes.is_empty() {
+        (triangle_vs_spv(), true)
+    } else {
+        match super::spirv::record_vs_words(vs_bytes) {
+            Ok(t) if t.complete() => (t.words, false),
+            _ => (triangle_vs_spv(), true),
+        }
+    };
+    let fs_words = green_fs_spv();
+    draw_triangle_offscreen(&vs_words, &fs_words).map(|p| (p, vs_fallback))
+}
+
 /// Shared offscreen draw behind [`draw_offscreen`] and [`draw_triangle_offscreen`]:
 /// 64×64 `R8G8B8A8_UNORM` image + render pass (cleared to `clear_color`) +
 /// framebuffer, graphics pipeline from `vs_words` + `fs_words`, one draw, then

@@ -18,7 +18,8 @@
 //! Slot-routing queue (M1 step-88 inventory, K-D3D-06 order; callers in
 //! `tests/testtitle/src/gpu.rs`, which reaches console slots by raw vtable
 //! index — the title has zero static d3d12 imports). Routed today: device
-//! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #11, null + Vulkan-list
+//! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #9 (Close) / #11, queue
+//! #10 (ExecuteCommandLists: null asserts the record, Vulkan submits), null + Vulkan-list
 //! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, null + Vulkan-device AS SRV
 //! #18, Vulkan-device frame clock
 //! #78–#81 (Linux twin + ancillary routing) and Vulkan-queue #30 `PresentX`
@@ -217,7 +218,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[75] = Device_UnregisterPagePoolX as usize;
         }
         Kind::CommandQueue | Kind::VulkanQueue => {
-            v[10] = Ret_Void as usize; // ExecuteCommandLists
+            v[10] = Queue_ExecuteCommandLists as usize;
             v[14] = Queue_Signal as usize;
             v[15] = Ret_S_OK as usize; // Wait
             v[16] = Queue_GetTimestampFrequency as usize;
@@ -227,7 +228,7 @@ fn vtable(kind: Kind) -> *const usize {
         Kind::CommandAllocator => v[8] = Ret_S_OK as usize, // Reset
         Kind::CommandList | Kind::VulkanList => {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
-            v[9] = Ret_S_OK as usize; // Close
+            v[9] = List_Close as usize;
             v[10] = Ret_S_OK as usize; // Reset
             v[11] = Dma_CopyBufferRegion as usize; // console DMA CopyBufferRegion
         }
@@ -565,7 +566,8 @@ pub struct PsoRecord {
 
 /// List-bound draw state: the PSO bound at SetPipelineState plus its record,
 /// with the list-bound assembly S2 stores (root sig, render targets, index
-/// buffer, viewports/scissors, topology). Store-only; S3 interprets.
+/// buffer, viewports/scissors, topology) and the S4 Close mark. Store-only;
+/// S3 interprets, S4 executes.
 #[derive(Clone, Default)]
 pub struct ListDrawRecord {
     pub pso: usize,
@@ -582,6 +584,7 @@ pub struct ListDrawRecord {
     pub topology: u32,
     pub viewports: Vec<u8>,
     pub scissors: Vec<u8>,
+    pub closed: bool,
 }
 
 fn pso_store() -> &'static Mutex<HashMap<usize, PsoRecord>> {
@@ -725,6 +728,101 @@ unsafe extern "win64" fn List_RSSetScissorRects(this: *mut NullObj, n: u32, rect
     let bytes = (n.min(16) as usize) * 16;
     let v = std::slice::from_raw_parts(rects, bytes).to_vec();
     list_store().lock().unwrap().entry(this as usize).or_default().scissors = v;
+}
+
+// ---------------------------------------------------------------------------------------
+// M2 draw S4: Close/Execute flush. List slot 9 `Close` marks the list; queue
+// slot 10 `ExecuteCommandLists` flushes each listed record — null queues
+// assert the record exists and stop there (no pixels), Vulkan queues run the
+// S3 pipeline build and then a real offscreen submit whose pixels wait for
+// the S5 readback. A list with no bound PSO is skipped with a debug line
+// (fail-closed); missing-Vulkan (`"no ..."`) errors skip the same way.
+// ---------------------------------------------------------------------------------------
+
+static EXECUTE_FLUSHES: AtomicU64 = AtomicU64::new(0);
+
+fn last_pixels_store() -> &'static Mutex<Option<crate::gpu::recomp::vulkan_graphics::OffscreenPixels>> {
+    static S: OnceLock<Mutex<Option<crate::gpu::recomp::vulkan_graphics::OffscreenPixels>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// S4 flushes so far (null + Vulkan): how many listed records Execute saw.
+pub fn execute_flush_count() -> u64 {
+    EXECUTE_FLUSHES.load(Ordering::Relaxed)
+}
+
+/// Pixels from the last Vulkan Execute submit (`None` until one lands; S5
+/// reads these back). Null Executes never touch this.
+pub fn last_execute_pixels() -> Option<crate::gpu::recomp::vulkan_graphics::OffscreenPixels> {
+    last_pixels_store().lock().unwrap().clone()
+}
+
+/// List slot 9 `Close`: mark the list closed (S4 Execute flushes it).
+unsafe extern "win64" fn List_Close(this: *mut NullObj) -> HRESULT {
+    if !this.is_null() {
+        list_store().lock().unwrap().entry(this as usize).or_default().closed = true;
+    }
+    S_OK
+}
+
+/// Queue slot 10 `ExecuteCommandLists(count, lists)`: flush each listed
+/// S1–S3 record; Vulkan queues submit for real pixels.
+unsafe extern "win64" fn Queue_ExecuteCommandLists(this: *mut NullObj, count: u32, lists: *const *mut NullObj) {
+    if this.is_null() || lists.is_null() || count == 0 {
+        return;
+    }
+    let vk = (*this).kind == Kind::VulkanQueue;
+    for i in 0..(count.min(64) as usize) {
+        let l = *lists.add(i);
+        if l.is_null() {
+            continue;
+        }
+        let r = list_store().lock().unwrap().get(&(l as usize)).cloned();
+        let Some(r) = r else {
+            crate::xlog_debug!("D3D12.X Execute: list {:#x} holds no record — skipping", l as usize);
+            continue;
+        };
+        if r.pso == 0 {
+            crate::xlog_debug!("D3D12.X Execute: list {:#x} binds no PSO — skipping", l as usize);
+            continue;
+        }
+        EXECUTE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        if !vk {
+            // null lists assert the record, no pixels.
+            continue;
+        }
+        // Copy the VS bytes out from under the store lock (the title's
+        // graphics memory is host memory; cap garbage lengths at the
+        // triangle fallback instead of faulting).
+        let bytes = if r.pso_info.vs_ptr != 0 && r.pso_info.vs_len < (16 << 20) && r.pso_info.vs_len != 0 {
+            std::slice::from_raw_parts(r.pso_info.vs_ptr as *const u8, r.pso_info.vs_len).to_vec()
+        } else {
+            Vec::new()
+        };
+        match crate::gpu::recomp::vulkan_graphics::build_record_pipeline(&bytes, r.pso_info.num_rtv) {
+            Ok(sum) => crate::xlog_debug!(
+                "D3D12.X Execute: record pipeline built (vs {} words, fallback {})",
+                sum.vs_words,
+                sum.vs_fallback
+            ),
+            Err(e) if e.starts_with("no ") => {
+                crate::xlog_debug!("D3D12.X Execute: pipeline skipped ({e})");
+                continue;
+            }
+            Err(e) => {
+                crate::xlog_warn!("D3D12.X Execute: pipeline failed ({e})");
+                continue;
+            }
+        }
+        match crate::gpu::recomp::vulkan_graphics::execute_record_draw(&bytes) {
+            Ok((px, fallback)) => {
+                crate::xlog_debug!("D3D12.X Execute: offscreen submit (fallback {fallback})");
+                *last_pixels_store().lock().unwrap() = Some(px);
+            }
+            Err(e) if e.starts_with("no ") => crate::xlog_debug!("D3D12.X Execute: submit skipped ({e})"),
+            Err(e) => crate::xlog_warn!("D3D12.X Execute: submit failed ({e})"),
+        }
+    }
 }
 
 /// (payload size, payload alignment) of D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values.
@@ -3413,6 +3511,85 @@ mod tests {
             assert!(sum.vs_fallback, "garbage VS bytes must take the triangle fallback");
             assert_eq!(sum.fs_words as usize, green_fs_spv().len(), "PS is always const-green");
             assert_eq!((sum.rtv_count, r.pso_info.num_rtv), (1, 1));
+        }
+    }
+
+    /// M2 draw S4 failing-first: Close marks the list and ExecuteCommandLists
+    /// flushes the S1–S3 record — null queues assert the record (no pixels),
+    /// Vulkan queues run the S3 pipeline build plus a real offscreen submit
+    /// (pixels stashed for the S5 readback). Fails pre-S4: queue #10 is a
+    /// no-op, so the flush count never moves and no pixels land.
+    #[test]
+    fn draw_s4_execute_flushes_record_offscreen() {
+        unsafe {
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&null_sel, None, &mut dev), S_OK);
+            let vs = vec![0xAAu8; 64];
+            let ps = vec![0xBBu8; 64];
+            let mut desc = vec![0u8; super::GFX_DESC_MIN];
+            desc[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+            desc[16..24].copy_from_slice(&(vs.len()).to_le_bytes());
+            desc[24..32].copy_from_slice(&(ps.as_ptr() as usize).to_le_bytes());
+            desc[32..40].copy_from_slice(&(ps.len()).to_le_bytes());
+            desc[super::GFX_NUMRT_OFF..super::GFX_NUMRT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+            type PsoX = unsafe extern "win64" fn(*mut c_void, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let pso_x: PsoX = std::mem::transmute(slot(dev, 60));
+            let mut pso = std::ptr::null_mut();
+            assert_eq!(pso_x(dev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut pso), S_OK);
+            type MkQueue = unsafe extern "win64" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let mkq: MkQueue = std::mem::transmute(slot(dev, 8));
+            let mut q = std::ptr::null_mut();
+            assert_eq!(mkq(dev, std::ptr::null(), std::ptr::null(), &mut q), S_OK);
+            type ListX = unsafe extern "win64" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let list_x: ListX = std::mem::transmute(slot(dev, 73));
+            let mut l = std::ptr::null_mut();
+            assert_eq!(list_x(dev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut l), S_OK);
+            type SetPso = unsafe extern "win64" fn(*mut c_void, *mut c_void);
+            let set: SetPso = std::mem::transmute(slot(l, 25));
+            set(l, pso);
+            // Close (slot 9) marks the list closed.
+            type Close = unsafe extern "win64" fn(*mut c_void) -> HRESULT;
+            let close: Close = std::mem::transmute(slot(l, 9));
+            assert_eq!(close(l), S_OK);
+            assert!(super::list_record_for(l as usize).map(|r| r.closed).unwrap_or(false), "Close marks the list");
+            // null Execute (slot 10): flushes the record, draws no pixels.
+            let before = super::execute_flush_count();
+            let had_px = super::last_execute_pixels().is_some();
+            type Exec = unsafe extern "win64" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: Exec = std::mem::transmute(slot(q, 10));
+            exec(q, 1, &l);
+            assert_eq!(super::execute_flush_count(), before + 1, "null Execute flushes the record");
+            assert_eq!(super::last_execute_pixels().is_some(), had_px, "null Execute draws no pixels");
+            // Vulkan half: a real submit lands real pixels (S5 reads them back).
+            match acquire() {
+                None => crate::gpu::recomp::vulkan_runner::skip_test("no Vulkan"),
+                Some(st) => {
+                    let vulkan_sel = Selection { backend: Backend::Vulkan, lane: None, reason: "test".into() };
+                    let mut vdev = std::ptr::null_mut();
+                    assert_eq!(create_device_for(&vulkan_sel, Some(st), &mut vdev), S_OK);
+                    let mkq: MkQueue = std::mem::transmute(slot(vdev, 8));
+                    let mut vq = std::ptr::null_mut();
+                    assert_eq!(mkq(vdev, std::ptr::null(), std::ptr::null(), &mut vq), S_OK);
+                    assert_eq!((*(vq as *mut NullObj)).kind, Kind::VulkanQueue);
+                    let list_x: ListX = std::mem::transmute(slot(vdev, 73));
+                    let mut vl = std::ptr::null_mut();
+                    assert_eq!(list_x(vdev, [0x10u32, 0, 1, 0].as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut vl), S_OK);
+                    assert_eq!((*(vl as *mut NullObj)).kind, Kind::VulkanList);
+                    let mut vpso = std::ptr::null_mut();
+                    assert_eq!(pso_x(vdev, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut vpso), S_OK);
+                    let set: SetPso = std::mem::transmute(slot(vl, 25));
+                    set(vl, vpso);
+                    let close: Close = std::mem::transmute(slot(vl, 9));
+                    assert_eq!(close(vl), S_OK);
+                    let exec: Exec = std::mem::transmute(slot(vq, 10));
+                    exec(vq, 1, &vl);
+                    assert_eq!(super::execute_flush_count(), before + 2, "Vulkan Execute flushes too");
+                    let px = super::last_execute_pixels().expect("Vulkan Execute submits real pixels");
+                    assert_eq!((px.width, px.height), (64, 64));
+                    assert_eq!(px.rgba.len(), 64 * 64 * 4);
+                }
+            }
         }
     }
 
