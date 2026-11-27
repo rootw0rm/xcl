@@ -1698,3 +1698,41 @@ newest at the bottom.
   post-merge; future windows only look past the top, so without it a
   merge would go unnoticed). No overlap with step-147 (#2926 dxil
   hunks) or step-148 (xuser twin test).
+
+## 2026-11-27 — step-151 (task-1795740427-4b9d): triage #2931 (window >2930), top now #2931, probe past #2931
+
+- `upstream/main` = `8b957bec` (unchanged; `merge-base --is-ancestor
+  upstream/main HEAD` exit 0 — zero sync fallout, fully merged).
+- Batched `git ls-remote upstream 'refs/pull/*/head'` (per
+  mem-1795715658-5c18): 2399 refs (delta +1 vs step-149-critic's 2398 —
+  the #2931 ref itself, not a miss). Numbers >2930 present: 2931 only
+  (29xx glob tail ends at `refs/pull/2931/head`). Per-PR probe
+  #2932..#2950 ALL MISSING (sequential, per mem-1795712765-78dc never
+  stop at the first gap) → top now #2931. Head fetched (`pr2931`,
+  deleted after review).
+- Pins re-verified (zero drift, no force-push): #2907 `7575f671`
+  + #2913 `992ef508` match step-145 pins. New head #2931 `093a5fcd`
+  OPEN (`merge-base --is-ancestor` vs `upstream/main` exit 1).
+  #2929 `a87d3c2a` + #2930 `4e008ce5` re-verified still OPEN (heads
+  unchanged) → step-150 recheck stays pending.
+- Triage (1 OPEN):
+  - #2931 SKIP (Windows-only; single-commit `093a5fcd`
+    "Shaders: split compute pieces share one pool of piece builders").
+    Single file `crates/xcl/src/shaders.rs` +188/-5, and every hunk
+    sits in `#[cfg(windows)]`-gated code on Linux: `struct Pipelines`
+    (`shaders.rs:1302`), `Sync` + `impl Pipelines` (`:1513`/`:1516`),
+    `fn precompile` (`:1793`), `make_with_cache_path` / `make_one`
+    (uses `windows::Win32::Graphics::Direct3D12::*`), and the new
+    `split_programs_share_the_piece_builders` test (uses
+    `crate::hle::d3d12x::real::driver_cache` + `recomp::dxc` + a live
+    D3D12 device). The upstream file has zero `cfg(windows)` gates only
+    because upstream is Windows-only. Functionally a driver-compile
+    throughput optimization (one shared piece-builder pool so at most
+    `most` pieces hold a loaded driver blob at a time, refs #2880) for
+    D3D12 `CreateComputePipelineState`; Linux has no `Pipelines`
+    (`precompile` is a `not(windows)` stub `Err`). The top-of-file
+    import hunks (`Arc`/`Condvar`, `DispatchChain` use) are inert on
+    Linux. No Linux consumer, no Linux shape — same category as #2928.
+- Tasks filed: none (no keepers in window; #2929/#2930 already owned by
+  step-150). No overlap with step-147 (#2926 dxil hunks) or step-148
+  (xuser twin test).
