@@ -1597,6 +1597,40 @@ mod tests {
         }
     }
 
+    /// Linux twin of upstream `xuser_lookup_slots_keep_id_namespaces_separate`
+    /// (#2922): the two lookup namespaces stay separate at the function level.
+    /// `XUserFindUserByLocalId` serves only `LOCAL_ID`; `XUserFindUserById`
+    /// serves only `config().user_id`. A swapped-namespace ID must fail with
+    /// `E_NOT_FOUND` and null the out-pointer (same contract as the existing
+    /// unknown-ID pins below). Upstream covers this through COM slots 10/12;
+    /// this twin covers the Linux direct functions (slot table is direct).
+    #[test]
+    fn xuser_lookup_functions_keep_id_namespaces_separate() {
+        unsafe {
+            let local_id = LOCAL_ID;
+            let xuid = crate::state::config().user_id;
+            assert_ne!(local_id, xuid, "fixture needs distinct IDs");
+
+            let mut handle = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XUserFindUserByLocalId(local_id, &mut handle), S_OK);
+            assert!(!handle.is_null());
+            XUserCloseHandle(handle);
+
+            let mut handle2 = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XUserFindUserById(xuid, &mut handle2), S_OK);
+            assert!(!handle2.is_null());
+            XUserCloseHandle(handle2);
+
+            let mut swapped = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XUserFindUserByLocalId(xuid, &mut swapped), E_NOT_FOUND);
+            assert_eq!(swapped, std::ptr::null_mut());
+
+            let mut swapped2 = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XUserFindUserById(local_id, &mut swapped2), E_NOT_FOUND);
+            assert_eq!(swapped2, std::ptr::null_mut());
+        }
+    }
+
     #[test]
     fn result_and_lookup_functions_null_outptrs_on_failure() {
         unsafe {
