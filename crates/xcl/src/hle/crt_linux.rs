@@ -699,9 +699,10 @@ pub unsafe extern "win64" fn strncmp(a: *const u8, b: *const u8, n: usize) -> i3
     result
 }
 
-/// `XCL_TRACE_STRNCMP`: log each `strncmp` call's bounded arg previews and
-/// result (retail M1 step-04: the `0x140968480` dispatcher's key probes reach
-/// this shim, so the log names the keys the game looks up on the abort path).
+/// `XCL_TRACE_STRNCMP`: log each `strncmp`/`_strnicmp` call's bounded arg
+/// previews and result (retail M1 step-04: the `0x140968480` dispatcher's key
+/// probes reach this shim, so the log names the keys the game looks up on the
+/// abort path; step-05: full inputs + `_strnicmp` coverage, see below).
 /// Off by default; capped so a boot flood stays a bounded xcl.log tail.
 fn strncmp_tracing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -713,6 +714,43 @@ fn strncmp_tracing() -> bool {
 const STRNCMP_PREVIEW_MAX: usize = 64;
 const STRNCMP_LOG_MAX: usize = 512;
 static STRNCMP_LOGGED: AtomicUsize = AtomicUsize::new(0);
+static STRNICMP_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// Full-input cap (retail M1 step-05): the dispatcher's `n` only covers the
+/// scheme prefix, so the step-04 previews truncated the value that matters
+/// (`G:/app…`, `packro…`). The probe also logs the whole NUL-terminated input
+/// up to this cap. Reads past the `n` bytes `strncmp` itself compares — sound
+/// only for the NUL-terminated inputs the title passes (the dispatcher runs a
+/// `strlen`-like first; the Havok-style keys are C strings) — and runs only
+/// when the triage env var is set (default-off path never reads past `n`).
+const STRNCMP_FULL_MAX: usize = 256;
+
+/// Full NUL-terminated, lossy input string, capped at [`STRNCMP_FULL_MAX`].
+fn strncmp_cstr_full(s: *const u8) -> String {
+    let mut buf = Vec::with_capacity(64);
+    for i in 0..STRNCMP_FULL_MAX {
+        // SAFETY: triage-only (see `STRNCMP_FULL_MAX`); stops at the first NUL.
+        let c = unsafe { *s.add(i) };
+        if c == 0 {
+            break;
+        }
+        buf.push(c);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Game call-site attribution for the trace below is done statically, by
+/// `(n, key)` (retail M1 step-05): every dispatcher key maps to a unique
+/// `lea rdx,[rip+…]` site in the disassembly except `tcpip:` (two sites: the
+/// `0x14096853b` dispatcher probe and the `0x1428c63c0` strip-prefix helper).
+/// A first revision tried to log the caller by scanning stack words for
+/// mapped-image addresses, but two live retail runs proved that misattributes:
+/// the win64 home space spills the key pointer onto our stack ahead of any
+/// return address, and HLE trampoline frames add more data words, so the
+/// "caller" was a `.rdata`/`.data` operand, not code. Real unwind PCs would
+/// need `Backtrace::frames` (unstable on this toolchain) or a new unwind
+/// dependency for a default-off probe — not worth it when the static mapping
+/// already answers which probe examined which input.
 
 /// Bounded, NUL-terminated, lossy preview of a `strncmp` arg: reads at most
 /// `min(n, STRNCMP_PREVIEW_MAX)` bytes — never more than `strncmp` itself
@@ -741,7 +779,9 @@ fn trace_strncmp(a: *const u8, b: *const u8, n: usize, result: i32) {
     }
     let pa = strncmp_arg_preview(a, n);
     let pb = strncmp_arg_preview(b, n);
-    crate::xlog_info!("[STRNCMP] n={n} a={pa:?} b={pb:?} -> {result}");
+    let fa = strncmp_cstr_full(a);
+    let fb = strncmp_cstr_full(b);
+    crate::xlog_info!("[STRNCMP] n={n} a={pa:?} a_full={fa:?} b={pb:?} b_full={fb:?} -> {result}");
 }
 
 /// `int _strnicmp(a, b, n)` — bounded case-insensitive `strcmp` (ASCII fold),
@@ -749,7 +789,12 @@ fn trace_strncmp(a: *const u8, b: *const u8, n: usize, result: i32) {
 /// the drive-prefix probe at `exe+0x54F8A70` compares `G:/...` against `xg:` /
 /// `xd:`; the auto-stub always reported "equal", which stripped the drive
 /// letter and broke the dump-path lookup in `sub_14056EB30`).
+/// Traced under the same `XCL_TRACE_STRNCMP` gate (retail M1 step-05): the
+/// `0x140968480` dispatcher issues its `t:`/`g:`/`R:`-style probes through
+/// this slot (`0x1467947b8`), so without it the dispatcher's input source is
+/// half-invisible.
 pub unsafe extern "win64" fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    let mut result = 0;
     for i in 0..n {
         let mut x = *a.add(i);
         let mut y = *b.add(i);
@@ -760,13 +805,29 @@ pub unsafe extern "win64" fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> 
             y += 32;
         }
         if x != y {
-            return x as i32 - y as i32;
+            result = x as i32 - y as i32;
+            break;
         }
         if x == 0 {
-            return 0;
+            break;
         }
     }
-    0
+    trace_strnicmp(a, b, n, result);
+    result
+}
+
+fn trace_strnicmp(a: *const u8, b: *const u8, n: usize, result: i32) {
+    if !strncmp_tracing() {
+        return;
+    }
+    if STRNICMP_LOGGED.fetch_add(1, Ordering::Relaxed) >= STRNCMP_LOG_MAX {
+        return;
+    }
+    let pa = strncmp_arg_preview(a, n);
+    let pb = strncmp_arg_preview(b, n);
+    let fa = strncmp_cstr_full(a);
+    let fb = strncmp_cstr_full(b);
+    crate::xlog_info!("[STRNICMP] n={n} a={pa:?} a_full={fa:?} b={pb:?} b_full={fb:?} -> {result}");
 }
 
 /// `int wcscmp(a, b)` — UTF-16 unit order, `0` when equal.
@@ -3419,6 +3480,23 @@ mod tests {
             assert_eq!(strncmp_arg_preview(b"\xff\xfe\0".as_ptr(), 3), "��");
             // Zero length previews empty.
             assert_eq!(strncmp_arg_preview(b"abc\0".as_ptr(), 0), "");
+        }
+    }
+
+    #[test]
+    fn strncmp_full_reports_beyond_n() {
+        unsafe {
+            // Step-05: the full input extends past the `n`-byte prefix the
+            // dispatcher compares (step-04 only logged `G:/app…`/`packro…`).
+            let s = b"packroot:/game/content\0";
+            assert_eq!(strncmp_cstr_full(s.as_ptr()), "packroot:/game/content");
+            // Stops at NUL and stays lossy + capped like the prefix preview.
+            assert_eq!(strncmp_cstr_full(b"ab\0cd\0".as_ptr()), "ab");
+            assert_eq!(strncmp_cstr_full(b"\xff\xfe\0".as_ptr()), "��");
+            let mut long = vec![b'k'; 300];
+            long.push(0);
+            let full = strncmp_cstr_full(long.as_ptr());
+            assert_eq!(full.len(), STRNCMP_FULL_MAX, "full input is capped, got len {}", full.len());
         }
     }
 
