@@ -47,7 +47,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::hle::vulkan_linux::{Backend, Selection, VulkanState, acquire, select_cached};
@@ -146,6 +146,151 @@ unsafe impl Send for NullObj {}
 static CREATED: AtomicU64 = AtomicU64::new(0);
 
 static VTABLES: OnceLock<Mutex<Vec<(Kind, usize)>>> = OnceLock::new();
+
+// ---------------------------------------------------------------------------------------
+// console command-list layout (Step 68)
+// ---------------------------------------------------------------------------------------
+
+/// The title runtime numbers the command list's console methods off the PC
+/// order by two (`hle/d3d12x/real.rs`'s `QUEUE_SHIFTED`): its Signal / Wait
+/// moved on the queue, and on the list `CopyMemoryX` / `FillMemoryWith32BitValueX`
+/// / the write-and-wait / timestamp family / `KickoffX` / `RSSetDepthBiasX`
+/// sit two slots later. Which numbering a title uses cannot be told from
+/// device creation; its calls tell: queue #16/#17 with one of its fences,
+/// device #108/#127/#133 (console-only) or list #139 (the newer Reset) only
+/// exist in the newer runtime. The flag is read at each slot call, so lists
+/// created before the runtime identifies itself still route correctly; the
+/// older meaning applies while it is unset (the Windows fallback).
+static NEWER_LIST_LAYOUT: AtomicBool = AtomicBool::new(false);
+
+/// Newer command-list slot → the older layout's slot of the same method.
+/// Byte-for-byte the Windows twin's `hle/d3d12x/real.rs::NEWER_LIST_SLOTS`
+/// (that module does not compile on Linux); a drift between the twins is a
+/// routing bug.
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [
+    (61, 59),
+    (62, 60),
+    (63, 61),
+    (64, 62),
+    (65, 63),
+    (70, 68),
+    (71, 69),
+    (72, 70),
+    (73, 71),
+    (74, 72),
+    (80, 78),
+    (83, 81),
+    (85, 83),
+    (86, 84),
+    (87, 85),
+    (90, 88),
+    (91, 89),
+    (92, 90),
+    (95, 93),
+    (96, 94),
+    (129, 127),
+    (139, 10),
+];
+
+fn note_newer_list_layout() {
+    if !NEWER_LIST_LAYOUT.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!(
+            "D3D12.X: the title's runtime uses the newer console command-list layout \
+             (queue #16/#17 fence, device #108/#127/#133 or list #139)"
+        );
+    }
+}
+
+/// The logging stub the vtable would have at `slot` without a console handler.
+fn list_stub(slot: usize) -> usize {
+    crate::stubs::make_stub(DLL, &format!("{}::#{slot}", Kind::CommandList.iface()), 0)
+}
+
+/// A command-list method the older layout has at `slot`. `#10` is its Reset
+/// (the null backend acknowledges it); everything else is a logging stub.
+fn legacy_list_handler(slot: usize) -> usize {
+    match slot {
+        10 => Ret_S_OK as usize, // Reset
+        60 => VulList_CopyMemory as usize,
+        61 => VulList_Fill32 as usize,
+        68 => List_OMSetDepthBounds as usize,
+        69 => VulList_Write32Bottom as usize,
+        70 => VulList_TimestampBottom as usize,
+        71 => VulList_Wait32 as usize,
+        72 => VulList_Wait64 as usize,
+        81 => List_NoteDraw as usize,
+        89 => VulList_Write64Top as usize,
+        93 => VulList_Kickoff as usize,
+        94 => List_RSSetDepthBiasX as usize,
+        _ => list_stub(slot),
+    }
+}
+
+fn legacy_list_implemented(slot: usize) -> bool {
+    matches!(slot, 10 | 60 | 61 | 68 | 69 | 70 | 71 | 72 | 81 | 89 | 93 | 94)
+}
+
+/// The method the newer runtime has at a newer-layout slot: the older
+/// layout's method at `older_slot` moved there, except for the two
+/// console-only methods that have no older numbering of their own
+/// (`ExecuteIndirect` at #59, the newer Reset at #139 → older #10).
+fn newer_list_handler(older_slot: usize) -> usize {
+    match older_slot {
+        59 => VulList_ExecuteIndirect as usize,
+        10 => List_ResetX as usize,
+        s => legacy_list_handler(s),
+    }
+}
+
+/// `(older-layout target, newer-layout target)` of a command-list slot whose
+/// meaning depends on the title runtime's numbering; `None` keeps the plain
+/// logging stub (neither layout has a handler there on this backend).
+fn list_slot_targets(slot: usize) -> Option<(usize, usize)> {
+    let &(_, older_slot) = NEWER_LIST_SLOTS.iter().find(|&&(newer, _)| newer == slot)?;
+    let newer_implemented = matches!(older_slot, 10 | 59) || legacy_list_implemented(older_slot);
+    if !legacy_list_implemented(slot) && !newer_implemented {
+        return None;
+    }
+    Some((legacy_list_handler(slot), newer_list_handler(older_slot)))
+}
+
+/// Newer-only entry point Reset #139: a call to this slot is itself proof of
+/// the newer layout, so latch before running the console's three-argument
+/// Reset.
+unsafe extern "win64" fn VulList_Slot139(this: *mut NullObj, alloc: *mut c_void, pso: *mut c_void, flags: u64) -> HRESULT {
+    note_newer_list_layout();
+    List_ResetX(this, alloc, pso, flags)
+}
+
+/// A slot thunk that picks its target at each call from the layout byte,
+/// leaving every argument register — rcx/rdx/r8/r9, xmm0–15 and the caller's
+/// stack arguments — untouched. It clobbers only the two volatile registers
+/// `rax`/`r10`:
+///
+/// ```text
+/// mov rax, flag ; cmp byte [rax], 0
+/// mov rax, older ; mov r10, newer ; cmovne rax, r10 ; jmp rax
+/// ```
+///
+/// No caller classification: every call to a null-backend vtable slot comes
+/// from the title.
+fn layout_thunk(older: usize, newer: usize, flag: &'static AtomicBool) -> usize {
+    let mut c: Vec<u8> = Vec::with_capacity(48);
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    c.extend_from_slice(&(flag as *const AtomicBool as u64).to_le_bytes());
+    c.extend_from_slice(&[0x80, 0x38, 0x00]); // cmp byte [rax], 0
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (older target)
+    c.extend_from_slice(&(older as u64).to_le_bytes());
+    c.extend_from_slice(&[0x49, 0xBA]); // mov r10, imm64 (newer target)
+    c.extend_from_slice(&(newer as u64).to_le_bytes());
+    c.extend_from_slice(&[0x49, 0x0F, 0x45, 0xC2]); // cmovne rax, r10 (r10 in r/m, REX.B)
+    c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+    let p = crate::stubs::alloc_code(c.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
+    }
+    p as usize
+}
 
 fn vtable(kind: Kind) -> *const usize {
     let t = VTABLES.get_or_init(|| Mutex::new(Vec::new()));
@@ -341,15 +486,25 @@ fn vtable(kind: Kind) -> *const usize {
         v[29] = List_EndQuery as usize;
         v[30] = List_ResolveQueryData as usize;
         v[81] = List_NoteDraw as usize;
+        // Console command-list methods the title calls on both layouts: the
+        // older numbering at these slots. The slots a newer runtime moves are
+        // chosen at each call below.
         v[60] = VulList_CopyMemory as usize;
-        v[61] = VulList_Fill32 as usize;
+        v[68] = List_OMSetDepthBounds as usize;
         v[69] = VulList_Write32Bottom as usize;
-        v[70] = VulList_TimestampBottom as usize;
-        v[71] = VulList_Wait32 as usize;
-        v[72] = VulList_Wait64 as usize;
         v[89] = VulList_Write64Top as usize;
         v[93] = VulList_Kickoff as usize;
         v[94] = List_RSSetDepthBiasX as usize; // S6 dynamic depth bias
+        // Console #32 SetDescriptorHeaps: 2-arg acknowledgement (the null
+        // backend has no descriptor heaps to bind).
+        v[32] = List_SetDescriptorHeapsX as usize;
+        for slot in 0..VTBL_SLOTS {
+            if let Some((older, newer)) = list_slot_targets(slot) {
+                // Reset #139 is a newer-only entry point: calling it proves
+                // the layout, so it latches then runs Reset.
+                v[slot] = if slot == 139 { VulList_Slot139 as usize } else { layout_thunk(older, newer, &NEWER_LIST_LAYOUT) };
+            }
+        }
     }
     if kind == Kind::VulkanList || kind == Kind::CommandList {
         v[146] = Ret_Void as usize; // UAV barrier (single queue: already coherent)
@@ -766,6 +921,9 @@ pub struct ListDrawRecord {
     pub ops: Vec<DrawOp>,
     pub dyn_bias: Option<[f32; 3]>,
     pub static_bias: [f32; 3],
+    /// Console `OMSetDepthBounds(min, max)` (#68, or newer #70): store-only,
+    /// like the null backend's other raster state.
+    pub depth_bounds: Option<[f32; 2]>,
 }
 
 fn pso_store() -> &'static Mutex<HashMap<usize, PsoRecord>> {
@@ -1437,6 +1595,7 @@ unsafe extern "win64" fn Device_GetResourceAllocationInfo2(
     descs: *const u8,
     infos: *mut [u64; 3],
 ) -> *mut u8 {
+    note_newer_list_layout(); // console-only device method (#108)
     let (_this, ret) = this_and_ret(a, b);
     let (mut size, mut align) = (0u64, 0u64);
     for k in 0..n as usize {
@@ -1501,6 +1660,7 @@ unsafe extern "win64" fn Device_CreateCommittedResourceLayoutX(
     _riid: *const c_void,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
+    note_newer_list_layout(); // console-only device method (#127)
     const ALLOW_DISPLAY: u32 = 0x8;
     if flags & ALLOW_DISPLAY != 0 && !desc.is_null() && !ppv.is_null() {
         let x = (desc as *const [u8; 0x38]).read_unaligned();
@@ -1857,6 +2017,7 @@ unsafe extern "win64" fn Device_CreatePlacedResourceLayoutX(
     riid: *const c_void,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
+    note_newer_list_layout(); // console-only device method (#133)
     Device_CreatePlacedResourceX(this, va, desc, 0, clear, riid, ppv)
 }
 
@@ -2413,6 +2574,51 @@ unsafe extern "win64" fn VulList_Wait64(_t: *mut NullObj, va: u64, func: u32, va
 /// applied synchronously, so there is nothing queued to flush.
 unsafe extern "win64" fn VulList_Kickoff(_t: *mut NullObj) {}
 
+/// `ExecuteIndirectX(signature, max_count, argument_buffer, offset, count_buffer, count_offset)`
+/// (newer layout #61): the null backend has one coherent queue and records no
+/// GPU work, so the indirect draw/dispatch is acknowledged without replay.
+unsafe extern "win64" fn VulList_ExecuteIndirect(
+    _t: *mut NullObj,
+    _sig: *mut c_void,
+    _max: u32,
+    _args: *const c_void,
+    _args_off: u64,
+    _count: *const c_void,
+    _count_off: u64,
+) -> HRESULT {
+    S_OK
+}
+
+/// `OMSetDepthBounds(min, max)` (older #68 / newer #70): store-only raster
+/// state, like `RSSetDepthBiasX` — no rasteriser consumes it on the null
+/// backend.
+unsafe extern "win64" fn List_OMSetDepthBounds(this: *mut NullObj, min: f32, max: f32) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().depth_bounds = Some([min, max]);
+}
+
+/// Console #32 `SetDescriptorHeaps(count, heaps)`: the null backend owns no
+/// descriptor heaps, so the call is acknowledged (the title only needs S_OK).
+unsafe extern "win64" fn List_SetDescriptorHeapsX(_t: *mut NullObj, _n: u32, _heaps: *const usize) -> HRESULT {
+    S_OK
+}
+
+/// Newer layout #139 `Reset(allocator, initial_pso, flags)` — the console's
+/// three-argument Reset. On the null backend Reset only re-opens the list (the
+/// PC #10 path acknowledges); the title passes a NULL pipeline on the lists it
+/// takes from its pool.
+unsafe extern "win64" fn List_ResetX(this: *mut NullObj, _alloc: *mut c_void, pso: *mut c_void, _flags: u64) -> HRESULT {
+    if !this.is_null() {
+        let mut ls = list_store().lock().unwrap();
+        let e = ls.entry(this as usize).or_default();
+        e.pso = pso as usize;
+        e.closed = false;
+    }
+    S_OK
+}
+
 /// `AllocateUploadMemoryX(size, alignment)` (slot 148): host upload memory —
 /// the title only needs it aligned and writable (it writes a tag word and
 /// reads it back). Zeroed, intentionally leaked like every null-device block;
@@ -2458,6 +2664,7 @@ unsafe extern "win64" fn Queue_GetTimestampFrequency(_t: *mut NullObj, f: *mut u
 /// poll called `0x989680` as a function pointer at `exe+0x4fb0aec`.
 unsafe extern "win64" fn Queue_Slot16(this: *mut NullObj, a1: *mut c_void, a2: u64) -> HRESULT {
     if is_title_fence(a1) {
+        note_newer_list_layout();
         Queue_Signal(this, a1 as *mut NullObj, a2)
     } else {
         Queue_GetTimestampFrequency(this, a1 as *mut u64)
@@ -2469,6 +2676,7 @@ unsafe extern "win64" fn Queue_Slot16(this: *mut NullObj, a1: *mut c_void, a2: u
 /// everything instantly, so Wait is `S_OK`.
 unsafe extern "win64" fn Queue_Slot17(this: *mut NullObj, a1: *mut c_void, a2: u64) -> HRESULT {
     if is_title_fence(a1) {
+        note_newer_list_layout();
         S_OK
     } else {
         Queue_GetClockCalibration(this, a1 as *mut u64, a2 as usize as *mut u64)
@@ -3428,6 +3636,7 @@ mod tests {
         // deferred-free poll then called it as a function pointer
         // (`exe+0x4fb0aec`, fault `0x9896e0`) — Signal must only bump the
         // fence's value.
+        let _g = layout_serial().lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut dev = std::ptr::null_mut();
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
@@ -3473,6 +3682,7 @@ mod tests {
         // Console fence #12 is the address of the completed value the title
         // polls (`monitorx`/`mwaitx`; Windows `fence_x::completed_value_address`).
         // The null GPU completes instantly, so a signal advances the same cell.
+        let _g = layout_serial().lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut dev = std::ptr::null_mut();
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
@@ -3547,6 +3757,8 @@ mod tests {
         // copy, a timestamp, waits, kickoff) — the title's
         // `console_list_methods` reads back through these slots on both
         // backends. Fails pre-route (slot 69 is a logging stub: no write).
+        let _g = layout_serial().lock().unwrap_or_else(|e| e.into_inner());
+        NEWER_LIST_LAYOUT.store(false, Ordering::Release); // the older numbering below
         unsafe {
             let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
             let mut ndev = std::ptr::null_mut();
@@ -5198,6 +5410,155 @@ mod tests {
         assert_eq!(super::group_own_vs_bytes(pb, pl), b);
         assert!(super::group_own_vs_bytes(pl, pl).is_empty(), "list PSO inherits");
         assert!(super::group_own_vs_bytes(0x5_4000_099, pl).is_empty(), "unknown PSO inherits");
+    }
+
+    /// The newer-layout command-list table must stay identical to the Windows
+    /// twin's (`hle/d3d12x/real.rs::NEWER_LIST_SLOTS`, which does not compile
+    /// on Linux, so the literal is pinned here).
+    #[test]
+    fn newer_list_slot_table_matches_the_windows_twin() {
+        const EXPECTED: [(usize, usize); 22] = [
+            (61, 59),
+            (62, 60),
+            (63, 61),
+            (64, 62),
+            (65, 63),
+            (70, 68),
+            (71, 69),
+            (72, 70),
+            (73, 71),
+            (74, 72),
+            (80, 78),
+            (83, 81),
+            (85, 83),
+            (86, 84),
+            (87, 85),
+            (90, 88),
+            (91, 89),
+            (92, 90),
+            (95, 93),
+            (96, 94),
+            (129, 127),
+            (139, 10),
+        ];
+        assert_eq!(NEWER_LIST_SLOTS.len(), EXPECTED.len());
+        for (linux, windows) in NEWER_LIST_SLOTS.iter().zip(EXPECTED) {
+            assert_eq!(*linux, windows, "Linux/Windows newer-list slot tables drifted");
+        }
+        // The slots this backend implements on either side get a call-time
+        // thunk; the rest stay logging stubs.
+        let wired: Vec<usize> = (0..VTBL_SLOTS).filter(|&s| list_slot_targets(s).is_some()).collect();
+        assert_eq!(wired, vec![61, 62, 63, 70, 71, 72, 73, 74, 83, 91, 95, 96, 139]);
+    }
+
+    /// `slot(list, 70)` is `OMSetDepthBounds` on the newer layout and
+    /// `TimestampBottom` on the older one; `#72` is the timestamp on newer,
+    /// `#74` `Wait64`; `#32` is always the console `SetDescriptorHeaps`;
+    /// `#139` resets on newer and is a stub in the older table.
+    #[test]
+    fn newer_list_layout_selects_the_moved_methods() {
+        let t = |s: usize| list_slot_targets(s).expect("slot has a layout split");
+        assert_eq!(t(70).0, VulList_TimestampBottom as usize);
+        assert_eq!(t(70).1, List_OMSetDepthBounds as usize);
+        assert_ne!(t(70).1, VulList_TimestampBottom as usize);
+        assert_eq!(t(71).0, VulList_Wait32 as usize);
+        assert_eq!(t(71).1, VulList_Write32Bottom as usize);
+        assert_eq!(t(72).0, VulList_Wait64 as usize);
+        assert_eq!(t(72).1, VulList_TimestampBottom as usize);
+        assert_eq!(t(74).0, list_stub(74));
+        assert_eq!(t(74).1, VulList_Wait64 as usize);
+        assert_eq!(t(61).0, VulList_Fill32 as usize);
+        assert_eq!(t(61).1, VulList_ExecuteIndirect as usize);
+        assert_eq!(t(62).1, VulList_CopyMemory as usize);
+        assert_eq!(t(63).1, VulList_Fill32 as usize);
+        assert_eq!(t(91).1, VulList_Write64Top as usize);
+        assert_eq!(t(95).1, VulList_Kickoff as usize);
+        assert_eq!(t(96).1, List_RSSetDepthBiasX as usize);
+        assert_eq!(t(139).0, list_stub(139));
+        assert_eq!(t(139).1, List_ResetX as usize);
+        // Slots this backend implements on neither side keep the honest stub.
+        assert_eq!(list_slot_targets(80), None); // newer #80 (older #78 DispatchX) not implemented
+        assert_eq!(list_slot_targets(129), None);
+        unsafe {
+            let list = new_obj(Kind::CommandList) as *mut c_void;
+            assert_eq!(slot(list, 32), List_SetDescriptorHeapsX as usize);
+            assert_ne!(slot(list, 139), list_stub(139));
+            assert_ne!(slot(list, 139), t(139).0);
+            assert_ne!(slot(list, 70), t(70).0);
+        }
+    }
+
+    fn layout_serial() -> &'static Mutex<()> {
+        static S: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+        &S
+    }
+
+    /// End to end through the vtable: older #70 writes a timestamp;
+    /// a newer-only Reset #139 call latches the layout; then #70 stores depth
+    /// bounds, #72 is the timestamp, #74 Wait64 and #32 SetDescriptorHeaps.
+    #[test]
+    fn newer_list_layout_routes_depth_bounds_timestamp_and_reset() {
+        let _g = layout_serial().lock().unwrap_or_else(|e| e.into_inner());
+        NEWER_LIST_LAYOUT.store(false, Ordering::Release);
+        unsafe {
+            let list = new_obj(Kind::CommandList);
+            let obj = list as *mut c_void;
+
+            let mut stamp = 0u64;
+            let ts70: unsafe extern "win64" fn(*mut c_void, u64, u64, u32, u32) = std::mem::transmute(slot(obj, 70));
+            ts70(obj, &mut stamp as *mut u64 as u64, 0, 0, 0);
+            assert!(stamp > 0, "older layout #70 is the timestamp");
+            assert_eq!(list_record_for(list as usize).unwrap_or_default().depth_bounds, None);
+
+            let reset: unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut c_void, u64) -> HRESULT =
+                std::mem::transmute(slot(obj, 139));
+            assert_eq!(reset(obj, std::ptr::null_mut(), std::ptr::null_mut(), 0), S_OK);
+            assert!(NEWER_LIST_LAYOUT.load(Ordering::Acquire), "#139 proves the newer layout");
+
+            let dbounds: unsafe extern "win64" fn(*mut c_void, f32, f32) = std::mem::transmute(slot(obj, 70));
+            dbounds(obj, 0.25, 0.75);
+            assert_eq!(list_record_for(obj as usize).unwrap().depth_bounds, Some([0.25, 0.75]));
+            assert!(stamp > 0, "depth bounds must not write the timestamp slot");
+
+            stamp = 0;
+            let ts72: unsafe extern "win64" fn(*mut c_void, u64, u64, u32, u32) = std::mem::transmute(slot(obj, 72));
+            ts72(obj, &mut stamp as *mut u64 as u64, 0, 0, 0);
+            assert!(stamp > 0, "newer layout #72 is the timestamp");
+            assert_eq!(list_record_for(obj as usize).unwrap().depth_bounds, Some([0.25, 0.75]));
+
+            let wait64: unsafe extern "win64" fn(*mut c_void, u64, u32, u64, u64, u32) =
+                std::mem::transmute(slot(obj, 74));
+            wait64(obj, &mut stamp as *mut u64 as u64, 8, 0, 0, 0); // ALWAYS: no polling
+
+            let heaps: unsafe extern "win64" fn(*mut c_void, u32, *const usize) -> HRESULT =
+                std::mem::transmute(slot(obj, 32));
+            assert_eq!(heaps(obj, 1, std::ptr::null()), S_OK);
+        }
+        NEWER_LIST_LAYOUT.store(false, Ordering::Release);
+    }
+
+    /// The layout thunk reads its flag at each call and forwards every
+    /// argument register, the floating-point ones and the stack arguments too
+    /// (otherwise a newer title's `OMSetDepthBounds(min, max)` reaches the
+    /// timestamp handler with `rdx == 1`).
+    #[test]
+    fn list_layout_thunk_reads_the_flag_at_each_call_and_preserves_arguments() {
+        unsafe extern "win64" fn older(a: u64, b: u64, c: u64, d: u64, e: f32, f: f64) -> u64 {
+            a + 10 * b + 100 * c + 1000 * d + (e * 10_000.0) as u64 + (f * 100_000.0) as u64
+        }
+        unsafe extern "win64" fn newer(a: u64, b: u64, c: u64, d: u64, e: f32, f: f64) -> u64 {
+            older(a, b, c, d, e, f) + 7
+        }
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let p = layout_thunk(older as usize, newer as usize, &FLAG);
+        let f: unsafe extern "win64" fn(u64, u64, u64, u64, f32, f64) -> u64 = unsafe { std::mem::transmute(p) };
+        unsafe {
+            assert_eq!(f(1, 2, 3, 4, 5.0, 6.0), older(1, 2, 3, 4, 5.0, 6.0));
+            FLAG.store(true, Ordering::Release);
+            assert_eq!(f(1, 2, 3, 4, 5.0, 6.0), newer(1, 2, 3, 4, 5.0, 6.0));
+            FLAG.store(false, Ordering::Release);
+            assert_eq!(f(1, 2, 3, 4, 5.0, 6.0), older(1, 2, 3, 4, 5.0, 6.0));
+        }
     }
 
     /// Calls `f(this)` (Win64) the way console code does, with a writable pointer left in rdx.    #[cfg(all(target_arch = "x86_64", windows))]
