@@ -453,6 +453,8 @@ pub unsafe extern "win64" fn VirtualFree(addr: *mut c_void, size: usize, ftype: 
             set_error(ERROR_INVALID_PARAMETER);
             return 0;
         };
+        // Physical pages mapped into this reservation go home before it disappears.
+        unmap_away_range(base, len);
         if libc::munmap(base as *mut c_void, len) != 0 {
             set_error(ERROR_INVALID_PARAMETER);
             return 0;
@@ -472,6 +474,7 @@ pub unsafe extern "win64" fn VirtualFree(addr: *mut c_void, size: usize, ftype: 
             return 0;
         }
         // The reservation stays; its contents read as zeros afterwards.
+        unmap_away_range(base, len);
         libc::madvise(base as *mut c_void, len, libc::MADV_DONTNEED);
         set_error(ERROR_SUCCESS);
         return 1;
@@ -3509,6 +3512,27 @@ fn gfx_decommit_at(at: usize, len: usize) {
     }
 }
 
+/// Whether `[addr, addr + len)` lies inside one live plain `VirtualAlloc`
+/// reservation. `XMemVirtualAlloc` with `memory_type == 0` takes that path (the
+/// Windows twin too), and `XMemMapPhysicalPages` must accept the reserved VA.
+fn plain_reservation_contains(addr: usize, len: usize) -> bool {
+    let Some(end) = addr.checked_add(len) else { return false };
+    let a = allocations().lock().unwrap();
+    let Some((&base, &(size, _))) = a.range(..=addr).next_back() else { return false };
+    end <= base.saturating_add(size)
+}
+
+/// Commit one physical page's VA in the graphics pool or a plain reservation.
+fn commit_physical_page(at: usize) -> bool {
+    if gfx_contains(at) && gfx_contains(at + PHYS_PAGE - 1) {
+        return gfx_commit_at(at, PHYS_PAGE);
+    }
+    if !plain_reservation_contains(at, PHYS_PAGE) {
+        return false;
+    }
+    unsafe { libc::mprotect(at as *mut c_void, PHYS_PAGE, libc::PROT_READ | libc::PROT_WRITE) == 0 }
+}
+
 static XMEM_HEAP_SIZES: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
 
 fn xmem_heap_sizes() -> &'static Mutex<HashMap<usize, usize>> {
@@ -3997,10 +4021,14 @@ unsafe fn map_pages(base: usize, n: usize, pages: Option<Vec<usize>>) -> *mut c_
         set_error(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
-    // Every target page must be inside the graphics pool when an address is given.
+    // Every target page must be inside the graphics pool or a live plain
+    // reservation when an address is given: `XMemVirtualAlloc` with
+    // `memory_type == 0` reserves ordinary `VirtualAlloc` memory, and the title
+    // maps physical pages into it (both twins' `XMemVirtualAlloc` take that path).
     if base != 0 {
         for i in 0..n {
-            if !gfx_contains(base + i * PHYS_PAGE) {
+            let at = base + i * PHYS_PAGE;
+            if !gfx_contains(at) && !plain_reservation_contains(at, PHYS_PAGE) {
                 set_error(ERROR_INVALID_ADDRESS);
                 return std::ptr::null_mut();
             }
@@ -4026,7 +4054,7 @@ unsafe fn map_pages(base: usize, n: usize, pages: Option<Vec<usize>>) -> *mut c_
         // A page mapped elsewhere moves: old VA → new VA, old VA given up.
         if let Some(&old) = st.page.get(&p) {
             if old != at {
-                if !gfx_commit_at(at, PHYS_PAGE) {
+                if !commit_physical_page(at) {
                     set_error(ERROR_INVALID_ADDRESS);
                     return std::ptr::null_mut();
                 }
@@ -4042,7 +4070,7 @@ unsafe fn map_pages(base: usize, n: usize, pages: Option<Vec<usize>>) -> *mut c_
                 continue;
             }
         }
-        if !gfx_commit_at(at, PHYS_PAGE) {
+        if !commit_physical_page(at) {
             set_error(ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
         }
@@ -14101,6 +14129,30 @@ mod tests {
             assert_eq!(VirtualFree(m1 as *mut c_void, 0, 0x8000), 1);
             assert_eq!(VirtualFree(m2 as *mut c_void, 0, 0x8000), 1);
             assert_eq!(VirtualFree(m1b as *mut c_void, 0, 0x8000), 1);
+        }
+    }
+
+    #[test]
+    fn physical_pages_map_into_a_plain_reservation() {
+        // `XMemVirtualAlloc` with memory_type 0 reserves ordinary `VirtualAlloc`
+        // memory (the Windows twin does the same); `XMemMapPhysicalPages` must
+        // accept that VA, not only graphics-pool ranges. Retail reserves a
+        // 6 GiB stream window this way and int3s when the map is refused.
+        unsafe {
+            let (mut n, mut pages) = (1usize, [0u64; 1]);
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            assert!(write_physical_pages(&[pages[0] as usize], 0, &0x42u32.to_ne_bytes()));
+            // mmap only guarantees 4 KiB; take a 64 KiB-aligned address inside
+            // the reservation (the title's reservation is already aligned).
+            let raw = VirtualAlloc(std::ptr::null(), 0x30000, 0x2000, 4) as usize;
+            assert_ne!(raw, 0);
+            let at = ((raw + 0xffff) & !0xffff) as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(at, 1, pages.as_mut_ptr()) as usize, at as usize);
+            assert_eq!(*(at as *const u32), 0x42);
+            // Unmap (null page) copies the contents home and decommits the VA.
+            assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null_mut()) as usize, at as usize);
+            assert_eq!(VirtualFree(raw as *mut c_void, 0, 0x8000), 1);
+            assert_eq!(XMemFreePhysicalPages(1, pages.as_mut_ptr()), 1);
         }
     }
 
