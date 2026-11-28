@@ -368,6 +368,8 @@ fn vtable(kind: Kind) -> *const usize {
             v[16] = Device_CreateRootSignature as usize;
             // console CopyDescriptorsSimple: the slot bytes in the title's heap
             v[24] = Device_CopyDescriptorsSimple as usize;
+            // console CreateShaderResourceViewAt: the staging writer for #24
+            v[70] = Device_CreateShaderResourceViewAt as usize;
             v[25] = Device_GetResourceAllocationInfo as usize;
             v[26] = Device_GetCustomHeapProperties as usize;
             v[27] = Device_CreateCommittedResource as usize;
@@ -1653,6 +1655,110 @@ unsafe extern "win64" fn Device_CopyDescriptorsSimple(_t: *mut NullObj, n: u32, 
     }
     std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
     S_OK
+}
+/// Console device #70 `CreateShaderResourceViewAt(resource_desc, view, cpu)`:
+/// the writer half of retail's raw-memory descriptor staging (`exe+0x4ecc81b`,
+/// right before the #24 copy). The view is the console layout: Format u32 @0,
+/// ViewDimension u32 @4, Shader4ComponentMapping u32 @8 (0x1688 = identity),
+/// the dimension union @0x10 and the GPU address u64 @0x28 — the layout the
+/// twin's RTAS handler already reads Location from, not the PC
+/// `D3D12_SHADER_RESOURCE_VIEW_DESC` (union @8). The handler writes the
+/// console descriptor into the 32-byte slot at `cpu`: a V# for BUFFER, a T#
+/// with BASE_ADDRESS for dimensions 2–10, the BVH words for a ray-tracing
+/// view. `cpu` must be a graphics-pool address (a title heap slot), else
+/// nothing is written; the GPU address is encoded, never dereferenced.
+unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rdesc: *const u8, view: *const u8, cpu: u64) {
+    use crate::gpu::desc::{self, ImageType};
+    const SLOT: usize = 32;
+    if view.is_null() || cpu == 0 || !crate::hle::kernelx_linux::gfx_contains_range(cpu as usize, SLOT) {
+        return;
+    }
+    let u32_at = |off: usize| (view.add(off) as *const u32).read_unaligned();
+    let dim = u32_at(4);
+    let va = (view.add(0x28) as *const u64).read_unaligned();
+    if va == 0 {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!("D3D12.X: CreateShaderResourceViewAt(#{dim}) with a null GPU address: slot {cpu:#x}");
+        }
+        return;
+    }
+    let mut words = [0u32; 8];
+    match dim {
+        1 => {
+            let first = (view.add(0x10) as *const u64).read_unaligned();
+            let n = u32_at(0x18);
+            let stride = u32_at(0x1c);
+            let raw = u32_at(0x20) & 1 != 0;
+            let fmt = desc::gfx10_format_num(u32_at(0)).unwrap_or(0);
+            let (stride, elem) = if raw {
+                (0, 4)
+            } else if stride > 0 {
+                (stride, stride)
+            } else {
+                let e = desc::format_bytes(fmt);
+                (e, e)
+            };
+            let Some(address) = first.checked_mul(elem as u64).and_then(|off| va.checked_add(off)) else {
+                return;
+            };
+            let records = if stride == 0 { n.saturating_mul(4) } else { n };
+            words[..4].copy_from_slice(&desc::buffer_words(address, stride, records, fmt));
+        }
+        2..=10 => {
+            if rdesc.is_null() {
+                return;
+            }
+            let view_format = u32_at(0);
+            let mapping = u32_at(8);
+            let res_format = (rdesc.add(32) as *const u32).read_unaligned();
+            let fmt = desc::gfx10_format_num(if view_format == 0 { res_format } else { view_format }).unwrap_or(0);
+            let width = (rdesc.add(16) as *const u64).read_unaligned() as u32;
+            let height = (rdesc.add(24) as *const u32).read_unaligned();
+            let array = (rdesc.add(28) as *const u16).read_unaligned() as u32;
+            let mips = (rdesc.add(30) as *const u16).read_unaligned() as u32;
+            let samples = (rdesc.add(36) as *const u32).read_unaligned().max(1);
+            let (ty, most, levels, first_slice, depth) = match dim {
+                2 => (ImageType::D1, u32_at(0x10), u32_at(0x14), 0, 1),
+                3 => (ImageType::D1Array, u32_at(0x10), u32_at(0x14), u32_at(0x18), u32_at(0x1c).max(1)),
+                4 => (ImageType::D2, u32_at(0x10), u32_at(0x14), 0, 1),
+                5 => (ImageType::D2Array, u32_at(0x10), u32_at(0x14), u32_at(0x18), u32_at(0x1c).max(1)),
+                6 => (ImageType::D2Msaa, 0, 1, 0, 1),
+                7 => (ImageType::D2MsaaArray, 0, 1, u32_at(0x10), u32_at(0x14).max(1)),
+                8 => (ImageType::D3, u32_at(0x10), u32_at(0x14), 0, array.max(1)),
+                9 => (ImageType::Cube, u32_at(0x10), u32_at(0x14), 0, array.max(6)),
+                // TEXTURECUBEARRAY: NumCubes faces, starting at First2DArrayFace
+                10 => (ImageType::Cube, u32_at(0x10), u32_at(0x14), u32_at(0x18), u32_at(0x1c).max(1).saturating_mul(6)),
+                _ => return,
+            };
+            let (base_level, last_level, max_mip) = if matches!(ty, ImageType::D2Msaa | ImageType::D2MsaaArray) {
+                (0, samples.trailing_zeros().min(4), 0)
+            } else {
+                let res_max = mips.max(1) - 1;
+                let base = most.min(res_max).min(15);
+                let last = if levels == 0 || levels == u32::MAX {
+                    res_max
+                } else {
+                    base.saturating_add(levels.saturating_sub(1)).min(res_max)
+                }
+                .min(15);
+                (base, last, res_max.min(15))
+            };
+            let dst_sel = [0u32, 3, 6, 9].map(|shift| {
+                let c = (mapping >> shift) & 7;
+                if c < 4 {
+                    c + 4
+                } else {
+                    c
+                }
+            });
+            words = desc::console_image_words(va, fmt, ty, width, height, depth, base_level, last_level, max_mip, first_slice, dst_sel);
+        }
+        11 => words[..4].copy_from_slice(&desc::bvh_words(va, false)),
+        _ => return,
+    }
+    std::ptr::write_bytes(cpu as *mut u8, 0, SLOT);
+    std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, cpu as *mut u8, SLOT);
 }
 unsafe extern "win64" fn Device_CreateRootSignature(_t: *mut NullObj, _m: u32, b: *const c_void, l: usize, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     crate::gpu::shader::capture("rootsig", b as usize, l);
@@ -3578,6 +3684,126 @@ mod tests {
             let mut dev = std::ptr::null_mut();
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
             assert_eq!(slot(dev, 24), Device_CopyDescriptorsSimple as usize);
+        }
+    }
+
+    /// One console `CreateShaderResourceViewAt` view: the console layout has
+    /// Format u32 @0, ViewDimension u32 @4, Shader4ComponentMapping u32 @8
+    /// (0x1688 = identity), the dimension union @0x10 and the GPU address @0x28.
+    fn srv_at_view(format: u32, dim: u32, union: &[u8], va: u64) -> [u8; 0x30] {
+        let mut v = [0u8; 0x30];
+        v[0..4].copy_from_slice(&format.to_le_bytes());
+        v[4..8].copy_from_slice(&dim.to_le_bytes());
+        v[8..12].copy_from_slice(&0x1688u32.to_le_bytes());
+        v[0x10..0x10 + union.len()].copy_from_slice(union);
+        v[0x28..0x30].copy_from_slice(&va.to_le_bytes());
+        v
+    }
+
+    /// Retail's console device #70 `CreateShaderResourceViewAt` on the
+    /// raw-memory BUFFER staging path (`exe+0x4ecc81b`): the staging helper
+    /// passes a BUFFER resource desc, a BUFFER view (FirstElement 16, 64
+    /// elements, RAW) and a GPU address; the handler writes the console V# in
+    /// the title's 32-byte slot. RED before routing: the logging stub leaves
+    /// the sentinel.
+    #[test]
+    fn console_create_srv_at_writes_buffer_v_words() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let cpu = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("descriptor slot");
+            std::ptr::write_bytes(cpu as *mut u8, 0x5A, 32);
+            let mut rdesc = [0u8; 56];
+            rdesc[0..4].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+            rdesc[16..24].copy_from_slice(&256u64.to_le_bytes());
+            let mut union = [0u8; 0x18];
+            union[0..8].copy_from_slice(&16u64.to_le_bytes()); // FirstElement
+            union[8..12].copy_from_slice(&64u32.to_le_bytes()); // NumElements
+            union[12..16].copy_from_slice(&0u32.to_le_bytes()); // StructureByteStride
+            union[16..20].copy_from_slice(&1u32.to_le_bytes()); // RAW
+            let va = 0x10_2000_0000u64;
+            let view = srv_at_view(41, 1, &union, va); // DXGI_FORMAT_R32_FLOAT
+            type SrvAt = unsafe extern "win64" fn(*mut c_void, *const u8, *const u8, u64);
+            let srv: SrvAt = std::mem::transmute(slot(dev, 70));
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
+
+            let words: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
+            let b = crate::gpu::desc::buffer(&[words[0], words[1], words[2], words[3]]);
+            assert_eq!((b.address, b.stride, b.num_records, b.format), (va + 64, 0, 256, 22), "V# of the raw buffer");
+            assert_eq!(b.dst_sel, [4, 5, 6, 7]);
+            assert_eq!(&words[4..], &[0u32; 4], "the rest of the console slot is zeroed");
+        }
+    }
+
+    /// The texture half: a 2D view of cached mips 1..3 of a 256×128, 8-mip
+    /// RGBA8 resource. The console T# carries the GPU address, GFX10 format 56
+    /// (R8G8B8A8_UNORM), base/last/max mip 1/3/7 and the identity DST_SEL.
+    #[test]
+    fn console_create_srv_at_writes_texture_t_sharp() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let cpu = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("descriptor slot");
+            std::ptr::write_bytes(cpu as *mut u8, 0x5A, 32);
+            let mut rdesc = [0u8; 56];
+            rdesc[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+            rdesc[16..24].copy_from_slice(&256u64.to_le_bytes());
+            rdesc[24..28].copy_from_slice(&128u32.to_le_bytes());
+            rdesc[28..30].copy_from_slice(&1u16.to_le_bytes()); // DepthOrArraySize
+            rdesc[30..32].copy_from_slice(&8u16.to_le_bytes()); // MipLevels
+            rdesc[32..36].copy_from_slice(&28u32.to_le_bytes()); // R8G8B8A8_UNORM
+            rdesc[36..40].copy_from_slice(&1u32.to_le_bytes()); // SampleDesc.Count
+            let mut union = [0u8; 8];
+            union[0..4].copy_from_slice(&1u32.to_le_bytes()); // MostDetailedMip
+            union[4..8].copy_from_slice(&3u32.to_le_bytes()); // MipLevels
+            let va = 0x10_4000_0000u64;
+            let view = srv_at_view(28, 4, &union, va); // TEXTURE2D
+            type SrvAt = unsafe extern "win64" fn(*mut c_void, *const u8, *const u8, u64);
+            let srv: SrvAt = std::mem::transmute(slot(dev, 70));
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
+
+            let words: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
+            let i = crate::gpu::desc::image(&words).expect("a console T#");
+            assert_eq!((i.address, i.format, i.width, i.height, i.depth), (va, 56, 256, 128, 1));
+            assert_eq!((i.ty, i.base_level, i.last_level, i.max_mip), (crate::gpu::desc::ImageType::D2, 1, 3, 7));
+            assert_eq!(i.dst_sel, [4, 5, 6, 7]);
+        }
+    }
+
+    /// No write outside the graphics pool, and no descriptor for a null GPU
+    /// address: a wild view must not put bytes into host memory.
+    #[test]
+    fn console_create_srv_at_refuses_bad_slots_and_null_addresses() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let mut rdesc = [0u8; 56];
+            rdesc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            let mut union = [0u8; 0x18];
+            union[8..12].copy_from_slice(&64u32.to_le_bytes());
+            let mut view = srv_at_view(41, 1, &union, 0x10_2000_0000);
+            type SrvAt = unsafe extern "win64" fn(*mut c_void, *const u8, *const u8, u64);
+            let srv: SrvAt = std::mem::transmute(slot(dev, 70));
+
+            let local = [0x5A5A_5A5Au32; 8];
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), local.as_ptr() as u64);
+            assert_eq!(local, [0x5A5A_5A5Au32; 8], "a slot outside the pool is not written");
+
+            let cpu = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("descriptor slot");
+            std::ptr::write_bytes(cpu as *mut u8, 0x5A, 32);
+            view[0x28..0x30].fill(0);
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
+            let sentinel: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
+            assert_eq!(sentinel, [0x5A5A_5A5Au32; 8], "a null GPU address writes no descriptor");
+        }
+    }
+
+    #[test]
+    fn console_create_srv_at_is_routed() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            assert_eq!(slot(dev, 70), Device_CreateShaderResourceViewAt as usize);
         }
     }
 

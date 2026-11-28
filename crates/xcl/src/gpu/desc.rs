@@ -630,6 +630,29 @@ mod tests {
         let b = buffer(&[0x1000, 0x12 | 16 << 16, 64, 4 | 5 << 3 | 6 << 6 | 7 << 9 | 77 << 12]);
         assert_eq!((b.address, b.stride, b.num_records, b.format, b.dst_sel), (0x12_0000_1000, 16, 64, 77, [4, 5, 6, 7]));
     }
+
+    #[test]
+    fn gfx10_format_numbers_match_the_wire_values() {
+        // DXGI_FORMAT numbers as the title passes them (no `windows` type on Linux)
+        assert_eq!(gfx10_format_num(28), Some(56)); // R8G8B8A8_UNORM
+        assert_eq!(gfx10_format_num(41), Some(22)); // R32_FLOAT
+        assert_eq!(gfx10_format_num(10), Some(71)); // R16G16B16A16_FLOAT
+        assert_eq!(gfx10_format_num(2), Some(77)); // R32G32B32A32_FLOAT
+        assert_eq!(gfx10_format_num(99), Some(182)); // BC7_UNORM_SRGB
+        assert_eq!(gfx10_format_num(0), None); // UNKNOWN / typeless
+        assert_eq!(gfx10_format_num(44), None); // R10G10B10A2 2_10_10_10 has no DXGI equivalent
+    }
+
+    #[test]
+    fn console_image_words_carry_address_and_view_levels() {
+        let w = console_image_words(0x10_2000_0000, 56, ImageType::D2Array, 256, 128, 4, 1, 3, 7, 2, [4, 6, 4, 7]);
+        let i = image(&w).unwrap();
+        assert_eq!((i.address, i.format, i.width, i.height, i.depth, i.ty), (0x10_2000_0000, 56, 256, 128, 4, ImageType::D2Array));
+        assert_eq!((i.base_level, i.last_level, i.max_mip, i.base_array), (1, 3, 7, 2));
+        assert_eq!(i.dst_sel, [4, 6, 4, 7]);
+        assert_eq!(i.swizzle_mode, 0, "a console view the title made is linear");
+        assert!(image(&[0; 8]).is_none());
+    }
 }
 
 /// GFX10 IMG_FORMAT of a DXGI format (the inverse of `dxgi_format`; typeless → None).
@@ -664,10 +687,72 @@ pub fn xcl_image_for_view(srv_heap_index: u32, format: u32, ty: ImageType, width
     t
 }
 
+/// `(GFX10 IMG_FORMAT, DXGI_FORMAT number)` for every format `dxgi_format`
+/// maps (`dxgi_format` itself needs the `windows` type; the title's descriptors
+/// carry the number). Ascending by GFX10, so the first match is the same one
+/// `gfx10_format` finds.
+const GFX10_TO_DXGI: [(u32, u32); 58] = [
+    (1, 61), (2, 63), (5, 62), (6, 64), (7, 56), (8, 58),
+    (11, 57), (12, 59), (13, 54), (14, 49), (15, 51), (18, 50),
+    (19, 52), (20, 42), (21, 43), (22, 41), (23, 35), (24, 37),
+    (27, 36), (28, 38), (29, 34), (36, 26), (50, 24), (54, 25),
+    (56, 28), (57, 31), (60, 30), (61, 32), (62, 17), (63, 18),
+    (64, 16), (65, 11), (66, 13), (69, 12), (70, 14), (71, 10),
+    (72, 7), (73, 8), (74, 6), (75, 3), (76, 4), (77, 2),
+    (130, 29), (132, 67), (169, 71), (170, 72), (171, 74), (172, 75),
+    (173, 77), (174, 78), (175, 80), (176, 81), (177, 83), (178, 84),
+    (179, 95), (180, 96), (181, 98), (182, 99),
+];
+
+/// GFX10 IMG_FORMAT of a DXGI format **number** (`DXGI_FORMAT_*`'s wire
+/// value): the platform-free inverse of `dxgi_format`, `None` for typeless
+/// and formats without a DXGI equivalent. A Windows test pins it to
+/// `gfx10_format`.
+pub fn gfx10_format_num(f: u32) -> Option<u32> {
+    GFX10_TO_DXGI.iter().find(|&&(_, d)| d == f).map(|&(g, _)| g)
+}
+
+/// A console T# for the image at `address`: [`xcl_image_for_view`]'s format /
+/// size / type fields plus the console view's own base mip, last mip, highest
+/// mip, first array slice and component mapping, with BASE_ADDRESS in words
+/// 0 and 1 (as the title's console runtime writes it). `dst_sel` is the GFX
+/// component index of each channel (0/1, 4..7 = x..w).
+pub fn console_image_words(
+    address: u64,
+    format: u32,
+    ty: ImageType,
+    width: u32,
+    height: u32,
+    depth: u32,
+    base_level: u32,
+    last_level: u32,
+    max_mip: u32,
+    base_array: u32,
+    dst_sel: [u32; 4],
+) -> [u32; 8] {
+    let mut t = xcl_image_for_view(0, format, ty, width, height, depth, last_level.saturating_add(1));
+    t[0] = (address >> 8) as u32;
+    t[1] = (t[1] & !0xFF) | ((address >> 40) as u32 & 0xFF);
+    t[3] = (t[3] & !0xFFF) | (dst_sel[0] & 7) | (dst_sel[1] & 7) << 3 | (dst_sel[2] & 7) << 6 | (dst_sel[3] & 7) << 9;
+    t[3] = (t[3] & !0x000F_0000) | (last_level & 0xF) << 16;
+    t[3] = (t[3] & !0x0000_F000) | (base_level & 0xF) << 12;
+    t[4] = (t[4] & !0x1FFF_0000) | (base_array & 0x1FFF) << 16;
+    t[5] = (t[5] & !0xF0) | (max_mip & 0xF) << 4;
+    t
+}
+
 #[cfg(windows)]
 #[cfg(test)]
 mod view_tests {
     use super::*;
+
+    #[test]
+    fn gfx10_format_numbers_match_the_windows_twin() {
+        for &(g, d) in GFX10_TO_DXGI.iter() {
+            assert_eq!(gfx10_format_num(d), Some(g));
+            assert_eq!(gfx10_format(DXGI_FORMAT(d as i32)), Some(g), "DXGI {d} -> GFX10 {g}");
+        }
+    }
 
     #[test]
     fn view_descriptors_decode_back() {
