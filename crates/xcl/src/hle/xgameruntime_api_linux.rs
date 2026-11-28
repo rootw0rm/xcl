@@ -709,6 +709,8 @@ fn xsystem() -> Vec<(&'static str, usize)> {
 fn xnetworking() -> Vec<(&'static str, usize)> {
     vec![
         ("XNetworkingQueryPreferredLocalUdpMultiplayerPort", xq::XNetworkingQueryPreferredLocalUdpMultiplayerPort as usize),
+        ("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync", xq::XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync as usize),
+        ("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult", xq::XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult as usize),
         ("XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged", xq::XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged as usize),
         ("XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged", xq::XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged as usize),
         ("XNetworkingGetConnectivityHint", xq::XNetworkingGetConnectivityHint as usize),
@@ -1690,6 +1692,42 @@ mod tests {
             close_provider(o, provider3);
 
             let _ = std::fs::remove_dir_all(crate::state::data_dir().join("gamesave").join(&cfg_name));
+        }
+    }
+
+    /// The title's networking init asks for the multiplayer UDP port asynchronously.
+    /// `/tmp/xcl-step88-r1`: `XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync`
+    /// answered E_NOTIMPL because the Linux class list held only the sync/registration rows.
+    #[test]
+    fn networking_port_async_and_result_through_the_class_vtable() {
+        unsafe {
+            let (clsid, iid, begin_slot) = slot_in_table("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync");
+            assert_eq!(clsid, XNETWORKING);
+            let (hr, o) = query(clsid, iid);
+            assert_eq!(hr, S_OK);
+            assert!(!o.is_null());
+            let begin: unsafe extern "win64" fn(*mut c_void, *mut XAsyncBlock) -> HRESULT = slot(o, begin_slot);
+            let result: unsafe extern "win64" fn(*mut c_void, *mut XAsyncBlock, *mut u16) -> HRESULT =
+                slot(o, slot_in_table("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult").2);
+
+            let mut block: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(begin(o, &mut block), S_OK, "the port async must be wired");
+            assert_eq!(xu::XAsyncGetStatus(&mut block, true), S_OK);
+            let mut port = 0u16;
+            assert_eq!(result(o, &mut block, &mut port), S_OK);
+            assert_eq!(port, xq::DEFAULT_UDP_PORT);
+            // The result payload is one-shot on the XAsync engine.
+            let mut again = 0u16;
+            assert_eq!(result(o, &mut block, &mut again), xu::E_ILLEGAL_METHOD_CALL);
+
+            // A null result pointer is rejected before the payload is consumed.
+            let mut block2: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(begin(o, &mut block2), S_OK);
+            assert_eq!(xu::XAsyncGetStatus(&mut block2, true), S_OK);
+            assert_eq!(result(o, &mut block2, std::ptr::null_mut()), E_INVALIDARG);
+            let mut port2 = 0u16;
+            assert_eq!(result(o, &mut block2, &mut port2), S_OK);
+            assert_eq!(port2, xq::DEFAULT_UDP_PORT);
         }
     }
 

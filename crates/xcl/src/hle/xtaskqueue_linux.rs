@@ -10,8 +10,9 @@
 //! submit, `Dispatch` with timeout, `Terminate` (canceled drain + delayed cancel),
 //! composite ports sharing, duplicate/close handles, `IsEmpty`, process queue,
 //! monitors, plus the `XNetworking` UDP-port/connectivity shims — is real `win64`
-//! code here so the imports resolve as HLE. `XAsync`-backed variants stay `Stub`
-//! until the async slice lands.
+//! code here so the imports resolve as HLE. The UDP-port async pair runs on the
+//! title's XAsync engine; other `XAsync`-backed variants stay `Stub` until their
+//! slice lands.
 
 #![allow(non_snake_case)]
 
@@ -22,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use crate::hle::xuser_linux::{begin_with, XAsyncBlock, XAsyncGetResult};
 use crate::util::{E_ABORT, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 
 pub const MODE_MANUAL: u32 = 0;
@@ -1090,6 +1092,25 @@ pub unsafe extern "win64" fn XNetworkingQueryPreferredLocalUdpMultiplayerPort(po
     S_OK
 }
 
+static UDP_PORT_ASYNC_ID: u8 = 0;
+
+/// The port is a constant, so the async answer is immediate; the payload and the
+/// one-shot status live in the title's own XAsync engine (`hle/xuser_linux.rs`).
+pub unsafe extern "win64" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(b: *mut XAsyncBlock) -> HRESULT {
+    begin_with(b, &UDP_PORT_ASYNC_ID as *const u8 as usize, || Ok(DEFAULT_UDP_PORT.to_le_bytes().to_vec()))
+}
+
+pub unsafe extern "win64" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
+    b: *mut XAsyncBlock,
+    port: *mut u16,
+) -> HRESULT {
+    if port.is_null() {
+        return E_INVALIDARG;
+    }
+    *port = 0;
+    XAsyncGetResult(b, &UDP_PORT_ASYNC_ID as *const u8 as *const c_void, std::mem::size_of::<u16>(), port as *mut c_void, std::ptr::null_mut())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct XNetworkingConnectivityHint {
@@ -1186,6 +1207,14 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         (
             "XNetworkingQueryPreferredLocalUdpMultiplayerPort",
             XNetworkingQueryPreferredLocalUdpMultiplayerPort as usize,
+        ),
+        (
+            "XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync",
+            XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync as usize,
+        ),
+        (
+            "XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult",
+            XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult as usize,
         ),
         (
             "XNetworkingGetConnectivityHint",
