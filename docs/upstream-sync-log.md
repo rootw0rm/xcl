@@ -2069,3 +2069,76 @@ newest at the bottom.
   pso-precompile documented no-port above (Step 33).
 - Retry the ancestry merge only when `merge-base --all` prints ONE base;
   until then, sync = ff `main` + triage net diff + port/no-port.
+
+## 2026-11-28 — upstream/main e429936c: main ff'd, no Linux ports (Windows pipeline/bench wave)
+
+- Fetch at this Step 71: `upstream/main` stays `e429936c10a5` (376 commits).
+  Before the fast-forward (main was `2c717a04`):
+  `git diff --stat main..upstream/main` = **104 files, +54,495/−5,110**.
+  `main` is an ancestor of the tip: fast-forwarded
+  (`git push . upstream/main:main`, `2c717a04..e429936c`) and pushed
+  `origin/main`; all three refs now `e429936c`.
+- `git merge-base --all HEAD upstream/main` still prints TWO bases
+  (`81693f020768`, `b8b4135b7261`): no ancestry merge (same criss-cross as
+  the previous entry). Sync remains ff + net-diff triage.
+- Net-diff split (numstat): **70 Windows/feature files +47,238/−4,494**
+  (`hle/**`, `eh.rs`, `gpu/{texture,fence,uma}.rs`, `gpu/recomp/**`,
+  `main.rs`, benches, `scripts/**`, CI, Cargo.toml); **33 Linux-compiled
+  or shared paths +6,772/−616** (`gpu/dxil/**`, `gpu/effects.rs`,
+  `gpu/tiling.rs`, `host.rs`, `modules.rs`, `report.rs`, `shaders.rs` +
+  `shaders/*.rs`, `build.rs`, `docs/wave64-on-wave32.md`); the new
+  `stall.rs` +485 is Windows D3D12.X stall tracing (referenced from
+  `gpu/fence.rs` and the new `report.rs` fields). No ports.
+- **`4701a874` (one-wave split-wave64 barriers)** — evaluated, no-port.
+  It changes only the rendezvous choice: `emit.rs` `x64_spin` becomes
+  `x64_spin_for(threads, env)` = `threads > 64 || env set non-zero`, i.e.
+  one-wave groups (≤64 threads) default to `GroupMemoryBarrierWithGroupSync`
+  again instead of counters. On linux the HLSL emitter has no runtime
+  consumer: the shipped GPU path translates only the blit-class VS subset
+  to GLSL/SPIR-V (`gpu/recomp/glsl.rs`, `spirv.rs`; `gpu/recomp/mod.rs:56-75`
+  gates `dxc`/`dxil`/`pso`/`runner` behind `#[cfg(windows)]`), so there is no
+  reproduced Linux split defect to test. The `--direct` 84-PS class is the
+  direct-DXIL translator's upper-lane read analysis (`gpu/dxil/lanes.rs`),
+  already fixed on linux in Step 34 (`upper_lanes`, `a8f87b44`); `4701a874`
+  touches neither the analysis nor its fallback count. Our branch also
+  keeps the deliberate safety default (`emit.rs:4787-4789`: counters for
+  one-wave groups; `XCL_WAVE64_SPIN=0` selects barriers), and no Linux
+  observation justifies flipping it.
+- Rest of `gpu/dxil/**` (+2,185/−341): Windows `--direct`/HLSL translation
+  work (loop phis, LDS routing, compact tables, mask/carry simplifications).
+  Linux refuses that path: `shaders.rs:2136` / `:2208` ("DXC is
+  Windows-only"), pinned by `tests/shaders_e2e.rs`; the dxil unit tests run
+  but name no Linux defect. No-port.
+- `shaders.rs` (+1,830/−98) and new `shaders/{pipeline_library,pso_corpus,
+  warm_blobs,warm_library,warm_pack,warm_replay}.rs` (+1,477): Windows PSO
+  prewarm/pipeline-library/bench work. `shaders.rs:1882` `precompile` is
+  `#[cfg(windows)]`, Linux's twin is the refusal at `:2135-2136`. The rules'
+  excluded class (pipelines/receipts/benchmarks) — no-port.
+- `report.rs` (+258) and `build.rs` (+56/−1): pipeline-preparation/stall
+  fields and `XCL_PIPELINE_LAYOUT_ID` over Windows sources
+  (`crate::hle::d3d12x::pso_async::*`, `hle/d3d12x/real/two_pass_identity.rs`,
+  `gfx_records.rs`). Our `report.rs` is Linux-adapted and `hle` is not
+  compiled here (`lib.rs:30-34`); porting the file verbatim breaks the
+  Linux build. No-port.
+- `gpu/effects.rs` (+199/−36) and `gpu/tiling.rs` (+321/−62): streaming
+  allocation removal and block-slab contiguous-run copies, both with
+  equivalence tests against the old code. Performance only, no Linux
+  defect measured — no-port.
+- `modules.rs` (+252/−25): `contains` overflow fix (`checked_sub`) and an
+  O(1) envelope rejection in `image_base_for_addr`; robustness/perf with a
+  unit-test repro, not a reproduced Linux failure — no-port.
+- Windows twins with existing Linux counterparts: `hle/kernelx.rs`
+  (`VirtualAllocEx/VirtualProtectEx` own-process + sparse protection;
+  `kernelx_linux.rs:538-577` already accepts `-1`/`-2`), `gpu/uma.rs`
+  (auto coherent cap, Windows-only), `gpu/texture.rs`, `hle/{opus,xaudio2,
+  bcpack,dstorage}.rs` (Windows resource/audio paths; linux keeps
+  `xaudio2_linux`/`dstorage_linux`), `host.rs` (`system_commit`), `eh.rs`
+  (`Monitorx/Mwaitx` rewrites; linux uses `eh_linux.rs`). No-port.
+- `docs/wave64-on-wave32.md` (+43/−36) documents the new barrier default;
+  not ported with the code it describes.
+- Gates at `ffca2131` (same tree; docs-only change): `cargo check -p xcl
+  --tests` 0, `cargo check --workspace` 0, lib **921 passed / 0 failed /
+  1 ignored**, `launcher_e2e` 7/0. Push `main` fast-forward-only.
+- Outcome: `main` fast-forwarded and pushed; `linux` has no new upstream
+  content to port from this tip. Next sync re-fetches (the tip may move).
+
