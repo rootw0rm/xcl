@@ -7467,6 +7467,50 @@ pub unsafe extern "win64" fn CoCreateInstance(
     REGDB_E_CLASSNOTAVAILABLE
 }
 
+/// `HRESULT CoCreateGuid(GUID*)` — a fresh version-4 GUID. The bytes come from
+/// the same OS entropy source as `std::_Random_device` (no constant, no
+/// seeded PRNG), and the version/variant bits are forced per RFC 4122. Retail
+/// Step 80: the title's GUID helper `0x1455f3820` formats this value for a
+/// save-container name; the auto-stub returned S_OK without writing it.
+pub unsafe extern "win64" fn CoCreateGuid(guid: *mut u8) -> HRESULT {
+    if guid.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut bytes = [0u8; 16];
+    crate::hle::crt_linux::fill_os_entropy(&mut bytes);
+    bytes[7] = (bytes[7] & 0x0F) | 0x40; // version 4 (high nibble of Data3)
+    bytes[8] = (bytes[8] & 0x3F) | 0x80; // RFC 4122 variant (Data4[0])
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), guid, bytes.len());
+    S_OK
+}
+
+/// `int StringFromGUID2(REFGUID, LPOLESTR, int cch)` — the brace form
+/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` in UTF-16, uppercase hex like the
+/// Win32 implementation. Returns the number of characters written including
+/// the terminating NUL (39), or 0 when `cch < 39`, the buffer is null or the
+/// GUID is null; a refused call writes nothing.
+pub unsafe extern "win64" fn StringFromGUID2(guid: *const u8, out: *mut u16, cch: i32) -> i32 {
+    const REQUIRED: i32 = 39; // 38 characters + NUL
+    if guid.is_null() || out.is_null() || cch < REQUIRED {
+        return 0;
+    }
+    let g = std::slice::from_raw_parts(guid, 16);
+    let data1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+    let data2 = u16::from_le_bytes([g[4], g[5]]);
+    let data3 = u16::from_le_bytes([g[6], g[7]]);
+    let d4 = &g[8..16];
+    let text = format!(
+        "{{{data1:08X}-{data2:04X}-{data3:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+    );
+    debug_assert_eq!(text.len(), 38);
+    for (i, unit) in text.encode_utf16().enumerate() {
+        *out.add(i) = unit;
+    }
+    *out.add(38) = 0;
+    REQUIRED
+}
+
 // ---------------------------------------------------------------------------------------
 // String conversion: MultiByteToWideChar / WideCharToMultiByte (retail abort 0x2237179)
 // ---------------------------------------------------------------------------------------
@@ -10339,6 +10383,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("CoInitializeEx", CoInitializeEx as usize),
         ("CoUninitialize", CoUninitialize as usize),
         ("CoCreateInstance", CoCreateInstance as usize),
+        ("CoCreateGuid", CoCreateGuid as usize),
+        ("StringFromGUID2", StringFromGUID2 as usize),
         ("VirtualAlloc", VirtualAlloc as usize),
         ("VirtualAllocEx", VirtualAllocEx as usize),
         ("VirtualFree", VirtualFree as usize),
@@ -11427,6 +11473,60 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn guid_creation_and_formatting_follow_the_win32_contract() {
+        // Retail Step 80: the XGameSave failure path calls CoCreateGuid and
+        // StringFromGUID2 (exe+0x55f3865/0x55f3883) and then builds a
+        // std::wstring from the formatted buffer. Both were auto-stubs that
+        // wrote nothing, so the GUID was all-zero and the string buffer kept
+        // uninitialized stack.
+        type CoCreateGuid = unsafe extern "win64" fn(*mut u8) -> i32;
+        type StringFromGuid2 = unsafe extern "win64" fn(*const u8, *mut u16, i32) -> i32;
+        let create: CoCreateGuid = unsafe { std::mem::transmute(com_export("CoCreateGuid")) };
+        let format: StringFromGuid2 =
+            unsafe { std::mem::transmute(com_export("StringFromGUID2")) };
+        unsafe {
+            const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+            assert_eq!(create(std::ptr::null_mut()), E_INVALIDARG);
+            // A v4 GUID: version nibble 4, RFC 4122 variant, and two draws
+            // from the OS entropy source differ.
+            let mut a = [0u8; 16];
+            let mut b = [0u8; 16];
+            assert_eq!(create(a.as_mut_ptr()), 0);
+            assert_eq!(create(b.as_mut_ptr()), 0);
+            assert_ne!(a, b);
+            assert_eq!(a[7] & 0xF0, 0x40, "version nibble");
+            assert_eq!(a[8] & 0xC0, 0x80, "RFC 4122 variant");
+            // The brace form, uppercase hex, fields in GUID byte order.
+            let g: [u8; 16] = [
+                0x8b, 0x2c, 0x0d, 0x01, 0x34, 0x12, 0x78, 0x56, 0xab, 0xcd, 0xef, 0x01, 0x23,
+                0x45, 0x67, 0x89,
+            ];
+            let expect: Vec<u16> = "{010D2C8B-1234-5678-ABCD-EF0123456789}\0"
+                .encode_utf16()
+                .collect();
+            assert_eq!(expect.len(), 39);
+            let mut buf = [0xFFFFu16; 40];
+            assert_eq!(format(g.as_ptr(), buf.as_mut_ptr(), 40), 39);
+            assert_eq!(&buf[..39], &expect[..]);
+            assert_eq!(buf[39], 0xFFFF, "nothing past the NUL");
+            // Too small: 0 and no write.
+            let mut small = [0xFFFFu16; 40];
+            assert_eq!(format(g.as_ptr(), small.as_mut_ptr(), 38), 0);
+            assert_eq!(small, [0xFFFFu16; 40]);
+            // Exact fit puts the NUL in the last unit.
+            let mut exact = [0xFFFFu16; 39];
+            assert_eq!(format(g.as_ptr(), exact.as_mut_ptr(), 39), 39);
+            assert_eq!(exact[38], 0);
+            // Null / zero-length arguments are refused without writing.
+            assert_eq!(format(std::ptr::null(), buf.as_mut_ptr(), 40), 0);
+            assert_eq!(format(g.as_ptr(), std::ptr::null_mut(), 40), 0);
+            let mut zero = [0xFFFFu16; 40];
+            assert_eq!(format(g.as_ptr(), zero.as_mut_ptr(), 0), 0);
+            assert_eq!(zero, [0xFFFFu16; 40]);
+        }
     }
 
     #[test]

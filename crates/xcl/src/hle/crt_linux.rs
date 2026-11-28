@@ -292,9 +292,12 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// OS entropy for `std::_Random_device`: `getrandom(2)` first, `/dev/urandom` second.
-fn os_entropy_u32() -> Option<u32> {
-    let mut buf = [0u8; 4];
+/// Fill `buf` from the OS entropy source: `getrandom(2)` first, `/dev/urandom`
+/// second. Returns whether either source answered; when neither does, the
+/// buffer is still filled from the monotonic clock so a caller never keeps
+/// stale bytes. Shared by `std::_Random_device`, `CoCreateGuid` and the BCrypt
+/// RNG shim — one entropy convention, not three.
+pub(crate) fn fill_os_entropy(buf: &mut [u8]) -> bool {
     let n = unsafe {
         libc::syscall(
             libc::SYS_getrandom,
@@ -304,12 +307,32 @@ fn os_entropy_u32() -> Option<u32> {
         )
     };
     if n == buf.len() as libc::c_long {
-        return Some(u32::from_ne_bytes(buf));
+        return true;
     }
     use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").ok()?;
-    f.read_exact(&mut buf).ok()?;
-    Some(u32::from_ne_bytes(buf))
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(buf).is_ok() {
+            return true;
+        }
+    }
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let mut seed = (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64)
+        .wrapping_add(buf.len() as u64);
+    for chunk in buf.chunks_mut(8) {
+        seed = mix64(seed);
+        let word = seed.to_ne_bytes();
+        chunk.copy_from_slice(&word[..chunk.len()]);
+    }
+    false
+}
+
+/// OS entropy for `std::_Random_device`: `getrandom(2)` first, `/dev/urandom` second.
+fn os_entropy_u32() -> Option<u32> {
+    let mut buf = [0u8; 4];
+    fill_os_entropy(&mut buf).then_some(u32::from_ne_bytes(buf))
 }
 
 /// Last resort when neither entropy source answers: mix the monotonic clock, which
