@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::pe::ImportName;
@@ -77,6 +77,11 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_DECOMMIT: u32 = 0x4000;
 const MEM_RELEASE: u32 = 0x8000;
+// Placeholder reservations (VirtualAlloc/VirtualFree flags, not types).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
 
 // Windows page protections.
 const PAGE_NOACCESS: u32 = 0x01;
@@ -148,12 +153,185 @@ fn mmap_prot_for_new(committed: bool, protect: u32) -> libc::c_int {
     }
 }
 
+/// One address range of a placeholder reservation. Splitting and replacing change the
+/// logical regions in place, never release their addresses; `backing` is the graphics-pool
+/// allocation that owns every range (title placeholders back physical pages, so the VA
+/// space must stay GPU-visible).
+#[derive(Clone)]
+struct PlaceholderRegion {
+    end: usize,
+    placeholder: bool,
+    backing: usize,
+}
+
+static PLACEHOLDERS: LazyLock<Mutex<BTreeMap<usize, PlaceholderRegion>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn placeholders() -> &'static Mutex<BTreeMap<usize, PlaceholderRegion>> {
+    &PLACEHOLDERS
+}
+
+/// `None`: not a placeholder operation; the ordinary allocation path handles it.
+unsafe fn placeholder_alloc(addr: *const c_void, size: usize, atype: u32, protect: u32) -> Option<*mut c_void> {
+    if atype & MEM_RESERVE_PLACEHOLDER != 0 {
+        if atype & (MEM_RESERVE | MEM_COMMIT) != MEM_RESERVE || protect != PAGE_NOACCESS || size == 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return Some(std::ptr::null_mut());
+        }
+        if !addr.is_null() {
+            set_error(ERROR_INVALID_ADDRESS);
+            return Some(std::ptr::null_mut());
+        }
+        let Some(len) = size.checked_next_multiple_of(GFX_GRAIN) else {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            return Some(std::ptr::null_mut());
+        };
+        let Some(base) = gfx_alloc(len, GFX_GRAIN, false) else {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            return Some(std::ptr::null_mut());
+        };
+        placeholders().lock().unwrap().insert(
+            base,
+            PlaceholderRegion { end: base + len, placeholder: true, backing: base },
+        );
+        set_error(ERROR_SUCCESS);
+        return Some(base as *mut c_void);
+    }
+    if atype & MEM_REPLACE_PLACEHOLDER != 0 && atype & MEM_RESERVE != 0 {
+        let base = addr as usize;
+        let mut regions = placeholders().lock().unwrap();
+        let Some(r) = regions
+            .get_mut(&base)
+            .filter(|r| r.placeholder && base.checked_add(size) == Some(r.end))
+        else {
+            set_error(ERROR_INVALID_ADDRESS);
+            return Some(std::ptr::null_mut());
+        };
+        if atype & MEM_COMMIT != 0 && !gfx_commit_at(base, size) {
+            set_error(ERROR_INVALID_ADDRESS);
+            return Some(std::ptr::null_mut());
+        }
+        r.placeholder = false;
+        set_error(ERROR_SUCCESS);
+        return Some(base as *mut c_void);
+    }
+    // Committing a range of a replaced placeholder: `VirtualAlloc(base, size, MEM_COMMIT)`.
+    if atype & (MEM_REPLACE_PLACEHOLDER | MEM_RESERVE) == 0 && atype & MEM_COMMIT != 0 && !addr.is_null() && size != 0 {
+        let base = addr as usize;
+        let mut regions = placeholders().lock().unwrap();
+        if let Some(r) = regions.range(..=base).next_back().map(|(_, r)| r) {
+            if base < r.end
+                && !r.placeholder
+                && base.checked_add(size).is_some_and(|end| end <= r.end)
+            {
+                if !gfx_commit_at(base, size) {
+                    set_error(ERROR_INVALID_ADDRESS);
+                    return Some(std::ptr::null_mut());
+                }
+                set_error(ERROR_SUCCESS);
+                return Some(base as *mut c_void);
+            }
+        }
+    }
+    None
+}
+
+/// `None`: the address is not part of a placeholder reservation.
+unsafe fn placeholder_free(addr: *mut c_void, size: usize, ftype: u32) -> Option<i32> {
+    let base = addr as usize;
+    let mut regions = placeholders().lock().unwrap();
+    let (&start, region) = regions.range(..=base).next_back().filter(|(_, r)| base < r.end)?;
+    let r = region.clone();
+    let fail = || {
+        set_error(ERROR_INVALID_PARAMETER);
+        Some(0)
+    };
+    if ftype == MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER {
+        if r.placeholder {
+            let Some(end) = base
+                .checked_add(size)
+                .filter(|&end| size > 0 && end <= r.end && end.is_multiple_of(GFX_GRAIN))
+            else {
+                return fail();
+            };
+            if !base.is_multiple_of(GFX_GRAIN) {
+                return fail();
+            }
+            regions.remove(&start);
+            if start < base {
+                regions.insert(start, PlaceholderRegion { end: base, ..r.clone() });
+            }
+            regions.insert(base, PlaceholderRegion { end, ..r.clone() });
+            if end < r.end {
+                regions.insert(end, r);
+            }
+            set_error(ERROR_SUCCESS);
+            return Some(1);
+        }
+        // Returning a replaced range to a placeholder releases its pages.
+        if start != base || (size != 0 && base.checked_add(size) != Some(r.end)) {
+            return fail();
+        }
+        gfx_decommit_at(base, r.end - base);
+        if let Some(region) = regions.get_mut(&base) {
+            region.placeholder = true;
+        }
+        set_error(ERROR_SUCCESS);
+        return Some(1);
+    }
+    if ftype == MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS {
+        let Some(end) = base.checked_add(size).filter(|&end| end > base) else { return fail() };
+        let mut next = base;
+        let mut keys = Vec::new();
+        for (&at, region) in regions.range(base..end) {
+            if at != next || !region.placeholder || region.backing != r.backing || region.end > end {
+                return fail();
+            }
+            keys.push(at);
+            next = region.end;
+        }
+        if start != base || next != end {
+            return fail();
+        }
+        for key in keys {
+            regions.remove(&key);
+        }
+        regions.insert(base, PlaceholderRegion { end, ..r });
+        set_error(ERROR_SUCCESS);
+        return Some(1);
+    }
+    if ftype == MEM_DECOMMIT {
+        if r.placeholder || (size == 0 && start != base) || base.checked_add(size).is_none_or(|end| end > r.end) {
+            return fail();
+        }
+        let len = if size == 0 { r.end - base } else { size };
+        gfx_decommit_at(base, len);
+        set_error(ERROR_SUCCESS);
+        return Some(1);
+    }
+    if start != base || ftype != MEM_RELEASE || size != 0 {
+        return fail();
+    }
+    let r = regions.remove(&base).unwrap();
+    if !r.placeholder {
+        gfx_decommit_at(base, r.end - base);
+    }
+    if !regions.values().any(|region| region.backing == r.backing) {
+        gfx_free(r.backing);
+    }
+    set_error(ERROR_SUCCESS);
+    Some(1)
+}
+
 pub unsafe extern "win64" fn VirtualAlloc(
     addr: *const c_void,
     size: usize,
     atype: u32,
     protect: u32,
 ) -> *mut c_void {
+    if let Some(q) = placeholder_alloc(addr, size, atype, protect) {
+        return q;
+    }
     // A flagless type is a caller bug (Windows fails it); the sanitizer only fills in
     // console-specific combinations, it never rescues zero.
     if atype & (MEM_RESERVE | MEM_COMMIT) == 0 {
@@ -219,6 +397,9 @@ pub unsafe extern "win64" fn VirtualFree(addr: *mut c_void, size: usize, ftype: 
     if addr.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    if let Some(ok) = placeholder_free(addr, size, ftype) {
+        return ok;
     }
     let base = addr as usize;
     // Graphics-pool ranges (XMemVirtualAlloc/XMemAlloc/XMemMapPhysicalPages) release
@@ -10493,6 +10674,59 @@ mod tests {
             assert!(again.is_null());
             assert_eq!(GetLastError(), ERROR_INVALID_ADDRESS);
             assert_eq!(VirtualFree(holder, 0, MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn placeholder_split_and_replacement_keep_the_va_reserved() {
+        unsafe {
+            let grain = GFX_GRAIN;
+            // Retail order (`exe+0x1e86440`): one placeholder reservation, carved into
+            // ranges with `MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER`, then each carved range
+            // re-allocated at its own VA (`0x20406000` = `MEM_REPLACE_PLACEHOLDER |
+            // MEM_RESERVE | large/physical pages`) and committed in place.
+            let base = XMemVirtualAlloc(std::ptr::null(), 3 * grain, 0x42000, 7, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0, "placeholder reservation refused");
+            assert_eq!(perms_at(base).as_deref(), Some("---p"));
+
+            assert_eq!(
+                VirtualFree(base as *mut c_void, grain, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                1,
+                "split a placeholder without releasing its address space"
+            );
+            assert_eq!(
+                VirtualFree((base + grain) as *mut c_void, grain, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                1
+            );
+            assert_eq!(perms_at(base).as_deref(), Some("---p"));
+            assert_eq!(perms_at(base + 2 * grain).as_deref(), Some("---p"));
+
+            // A replacement matches exactly one carved range, at its original address.
+            assert_eq!(VirtualAlloc(base as *const c_void, grain, 0x20406000, 0x1004) as usize, base);
+            set_error(ERROR_SUCCESS);
+            assert!(VirtualAlloc((base + grain) as *const c_void, 2 * grain, 0x20406000, 0x1004).is_null());
+            assert_eq!(GetLastError(), ERROR_INVALID_ADDRESS);
+
+            // Committing the replacement in place makes it writable; the rest stays reserved.
+            assert_eq!(VirtualAlloc(base as *const c_void, grain, MEM_COMMIT, PAGE_READWRITE) as usize, base);
+            *(base as *mut u32) = 0x1234_5678;
+            assert_eq!(*(base as *const u32), 0x1234_5678);
+            assert_eq!(perms_at(base).as_deref(), Some("rw-p"));
+            assert_eq!(perms_at(base + grain).as_deref(), Some("---p"));
+            assert_eq!(perms_at(base + 2 * grain).as_deref(), Some("---p"));
+
+            // Back to a placeholder, coalesce the splits, release the backing reservation.
+            assert_eq!(
+                VirtualFree(base as *mut c_void, grain, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                1,
+                "return a replacement to a placeholder"
+            );
+            assert_eq!(
+                VirtualFree(base as *mut c_void, 3 * grain, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS),
+                1,
+                "coalesce adjacent placeholders"
+            );
+            assert_eq!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 1);
         }
     }
 
