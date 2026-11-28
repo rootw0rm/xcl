@@ -372,6 +372,8 @@ fn vtable(kind: Kind) -> *const usize {
             v[21] = Device_CreateDepthStencilView as usize;
             // console CopyDescriptorsSimple: the slot bytes in the title's heap
             v[24] = Device_CopyDescriptorsSimple as usize;
+            // console CreateSamplerX: the sampler S# in the title's heap slot
+            v[61] = Device_CreateSamplerX as usize;
             // console CreateShaderResourceViewAt: the staging writer for #24
             v[70] = Device_CreateShaderResourceViewAt as usize;
             v[25] = Device_GetResourceAllocationInfo as usize;
@@ -1597,6 +1599,25 @@ unsafe extern "win64" fn Device_CheckFeatureSupport(_t: *mut NullObj, feature: u
     S_OK
 }
 
+/// Descriptor heaps created by [`Device_CreateDescriptorHeap`]: `(base, bytes,
+/// type)`. A Linux CPU handle is the host address of a 32-byte slot in one of
+/// these ranges (`GetDescriptorHandleIncrementSize`), so a slot is only valid
+/// when it lies inside a heap the title created — a graphics-pool address
+/// alone is not proof of a descriptor slot. Step 75 uses this for the console
+/// sampler writer; `#24`/`#70` keep their coarser pool check until every retail
+/// handle they see is proven to be inside a registered heap.
+static DESCRIPTOR_HEAPS: LazyLock<Mutex<Vec<(u64, u64, u32)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The registered descriptor heap holding the 32-byte slot at `cpu`, if any.
+fn descriptor_heap_at(cpu: u64) -> Option<(u64, u64, u32)> {
+    DESCRIPTOR_HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(base, bytes, _)| cpu >= base && bytes >= 32 && cpu - base <= bytes - 32)
+}
+
 /// Console descriptor heaps live in unified-memory window 0 (the retail game's
 /// first placeholder begins with its view heap, and shader tables address them
 /// with 32 bits): the handle range comes from the title's allocation hook when it
@@ -1612,24 +1633,28 @@ unsafe extern "win64" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *co
     let o = new_obj(Kind::DescriptorHeap);
     if !desc.is_null() {
         std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 16);
+        // D3D12_DESCRIPTOR_HEAP_DESC: Type u32 @0, NumDescriptors u32 @4.
+        let ty = (desc as *const u32).read_unaligned();
         let n = *(desc.add(4) as *const u32) as usize;
         // The title's allocator sees the requested size; only the pool fallback is capped.
         let bytes = n.max(1) * 32;
-        let start = crate::hle::kernelx_linux::title_descriptor_heap_memory(bytes)
-            .or_else(|| {
+        let (base, allocated) =
+            if let Some(p) = crate::hle::kernelx_linux::title_descriptor_heap_memory(bytes) {
+                (p as u64, bytes)
+            } else if let Some(p) =
                 // 64 KiB floor is the pool grain; the title reads slots back, so commit.
                 crate::hle::kernelx_linux::gfx_alloc_window0(bytes.min(64 << 20), 0x1_0000, true)
-            })
-            .unwrap_or(0);
-        (*o).value.store(
-            if start != 0 {
-                start as u64
+            {
+                (p as u64, bytes.min(64 << 20))
             } else {
                 // exhaustion fallback: unique, never-dereferenced-by-us address range
-                vec![0u8; bytes].leak().as_ptr() as u64
-            },
-            Ordering::Relaxed,
-        );
+                (vec![0u8; bytes].leak().as_ptr() as u64, bytes)
+            };
+        (*o).value.store(base, Ordering::Relaxed);
+        DESCRIPTOR_HEAPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((base, allocated as u64, ty));
     }
     *ppv = o as *mut c_void;
     S_OK
@@ -1659,6 +1684,45 @@ unsafe extern "win64" fn Device_CopyDescriptorsSimple(_t: *mut NullObj, n: u32, 
     }
     std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
     S_OK
+}
+/// Console device #61 `CreateSamplerX(desc, cpu)`: retail's wrapper
+/// `0x1412b9800` forwards the title's sampler state through `[device+0x1e8]`
+/// (`exe+0x12b981e`, 113 calls in one fresh-root run) and then stages the slot
+/// with #24 as a SAMPLER descriptor. The destination is the title's sampler
+/// heap base `[0x1475e7428]` plus `index * [0x1475e7438]`, i.e. a 32-byte slot
+/// of a heap from [`Device_CreateDescriptorHeap`]. The title builds the
+/// 0x6C-byte console descriptor (PC fields at +0x18 address modes, +0x24/+0x28
+/// LODs, +0x30 bias, +0x34 anisotropy, +0x40 comparison), but on Linux the
+/// slot *is* the console S# the translated shaders read, so it carries the
+/// XCL ABI form exactly like the Windows twin's `dev_create_sampler_x`: word 3
+/// [11:0] = the slot index in the heap, the rest zero (the sampler state lives
+/// in the PC sampler heap on Windows, which this backend does not have). The
+/// extended console fields are not modelled. A slot outside a registered heap,
+/// an unaligned slot or an unreadable descriptor writes nothing and logs one
+/// warning per eight calls.
+unsafe extern "win64" fn Device_CreateSamplerX(_t: *mut NullObj, desc: *const u8, cpu: u64) {
+    use crate::hle::kernelx_linux::gfx_range_readable;
+    const SLOT: usize = 32;
+    let heap = descriptor_heap_at(cpu);
+    // Slots advance by the heap's increment (32 bytes here), so a handle is
+    // aligned when it is a whole slot from the heap base — not necessarily
+    // 32-byte aligned in host memory (the exhaustion fallback is malloc-backed).
+    let aligned = heap.is_some_and(|(base, _, _)| (cpu - base) % SLOT as u64 == 0);
+    let desc_ok = !desc.is_null() && gfx_range_readable(desc as usize, 0x6C);
+    let Some((base, _bytes, _ty)) = heap.filter(|_| aligned && desc_ok) else {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "D3D12.X: CreateSamplerX refused: slot {cpu:#x} (slot-aligned {aligned}, registered heap {}), desc {desc:p} (readable {desc_ok})",
+                heap.is_some()
+            );
+        }
+        return;
+    };
+    let index = ((cpu - base) / SLOT as u64) as u32;
+    let words = crate::gpu::desc::xcl_sampler_words(&[0; 4], index);
+    std::ptr::write_bytes(cpu as *mut u8, 0, SLOT);
+    std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, cpu as *mut u8, words.len() * 4);
 }
 /// A console view-kind whose writer takes a PC-layout view descriptor and a
 /// CPU handle: device #19 UAV, #20 RTV, #21 DSV. The Linux descriptors are the
@@ -3984,6 +4048,64 @@ mod tests {
             let mut dev = std::ptr::null_mut();
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
             assert_eq!(slot(dev, 24), Device_CopyDescriptorsSimple as usize);
+        }
+    }
+
+    /// Retail's console device #61 `CreateSamplerX(desc, cpu)`: the wrapper
+    /// `0x1412b9800` calls `[device+0x1e8]` (`exe+0x12b981e`, 113 calls) with a
+    /// destination in the title's sampler heap, then stages the slot with #24
+    /// (type SAMPLER). The handler writes the XCL-ABI S# into the 32-byte slot:
+    /// `xcl_sampler_words` word 3 [11:0] = the slot index in the registered heap.
+    /// RED before routing: the logging stub leaves the `0x5A` sentinel. Slots
+    /// outside a registered heap, unaligned slots and unreadable descriptors are
+    /// refused without a write.
+    #[test]
+    fn console_create_sampler_writes_s_sharp_at_heap_slots() {
+        let _serial = title_hooks_serial().lock().unwrap();
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_heap: Fn4 = std::mem::transmute(slot(dev, 14));
+            let heap_desc = [1u32, 16, 1, 0]; // SAMPLER, 16 descriptors, shader visible
+            let mut heap = std::ptr::null_mut();
+            assert_eq!(create_heap(dev, heap_desc.as_ptr() as *const c_void, std::ptr::null(), &mut heap), S_OK);
+            let base = (*(heap as *mut NullObj)).value.load(Ordering::Relaxed);
+            assert_ne!(base, 0, "the sampler heap has a handle range");
+
+            // A non-zero descriptor body proves the slot is the ABI S#, not a
+            // byte copy of the console descriptor the title built.
+            let desc = [0x7Fu8; 0x6C];
+            let slot0 = base;
+            let slot5 = base + 5 * 32;
+            std::ptr::write_bytes(slot0 as *mut u8, 0x5A, 32);
+            std::ptr::write_bytes(slot5 as *mut u8, 0x5A, 32);
+            let create_sampler: unsafe extern "win64" fn(*mut c_void, *const u8, u64) = std::mem::transmute(slot(dev, 61));
+
+            // Refusals: an unaligned handle, a NULL descriptor and a pool range
+            // that no `Device_CreateDescriptorHeap` registered all write nothing.
+            create_sampler(dev, desc.as_ptr(), slot0 + 8);
+            assert_eq!(std::ptr::read_unaligned(slot0 as *const [u32; 8]), [0x5A5A_5A5A; 8], "unaligned slot untouched");
+            create_sampler(dev, std::ptr::null(), slot5);
+            assert_eq!(std::ptr::read_unaligned(slot5 as *const [u32; 8]), [0x5A5A_5A5A; 8], "NULL descriptor untouched");
+            let rogue = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("raw pool range");
+            std::ptr::write_bytes(rogue as *mut u8, 0x5A, 32);
+            create_sampler(dev, desc.as_ptr(), rogue as u64);
+            assert_eq!(std::ptr::read_unaligned(rogue as *const [u32; 8]), [0x5A5A_5A5A; 8], "unregistered range untouched");
+
+            // The heap's first slot is index 0; the sixth is index 5.
+            create_sampler(dev, desc.as_ptr(), slot0);
+            create_sampler(dev, desc.as_ptr(), slot5);
+            assert_eq!(std::ptr::read_unaligned(slot0 as *const [u32; 8]), [0, 0, 0, 0, 0, 0, 0, 0], "S# index 0, rest zeroed");
+            assert_eq!(std::ptr::read_unaligned(slot5 as *const [u32; 8]), [0, 0, 0, 5, 0, 0, 0, 0], "S# index 5, rest zeroed");
+        }
+    }
+
+    #[test]
+    fn console_create_sampler_is_routed() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            assert_eq!(slot(dev, 61), Device_CreateSamplerX as usize);
         }
     }
 
