@@ -4843,12 +4843,43 @@ pub unsafe extern "win64" fn CreateFile2(
     }
 }
 
+/// Windows `OVERLAPPED` (winnt.h): the status block at +0/+8 and the
+/// `Offset`/`OffsetHigh` union at +0x10; the event handle at +0x18 is not used
+/// here (XCL completes I/O synchronously).
+///
+/// A handle opened without `FILE_FLAG_OVERLAPPED` still completes such an I/O
+/// synchronously, but the explicit offset decides where the transfer starts and
+/// the file position afterwards is `offset + transferred`.
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+}
+
+/// Read `Offset`/`OffsetHigh` from a possibly 4-byte-aligned guest `OVERLAPPED`.
+unsafe fn overlapped_offset(ov: *mut c_void) -> u64 {
+    let o = unsafe { ov.cast::<Overlapped>().read_unaligned() };
+    (o.offset as u64) | ((o.offset_high as u64) << 32)
+}
+
+/// Publish a synchronous completion: `Internal = STATUS_SUCCESS`,
+/// `InternalHigh = transferred` (what the OS writes for a completed I/O).
+unsafe fn overlapped_complete(ov: *mut c_void, transferred: u32) {
+    let p = ov.cast::<Overlapped>();
+    unsafe {
+        std::ptr::addr_of_mut!((*p).internal).write_unaligned(0);
+        std::ptr::addr_of_mut!((*p).internal_high).write_unaligned(transferred as usize);
+    }
+}
+
 pub unsafe extern "win64" fn ReadFile(
     handle: usize,
     buf: *mut c_void,
     n: u32,
     done: *mut u32,
-    _ov: *mut c_void,
+    ov: *mut c_void,
 ) -> i32 {
     if buf.is_null() && n != 0 {
         set_error(ERROR_INVALID_PARAMETER);
@@ -4882,8 +4913,21 @@ pub unsafe extern "win64" fn ReadFile(
     };
     let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, n as usize) };
     let mut g = arc.lock().unwrap();
+    if !ov.is_null() {
+        // Explicit offset: start there instead of at the shared file position.
+        if let Err(e) = std::io::Seek::seek(
+            &mut *g,
+            std::io::SeekFrom::Start(unsafe { overlapped_offset(ov) }),
+        ) {
+            set_error(e.raw_os_error().unwrap_or(5) as u32);
+            return 0;
+        }
+    }
     match std::io::Read::read(&mut *g, slice) {
         Ok(k) => {
+            if !ov.is_null() {
+                unsafe { overlapped_complete(ov, k as u32) };
+            }
             if !done.is_null() {
                 *done = k as u32;
             }
@@ -4902,7 +4946,7 @@ pub unsafe extern "win64" fn WriteFile(
     buf: *const c_void,
     n: u32,
     done: *mut u32,
-    _ov: *mut c_void,
+    ov: *mut c_void,
 ) -> i32 {
     if buf.is_null() && n != 0 {
         set_error(ERROR_INVALID_PARAMETER);
@@ -4958,8 +5002,21 @@ pub unsafe extern "win64" fn WriteFile(
     };
     let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, n as usize) };
     let mut g = arc.lock().unwrap();
+    if !ov.is_null() {
+        // Explicit offset: start there instead of at the shared file position.
+        if let Err(e) = std::io::Seek::seek(
+            &mut *g,
+            std::io::SeekFrom::Start(unsafe { overlapped_offset(ov) }),
+        ) {
+            set_error(e.raw_os_error().unwrap_or(5) as u32);
+            return 0;
+        }
+    }
     match std::io::Write::write(&mut *g, slice) {
         Ok(k) => {
+            if !ov.is_null() {
+                unsafe { overlapped_complete(ov, k as u32) };
+            }
             if !done.is_null() {
                 *done = k as u32;
             }
@@ -10856,6 +10913,114 @@ mod tests {
             }
         }
         out
+    }
+
+    /// `ReadFile`/`WriteFile` honor the explicit `OVERLAPPED` offset on a
+    /// synchronously-opened file and leave the handle positioned at
+    /// `offset + transferred`, like the Windows contract. The retail pack reader
+    /// issues its RPF9 header/table reads this way: ignoring the offset served
+    /// the file position instead, which turned `appdata0.rpf`'s kind byte at
+    /// logical 0x2e (0x09, class 4) into file 0x102e (0x0b, class 5) and
+    /// aborted the boot in the class-5 pack-cache refusal.
+    #[test]
+    fn overlapped_file_io_uses_the_explicit_offset() {
+        unsafe {
+            let _ = ensure_test_vfs();
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const CREATE_ALWAYS: u32 = 2;
+            const OPEN_EXISTING: u32 = 3;
+            let name = format!(
+                "G:\\data\\overlapped_{}_{}.bin",
+                std::process::id(),
+                line!()
+            );
+
+            let h = open_w(&name, GENERIC_WRITE, CREATE_ALWAYS);
+            let mut done = 0u32;
+            assert_eq!(
+                WriteFile(
+                    h,
+                    b"0123456789abcdef".as_ptr() as *const c_void,
+                    16,
+                    &mut done,
+                    std::ptr::null_mut()
+                ),
+                1
+            );
+            assert_eq!(CloseHandle(h), 1);
+
+            let h = open_w(&name, GENERIC_READ, OPEN_EXISTING);
+            // Park the handle away from the offset the OVERLAPPED asks for.
+            let mut pos = 0u64;
+            assert_eq!(SetFilePointerEx(h, 8, &mut pos, FILE_BEGIN), 1);
+            let mut ov: Overlapped = std::mem::zeroed();
+            let mut buf = [0xFFu8; 16];
+            assert_eq!(
+                ReadFile(
+                    h,
+                    buf.as_mut_ptr() as *mut c_void,
+                    4,
+                    &mut done,
+                    &mut ov as *mut Overlapped as *mut c_void
+                ),
+                1
+            );
+            assert_eq!(done, 4);
+            assert_eq!(&buf[..4], b"0123");
+            assert_eq!(ov.internal_high, 4);
+            // Synchronous completion leaves the handle at offset + transferred.
+            assert_eq!(
+                ReadFile(h, buf.as_mut_ptr() as *mut c_void, 4, &mut done, std::ptr::null_mut()),
+                1
+            );
+            assert_eq!(&buf[..4], b"4567");
+            // OffsetHigh participates in the 64-bit offset.
+            let mut high: Overlapped = std::mem::zeroed();
+            high.offset = 12;
+            assert_eq!(
+                ReadFile(
+                    h,
+                    buf.as_mut_ptr() as *mut c_void,
+                    4,
+                    &mut done,
+                    &mut high as *mut Overlapped as *mut c_void
+                ),
+                1
+            );
+            assert_eq!(done, 4);
+            assert_eq!(&buf[..4], b"cdef");
+            assert_eq!(CloseHandle(h), 1);
+
+            // The same rule applies to writes: only the requested bytes change.
+            let mut ov: Overlapped = std::mem::zeroed();
+            ov.offset = 4;
+            let h = open_w(&name, GENERIC_WRITE, OPEN_EXISTING);
+            let mut done = 0u32;
+            assert_eq!(
+                SetFilePointerEx(h, 0, std::ptr::null_mut(), FILE_END),
+                1
+            );
+            assert_eq!(
+                WriteFile(
+                    h,
+                    b"XY".as_ptr() as *const c_void,
+                    2,
+                    &mut done,
+                    &mut ov as *mut Overlapped as *mut c_void
+                ),
+                1
+            );
+            assert_eq!(done, 2);
+            assert_eq!(ov.internal_high, 2);
+            assert_eq!(CloseHandle(h), 1);
+
+            let h = open_w(&name, GENERIC_READ, OPEN_EXISTING);
+            assert_eq!(read_all(h), b"0123XY6789abcdef");
+            assert_eq!(CloseHandle(h), 1);
+            let del = crate::util::wide(&name);
+            assert_eq!(DeleteFileW(del.as_ptr()), 1);
+        }
     }
 
     unsafe fn open_w(path: &str, access: u32, disp: u32) -> usize {
