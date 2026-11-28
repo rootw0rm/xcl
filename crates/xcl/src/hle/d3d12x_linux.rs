@@ -19,8 +19,11 @@
 //! `tests/testtitle/src/gpu.rs`, which reaches console slots by raw vtable
 //! index — the title has zero static d3d12 imports). Routed today: device
 //! #44/#47/#48/#52/#56/#73/#74/#75, heap #9, list #9 (Close) / #11 / #12 /
-//! #13 (draw counting) / #28 (BeginQuery) / #29 (EndQuery) / #30
-//! (ResolveQueryData) / #81 (DrawIndexedX), queue
+//! #13 (draw counting) / #23–#24 / #28 (BeginQuery) / #29 (EndQuery) / #30
+//! (ResolveQueryData) / #32 (SetDescriptorHeaps) / #34 (root signature) /
+//! #36 (root table) / #44 (root SRV) / #47 (index buffer) / #48 (vertex
+//! buffers) / #50 (render targets) / #52 (ClearRenderTargetView) / #81
+//! (DrawIndexedX), queue
 //! #10 (ExecuteCommandLists: null asserts the record, Vulkan submits), null + Vulkan-list
 //! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, null + Vulkan-device AS SRV
 //! #18, Vulkan-device frame clock
@@ -199,6 +202,40 @@ fn note_newer_list_layout() {
              (queue #16/#17 fence, device #108/#127/#133 or list #139)"
         );
     }
+}
+
+/// The Windows twin's `hle/d3d12x/real.rs::console_remap(Kind::CommandList)`
+/// base block (that module does not compile on Linux): the console list keeps
+/// slots 0–27 and 56–59 in PC order, moves the PC query methods 52–55 to
+/// 28–31, and the PC methods 28–51 four slots further (console 32–55). `None`
+/// for a slot outside the block. The test pins every pair; a drift between
+/// the twins is a routing bug.
+fn console_list_base_slot(console: usize) -> Option<usize> {
+    match console {
+        28..=31 => Some(console + 24),
+        32..=55 => Some(console - 4),
+        _ => None,
+    }
+}
+
+/// The console base slot's PC method when the null list implements it, by PC
+/// slot. The handler goes at the **console** slot: the title calls the console
+/// numbering, so the PC index would reach another method's handler (or the
+/// wrong stub). A PC method without a handler here leaves the console slot the
+/// honest logging stub. Console #28–31 (the query methods) are routed
+/// separately below.
+fn console_base_handler(pc: usize) -> Option<usize> {
+    Some(match pc {
+        28 => List_SetDescriptorHeapsX as usize, // no heaps to bind: 2-arg ack
+        30 => List_SetGraphicsRootSignature as usize, // S2 root sig (store-only)
+        32 => List_SetGraphicsRootDescriptorTable as usize,
+        40 => List_SetGraphicsRootShaderResourceView as usize,
+        43 => List_IASetIndexBuffer as usize, // S2 index buffer (store-only)
+        44 => List_IASetVertexBuffers as usize,
+        46 => List_OMSetRenderTargets as usize, // S2 render targets (store-only)
+        48 => List_ClearRenderTargetView as usize,
+        _ => return None,
+    })
 }
 
 /// The logging stub the vtable would have at `slot` without a console handler.
@@ -467,9 +504,16 @@ fn vtable(kind: Kind) -> *const usize {
         v[20] = List_IASetPrimitiveTopology as usize; // S2 topology (PC-side, store-only)
         v[21] = List_RSSetViewports as usize; // S2 viewports (PC-side, store-only)
         v[22] = List_RSSetScissorRects as usize; // S2 scissors (PC-side, store-only)
-        v[34] = List_SetGraphicsRootSignature as usize; // S2 root sig (store-only)
-        v[47] = List_IASetIndexBuffer as usize; // S2 index buffer (store-only)
-        v[50] = List_OMSetRenderTargets as usize; // S2 render targets (store-only)
+        // Console base layout (Step 70, the twin's `real.rs::console_remap`):
+        // the PC methods 28–51 sit four console slots further. A PC method
+        // without a handler leaves its console slot the logging stub.
+        for console in 28..=55 {
+            if let Some(handler) = console_list_base_slot(console).and_then(console_base_handler) {
+                v[console] = handler;
+            }
+        }
+        v[23] = List_OMSetBlendFactor as usize; // PC order keeps #23/#24
+        v[24] = List_OMSetStencilRef as usize;
         // PC CopyBufferRegion (slot 15): the same immediate host memcpy as the
         // console DMA one — the single queue is already coherent, so the copy
         // lands at record time and ExecuteCommandLists stays a no-op.
@@ -495,9 +539,6 @@ fn vtable(kind: Kind) -> *const usize {
         v[89] = VulList_Write64Top as usize;
         v[93] = VulList_Kickoff as usize;
         v[94] = List_RSSetDepthBiasX as usize; // S6 dynamic depth bias
-        // Console #32 SetDescriptorHeaps: 2-arg acknowledgement (the null
-        // backend has no descriptor heaps to bind).
-        v[32] = List_SetDescriptorHeapsX as usize;
         for slot in 0..VTBL_SLOTS {
             if let Some((older, newer)) = list_slot_targets(slot) {
                 // Reset #139 is a newer-only entry point: calling it proves
@@ -924,6 +965,25 @@ pub struct ListDrawRecord {
     /// Console `OMSetDepthBounds(min, max)` (#68, or newer #70): store-only,
     /// like the null backend's other raster state.
     pub depth_bounds: Option<[f32; 2]>,
+    /// Console list #23 `OMSetBlendFactor`: the bound factor (`None` after a
+    /// null argument, i.e. the D3D12 default 1, 1, 1, 1).
+    pub blend_factor: Option<[f32; 4]>,
+    /// Console list #24 `OMSetStencilRef`.
+    pub stencil_ref: Option<u32>,
+    /// Console list #36 `SetGraphicsRootDescriptorTable` (PC #32): the last
+    /// `(root parameter, base descriptor)`.
+    pub root_table: Option<(u32, u64)>,
+    /// Console list #44 `SetGraphicsRootShaderResourceView` (PC #40): the
+    /// last `(root parameter, buffer location)`.
+    pub root_srv: Option<(u32, u64)>,
+    /// Console list #48 `IASetVertexBuffers` (PC #44): the first slot and the
+    /// raw 16-byte `D3D12_VERTEX_BUFFER_VIEW`s that follow it.
+    pub vb_start: u32,
+    pub vb_views: Vec<u8>,
+    /// Console list #52 `ClearRenderTargetView` (PC #48): the last
+    /// `(rtv handle, colour, rect count)`. The null backend has no target to
+    /// clear.
+    pub clear_rtv: Option<(u64, [f32; 4], u32)>,
 }
 
 fn pso_store() -> &'static Mutex<HashMap<usize, PsoRecord>> {
@@ -1074,6 +1134,76 @@ unsafe extern "win64" fn List_IASetIndexBuffer(this: *mut NullObj, view: *const 
     e.index_va = *(view as *const u64);
     e.index_size = *(view.add(8) as *const u32);
     e.index_format = *(view.add(12) as *const u32);
+}
+
+/// Console list #23 `OMSetBlendFactor(factor[4])`: stash the factor. The PC
+/// index is the same (0–27 keep the PC order); a null pointer clears it.
+unsafe extern "win64" fn List_OMSetBlendFactor(this: *mut NullObj, factor: *const f32) {
+    if this.is_null() {
+        return;
+    }
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    e.blend_factor = if factor.is_null() {
+        None
+    } else {
+        Some([*factor, *factor.add(1), *factor.add(2), *factor.add(3)])
+    };
+}
+
+/// Console list #24 `OMSetStencilRef(ref)`: stash the reference value.
+unsafe extern "win64" fn List_OMSetStencilRef(this: *mut NullObj, value: u32) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().stencil_ref = Some(value);
+}
+
+/// Console list #36 `SetGraphicsRootDescriptorTable(param, base)` (PC #32):
+/// the console list numbers the PC methods 28–51 four slots further, so the
+/// title's table call arrives here, not at the PC index. Store-only.
+unsafe extern "win64" fn List_SetGraphicsRootDescriptorTable(this: *mut NullObj, param: u32, base: u64) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().root_table = Some((param, base));
+}
+
+/// Console list #44 `SetGraphicsRootShaderResourceView(param, location)`
+/// (PC #40): store the root descriptor address.
+unsafe extern "win64" fn List_SetGraphicsRootShaderResourceView(this: *mut NullObj, param: u32, location: u64) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().root_srv = Some((param, location));
+}
+
+/// Console list #48 `IASetVertexBuffers(start, count, views)` (PC #44): stash
+/// the raw 16-byte views after the first slot. A null array clears them.
+unsafe extern "win64" fn List_IASetVertexBuffers(this: *mut NullObj, start: u32, count: u32, views: *const u8) {
+    if this.is_null() {
+        return;
+    }
+    let mut ls = list_store().lock().unwrap();
+    let e = ls.entry(this as usize).or_default();
+    e.vb_start = start;
+    e.vb_views.clear();
+    if views.is_null() {
+        return;
+    }
+    let bytes = (count.min(32) as usize) * 16;
+    e.vb_views.extend_from_slice(std::slice::from_raw_parts(views, bytes));
+}
+
+/// Console list #52 `ClearRenderTargetView(rtv, colour, nrects, rects)`
+/// (PC #48): store-only acknowledgement — the null backend has no target to
+/// clear.
+unsafe extern "win64" fn List_ClearRenderTargetView(this: *mut NullObj, rtv: u64, color: *const f32, n: u32, _rects: *const c_void) {
+    if this.is_null() || color.is_null() {
+        return;
+    }
+    let c = [*color, *color.add(1), *color.add(2), *color.add(3)];
+    list_store().lock().unwrap().entry(this as usize).or_default().clear_rtv = Some((rtv, c, n));
 }
 
 /// PC list slot 20 `IASetPrimitiveTopology(topology)`: stash the topology.
@@ -5494,6 +5624,83 @@ mod tests {
     fn layout_serial() -> &'static Mutex<()> {
         static S: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
         &S
+    }
+
+    /// The console base block must stay identical to the Windows twin's
+    /// `real.rs::console_remap(Kind::CommandList)` (the twin does not compile
+    /// on Linux, so the literal is pinned here): console 28–31 are the PC
+    /// query methods 52–55 and console 32–55 are PC 28–51.
+    #[test]
+    fn console_list_base_slots_match_the_windows_twin() {
+        const EXPECTED: [(usize, usize); 28] = [
+            (28, 52), (29, 53), (30, 54), (31, 55), (32, 28), (33, 29), (34, 30),
+            (35, 31), (36, 32), (37, 33), (38, 34), (39, 35), (40, 36), (41, 37),
+            (42, 38), (43, 39), (44, 40), (45, 41), (46, 42), (47, 43), (48, 44),
+            (49, 45), (50, 46), (51, 47), (52, 48), (53, 49), (54, 50), (55, 51),
+        ];
+        for (console, pc) in EXPECTED {
+            assert_eq!(console_list_base_slot(console), Some(pc), "console #{console} is PC #{pc}");
+        }
+        assert_eq!(console_list_base_slot(27), None);
+        assert_eq!(console_list_base_slot(56), None);
+        // Only the implemented PC methods get a handler; the retail-called
+        // ones are the title's ClearRenderTargetView #52, IASetVertexBuffers
+        // #48, root table #36, root SRV #44 plus the S2 stores.
+        let wired: Vec<usize> = (28..=55).filter(|&c| console_list_base_slot(c).and_then(console_base_handler).is_some()).collect();
+        assert_eq!(wired, vec![32, 34, 36, 44, 47, 48, 50, 52]);
+    }
+
+    /// End to end through the vtable: the retail title's console slots store
+    /// their state, and a PC index in the shifted block is never another
+    /// method's handler.
+    #[test]
+    fn console_base_slots_store_blend_stencil_roots_and_vertices() {
+        unsafe {
+            let list = new_obj(Kind::CommandList);
+            let obj = list as *mut c_void;
+            assert_eq!(slot(obj, 23), List_OMSetBlendFactor as usize);
+            assert_eq!(slot(obj, 24), List_OMSetStencilRef as usize);
+            assert_eq!(slot(obj, 36), List_SetGraphicsRootDescriptorTable as usize);
+            assert_eq!(slot(obj, 44), List_SetGraphicsRootShaderResourceView as usize);
+            assert_eq!(slot(obj, 48), List_IASetVertexBuffers as usize);
+            assert_eq!(slot(obj, 52), List_ClearRenderTargetView as usize);
+
+            type F2 = unsafe extern "win64" fn(*mut c_void, *const f32);
+            type U32 = unsafe extern "win64" fn(*mut c_void, u32);
+            type Root = unsafe extern "win64" fn(*mut c_void, u32, u64);
+            type Vb = unsafe extern "win64" fn(*mut c_void, u32, u32, *const u8);
+            type Clear = unsafe extern "win64" fn(*mut c_void, u64, *const f32, u32, *const c_void);
+
+            let factor = [0.25f32, 0.5, 0.75, 1.0];
+            let blend: F2 = std::mem::transmute(slot(obj, 23));
+            blend(obj, factor.as_ptr());
+            let stencil: U32 = std::mem::transmute(slot(obj, 24));
+            stencil(obj, 7);
+            let table: Root = std::mem::transmute(slot(obj, 36));
+            table(obj, 3, 0x1234_5678_9abc);
+            let srv: Root = std::mem::transmute(slot(obj, 44));
+            srv(obj, 2, 0x1400_0000);
+            let mut views = [0u8; 32];
+            views[..8].copy_from_slice(&0x1_0000u64.to_le_bytes());
+            views[8..12].copy_from_slice(&0x400u32.to_le_bytes());
+            views[12..16].copy_from_slice(&32u32.to_le_bytes());
+            let vb: Vb = std::mem::transmute(slot(obj, 48));
+            vb(obj, 5, 2, views.as_ptr());
+            let color = [0.1f32, 0.2, 0.3, 1.0];
+            let clear: Clear = std::mem::transmute(slot(obj, 52));
+            clear(obj, 0xab, color.as_ptr(), 0, std::ptr::null());
+
+            let r = list_record_for(obj as usize).expect("the calls store a list record");
+            assert_eq!(r.blend_factor, Some(factor));
+            assert_eq!(r.stencil_ref, Some(7));
+            assert_eq!(r.root_table, Some((3, 0x1234_5678_9abc)));
+            assert_eq!(r.root_srv, Some((2, 0x1400_0000)));
+            assert_eq!(r.vb_start, 5);
+            assert_eq!(r.vb_views.as_slice(), &views[..32]);
+            assert_eq!(r.clear_rtv, Some((0xab, color, 0)));
+            // console #49 is PC #45 SOSetTargets, which this backend keeps a stub
+            assert_eq!(slot(obj, 49), list_stub(49));
+        }
     }
 
     /// Serializes a test whose calls latch the process-wide newer-list flag and
