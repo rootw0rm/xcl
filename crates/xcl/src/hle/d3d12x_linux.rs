@@ -217,6 +217,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[73] = Device_CreateCommandListX as usize; // console list (DMA)
             v[74] = Device_RegisterPagePoolX as usize;
             v[75] = Device_UnregisterPagePoolX as usize;
+            v[108] = Device_GetResourceAllocationInfo2 as usize; // console allocation info (desc1)
             v[127] = Device_CreateCommittedResourceLayoutX as usize; // console committed resource (barrier layout)
         }
         Kind::CommandQueue | Kind::VulkanQueue => {
@@ -225,7 +226,14 @@ fn vtable(kind: Kind) -> *const usize {
             v[15] = Ret_S_OK as usize; // Wait
             v[16] = Queue_GetTimestampFrequency as usize;
             v[17] = Queue_GetClockCalibration as usize;
-            v[18] = Hidden_ZeroDesc16 as usize; // GetDesc
+            // The title's runtime uses the newer console queue layout: #18 is
+            // GetTimestampFrequency (HRESULT + u64 out), #19 GetClockCalibration,
+            // #20 GetDesc. Retail call: exe+0x2484180.
+            v[18] = Queue_GetTimestampFrequency as usize;
+            v[19] = Queue_GetClockCalibration as usize;
+            v[20] = Hidden_ZeroDesc16 as usize;
+            v[32] = Queue_PresentX as usize; // newer layout PresentX
+            v[35] = Queue_ExecuteCommandListsX as usize; // newer layout ExecuteCommandListsX
         }
         Kind::CommandAllocator => v[8] = Ret_S_OK as usize, // Reset
         Kind::CommandList | Kind::VulkanList => {
@@ -1357,6 +1365,41 @@ unsafe extern "win64" fn Device_GetResourceAllocationInfo(a: *mut c_void, b: *mu
     }
     ret
 }
+/// Console device #108 `GetResourceAllocationInfo2`: a hidden return buffer first
+/// (the title's order: `(ret, device, mask, count, D3D12_RESOURCE_DESC1[], infos)`),
+/// 0x48-byte descriptors, and an optional `{offset, alignment, size}` per
+/// resource. The title asserts the total size's high word is zero
+/// (`exe+0xabfe1b`), so the buffer is written even without a PC device.
+unsafe extern "win64" fn Device_GetResourceAllocationInfo2(
+    a: *mut c_void,
+    b: *mut c_void,
+    _mask: u32,
+    n: u32,
+    descs: *const u8,
+    infos: *mut [u64; 3],
+) -> *mut u8 {
+    let (_this, ret) = this_and_ret(a, b);
+    let (mut size, mut align) = (0u64, 0u64);
+    for k in 0..n as usize {
+        let d = if descs.is_null() { std::ptr::null() } else { descs.add(k * 0x48) };
+        let s = ((approx_size(d) as u64) + 0xFFFF) & !0xFFFF;
+        let offset = size.next_multiple_of(0x10000);
+        if !infos.is_null() {
+            // D3D12_RESOURCE_ALLOCATION_INFO1 { Offset, Alignment, SizeInBytes }.
+            infos.add(k).write_unaligned([offset, 0x10000, s]);
+        }
+        size = offset + s;
+        align = 0x10000;
+    }
+    if n > 1 {
+        size = size.next_multiple_of(align);
+    }
+    if !ret.is_null() {
+        (ret as *mut u64).write_unaligned(size);
+        (ret.add(8) as *mut u64).write_unaligned(align);
+    }
+    ret
+}
 unsafe extern "win64" fn Device_GetCustomHeapProperties(a: *mut c_void, b: *mut c_void, _m: u32, ty: u32) -> *mut u8 {
     let (_this, ret) = this_and_ret(a, b);
     if !ret.is_null() {
@@ -2341,6 +2384,19 @@ unsafe extern "win64" fn Queue_GetClockCalibration(_t: *mut NullObj, gpu: *mut u
     S_OK
 }
 
+/// Console newer queue #35 `ExecuteCommandListsX(count, lists, value, flags)`;
+/// the null device only needs the lists the title submitted (the extra value
+/// word is a console wait token).
+unsafe extern "win64" fn Queue_ExecuteCommandListsX(
+    this: *mut NullObj,
+    count: u32,
+    lists: *const *mut NullObj,
+    _value: u64,
+    _flags: u32,
+) {
+    Queue_ExecuteCommandLists(this, count, lists)
+}
+
 /// Host RGBA bytes of a back-buffer resource (R8G8B8A8 2D texture only):
 /// committed resources from their Map backing, placed ones straight from
 /// title memory. Unmodelled shapes return `None` and the caller presents
@@ -3103,6 +3159,71 @@ mod tests {
             assert_eq!(create(dev, desc.as_ptr(), 1, 1, std::ptr::null(), &mut out2), S_OK);
             assert!(!out2.is_null(), "the two console extras shifted the out argument");
             assert_eq!((*(out2 as *mut NullObj)).kind, Kind::PipelineState);
+        }
+    }
+
+    #[test]
+    fn console_resource_allocation_info2_writes_offsets_and_total() {
+        // Console device #108 is GetResourceAllocationInfo2: a hidden return
+        // buffer first, then the device, mask, count, an array of 0x48-byte
+        // resource descs, and an optional {offset, alignment, size} per
+        // resource. The title asserts the returned size's high word is zero.
+        type Info2 = unsafe extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            u32,
+            u32,
+            *const u8,
+            *mut [u64; 3],
+        ) -> *mut c_void;
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let f: Info2 = std::mem::transmute(slot(dev, 108));
+            let mut descs = [0u8; 0x48 * 2];
+            (descs.as_mut_ptr() as *mut u32).write_unaligned(1); // DIMENSION_BUFFER
+            (descs.as_mut_ptr().add(16) as *mut u64).write_unaligned(0x12345);
+            (descs.as_mut_ptr().add(0x48) as *mut u32).write_unaligned(1);
+            (descs.as_mut_ptr().add(0x48 + 16) as *mut u64).write_unaligned(0x20);
+            let mut out = [u64::MAX; 2];
+            let mut infos = [[u64::MAX; 3]; 2];
+            let r = f(
+                out.as_mut_ptr() as *mut c_void,
+                dev,
+                1,
+                2,
+                descs.as_ptr(),
+                infos.as_mut_ptr(),
+            );
+            assert_eq!(r as usize, out.as_mut_ptr() as usize, "slot 108 must return the hidden buffer");
+            assert_eq!(out[0], 0x30000, "total size of the two 64 KiB-rounded buffers");
+            assert_eq!(out[1], 0x10000, "alignment");
+            assert_eq!(infos, [[0, 0x10000, 0x20000], [0x20000, 0x10000, 0x10000]]);
+        }
+    }
+
+    #[test]
+    fn console_queue_timestamp_frequency_and_clock_calibration() {
+        // The title's runtime uses the newer console queue layout: #18 is
+        // GetTimestampFrequency (out pointer in rdx, HRESULT), not the PC
+        // #18 GetDesc. exe+0x2484180 checks the HRESULT and treats the out
+        // value as a frequency, then divides 1 by it.
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_queue: Fn4 = std::mem::transmute(slot(dev, 8));
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(dev, std::ptr::null(), std::ptr::null(), &mut q), S_OK);
+            let freq: unsafe extern "win64" fn(*mut c_void, *mut u64) -> HRESULT = std::mem::transmute(slot(q, 18));
+            let mut hz = 0u64;
+            assert_eq!(freq(q, &mut hz), S_OK);
+            assert_eq!(hz, 10_000_000);
+            let clock: unsafe extern "win64" fn(*mut c_void, *mut u64, *mut u64) -> HRESULT =
+                std::mem::transmute(slot(q, 19));
+            let (mut gpu, mut cpu) = (0u64, 0u64);
+            assert_eq!(clock(q, &mut gpu, &mut cpu), S_OK);
+            assert_ne!(gpu, 0);
+            assert_eq!(gpu, cpu);
         }
     }
 
