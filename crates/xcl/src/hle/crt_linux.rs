@@ -2424,6 +2424,45 @@ pub unsafe extern "win64" fn atan2(y: f64, x: f64) -> f64 {
     y.atan2(x)
 }
 
+/// `double log2(double x)` — base-2 logarithm. C99 edges: `±0 → -inf`,
+/// negative/NaN → NaN, `+inf → +inf`, and a denormal keeps its exact exponent
+/// (`2^-1074 → -1074`). Retail calls the integer helper at
+/// `exe+0x5bcf820`, which promotes its `ecx` argument, through IAT
+/// `0x146794698`.
+pub unsafe extern "win64" fn log2(x: f64) -> f64 {
+    x.log2()
+}
+
+// UCRT `_fdtest` category codes (`corecrt_math.h`; `fpclassify` returns these
+// same values — there are no `_FD_*` names in the modern CRT).
+const FP_ZERO: i16 = 0;
+const FP_INFINITE: i16 = 1;
+const FP_NAN: i16 = 2;
+const FP_NORMAL: i16 = -1;
+const FP_SUBNORMAL: i16 = -2;
+
+/// `short _fdtest(const float*)` — classifies the `float` at `value`. Retail
+/// (Step 84) stores a NaN at `[rsp+0x24]`, passes that address in `rcx` from
+/// `exe+0x5ebe26f`, and requires `FP_NAN` back in `ax`. A null pointer would
+/// fault in UCRT; the HLE guards it as an invalid value instead.
+pub unsafe extern "win64" fn _fdtest(value: *const f32) -> i16 {
+    if value.is_null() {
+        return FP_NAN;
+    }
+    let x = *value;
+    if x.is_nan() {
+        FP_NAN
+    } else if x.is_infinite() {
+        FP_INFINITE
+    } else if x == 0.0 {
+        FP_ZERO
+    } else if x.abs() < f32::MIN_POSITIVE {
+        FP_SUBNORMAL
+    } else {
+        FP_NORMAL
+    }
+}
+
 /// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
 pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
@@ -4804,6 +4843,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("fmodf", fmodf as usize),
         ("erff", erff as usize),
         ("atan2", atan2 as usize),
+        ("log2", log2 as usize),
+        ("_fdtest", _fdtest as usize),
     ]
 }
 
@@ -6087,6 +6128,73 @@ mod tests {
             assert_eq!(atan2(-0.0, -1.0), -PI);
             assert_eq!(atan2(1.0, f64::INFINITY), 0.0);
             assert!(atan2(f64::NAN, 1.0).is_nan());
+        }
+    }
+
+    #[test]
+    fn f64_log2_and_fdtest_follow_ucrt_categories() {
+        // Retail Step 84: the game imports double `log2` (IAT 0x146794698,
+        // called 2× through the integer helper at exe+0x5bcf820) and
+        // `_fdtest` (IAT 0x1467945e8, 2×; the first caller at exe+0x5ebe26f
+        // stores a NaN float in memory, passes its address in rcx, and
+        // requires the FP_NAN code 2 back in ax, else it reports an error).
+        for name in ["log2", "_fdtest"] {
+            assert!(exports().iter().any(|(n, _)| *n == name), "{name} must be wired");
+        }
+        type Log2 = unsafe extern "win64" fn(f64) -> f64;
+        type Fdtest = unsafe extern "win64" fn(*const f32) -> i16;
+        let addr = |name: &str| {
+            exports()
+                .into_iter()
+                .find_map(|(n, a)| (n == name).then_some(a))
+                .expect("export")
+        };
+        let log2: Log2 = unsafe { std::mem::transmute(addr("log2")) };
+        let fdtest: Fdtest = unsafe { std::mem::transmute(addr("_fdtest")) };
+        unsafe {
+            // C99 log2 edges, including the exact subnormal exponent.
+            assert_eq!(log2(8.0), 3.0);
+            assert_eq!(log2(0.5), -1.0);
+            assert_eq!(log2(1.0), 0.0);
+            assert!((log2(3.0) - 1.584_962_500_721_156_2).abs() < 1e-15);
+            assert!((log2(10.0) - 3.321_928_094_887_362).abs() < 1e-15);
+            assert_eq!(log2(0.0), f64::NEG_INFINITY);
+            assert_eq!(log2(-0.0), f64::NEG_INFINITY);
+            assert!(log2(-1.0).is_nan());
+            assert!(log2(f64::NEG_INFINITY).is_nan());
+            assert_eq!(log2(f64::INFINITY), f64::INFINITY);
+            assert!(log2(f64::NAN).is_nan());
+            // Smallest positive denormal: exponent -1074, not -inf/NaN.
+            assert_eq!(log2(f64::from_bits(1)), -1074.0);
+
+            // UCRT `_fdtest` returns the `FP_*` category codes from
+            // corecrt_math.h, not the `_FD_*` names the plan guessed:
+            // FP_ZERO 0, FP_INFINITE 1, FP_NAN 2, FP_NORMAL -1,
+            // FP_SUBNORMAL -2.
+            const FP_ZERO: i16 = 0;
+            const FP_INFINITE: i16 = 1;
+            const FP_NAN: i16 = 2;
+            const FP_NORMAL: i16 = -1;
+            const FP_SUBNORMAL: i16 = -2;
+            let category = |v: f32| {
+                let mut slot = v;
+                fdtest(&mut slot)
+            };
+            assert_eq!(category(f32::NAN), FP_NAN);
+            assert_eq!(category(f32::from_bits(0x7fc0_1234)), FP_NAN);
+            assert_eq!(category(f32::INFINITY), FP_INFINITE);
+            assert_eq!(category(f32::NEG_INFINITY), FP_INFINITE);
+            assert_eq!(category(0.0), FP_ZERO);
+            assert_eq!(category(-0.0), FP_ZERO);
+            assert_eq!(category(1.0), FP_NORMAL);
+            assert_eq!(category(-1.0), FP_NORMAL);
+            assert_eq!(category(f32::MAX), FP_NORMAL);
+            assert_eq!(category(f32::MIN_POSITIVE), FP_NORMAL);
+            assert_eq!(category(f32::from_bits(1)), FP_SUBNORMAL);
+            assert_eq!(category(-f32::from_bits(1)), FP_SUBNORMAL);
+            assert_eq!(category(1e-40), FP_SUBNORMAL);
+            // Defensive HLE guard: UCRT would fault on a null pointer.
+            assert_eq!(fdtest(std::ptr::null()), FP_NAN);
         }
     }
 
