@@ -534,6 +534,336 @@ pub unsafe extern "win64" fn AcpHalCreate(out: *mut *mut c_void) -> HRESULT {
     S_OK
 }
 
+// ---------------------------------------------------------------------------------------
+// xapu.dll: the decoder's command queue (silence on Linux)
+// ---------------------------------------------------------------------------------------
+//
+// The console's Opus decoder takes Activate / Process / Deactivate commands and
+// queues a result for each. Linux has no Opus decoder linked, and the Windows twin
+// already defines that case: every Process answers with `frames` samples of silence
+// in the requested layout, with `state` bits 0 (output ready) and 1 (more input
+// wanted). The structures are the title's packed layouts; the title polls
+// XApuDequeueResult, so the result contract is what has to match.
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct XApuCommand {
+    pub kind: u32,
+    pub stream: u32,
+    pub sequence: u32,
+    pub options: u32,
+    pub context: *mut c_void,
+}
+
+#[repr(C, packed)]
+struct XApuActivate {
+    id: XApuCommand,
+    channels: u32,
+}
+
+#[repr(C, packed)]
+struct XApuProcess {
+    id: XApuCommand,
+    ramp: f32,
+    pitch: f32,
+    first_frame: u32,
+    frames: u32,
+    input_bytes: u32,
+    input: *mut c_void,
+    output_bytes: u32,
+    output: *mut c_void,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct XApuResult {
+    pub id: XApuCommand,
+    pub state: u32,
+    pub state_data: u64,
+    pub time: u64,
+    pub error: HRESULT,
+    pub frames: u32,
+    pub output_bytes: u32,
+    pub output: *mut c_void,
+    pub pitch: f32,
+    pub input_bytes: u32,
+    pub input: *mut c_void,
+}
+
+#[repr(C, packed)]
+pub struct XApuConnectInput {
+    process: u32,
+    streams: u32,
+    commands_per_stream: u32,
+    data_bytes: u32,
+    frames_per_output: u32,
+    options: u32,
+}
+
+#[repr(C, packed)]
+pub struct XApuConnectOutput {
+    data: *mut c_void,
+    ready: *mut c_void,
+}
+
+const XAPU_ACTIVATE: u32 = 1;
+const XAPU_DEACTIVATE: u32 = 2;
+const XAPU_PROCESS: u32 = 3;
+/// XApuDequeueResult: no result waiting
+const XAPU_NO_RESULTS: HRESULT = 0x8AC8_1001u32 as HRESULT;
+
+/// What one decoder stream holds between commands.
+struct XApuStream {
+    /// 1 or 2 (what Activate asked for); a Process writes this layout
+    channels: u32,
+    /// between Activate and Deactivate
+    active: bool,
+}
+
+struct XApu {
+    results: Mutex<VecDeque<XApuResult>>,
+    channels: Mutex<Vec<XApuStream>>,
+    data: usize,
+    ready: usize,
+    frames_per_output: u32,
+}
+
+unsafe fn xapu_connect_with<FA, FE>(
+    input: *const XApuConnectInput,
+    output: *mut XApuConnectOutput,
+    handle: *mut *mut c_void,
+    alloc_fn: FA,
+    event_fn: FE,
+) -> HRESULT
+where
+    FA: FnOnce(usize, usize) -> Option<usize>,
+    FE: FnOnce() -> usize,
+{
+    if input.is_null() || output.is_null() || handle.is_null() {
+        return E_INVALIDARG;
+    }
+    let i = std::ptr::read_unaligned(input);
+    let clear_out = || {
+        std::ptr::write_unaligned(
+            output,
+            XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() },
+        );
+        *handle = std::ptr::null_mut();
+    };
+    let data = if i.data_bytes != 0 {
+        let Some(p) = alloc_fn(i.data_bytes as usize, 0x1_0000) else {
+            clear_out();
+            return E_OUTOFMEMORY;
+        };
+        p
+    } else {
+        0
+    };
+    let ready = if i.options & 8 != 0 {
+        let e = event_fn();
+        if e == 0 {
+            if data != 0 {
+                crate::hle::kernelx_linux::VirtualFree(
+                    data as *mut c_void,
+                    0,
+                    MEM_RELEASE,
+                );
+            }
+            clear_out();
+            return E_OUTOFMEMORY;
+        }
+        e
+    } else {
+        0
+    };
+    let n_streams = i.streams.max(1) as usize;
+    let mut channels = Vec::new();
+    if channels.try_reserve_exact(n_streams).is_err() {
+        if data != 0 {
+            crate::hle::kernelx_linux::VirtualFree(data as *mut c_void, 0, MEM_RELEASE);
+        }
+        if ready != 0 {
+            crate::hle::kernelx_linux::CloseHandle(ready);
+        }
+        clear_out();
+        return E_OUTOFMEMORY;
+    }
+    channels.resize_with(n_streams, || XApuStream { channels: 2, active: false });
+    let x = Box::new(XApu {
+        results: Mutex::new(VecDeque::new()),
+        channels: Mutex::new(channels),
+        data,
+        ready,
+        frames_per_output: i.frames_per_output,
+    });
+    std::ptr::write_unaligned(
+        output,
+        XApuConnectOutput { data: data as *mut c_void, ready: ready as *mut c_void },
+    );
+    *handle = Box::into_raw(x) as *mut c_void;
+    let (process, streams) = (i.process, i.streams);
+    crate::xlog_info!(
+        "xapu: decoder connected (process {process}, {streams} streams) – Opus is not decoded on Linux: Process answers silence"
+    );
+    S_OK
+}
+
+/// XApuConnect(&input, &output, &handle)
+pub unsafe extern "win64" fn XApuConnect(
+    input: *const XApuConnectInput,
+    output: *mut XApuConnectOutput,
+    handle: *mut *mut c_void,
+) -> HRESULT {
+    xapu_connect_with(
+        input,
+        output,
+        handle,
+        |size, align| alloc_aligned(size, align),
+        || crate::hle::kernelx_linux::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize,
+    )
+}
+
+/// XApuDisconnect(handle)
+pub unsafe extern "win64" fn XApuDisconnect(handle: *mut c_void) -> HRESULT {
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    let x = Box::from_raw(handle as *mut XApu);
+    if x.data != 0 {
+        crate::hle::kernelx_linux::VirtualFree(x.data as *mut c_void, 0, MEM_RELEASE);
+    }
+    if x.ready != 0 {
+        crate::hle::kernelx_linux::CloseHandle(x.ready);
+    }
+    S_OK
+}
+
+/// XApuEnqueueCommand(handle, &command, &results waiting): a Process command writes the
+/// asked frames as silence and queues a result; Activate/Deactivate record the stream.
+pub unsafe extern "win64" fn XApuEnqueueCommand(
+    handle: *mut c_void,
+    command: *const XApuCommand,
+    count: *mut u32,
+) -> HRESULT {
+    if handle.is_null() || command.is_null() {
+        return E_INVALIDARG;
+    }
+    let x = &*(handle as *const XApu);
+    let c = std::ptr::read_unaligned(command);
+    static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let kind = c.kind;
+    {
+        let mut s = SEEN.lock().unwrap();
+        if !s.contains(&kind) && s.len() < 64 {
+            s.push(kind);
+            crate::xlog_info!("xapu: decoder command {kind:#x} first seen");
+        }
+    }
+    let mut r = XApuResult {
+        id: c,
+        state: 0,
+        state_data: 0,
+        time: 0,
+        error: S_OK,
+        frames: 0,
+        output_bytes: 0,
+        output: std::ptr::null_mut(),
+        pitch: 1.0,
+        input_bytes: 0,
+        input: std::ptr::null_mut(),
+    };
+    {
+        let mut ch = x.channels.lock().unwrap();
+        let known = (c.stream as usize) < ch.len();
+        if c.kind == XAPU_ACTIVATE {
+            let n = std::ptr::read_unaligned(command as *const XApuActivate).channels;
+            let channels = if n == 1 { 1 } else { 2 };
+            if let Some(s) = ch.get_mut(c.stream as usize) {
+                s.channels = channels;
+                s.active = true;
+            }
+        } else if c.kind == XAPU_DEACTIVATE {
+            if let Some(s) = ch.get_mut(c.stream as usize) {
+                s.active = false;
+            }
+        } else if c.kind == XAPU_PROCESS {
+            let p = std::ptr::read_unaligned(command as *const XApuProcess);
+            let channels = if known {
+                ch[c.stream as usize].channels
+            } else {
+                ch.first().map_or(2, |s| s.channels)
+            };
+            let frame_bytes = channels * 4;
+            let asked = if p.frames != 0 { p.frames } else { x.frames_per_output };
+            let frames = (if asked != 0 { asked } else { 960 }).min(p.output_bytes / frame_bytes);
+            if !p.output.is_null() && frames != 0 {
+                // No Opus decoder on Linux: silence of the requested length. Byte writes,
+                // because the title's buffer is not known to be 4-byte aligned.
+                std::ptr::write_bytes(p.output as *mut u8, 0, (frames * frame_bytes) as usize);
+            }
+            // output ready, more input wanted
+            r.state = 1 | 2;
+            r.frames = frames;
+            r.output_bytes = frames * frame_bytes;
+            r.output = p.output;
+            r.pitch = p.pitch;
+            r.input_bytes = p.input_bytes;
+            r.input = p.input;
+        }
+    }
+    let n = {
+        let mut q = x.results.lock().unwrap();
+        q.push_back(r);
+        q.len() as u32
+    };
+    if !count.is_null() {
+        *count = n;
+    }
+    if x.ready != 0 && c.options & 1 != 0 {
+        crate::hle::kernelx_linux::SetEvent(x.ready);
+    }
+    S_OK
+}
+
+/// XApuDequeueResult(handle, &result)
+pub unsafe extern "win64" fn XApuDequeueResult(
+    handle: *mut c_void,
+    result: *mut XApuResult,
+) -> HRESULT {
+    if handle.is_null() || result.is_null() {
+        return E_INVALIDARG;
+    }
+    match (*(handle as *const XApu)).results.lock().unwrap().pop_front() {
+        Some(r) => {
+            std::ptr::write_unaligned(result, r);
+            S_OK
+        }
+        None => XAPU_NO_RESULTS,
+    }
+}
+
+/// XApuGetResultCount(handle, &count) -> count
+pub unsafe extern "win64" fn XApuGetResultCount(handle: *mut c_void, total: *mut u32) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let n = (*(handle as *const XApu)).results.lock().unwrap().len() as u32;
+    if !total.is_null() {
+        *total = n;
+    }
+    n
+}
+
+/// XApuGetUtilization(…, &utilization): streams available and the most there can be
+pub unsafe extern "win64" fn XApuGetUtilization(_a: u32, _b: u32, u: *mut u32) -> HRESULT {
+    if u.is_null() {
+        return E_INVALIDARG;
+    }
+    *u = 256;
+    *u.add(1) = 256;
+    S_OK
+}
+
 /// Implemented exports with real code addresses. Everything else in the acphal route
 /// (the XApu/XDsp command channels) stays stub metadata in `hle_linux` until a measured
 /// consumer reaches it.
@@ -549,6 +879,12 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("AcpHalAllocateShapeContexts", AcpHalAllocateShapeContexts as usize),
         ("AcpHalReleaseShapeContexts", AcpHalReleaseShapeContexts as usize),
         ("AcpHalCreate", AcpHalCreate as usize),
+        ("XApuConnect", XApuConnect as usize),
+        ("XApuDisconnect", XApuDisconnect as usize),
+        ("XApuEnqueueCommand", XApuEnqueueCommand as usize),
+        ("XApuDequeueResult", XApuDequeueResult as usize),
+        ("XApuGetResultCount", XApuGetResultCount as usize),
+        ("XApuGetUtilization", XApuGetUtilization as usize),
     ]
 }
 
@@ -784,6 +1120,132 @@ mod tests {
             assert!(pop(h, &mut m));
             assert_eq!(m.kind, MSG_DISCONNECTED);
             release(h);
+        }
+    }
+
+    #[test]
+    fn xapu_entry_points_are_wired() {
+        for name in [
+            "XApuConnect",
+            "XApuDisconnect",
+            "XApuEnqueueCommand",
+            "XApuDequeueResult",
+            "XApuGetResultCount",
+            "XApuGetUtilization",
+        ] {
+            acphal_addr(name);
+        }
+    }
+
+    #[test]
+    fn xapu_connect_process_and_dequeue() {
+        type Connect = unsafe extern "win64" fn(
+            *const XApuConnectInput,
+            *mut XApuConnectOutput,
+            *mut *mut c_void,
+        ) -> HRESULT;
+        type Disconnect = unsafe extern "win64" fn(*mut c_void) -> HRESULT;
+        type Enqueue =
+            unsafe extern "win64" fn(*mut c_void, *const XApuCommand, *mut u32) -> HRESULT;
+        type Dequeue = unsafe extern "win64" fn(*mut c_void, *mut XApuResult) -> HRESULT;
+        type Count = unsafe extern "win64" fn(*mut c_void, *mut u32) -> u32;
+        type Util = unsafe extern "win64" fn(u32, u32, *mut u32) -> HRESULT;
+        let connect: Connect = unsafe { std::mem::transmute(acphal_addr("XApuConnect")) };
+        let disconnect: Disconnect =
+            unsafe { std::mem::transmute(acphal_addr("XApuDisconnect")) };
+        let enqueue: Enqueue =
+            unsafe { std::mem::transmute(acphal_addr("XApuEnqueueCommand")) };
+        let dequeue: Dequeue =
+            unsafe { std::mem::transmute(acphal_addr("XApuDequeueResult")) };
+        let count: Count = unsafe { std::mem::transmute(acphal_addr("XApuGetResultCount")) };
+        let util: Util = unsafe { std::mem::transmute(acphal_addr("XApuGetUtilization")) };
+        unsafe {
+            let input = XApuConnectInput {
+                process: 1,
+                streams: 2,
+                commands_per_stream: 2,
+                data_bytes: 0x100,
+                frames_per_output: 4,
+                options: 0,
+            };
+            let mut output =
+                XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() };
+            let mut h: *mut c_void = std::ptr::null_mut();
+            assert_eq!(connect(&input, &mut output, &mut h), S_OK);
+            assert!(!h.is_null());
+            assert!(!output.data.is_null());
+            assert!(output.ready.is_null(), "options bit 3 was not set");
+
+            // Activate stream 0 with two channels; the result has no frames.
+            let act = XApuActivate {
+                id: XApuCommand {
+                    kind: 1,
+                    stream: 0,
+                    sequence: 0,
+                    options: 0,
+                    context: std::ptr::null_mut(),
+                },
+                channels: 2,
+            };
+            let mut n = 0u32;
+            assert_eq!(enqueue(h, &act as *const _ as *const XApuCommand, &mut n), S_OK);
+            assert_eq!(n, 1);
+            let mut r: XApuResult = std::mem::zeroed();
+            assert_eq!(dequeue(h, &mut r), S_OK);
+            let state = r.state;
+            assert_eq!(state, 0);
+
+            // Process 4 stereo frames: the asked frames arrive as zeroed bytes.
+            let mut out = vec![0xAAu8; 4 * 2 * 4];
+            let p = XApuProcess {
+                id: XApuCommand {
+                    kind: 3,
+                    stream: 0,
+                    sequence: 1,
+                    options: 0,
+                    context: std::ptr::null_mut(),
+                },
+                ramp: 0.0,
+                pitch: 48_000.0,
+                first_frame: 0,
+                frames: 4,
+                input_bytes: 0,
+                input: std::ptr::null_mut(),
+                output_bytes: out.len() as u32,
+                output: out.as_mut_ptr() as *mut c_void,
+            };
+            assert_eq!(enqueue(h, &p as *const _ as *const XApuCommand, &mut n), S_OK);
+            assert_eq!(n, 1);
+            assert_eq!(count(h, &mut n), 1);
+            assert_eq!(n, 1);
+            assert_eq!(dequeue(h, &mut r), S_OK);
+            let (frames, output_bytes, state, result_output, pitch) =
+                (r.frames, r.output_bytes, r.state, r.output, r.pitch);
+            assert_eq!((frames, output_bytes, state), (4, 32, 3));
+            let expected_output = p.output;
+            assert_eq!(result_output, expected_output);
+            assert_eq!(pitch, 48_000.0);
+            assert!(out.iter().all(|&b| b == 0), "silence, not stale bytes");
+            assert_eq!(dequeue(h, &mut r), XAPU_NO_RESULTS);
+            assert_eq!(count(h, &mut n), 0);
+
+            let mut u = [0u32; 2];
+            assert_eq!(util(0, 0, u.as_mut_ptr()), S_OK);
+            assert_eq!(u, [256, 256]);
+            assert_eq!(util(0, 0, std::ptr::null_mut()), E_INVALIDARG);
+
+            // Invalid arguments fail without touching a live handle.
+            assert_eq!(
+                connect(std::ptr::null(), &mut output, &mut h),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                enqueue(std::ptr::null_mut(), &act as *const _ as *const XApuCommand, &mut n),
+                E_INVALIDARG
+            );
+            assert_eq!(dequeue(std::ptr::null_mut(), &mut r), E_INVALIDARG);
+            assert_eq!(disconnect(h), S_OK);
+            assert_eq!(disconnect(std::ptr::null_mut()), E_INVALIDARG);
         }
     }
 }
