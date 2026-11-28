@@ -633,11 +633,14 @@ fn xuser_devices() -> Vec<(&'static str, usize)> {
 }
 
 fn xgamesave() -> Vec<(&'static str, usize)> {
-    vec![
+    let mut v = vec![
         ("XGameSaveFilesGetFolderWithUiAsync", xu::XGameSaveFilesGetFolderWithUiAsync as usize),
         ("XGameSaveFilesGetFolderWithUiResult", xu::XGameSaveFilesGetFolderWithUiResult as usize),
         ("XGameSaveFilesGetRemainingQuota", files_remaining_quota as usize),
-    ]
+    ];
+    // Step 88: the shared provider behind the Linux win64 shim (GDK rows 3..=29).
+    v.extend(crate::hle::gamesave_linux::exports());
+    v
 }
 
 fn xpls() -> Vec<(&'static str, usize)> {
@@ -1582,6 +1585,112 @@ mod tests {
         assert!(!main.iface.iids.is_empty() && main.iface.main);
         assert!(own(&XSTORE, &XSTORE).is_none());
         assert!(returns_bool("XUserIsStoreUser") && returns_bool("XPackageUnregisterPackageInstalled") && !returns_bool("XUserGetState"));
+    }
+
+    /// The title's save path. It queries the `XGameSave` class and calls
+    /// `XGameSaveInitializeProviderAsync` through the vtable; before Step 88 the class
+    /// carried only the three `XGameSaveFiles*` rows, so every provider slot was an
+    /// unimplemented stub that answered E_NOTIMPL and the title abandoned saves.
+    /// `/tmp/xcl-step87-r1`: `XGameSaveInitializeProviderAsync` at 12.458 s.
+    #[test]
+    fn xgamesave_provider_async_and_blob_round_trip_through_the_class_vtable() {
+        // repr(C) XGameSaveBlob: { const char* name; uint32 size; char* data; }
+        #[repr(C)]
+        struct TestBlob {
+            name: *const u8,
+            size: u32,
+            _pad: u32,
+            data: *mut u8,
+        }
+        unsafe {
+            let (clsid, iid, init_slot) = slot_in_table("XGameSaveInitializeProviderAsync");
+            assert_eq!(clsid, XGAMESAVE);
+            let (hr, o) = query(clsid, iid);
+            assert_eq!(hr, S_OK);
+            assert!(!o.is_null());
+            assert!(stats().apis.values().any(|v| v.starts_with("XGameSave: XCL")), "{:?}", stats().apis);
+            let at = |name: &str| slot_in_table(name).2;
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let cfg = format!("xcl-gs-step88-{}-{nonce}\0", std::process::id());
+            let cfg_name = cfg.trim_end_matches('\0').to_string();
+            let cfg_ptr = cfg.as_ptr();
+
+            // Async init with a zeroed block: the process task queue, like the title's.
+            let init: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const u8, bool, *mut XAsyncBlock) -> HRESULT =
+                slot(o, init_slot);
+            let mut block: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(init(o, std::ptr::null_mut(), cfg_ptr, false, &mut block), S_OK, "provider init must be wired");
+            assert_eq!(xu::XAsyncGetStatus(&mut block, true), S_OK, "the async work runs on the Linux engine");
+            let provider_result: unsafe extern "win64" fn(*mut c_void, *mut XAsyncBlock, *mut *mut c_void) -> HRESULT =
+                slot(o, at("XGameSaveInitializeProviderResult"));
+            let mut provider = std::ptr::null_mut();
+            assert_eq!(provider_result(o, &mut block, &mut provider), S_OK);
+            assert!(!provider.is_null());
+
+            // A fresh configuration id starts at the GDK default quota (256 MiB).
+            let quota_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut i64) -> HRESULT =
+                slot(o, at("XGameSaveGetRemainingQuota"));
+            let mut quota = -1i64;
+            assert_eq!(quota_fn(o, provider, &mut quota), S_OK);
+            assert_eq!(quota, crate::hle::gamesave_linux::QUOTA);
+
+            // Write one blob, close everything, then read it from a new provider instance.
+            let create: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const u8, *mut *mut c_void) -> HRESULT =
+                slot(o, at("XGameSaveCreateContainer"));
+            let mut container = std::ptr::null_mut();
+            assert_eq!(create(o, provider, b"slot1\0".as_ptr(), &mut container), S_OK);
+            assert!(!container.is_null());
+            let create_update: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const u8, *mut *mut c_void) -> HRESULT =
+                slot(o, at("XGameSaveCreateUpdate"));
+            let mut update = std::ptr::null_mut();
+            assert_eq!(create_update(o, container, b"Save 1\0".as_ptr(), &mut update), S_OK);
+            let write: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const u8, *const u8, usize) -> HRESULT =
+                slot(o, at("XGameSaveSubmitBlobWrite"));
+            assert_eq!(write(o, update, b"b1\0".as_ptr(), b"hello".as_ptr(), 5), S_OK);
+            let submit: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> HRESULT =
+                slot(o, at("XGameSaveSubmitUpdate"));
+            assert_eq!(submit(o, update), S_OK);
+            let close_update: unsafe extern "win64" fn(*mut c_void, *mut c_void) = slot(o, at("XGameSaveCloseUpdate"));
+            close_update(o, update);
+            let close_container: unsafe extern "win64" fn(*mut c_void, *mut c_void) = slot(o, at("XGameSaveCloseContainer"));
+            close_container(o, container);
+            let close_provider: unsafe extern "win64" fn(*mut c_void, *mut c_void) = slot(o, at("XGameSaveCloseProvider"));
+            close_provider(o, provider);
+
+            let init_sync: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const u8, bool, *mut *mut c_void) -> HRESULT =
+                slot(o, at("XGameSaveInitializeProvider"));
+            let mut provider2 = std::ptr::null_mut();
+            assert_eq!(init_sync(o, std::ptr::null_mut(), cfg_ptr, false, &mut provider2), S_OK);
+            assert!(!provider2.is_null());
+            let mut container2 = std::ptr::null_mut();
+            assert_eq!(create(o, provider2, b"slot1\0".as_ptr(), &mut container2), S_OK);
+            let read: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *const u8, *mut u32, usize, *mut c_void) -> HRESULT =
+                slot(o, at("XGameSaveReadBlobData"));
+            let names = [b"b1\0".as_ptr()];
+            let mut count = 1u32;
+            let mut buf = vec![0u64; 32];
+            assert_eq!(read(o, container2, names.as_ptr(), &mut count, buf.len() * 8, buf.as_mut_ptr() as *mut c_void), S_OK);
+            assert_eq!(count, 1);
+            let blob = &*(buf.as_ptr() as *const TestBlob);
+            assert_eq!(blob.size, 5);
+            assert_eq!(std::slice::from_raw_parts(blob.data, 5), b"hello");
+            assert_eq!(crate::util::from_cstr_ptr(blob.name).as_deref(), Some("b1"));
+            close_container(o, container2);
+            close_provider(o, provider2);
+
+            // Null output pointers stay E_INVALIDARG, and a failed Result does not
+            // consume the one-shot payload.
+            let mut retry: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(init(o, std::ptr::null_mut(), cfg_ptr, false, &mut retry), S_OK);
+            assert_eq!(xu::XAsyncGetStatus(&mut retry, true), S_OK);
+            assert_eq!(provider_result(o, &mut retry, std::ptr::null_mut()), E_INVALIDARG);
+            let mut provider3 = std::ptr::null_mut();
+            assert_eq!(provider_result(o, &mut retry, &mut provider3), S_OK);
+            assert!(!provider3.is_null());
+            close_provider(o, provider3);
+
+            let _ = std::fs::remove_dir_all(crate::state::data_dir().join("gamesave").join(&cfg_name));
+        }
     }
 
     #[test]

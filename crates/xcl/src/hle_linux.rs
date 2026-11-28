@@ -41,6 +41,8 @@ pub mod gameinput_linux;
 pub mod xtaskqueue_linux;
 #[path = "hle/xuser_linux.rs"]
 pub mod xuser_linux;
+#[path = "hle/gamesave_linux.rs"]
+pub mod gamesave_linux;
 #[path = "hle/xaudio2_linux.rs"]
 pub mod xaudio2_linux;
 #[path = "hle/d3d12x_linux.rs"]
@@ -249,6 +251,15 @@ fn xgameruntime_exports() -> Vec<(&'static str, usize)> {
         }
     }
     for (name, addr) in xuser_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    // Step-88 XGameSave provider: the shared cross-platform provider, behind the
+    // Linux XAsync/task-queue engine (all 27 GDK class rows 3..=29).
+    for (name, addr) in gamesave_linux::exports() {
         if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
             slot.1 = addr;
         } else {
@@ -871,6 +882,20 @@ mod tests {
             "XPackageIsPackagedProcess",
             "XPackageGetCurrentProcessPackageIdentifier",
             "XPackageGetIdentifier",
+        ] {
+            let (m, addr) = r.find_any(name).expect(name);
+            assert_eq!(m.name, XGAMERUNTIME);
+            assert_ne!(addr, 0, "{name} must be implemented");
+        }
+        // Step-88 XGameSave provider: the title calls InitializeProviderAsync at boot;
+        // the shared provider family is real code on Linux, not stub metadata.
+        for name in [
+            "XGameSaveInitializeProvider",
+            "XGameSaveInitializeProviderAsync",
+            "XGameSaveInitializeProviderResult",
+            "XGameSaveGetRemainingQuota",
+            "XGameSaveCreateContainer",
+            "XGameSaveSubmitUpdate",
         ] {
             let (m, addr) = r.find_any(name).expect(name);
             assert_eq!(m.name, XGAMERUNTIME);
