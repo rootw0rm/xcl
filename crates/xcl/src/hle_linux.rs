@@ -551,6 +551,24 @@ mod tests {
     }
 
     #[test]
+    fn etw_provider_is_wired() {
+        // Step 87: libhttpclient registers a no-op ETW provider
+        // (libHttpClient.GDK.dll+0x44401); the auto-stub returned 0 without writing the
+        // REGHANDLE at 0x1800de078, so the title's later writes went to a NULL provider.
+        let r = build(&Config::default());
+        for name in [
+            "EventRegister",
+            "EventSetInformation",
+            "EventWriteTransfer",
+            "EventUnregister",
+        ] {
+            let (m, addr) = r.find_any(name).unwrap_or_else(|| panic!("{name} must be wired"));
+            assert_eq!(m.name, KERNELX, "{name}");
+            assert_ne!(addr, 0, "{name} must be real code, not a stub");
+        }
+    }
+
+    #[test]
     fn aliases_take_precedence() {
         let mut c = Config::default();
         c.aliases.insert("kernel32.dll".into(), "@system".into());

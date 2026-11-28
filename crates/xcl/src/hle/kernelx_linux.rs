@@ -7512,6 +7512,116 @@ pub unsafe extern "win64" fn StringFromGUID2(guid: *const u8, out: *mut u16, cch
 }
 
 // ---------------------------------------------------------------------------------------
+// ETW no-op provider (Step 87): EventRegister / EventSetInformation / EventWriteTransfer /
+// EventUnregister
+// ---------------------------------------------------------------------------------------
+//
+// `libHttpClient.GDK.dll` imports advapi32's ETW provider API. At `+0x44401` it calls
+// `EventRegister(&provider_guid, enable_callback, callback_context, &g_reg_handle)` with
+// the out handle at `0x1800de078`, then `EventSetInformation(handle, 2 /*SetTraits*/,
+// traits, traits_len)` and writes events through `EventWriteTransfer`; `EventUnregister`
+// (helper `0x1800a8210`) clears the cookie and handle globals. The auto-stub returned 0
+// without writing the REGHANDLE, so the caller believed it had registered a provider
+// while every write went to a NULL handle.
+//
+// There is no ETW consumer in the static Linux exe, and ETW events are diagnostics: a
+// real no-op provider is the honest answer. Cookies are tracked so a foreign or
+// unregistered handle fails like Windows instead of silently succeeding, and `Unregister`
+// actually invalidates the cookie.
+
+/// Distinguishes our REGHANDLE from the small ids in the kernel handle tables. The value
+/// is opaque to the caller; the live set, not the pattern, decides validity.
+const ETW_COOKIE_TAG: usize = 0x5843_4C00_0000_0000;
+static ETW_COOKIE_NEXT: AtomicUsize = AtomicUsize::new(1);
+static ETW_COOKIES: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn etw_issue_cookie() -> usize {
+    loop {
+        let n = ETW_COOKIE_NEXT.fetch_add(1, Ordering::Relaxed);
+        let cookie = ETW_COOKIE_TAG | (n & 0xFFFF_FFFF);
+        let mut live = ETW_COOKIES.lock().unwrap();
+        if !live.contains(&cookie) {
+            live.push(cookie);
+            return cookie;
+        }
+    }
+}
+
+fn etw_handle_is_live(handle: usize) -> bool {
+    handle != 0 && ETW_COOKIES.lock().unwrap().contains(&handle)
+}
+
+/// `ULONG EventRegister(LPCGUID, PENABLECALLBACK, PVOID, PREGHANDLE)` — issue a non-null
+/// cookie. The enable callback is never invoked: the provider is always disabled, which is
+/// what a no-op provider means.
+pub unsafe extern "win64" fn EventRegister(
+    provider_id: *const u8,
+    _enable_callback: usize,
+    _callback_context: usize,
+    reg_handle: *mut usize,
+) -> u32 {
+    if provider_id.is_null() || reg_handle.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return ERROR_INVALID_PARAMETER;
+    }
+    reg_handle.write(etw_issue_cookie());
+    set_error(ERROR_SUCCESS);
+    ERROR_SUCCESS
+}
+
+/// `ULONG EventSetInformation(REGHANDLE, EVENT_INFO_CLASS, PVOID, ULONG)` — accept a
+/// cookie we issued and discard the provider metadata. A null/foreign handle is
+/// `ERROR_INVALID_HANDLE`.
+pub unsafe extern "win64" fn EventSetInformation(
+    reg_handle: usize,
+    _info_class: u32,
+    _event_information: *mut c_void,
+    _information_length: u32,
+) -> u32 {
+    if !etw_handle_is_live(reg_handle) {
+        set_error(ERROR_INVALID_HANDLE);
+        return ERROR_INVALID_HANDLE;
+    }
+    set_error(ERROR_SUCCESS);
+    ERROR_SUCCESS
+}
+
+/// `ULONG EventWriteTransfer(REGHANDLE, PCEVENT_DESCRIPTOR, LPCGUID, LPCGUID, ULONG,
+/// PEVENT_DATA_DESCRIPTOR)` — the event is dropped, as no consumer is attached. A
+/// null/foreign handle is `ERROR_INVALID_HANDLE`.
+pub unsafe extern "win64" fn EventWriteTransfer(
+    reg_handle: usize,
+    _event_descriptor: *const c_void,
+    _activity_id: *const u8,
+    _related_activity_id: *const u8,
+    _user_data_count: u32,
+    _user_data: *const c_void,
+) -> u32 {
+    if !etw_handle_is_live(reg_handle) {
+        set_error(ERROR_INVALID_HANDLE);
+        return ERROR_INVALID_HANDLE;
+    }
+    set_error(ERROR_SUCCESS);
+    ERROR_SUCCESS
+}
+
+/// `ULONG EventUnregister(REGHANDLE)` — invalidate a cookie we issued. A null or already
+/// unregistered handle is `ERROR_INVALID_HANDLE`.
+pub unsafe extern "win64" fn EventUnregister(reg_handle: usize) -> u32 {
+    let mut live = ETW_COOKIES.lock().unwrap();
+    if let Some(pos) = live.iter().position(|&c| c == reg_handle) {
+        live.swap_remove(pos);
+        drop(live);
+        set_error(ERROR_SUCCESS);
+        ERROR_SUCCESS
+    } else {
+        drop(live);
+        set_error(ERROR_INVALID_HANDLE);
+        ERROR_INVALID_HANDLE
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // String conversion: MultiByteToWideChar / WideCharToMultiByte (retail abort 0x2237179)
 // ---------------------------------------------------------------------------------------
 //
@@ -7784,10 +7894,10 @@ pub unsafe extern "win64" fn GetUserDefaultLocaleName(buf: *mut u16, len: i32) -
 /// `LOCALE_NAME_INVARIANT` is the empty string (0x007F),
 /// `LOCALE_NAME_SYSTEM_DEFAULT` is `!x-sys-default-locale` (0x0800), and a null name
 /// is `LOCALE_NAME_USER_DEFAULT` (the fixed `en-US`, 0x0409). Language-only names are
-/// neutral and need `LOCALE_ALLOW_NEUTRAL_NAMES` (0x80). Unknown names and flags
-/// outside 0x80 return 0 (`ERROR_INVALID_PARAMETER`).
+/// neutral and need `LOCALE_ALLOW_NEUTRAL_NAMES` (0x0800_0000). Unknown names and flags
+/// outside that bit return 0 (`ERROR_INVALID_PARAMETER`).
 pub unsafe extern "win64" fn LocaleNameToLCID(name: *const u16, flags: u32) -> u32 {
-    const LOCALE_ALLOW_NEUTRAL_NAMES: u32 = 0x0080;
+    const LOCALE_ALLOW_NEUTRAL_NAMES: u32 = 0x0800_0000;
     const LOCALE_INVARIANT: u32 = 0x007F;
     const LOCALE_SYSTEM_DEFAULT: u32 = 0x0800;
     const LCID_EN_US: u32 = 0x0409;
@@ -10432,6 +10542,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("CoCreateInstance", CoCreateInstance as usize),
         ("CoCreateGuid", CoCreateGuid as usize),
         ("StringFromGUID2", StringFromGUID2 as usize),
+        ("EventRegister", EventRegister as usize),
+        ("EventSetInformation", EventSetInformation as usize),
+        ("EventWriteTransfer", EventWriteTransfer as usize),
+        ("EventUnregister", EventUnregister as usize),
         ("VirtualAlloc", VirtualAlloc as usize),
         ("VirtualAllocEx", VirtualAllocEx as usize),
         ("VirtualFree", VirtualFree as usize),
@@ -11574,6 +11688,68 @@ mod tests {
             let mut zero = [0xFFFFu16; 40];
             assert_eq!(format(g.as_ptr(), zero.as_mut_ptr(), 0), 0);
             assert_eq!(zero, [0xFFFFu16; 40]);
+        }
+    }
+
+    #[test]
+    fn etw_provider_is_a_tracked_no_op() {
+        // Step 87: libhttpclient registers a provider and then writes events. The
+        // cookie must be non-null, accepted only while registered, and invalidated by
+        // EventUnregister; the info/write calls are deliberately no-ops (no consumer).
+        unsafe {
+            let guid = [0u8; 16];
+            let mut h = 0usize;
+            assert_eq!(
+                EventRegister(std::ptr::null(), 0, 0, &mut h),
+                ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(h, 0, "a refused register must not write the handle");
+            assert_eq!(
+                EventRegister(guid.as_ptr(), 0, 0, std::ptr::null_mut()),
+                ERROR_INVALID_PARAMETER
+            );
+            assert_eq!(EventRegister(guid.as_ptr(), 0, 0, &mut h), ERROR_SUCCESS);
+            assert_ne!(h, 0, "a registered provider needs a non-null cookie");
+            assert_eq!(EventSetInformation(h, 2, std::ptr::null_mut(), 0), ERROR_SUCCESS);
+            assert_eq!(
+                EventWriteTransfer(
+                    h,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                ),
+                ERROR_SUCCESS
+            );
+            // NULL and handles we never issued fail like Windows.
+            for bad in [0usize, 0xDEAD_BEEF] {
+                assert_eq!(
+                    EventSetInformation(bad, 2, std::ptr::null_mut(), 0),
+                    ERROR_INVALID_HANDLE
+                );
+                assert_eq!(
+                    EventWriteTransfer(
+                        bad,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                    ),
+                    ERROR_INVALID_HANDLE
+                );
+                assert_eq!(EventUnregister(bad), ERROR_INVALID_HANDLE);
+            }
+            // Two registrations are distinct; unregister invalidates only its own.
+            let mut second = 0usize;
+            assert_eq!(EventRegister(guid.as_ptr(), 0, 0, &mut second), ERROR_SUCCESS);
+            assert_ne!(second, h);
+            assert_eq!(EventUnregister(h), ERROR_SUCCESS);
+            assert_eq!(EventSetInformation(h, 2, std::ptr::null_mut(), 0), ERROR_INVALID_HANDLE);
+            assert_eq!(EventUnregister(h), ERROR_INVALID_HANDLE);
+            assert_eq!(EventSetInformation(second, 2, std::ptr::null_mut(), 0), ERROR_SUCCESS);
+            assert_eq!(EventUnregister(second), ERROR_SUCCESS);
         }
     }
 
@@ -15023,11 +15199,15 @@ mod tests {
             assert_eq!(call("!x-sys-default-locale", 0), 0x0800);
             // A null name is LOCALE_NAME_USER_DEFAULT: the fixed en-US user locale.
             assert_eq!(LocaleNameToLCID(std::ptr::null(), 0), 0x0409);
-            // Language-only names are neutral: only returned with the flag.
+            // Language-only names are neutral: only returned with the real
+            // LOCALE_ALLOW_NEUTRAL_NAMES flag (0x0800_0000, per WinNls.h). 0x80 is not
+            // that flag and must keep failing.
             assert_eq!(call("en", 0), 0);
             assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
-            assert_eq!(call("en", 0x80), 0x0009);
-            // Unknown names and flags outside 0x80 fail with 0.
+            assert_eq!(call("en", 0x80), 0);
+            assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
+            assert_eq!(call("en", 0x0800_0000), 0x0009);
+            // Unknown names and flags outside 0x0800_0000 fail with 0.
             assert_eq!(call("xx-YY", 0), 0);
             assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
             assert_eq!(call("en-US", 0x40), 0);
