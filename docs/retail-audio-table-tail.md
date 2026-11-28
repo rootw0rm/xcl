@@ -35,8 +35,8 @@ Step 53 blamed `G:\audio.rpf` from "last reads at the fault". A
 
 The table stream is built on **handle `0x10145` = `G:\data.rpf`**: the first
 `ReadFile` after the partial copy, and every refill for this reader, is on
-`0x10145`. The listener is audio because the decompressed content is the
-`audio:/config/audio_common.dat62.rle` resource (that path string sits on the
+`0x10145`. The content is audio because the resource is the
+`audio:/config/audio_common.dat62.rle` data (that path string sits on the
 walk's stack); it is stored in `data.rpf`. `audio.rpf` reads at the fault are
 a concurrent thread, not this table.
 
