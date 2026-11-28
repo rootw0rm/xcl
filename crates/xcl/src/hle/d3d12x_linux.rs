@@ -3267,6 +3267,7 @@ mod tests {
     /// no resource and never calls the title's allocator.
     #[test]
     fn display_target_memory_comes_from_the_title_allocation_hook() {
+        let _layout = LayoutSerial::take();
         use std::sync::atomic::{AtomicU64, AtomicUsize};
         static TEST_BLOCK: AtomicUsize = AtomicUsize::new(0);
         static TEST_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -3489,6 +3490,7 @@ mod tests {
 
     #[test]
     fn console_resource_allocation_info2_writes_offsets_and_total() {
+        let _layout = LayoutSerial::take();
         // Console device #108 is GetResourceAllocationInfo2: a hidden return
         // buffer first, then the device, mask, count, an array of 0x48-byte
         // resource descs, and an optional {offset, alignment, size} per
@@ -3571,6 +3573,7 @@ mod tests {
     /// faulted at `exe+0x501f808`.
     #[test]
     fn console_placed_resource_layout_slot133_writes_the_resource() {
+        let _layout = LayoutSerial::take();
         unsafe {
             let mut dev = std::ptr::null_mut();
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
@@ -5491,6 +5494,25 @@ mod tests {
     fn layout_serial() -> &'static Mutex<()> {
         static S: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
         &S
+    }
+
+    /// Serializes a test whose calls latch the process-wide newer-list flag and
+    /// clears the flag on drop, so a parallel test never observes a layout that
+    /// a previous test's device/queue slot happened to prove.
+    struct LayoutSerial {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl LayoutSerial {
+        fn take() -> Self {
+            Self { _guard: layout_serial().lock().unwrap_or_else(|e| e.into_inner()) }
+        }
+    }
+
+    impl Drop for LayoutSerial {
+        fn drop(&mut self) {
+            NEWER_LIST_LAYOUT.store(false, Ordering::Release);
+        }
     }
 
     /// End to end through the vtable: older #70 writes a timestamp;
