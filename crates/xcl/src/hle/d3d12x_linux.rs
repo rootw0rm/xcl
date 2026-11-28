@@ -366,6 +366,8 @@ fn vtable(kind: Kind) -> *const usize {
             v[14] = Device_CreateDescriptorHeap as usize;
             v[15] = Device_GetDescriptorHandleIncrementSize as usize;
             v[16] = Device_CreateRootSignature as usize;
+            // console CopyDescriptorsSimple: the slot bytes in the title's heap
+            v[24] = Device_CopyDescriptorsSimple as usize;
             v[25] = Device_GetResourceAllocationInfo as usize;
             v[26] = Device_GetCustomHeapProperties as usize;
             v[27] = Device_CreateCommittedResource as usize;
@@ -1628,6 +1630,29 @@ unsafe extern "win64" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *co
 }
 unsafe extern "win64" fn Device_GetDescriptorHandleIncrementSize(_t: *mut NullObj, _ty: u32) -> u32 {
     32
+}
+/// Console device #24 `CopyDescriptorsSimple(n, dst, src, type)`: retail stages
+/// a descriptor with #70 and copies it into its binding heap here
+/// (`exe+0x4ecc87e`, n = 1, both handles in the shader-visible heap; 113 calls
+/// in one fresh-root run). A Linux handle is a host address inside a heap from
+/// [`Device_CreateDescriptorHeap`] and every slot is 32 bytes
+/// ([`Device_GetDescriptorHandleIncrementSize`]), so the copy is the slot bytes.
+/// A range outside the graphics pool (or a length overflow) is refused, never
+/// written.
+unsafe extern "win64" fn Device_CopyDescriptorsSimple(_t: *mut NullObj, n: u32, dst: u64, src: u64, _ty: u32) -> HRESULT {
+    let Some(bytes) = (n as usize).checked_mul(32).filter(|b| *b != 0) else {
+        return E_INVALIDARG;
+    };
+    let (dst, src) = (dst as usize, src as usize);
+    if !crate::hle::kernelx_linux::gfx_contains_range(dst, bytes) || !crate::hle::kernelx_linux::gfx_contains_range(src, bytes) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!("D3D12.X: CopyDescriptorsSimple({n}) outside the descriptor heaps: {src:#x} -> {dst:#x}");
+        }
+        return E_INVALIDARG;
+    }
+    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
+    S_OK
 }
 unsafe extern "win64" fn Device_CreateRootSignature(_t: *mut NullObj, _m: u32, b: *const c_void, l: usize, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     crate::gpu::shader::capture("rootsig", b as usize, l);
@@ -3510,6 +3535,49 @@ mod tests {
                 assert!(p < r as u64 || p >= r as u64 + big as u64, "heap at {p:#x} inside the reservation {r:?}");
             }
             assert_eq!(crate::hle::kernelx_linux::VirtualFree(r, 0, 0x8000), 1);
+        }
+    }
+
+    /// Retail's console device #24 `CopyDescriptorsSimple(n, dst, src, type)`:
+    /// `exe+0x4ecc87e` copies the descriptor #70 just staged (n = 1) into the
+    /// binding heap, 113 calls in one fresh-root run. On Linux a handle is a
+    /// host address in a heap from `Device_CreateDescriptorHeap`, and every slot
+    /// is 32 bytes (`GetDescriptorHandleIncrementSize`), so the call is a byte
+    /// copy of the slot range. RED before the slot is routed: the logging stub
+    /// answers S_OK and leaves the destination sentinel untouched.
+    #[test]
+    fn console_copy_descriptors_simple_copies_heap_slots() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let src = crate::hle::kernelx_linux::gfx_alloc_window0(3 * 32, 0x1_0000, true).expect("source heap range");
+            let dst = crate::hle::kernelx_linux::gfx_alloc_window0(3 * 32, 0x1_0000, true).expect("destination heap range");
+            let words = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444, 0x5555_5555, 0x6666_6666, 0x7777_7777, 0x8888_8888];
+            for (k, w) in words.iter().enumerate() {
+                (src as *mut u32).add(k).write_unaligned(*w);
+            }
+            std::ptr::write_bytes(dst as *mut u8, 0x5A, 3 * 32);
+
+            let copy: unsafe extern "win64" fn(*mut c_void, u32, u64, u64, u32) -> HRESULT =
+                std::mem::transmute(slot(dev, 24));
+            assert_eq!(copy(dev, 2, dst as u64, src as u64, 0), S_OK);
+            let got: [u32; 8] = std::ptr::read_unaligned(dst as *const [u32; 8]);
+            assert_eq!(got, words, "two 32-byte slots copied");
+            assert_eq!((dst as *const u32).add(16).read_unaligned(), 0x5A5A_5A5A, "the slot after the copied range is untouched");
+
+            // A destination outside the graphics pool is refused, not written.
+            let local = [0x5A5A_5A5Au32; 8];
+            assert_eq!(copy(dev, 1, local.as_ptr() as u64, src as u64, 0), E_INVALIDARG);
+            assert_eq!(local, [0x5A5A_5A5Au32; 8], "a refused copy writes nothing");
+        }
+    }
+
+    #[test]
+    fn console_copy_descriptors_simple_is_routed() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            assert_eq!(slot(dev, 24), Device_CopyDescriptorsSimple as usize);
         }
     }
 
