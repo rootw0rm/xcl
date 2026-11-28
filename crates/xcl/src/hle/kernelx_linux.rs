@@ -7774,6 +7774,53 @@ pub unsafe extern "win64" fn GetUserDefaultLocaleName(buf: *mut u16, len: i32) -
     REQUIRED
 }
 
+/// `LCID LocaleNameToLCID(LPCWSTR lpName, DWORD dwFlags)` — BCP-47 name to Windows
+/// LCID from a fixed table. `en-US` is both `GetUserDefaultLocaleName`'s answer and
+/// `LOCALE_NAME_USER_DEFAULT`; the title's locale init compares that name with
+/// `L"en-001"` and then converts it, so a real LCID takes the `wcslen`/UTF-8
+/// continuation instead of the old stub's early return. No OS locale backend: the
+/// table is deterministic for the static Linux exe.
+///
+/// `LOCALE_NAME_INVARIANT` is the empty string (0x007F),
+/// `LOCALE_NAME_SYSTEM_DEFAULT` is `!x-sys-default-locale` (0x0800), and a null name
+/// is `LOCALE_NAME_USER_DEFAULT` (the fixed `en-US`, 0x0409). Language-only names are
+/// neutral and need `LOCALE_ALLOW_NEUTRAL_NAMES` (0x80). Unknown names and flags
+/// outside 0x80 return 0 (`ERROR_INVALID_PARAMETER`).
+pub unsafe extern "win64" fn LocaleNameToLCID(name: *const u16, flags: u32) -> u32 {
+    const LOCALE_ALLOW_NEUTRAL_NAMES: u32 = 0x0080;
+    const LOCALE_INVARIANT: u32 = 0x007F;
+    const LOCALE_SYSTEM_DEFAULT: u32 = 0x0800;
+    const LCID_EN_US: u32 = 0x0409;
+    const NAMED: &[(&str, u32)] = &[("en-US", LCID_EN_US), ("en-GB", 0x0809), ("en-001", 0x2409)];
+    const NEUTRAL: &[(&str, u32)] = &[("en", 0x0009)];
+
+    if flags & !LOCALE_ALLOW_NEUTRAL_NAMES != 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(name) = from_wide_ptr(name) else {
+        set_error(ERROR_SUCCESS);
+        return LCID_EN_US;
+    };
+    let lcid = if name.is_empty() {
+        LOCALE_INVARIANT
+    } else if name.eq_ignore_ascii_case("!x-sys-default-locale") {
+        LOCALE_SYSTEM_DEFAULT
+    } else if let Some(&(_, lcid)) = NAMED.iter().find(|(n, _)| name.eq_ignore_ascii_case(n)) {
+        lcid
+    } else if flags & LOCALE_ALLOW_NEUTRAL_NAMES != 0 {
+        NEUTRAL.iter().find(|(n, _)| name.eq_ignore_ascii_case(n)).map_or(0, |&(_, lcid)| lcid)
+    } else {
+        0
+    };
+    if lcid == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+    } else {
+        set_error(ERROR_SUCCESS);
+    }
+    lcid
+}
+
 // ---------------------------------------------------------------------------------------
 // Startup: command line, process heap, module file names (Phase C step 11b)
 // ---------------------------------------------------------------------------------------
@@ -10633,6 +10680,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("WideCharToMultiByte", WideCharToMultiByte as usize),
         ("GetUserDefaultGeoName", GetUserDefaultGeoName as usize),
         ("GetUserDefaultLocaleName", GetUserDefaultLocaleName as usize),
+        ("LocaleNameToLCID", LocaleNameToLCID as usize),
     ]
 }
 
@@ -14947,6 +14995,43 @@ mod tests {
             assert_eq!(GetUserDefaultLocaleName(std::ptr::null_mut(), 0x55), 0);
             assert_eq!(GetUserDefaultLocaleName(buf.as_mut_ptr(), 0), 0);
             assert!(exports().iter().any(|(n, _)| *n == "GetUserDefaultLocaleName"));
+        }
+    }
+
+    #[test]
+    fn locale_name_to_lcid_maps_the_fixed_table() {
+        // Retail Step 83: the locale init at 0x142217550 converts the real
+        // GetUserDefaultLocaleName answer ("en-US") and only continues into its
+        // wcslen/UTF-8 path when the LCID is non-zero.
+        unsafe {
+            assert!(
+                exports().iter().any(|(n, _)| *n == "LocaleNameToLCID"),
+                "LocaleNameToLCID must be wired"
+            );
+            let call = |name: &str, flags: u32| {
+                let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                LocaleNameToLCID(w.as_ptr(), flags)
+            };
+            // BCP-47 names are case-insensitive.
+            assert_eq!(call("en-US", 0), 0x0409);
+            assert_eq!(call("EN-us", 0), 0x0409);
+            assert_eq!(call("en-GB", 0), 0x0809);
+            assert_eq!(call("en-001", 0), 0x2409);
+            // LOCALE_NAME_INVARIANT is the empty string.
+            assert_eq!(call("", 0), 0x007F);
+            // The predefined system-default name keeps its constant LCID.
+            assert_eq!(call("!x-sys-default-locale", 0), 0x0800);
+            // A null name is LOCALE_NAME_USER_DEFAULT: the fixed en-US user locale.
+            assert_eq!(LocaleNameToLCID(std::ptr::null(), 0), 0x0409);
+            // Language-only names are neutral: only returned with the flag.
+            assert_eq!(call("en", 0), 0);
+            assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
+            assert_eq!(call("en", 0x80), 0x0009);
+            // Unknown names and flags outside 0x80 fail with 0.
+            assert_eq!(call("xx-YY", 0), 0);
+            assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
+            assert_eq!(call("en-US", 0x40), 0);
+            assert_eq!(get_error(), ERROR_INVALID_PARAMETER);
         }
     }
 
