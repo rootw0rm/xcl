@@ -39,24 +39,9 @@ extern "system" {
     #[link_name = "GetAddrInfoExW"]
     #[allow(clippy::too_many_arguments)]
     fn real_getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32;
-    #[link_name = "gethostname"]
-    fn real_gethostname(name: *mut u8, len: i32) -> i32;
 }
 
-/// A name that resolves without a network: none (the local addresses), this machine's own
-/// name, localhost – a console without a network still answers these (a retail game asks for
-/// its own name and none at start).
-fn local_name(name: &str) -> bool {
-    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.starts_with("127.") || name == "::1" {
-        return true;
-    }
-    let mut buf = [0u8; 256];
-    let own = unsafe { real_gethostname(buf.as_mut_ptr(), buf.len() as i32) } == 0;
-    own && {
-        let n = buf.iter().position(|&b| b == 0).unwrap_or(0);
-        std::str::from_utf8(&buf[..n]).is_ok_and(|h| h.eq_ignore_ascii_case(name))
-    }
-}
+pub(crate) use super::net_names::local_name;
 
 pub fn enabled() -> bool {
     std::env::var("XCL_NETWORK").is_ok_and(|v| v.trim() == "0")

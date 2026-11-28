@@ -21,6 +21,10 @@ pub mod kernelx_linux;
 pub mod crt_linux;
 #[path = "hle/bcrypt_linux.rs"]
 pub mod bcrypt_linux;
+#[path = "hle/net_names.rs"]
+pub mod net_names;
+#[path = "hle/ws2_linux.rs"]
+pub mod ws2_linux;
 #[path = "hle/xgameruntime_linux.rs"]
 pub mod xgameruntime_linux;
 #[path = "hle/xgameruntime_api_linux.rs"]
@@ -76,6 +80,10 @@ pub const D3DCOMPILER47: &str = "d3dcompiler_47.dll";
 /// `BCryptGenRandom`, `BCryptCloseAlgorithmProvider`). The title imports these from
 /// `bcrypt.dll`, a Windows system DLL with no Linux twin.
 pub const BCRYPT: &str = "bcrypt.dll";
+
+/// Canonical name of the Linux Winsock name-resolution shim (`gethostname`,
+/// `getaddrinfo` family, `freeaddrinfo`). Sockets themselves stay stubs.
+pub const WS2: &str = "ws2_32.dll";
 
 /// Linux form: keep the name, store `0` as `Stub` metadata. The Windows form keeps
 /// `$name as usize`. Only one of the two is compiled (see `lib.rs` `#[path]`).
@@ -386,7 +394,7 @@ fn crt_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn build(config: &Config) -> Registry {
-    let modules = vec![
+    let mut modules = vec![
         HleModule::new(KERNELX, kernelx_exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll", "psapi.dll"]),
         HleModule::new(XGAMERUNTIME, xgameruntime_exports(), &[]),
         HleModule::new(D3D12X, d3d12x_exports(), &[]),
@@ -401,7 +409,12 @@ fn build(config: &Config) -> Registry {
         HleModule::new(GAMEINPUT, gameinput_exports(), &[]),
         HleModule::new(UCRT, crt_exports(), &[]),
         HleModule::new(BCRYPT, bcrypt_linux::exports(), &[]),
+        HleModule::new(WS2, ws2_linux::exports(), &[]),
     ];
+    // Step 85: the title imports `gethostname` as ws2_32 ordinal 57.
+    if let Some(ws2) = modules.iter().position(|m| m.name == WS2) {
+        modules[ws2].ordinals = ws2_linux::ordinals().into_iter().collect();
+    }
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
     for (pat, target) in &config.aliases {
@@ -426,6 +439,9 @@ fn build(config: &Config) -> Registry {
     // Step 82: the CNG randomness triple. `bcrypt.dll` is a Windows system DLL; the
     // route keeps any stray host/title `bcrypt.dll` from shadowing the shim.
     routes.push(("bcrypt.dll".into(), Route::Hle(idx(BCRYPT))));
+    // Step 85: Winsock name resolution. `WSAStartup` (ordinal 115) has no entry
+    // here, so it keeps the contained-success stub; the socket ordinals stay stubs.
+    routes.push(("ws2_32.dll".into(), Route::Hle(idx(WS2))));
     // Phase C frontier: the game ships its own CRT DLLs; their imports of each
     // other and of api-ms-win-crt-*/ucrtbase must resolve to the real
     // implementations in `crt_linux`, never to bundled GameDll code or logging
@@ -501,6 +517,7 @@ mod tests {
         assert_eq!(name("ucrtbase.dll"), None);
         assert_eq!(name("api-ms-win-crt-runtime-l1-1-0.dll"), None);
         assert_eq!(name("bcrypt.dll"), Some(BCRYPT));
+        assert_eq!(name("ws2_32.dll"), Some(WS2));
     }
 
     #[test]
@@ -516,6 +533,21 @@ mod tests {
             assert_eq!(m.name, BCRYPT);
             assert_ne!(addr, 0, "{name} must be real code, not a stub");
         }
+    }
+
+    #[test]
+    fn ws2_name_resolution_is_wired() {
+        // Step 85: the title's LAN probe calls gethostname (ordinal 57), resolves the
+        // returned node name and frees the list.
+        let r = build(&Config::default());
+        for name in ["gethostname", "getaddrinfo", "GetAddrInfoW", "GetAddrInfoExW", "freeaddrinfo"] {
+            let (m, addr) = r.find_any(name).unwrap_or_else(|| panic!("{name} must be wired"));
+            assert_eq!(m.name, "ws2_32.dll", "{name}");
+            assert_ne!(addr, 0, "{name} must be real code, not a stub");
+        }
+        let m = r.hle_for("ws2_32.dll").expect("ws2_32.dll must route to its HLE module");
+        assert_eq!(m.name, "ws2_32.dll");
+        assert_eq!(m.ordinals.get(&57), Some(&"gethostname"), "ordinal 57 is gethostname");
     }
 
     #[test]
@@ -582,6 +614,7 @@ mod tests {
                     || m.name == XG
                     || m.name == ACPHAL
                     || m.name == BCRYPT
+                    || m.name == WS2
                     || m.name == D3DCOMPILER47)
                     && addr != 0
                 {

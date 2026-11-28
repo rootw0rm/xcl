@@ -22,6 +22,7 @@ mod input_rules;
 pub mod kbm;
 pub mod kernelx;
 pub mod mfplat;
+pub mod net_names;
 pub mod netoff;
 pub mod opus;
 pub mod playstation;
