@@ -208,10 +208,9 @@ pub fn set_frame_interval(len_us: u32) -> HRESULT {
     S_FALSE
 }
 
-/// Device #79 twin: `E_INVALIDARG` without an interval, for type >= 3, for a
-/// nonzero type before the origin is scheduled, or when unscheduling the
-/// origin; `STARTED_CLOCK` when this call starts the clock, else `S_FALSE`.
-pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
+/// Shared #79 validation and schedule storage; `Ok(true)` when this call
+/// starts the clock. The caller decides whether a clock thread actually runs.
+fn schedule_state(ty: u32, offset_us: u32, flags: u32) -> Result<bool, HRESULT> {
     let unschedule = flags & UNSCHEDULE != 0;
     let mut c = CLOCK.lock().unwrap();
     if c.interval_us == 0
@@ -219,7 +218,7 @@ pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
         || (!c.active && ty != 0)
         || (unschedule && (ty == 0 || !c.scheduled[0]))
     {
-        return E_INVALIDARG;
+        return Err(E_INVALIDARG);
     }
     let started = !c.active;
     if started {
@@ -233,13 +232,35 @@ pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
         c.offset_us[ty as usize] = offset_us % c.interval_us.max(1);
     }
     c.generation += 1;
-    drop(c);
+    Ok(started)
+}
+
+/// Device #79 twin: `E_INVALIDARG` without an interval, for type >= 3, for a
+/// nonzero type before the origin is scheduled, or when unscheduling the
+/// origin; `STARTED_CLOCK` when this call starts the clock, else `S_FALSE`.
+pub fn schedule_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
+    let started = match schedule_state(ty, offset_us, flags) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     ensure_clock_thread();
     CLOCK_WAKE.notify_all();
     if started {
         STARTED_CLOCK
     } else {
         S_FALSE
+    }
+}
+
+/// Record-only #79 for a backend with no clock thread (the null device):
+/// the same validation and stored schedule as [`schedule_frame_event`], but
+/// nothing ever fires and no thread is started. [`wait_frame_event_immediate`]
+/// answers waits from that schedule.
+pub fn record_frame_event(ty: u32, offset_us: u32, flags: u32) -> HRESULT {
+    match schedule_state(ty, offset_us, flags) {
+        Ok(started) if started => STARTED_CLOCK,
+        Ok(_) => S_FALSE,
+        Err(e) => e,
     }
 }
 
@@ -379,6 +400,34 @@ fn clock_thread() {
     }
 }
 
+/// Common #80 gate: the event must be scheduled and an origin token input
+/// valid (`E_INVALIDARG` otherwise). Returns the current fire counter of `ty`.
+fn wait_ready(ty: u32, flags: u32, token_in: u64) -> Result<u64, HRESULT> {
+    let clock = CLOCK.lock().unwrap();
+    if (ty as usize) >= TYPES || !clock.scheduled[ty as usize] {
+        return Err(E_INVALIDARG);
+    }
+    if ty == 0
+        && token_in != 0
+        && (!ISSUED.lock().unwrap().iter().any(|e| e.0 == token_in)
+            || flags & TOKEN_ON_TIMEOUT != 0)
+    {
+        return Err(E_INVALIDARG);
+    }
+    Ok(clock.fired[ty as usize])
+}
+
+/// The origin token of an immediate wait: a fresh stamp at `now`, re-stamping
+/// a known token input. Types 1/2 carry no token.
+fn issue_origin_now(ty: u32, token_in: u64, token: &mut u64) {
+    if ty != 0 {
+        return;
+    }
+    let now = nanos();
+    LAST_ORIGIN.store(now, Ordering::Relaxed);
+    issue(token, token_in, now);
+}
+
 /// Device #80 twin: block until event `ty` fires (or `timeout_ms` elapses).
 /// `S_OK` names the fired event (`token` takes a fresh origin token,
 /// re-stamped when one is passed in); `S_FALSE` on timeout; `E_INVALIDARG`
@@ -386,26 +435,12 @@ fn clock_thread() {
 /// immediately with a fresh token, like Windows.
 pub fn wait_frame_event(ty: u32, timeout_ms: u32, flags: u32, token: &mut u64) -> HRESULT {
     let token_in = *token;
-    let start = {
-        let clock = CLOCK.lock().unwrap();
-        if (ty as usize) >= TYPES || !clock.scheduled[ty as usize] {
-            return E_INVALIDARG;
-        }
-        if ty == 0
-            && token_in != 0
-            && (!ISSUED.lock().unwrap().iter().any(|e| e.0 == token_in)
-                || flags & TOKEN_ON_TIMEOUT != 0)
-        {
-            return E_INVALIDARG;
-        }
-        clock.fired[ty as usize]
+    let start = match wait_ready(ty, flags, token_in) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
     if interval_override() == Some(0) {
-        let now = nanos();
-        if ty == 0 {
-            LAST_ORIGIN.store(now, Ordering::Relaxed);
-            issue(token, token_in, now);
-        }
+        issue_origin_now(ty, token_in, token);
         return S_OK;
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
@@ -430,6 +465,20 @@ pub fn wait_frame_event(ty: u32, timeout_ms: u32, flags: u32, token: &mut u64) -
         let origin = ORIGINS.lock().unwrap().pop_front().unwrap_or_else(nanos);
         issue(token, token_in, origin);
     }
+    S_OK
+}
+
+/// Device #80 on a backend with no clock thread (the null device): the same
+/// schedule/token validation as [`wait_frame_event`], then `S_OK` at once
+/// with a fresh origin token (`S_FALSE` is never returned). The null backend
+/// has no vblank and its presenter is not an event source, so a blocking wait
+/// would stall the title until the timeout for a frame that never fires.
+pub fn wait_frame_event_immediate(ty: u32, flags: u32, token: &mut u64) -> HRESULT {
+    let token_in = *token;
+    if let Err(e) = wait_ready(ty, flags, token_in) {
+        return e;
+    }
+    issue_origin_now(ty, token_in, token);
     S_OK
 }
 
@@ -521,5 +570,35 @@ mod tests {
         assert_eq!(frame_statistics(0xDEAD), Err(E_FAIL));
         assert_eq!(wait_frame_event(1, 10, 0, &mut 0), E_INVALIDARG, "type 1 idle");
         assert_eq!(set_frame_interval(0), S_FALSE, "stops the clock");
+    }
+
+    /// Step 77: the null device's record-only clock. The schedule validates
+    /// like the timer clock but no thread fires; immediate waits return at
+    /// once with fresh tokens and never take the blocking path.
+    #[test]
+    fn record_only_clock_never_blocks() {
+        let _serial = CLOCK_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(set_frame_interval(16667), S_FALSE);
+        assert_eq!(wait_frame_event_immediate(0, 0, &mut 0), E_INVALIDARG, "not scheduled");
+        assert_eq!(record_frame_event(3, 0, 0), E_INVALIDARG, "no type 3");
+        let hr = record_frame_event(0, 0, 0);
+        assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+        let mut t = 0u64;
+        let t0 = std::time::Instant::now();
+        assert_eq!(wait_frame_event_immediate(0, 0, &mut t), S_OK);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500), "must not block");
+        assert_ne!(t, 0, "a fresh origin token");
+        // a known token input is re-stamped in place, an unknown one refused
+        let mut t2 = t;
+        assert_eq!(wait_frame_event_immediate(0, 0, &mut t2), S_OK);
+        assert_eq!(t2, t, "re-stamped, not replaced");
+        let mut unknown = 0xDEAD_BEEFu64;
+        assert_eq!(wait_frame_event_immediate(0, 0, &mut unknown), E_INVALIDARG);
+        assert_eq!(wait_frame_event_immediate(1, 0, &mut 0), E_INVALIDARG, "type 1 idle");
+        assert_eq!(record_frame_event(1, 0, 0), S_FALSE);
+        assert_eq!(wait_frame_event_immediate(1, 0, &mut 0), S_OK);
+        assert_eq!(record_frame_event(0, 0, UNSCHEDULE), E_INVALIDARG, "the origin never unschedules");
+        assert_eq!(set_frame_interval(0), S_FALSE);
+        assert_eq!(wait_frame_event_immediate(0, 0, &mut 0), E_INVALIDARG, "stopped");
     }
 }

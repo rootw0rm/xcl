@@ -26,25 +26,21 @@
 //! (DrawIndexedX), queue
 //! #10 (ExecuteCommandLists: null asserts the record, Vulkan submits), null + Vulkan-list
 //! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, null + Vulkan-device AS SRV
-//! #18, Vulkan-device frame clock
-//! #78–#81 (Linux twin + ancillary routing) and Vulkan-queue #30 `PresentX`
-//! (real swapchain present, 1d(ii)); both devices answer the DXGI device
-//! IIDs with an adapter/output chain (GetAdapter/GetDesc/EnumOutputs, 1d
-//! follow-up; the null device since step 40). Null stays default behind
-//! `XCL_VULKAN_BACKEND`: unrouted slots keep logging stubs. No fake-success:
-//! a routed slot presents a real frame or stays an honest logging stub.
+//! #18, both devices' frame slots #78–#81 (Linux twin + ancillary routing;
+//! the null device records the schedule and its #80 never blocks — Step 77)
+//! and Vulkan-queue #30 `PresentX` (real swapchain present, 1d(ii)). Both
+//! devices answer the DXGI device IIDs with an adapter/output chain
+//! (GetAdapter/GetDesc/EnumOutputs, 1d follow-up; the null device since step
+//! 40). Null stays default behind `XCL_VULKAN_BACKEND`: unrouted slots keep
+//! logging stubs. No fake-success: a routed slot presents a real frame or
+//! stays an honest logging stub.
 //
-//! Step-146 note (2026-11-27): re-verified at `46f7a172` — queue #30 and
-//! device #78–#81 are still logging stubs (no `v[78..81]` / queue `v[30]`
-//! assignment below), and the retail abort path still issues zero d3d12
-//! calls (`SIGSEGV game_scarlett_master.exe+0x2237320`, 20 `called_stubs`
-//! with no d3d12 entry, `xcl.log` with no d3d12/PresentX/frame line, xgr
-//! exactly XAsync/XNetworking/XUser). Routing this slice moves nothing until
-//! the game advances past the abort, so it stays unrouted. Linux PresentX
-//! additionally needs a `frame_linux` twin (`hle/d3d12x/frame.rs` is
-//! Windows-only: `windows_sys` handles + waitable-timer clock thread) plus
-//! windowed present wiring — queued for when the frontier reaches a console
-//! slot call, not before.
+//! Step-146 note (historical, 2026-11-27 at `46f7a172`): queue #30 and device
+//! #78–#81 were logging stubs then. The frame slots are routed since Step 77
+//! (the null device with a record-only clock); queue #30 stays Vulkan-only.
+//! Retail's abort path issues no d3d12 calls before the pool-OOM frontier
+//! (`SIGTRAP +0x2219651` at Step 76) — the frame-path slots are exercised
+//! once the title starts presenting.
 
 #![allow(non_snake_case)]
 
@@ -496,10 +492,10 @@ fn vtable(kind: Kind) -> *const usize {
         v[13] = Vulkan_CheckFeatureSupport as usize;
         v[18] = Vulkan_CreateShaderResourceView as usize;
         v[73] = Vulkan_CreateCommandListX as usize;
-        v[78] = Vulkan_SetFrameIntervalX as usize; // 1d(i) frame clock
-        v[79] = Vulkan_ScheduleFrameEventX as usize;
-        v[80] = Vulkan_WaitFrameEventX as usize;
-        v[81] = Vulkan_GetFrameStatisticsX as usize;
+        v[78] = Frame_SetFrameIntervalX as usize; // 1d(i) frame clock
+        v[79] = Frame_ScheduleFrameEventX as usize;
+        v[80] = Frame_WaitFrameEventX as usize;
+        v[81] = Frame_GetFrameStatisticsX as usize;
     }
     if kind == Kind::VulkanList {
         v[7] = VulkanList_GetDevice as usize;
@@ -569,6 +565,12 @@ fn vtable(kind: Kind) -> *const usize {
     // needed) so the title's `raytracing_surface` leg 2 passes by default.
     if kind == Kind::Device {
         v[18] = Vulkan_CreateShaderResourceView as usize;
+        // Step 77: the frame slots record the console schedule but never
+        // block — the null device has no vblank source and no presenter clock.
+        v[78] = Frame_SetFrameIntervalX as usize;
+        v[79] = Null_ScheduleFrameEventX as usize;
+        v[80] = Null_WaitFrameEventX as usize;
+        v[81] = Frame_GetFrameStatisticsX as usize;
     }
     if kind == Kind::VulkanQueue {
         v[30] = Queue_PresentX as usize; // 1d(ii) real present
@@ -2801,18 +2803,20 @@ unsafe extern "win64" fn Device_UnregisterPagePoolX(_t: *mut NullObj, pool: u64)
     }
 }
 
-/// Frame clock slots on the Vulkan device (1d(i)): thin adapters over the
-/// Linux twin (`d3d12x_frame_linux`) with the title's ancillary handles routed
-/// at schedule time. Signatures mirror the title's raw vtable calls
-/// (`present_x_frame`), return codes the Windows twin's.
+/// Frame clock slots #78–#81: thin adapters over the Linux twin
+/// (`d3d12x_frame_linux`) with the title's ancillary handles routed at
+/// schedule time. Signatures mirror the title's raw vtable calls
+/// (`present_x_frame`), return codes the Windows twin's. The Vulkan device
+/// runs the timer clock; the null device records the same schedule but waits
+/// never block (see [`Null_WaitFrameEventX`]).
 
 // device #78 SetFrameIntervalX(output, length µs, periodicity, flags)
-unsafe extern "win64" fn Vulkan_SetFrameIntervalX(_t: *mut NullObj, _out: *mut c_void, len_us: u32, _per: u32, _fl: u32) -> HRESULT {
+unsafe extern "win64" fn Frame_SetFrameIntervalX(_t: *mut NullObj, _out: *mut c_void, len_us: u32, _per: u32, _fl: u32) -> HRESULT {
     crate::hle::d3d12x_frame_linux::set_frame_interval(len_us)
 }
 
 // device #79 ScheduleFrameEventX(type, offset µs, ancillary, flags)
-unsafe extern "win64" fn Vulkan_ScheduleFrameEventX(_t: *mut NullObj, ty: u32, off_us: u32, block: *const u8, flags: u32) -> HRESULT {
+unsafe extern "win64" fn Frame_ScheduleFrameEventX(_t: *mut NullObj, ty: u32, off_us: u32, block: *const u8, flags: u32) -> HRESULT {
     // UNSCHEDULE = 1, like the Windows twin
     let hr = crate::hle::d3d12x_frame_linux::register_ancillary(ty, block, flags & 1 != 0);
     if hr != S_OK {
@@ -2821,8 +2825,17 @@ unsafe extern "win64" fn Vulkan_ScheduleFrameEventX(_t: *mut NullObj, ty: u32, o
     crate::hle::d3d12x_frame_linux::schedule_frame_event(ty, off_us, flags)
 }
 
+// device #79 on the null device: record the schedule, start no clock thread.
+unsafe extern "win64" fn Null_ScheduleFrameEventX(_t: *mut NullObj, ty: u32, off_us: u32, block: *const u8, flags: u32) -> HRESULT {
+    let hr = crate::hle::d3d12x_frame_linux::register_ancillary(ty, block, flags & 1 != 0);
+    if hr != S_OK {
+        return hr;
+    }
+    crate::hle::d3d12x_frame_linux::record_frame_event(ty, off_us, flags)
+}
+
 // device #80 WaitFrameEventX(type, timeout ms, ancillary, flags, token in/out)
-unsafe extern "win64" fn Vulkan_WaitFrameEventX(_t: *mut NullObj, ty: u32, timeout_ms: u32, _block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
+unsafe extern "win64" fn Frame_WaitFrameEventX(_t: *mut NullObj, ty: u32, timeout_ms: u32, _block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
     // the title may pass no token storage; the wait still paces the frame
     let mut t = if token.is_null() { 0 } else { *token };
     let hr = crate::hle::d3d12x_frame_linux::wait_frame_event(ty, timeout_ms, flags, &mut t);
@@ -2832,8 +2845,18 @@ unsafe extern "win64" fn Vulkan_WaitFrameEventX(_t: *mut NullObj, ty: u32, timeo
     hr
 }
 
+// device #80 on the null device: answer at once with a fresh origin token.
+unsafe extern "win64" fn Null_WaitFrameEventX(_t: *mut NullObj, ty: u32, _timeout_ms: u32, _block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
+    let mut t = if token.is_null() { 0 } else { *token };
+    let hr = crate::hle::d3d12x_frame_linux::wait_frame_event_immediate(ty, flags, &mut t);
+    if !token.is_null() {
+        *token = t;
+    }
+    hr
+}
+
 // device #81 GetFrameStatisticsX(token, type, count in/out, statistics)
-unsafe extern "win64" fn Vulkan_GetFrameStatisticsX(_t: *mut NullObj, token: u64, ty: u32, count: *mut u32, stats: *mut u8) -> HRESULT {
+unsafe extern "win64" fn Frame_GetFrameStatisticsX(_t: *mut NullObj, token: u64, ty: u32, count: *mut u32, stats: *mut u8) -> HRESULT {
     if count.is_null() || stats.is_null() {
         return E_INVALIDARG;
     }
@@ -5757,9 +5780,13 @@ mod tests {
             let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
             let mut ndev = std::ptr::null_mut();
             assert_eq!(create_device_for(&null_sel, None, &mut ndev), S_OK);
+            // Step 77: the null device routes the frame slots too, with a
+            // record-only clock that never blocks (its own test below).
             for i in [78usize, 79, 80, 81] {
-                let name = crate::stubs::info_of_stub(slot(ndev, i)).map(|s| s.name.as_str()).unwrap_or("");
-                assert_eq!(name, format!("ID3D12Device::#{i}"), "null slot {i} stays a stub");
+                assert!(
+                    crate::stubs::info_of_stub(slot(ndev, i)).is_none(),
+                    "null slot {i} is routed"
+                );
             }
             let vd = new_obj(Kind::VulkanDevice);
             let vdp = vd as *mut c_void;
@@ -5840,6 +5867,91 @@ mod tests {
             );
             assert!(origin > 0 && origin <= flip);
             assert_eq!(set(vdp, std::ptr::null_mut(), 0, 0, 0), S_FALSE);
+        }
+    }
+
+    #[test]
+    fn null_device_frame_clock_records_and_never_blocks() {
+        // Step 77: the null device has no vblank source and its presenter does
+        // not drive the clock, so #78/#79 record the console schedule and #80
+        // answers at once with a fresh origin token. A blocking wait here would
+        // stall the title on an event nothing fires.
+        let _serial = crate::hle::d3d12x_frame_linux::CLOCK_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&null_sel, None, &mut dev), S_OK);
+            for i in [78usize, 79, 80, 81] {
+                assert!(
+                    crate::stubs::info_of_stub(slot(dev, i)).is_none(),
+                    "null slot {i} is routed"
+                );
+            }
+            type SetIv = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, u32) -> HRESULT;
+            let set: SetIv = std::mem::transmute(slot(dev, 78));
+            type Sched = unsafe extern "win64" fn(*mut c_void, u32, u32, *const u8, u32) -> HRESULT;
+            let sched: Sched = std::mem::transmute(slot(dev, 79));
+            type Wait = unsafe extern "win64" fn(*mut c_void, u32, u32, *const u8, u32, *mut u64) -> HRESULT;
+            let wait: Wait = std::mem::transmute(slot(dev, 80));
+            type Stats = unsafe extern "win64" fn(*mut c_void, u64, u32, *mut u32, *mut u8) -> HRESULT;
+            let stats: Stats = std::mem::transmute(slot(dev, 81));
+
+            assert_eq!(set(dev, std::ptr::null_mut(), 16000, 1, 0), E_INVALIDARG, "off-display interval");
+            assert_eq!(set(dev, std::ptr::null_mut(), 16667, 1, 0), S_FALSE);
+            let mut token = 0u64;
+            assert_eq!(wait(dev, 0, 10, std::ptr::null(), 0, &mut token), E_INVALIDARG, "not scheduled");
+            let hr = sched(dev, 0, 0, std::ptr::null(), 0);
+            assert!(hr == S_FALSE || hr == 0x1000_0000, "{hr:#x}");
+            let t0 = std::time::Instant::now();
+            assert_eq!(wait(dev, 0, 5000, std::ptr::null(), 0, &mut token), S_OK);
+            let ms = t0.elapsed().as_millis();
+            assert!(ms < 500, "the null clock must not block ({ms} ms)");
+            assert_ne!(token, 0, "a fresh origin token");
+            // #81 before any flip: honest E_FAIL, no statistics written
+            let (mut n, mut st) = (1u32, [0u8; 0x40]);
+            assert_eq!(stats(dev, token, 0, &mut n, st.as_mut_ptr()), E_FAIL);
+            assert_eq!(n, 0);
+            // the null queue's PresentX (#32) records the flip; the adapter names it
+            crate::hle::d3d12x_frame_linux::mark_flipped(token);
+            assert_eq!(stats(dev, token, 0, &mut n, st.as_mut_ptr()), S_OK);
+            assert_eq!(n, 1);
+            let (origin, flip) = (
+                i64::from_le_bytes(st[0x10..0x18].try_into().unwrap()),
+                i64::from_le_bytes(st[0x18..0x20].try_into().unwrap()),
+            );
+            assert!(origin > 0 && origin <= flip, "{origin} {flip}");
+            assert_eq!(wait(dev, 1, 10, std::ptr::null(), 0, &mut 0u64), E_INVALIDARG, "type 1 idle");
+            assert_eq!(set(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE);
+            assert_eq!(wait(dev, 0, 10, std::ptr::null(), 0, &mut 0u64), E_INVALIDARG, "stopped");
+        }
+    }
+
+    #[test]
+    fn queue_31_and_allocator_9_stay_unmodelled_stubs() {
+        // Step 77: queue #31 takes GPU virtual addresses (not COM lists) and
+        // allocator #9 is past the public 0..8 chain; neither semantic is
+        // measured, so both stay honest logging stubs. A later route that
+        // assumed PC #31/#9 would fault on the measured shapes.
+        unsafe {
+            let q = new_obj(Kind::CommandQueue) as *mut c_void;
+            let a = new_obj(Kind::CommandAllocator) as *mut c_void;
+            assert_eq!(
+                crate::stubs::info_of_stub(slot(q, 31)).map(|s| s.name.as_str()),
+                Some("ID3D12CommandQueue::#31")
+            );
+            assert_eq!(
+                crate::stubs::info_of_stub(slot(a, 9)).map(|s| s.name.as_str()),
+                Some("ID3D12CommandAllocator::#9")
+            );
+            // The measured shapes: a VA batch on the queue, (callback, owner,
+            // offset) on the allocator. Both answer S_OK without dereferencing.
+            type Batch = unsafe extern "win64" fn(*mut c_void, u32, *const usize, u64, u32, u32) -> HRESULT;
+            let batch: Batch = std::mem::transmute(slot(q, 31));
+            let vas = [0x1_0000_0000usize, 0x1_2345_0000usize];
+            assert_eq!(batch(q, 2, vas.as_ptr(), 0x5678, 0x1440, 0), 0);
+            type Alloc9 = unsafe extern "win64" fn(*mut c_void, usize, *mut c_void, usize) -> HRESULT;
+            let alloc9: Alloc9 = std::mem::transmute(slot(a, 9));
+            assert_eq!(alloc9(a, 0x1_4555_df10, q, 0x30), 0);
         }
     }
 
