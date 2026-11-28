@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[path = "xgameruntime/gdk_table.rs"]
@@ -50,6 +50,8 @@ const fn g(v: u128) -> Guid {
 }
 
 pub const XUSER: Guid = g(0x01acd177_91f9_4763_a38e_ccbb55ce32e0);
+/// the closed-caption / speech family (`XClosedCaption*`): the GDK table's "XClosed"
+const XCLOSED: Guid = g(0x3e241977_6237_41e9_8559_102c2d9983f1);
 /// interface of XUserGetGamertag (with a gamertag component): its own vtable
 #[cfg_attr(not(test), allow(dead_code))]
 const XUSER_GAMERTAG_IID: Guid = g(0xcef4fac0_7676_4a94_a119_4c43f9eb5b74);
@@ -346,6 +348,79 @@ fn layout(c: Class) -> Vec<Iface> {
         .collect()
 }
 
+
+// ---------------------------------------------------------------------------------------
+// XClosed (XAccessibility): closed-caption properties and high contrast
+// ---------------------------------------------------------------------------------------
+//
+// Retail queries this class at startup; before it was answered the title logged
+// `XClosed: missing`, raised `XErrorReport 0x89240107` ("missing required
+// dependencies") and entered its runtime-shutdown path, leaving a dangling host
+// pointer. The properties are the Windows twin's C-locale defaults; the host has no
+// high-contrast scheme, so the mode is OFF.
+
+#[repr(C, align(4))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XColor {
+    pub a: u8,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/// `XClosedCaptionProperties` (`XAccessibility.h`, 28 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XClosedCaptionProperties {
+    pub background_color: XColor,
+    pub font_color: XColor,
+    pub window_color: XColor,
+    pub font_edge_attribute: u32,
+    pub font_style: u32,
+    pub font_scale: f32,
+    pub enabled: u8,
+    pub _pad: [u8; 3],
+}
+
+static CLOSED_CAPTION_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn closed_caption_properties(enabled: bool) -> XClosedCaptionProperties {
+    XClosedCaptionProperties {
+        background_color: XColor { a: 0xFF, r: 0x00, g: 0x00, b: 0x00 },
+        font_color: XColor { a: 0xFF, r: 0xFF, g: 0xFF, b: 0xFF },
+        window_color: XColor { a: 0x00, r: 0x00, g: 0x00, b: 0x00 },
+        font_edge_attribute: 0,
+        font_style: 0,
+        font_scale: 1.0,
+        enabled: u8::from(enabled),
+        _pad: [0; 3],
+    }
+}
+
+unsafe extern "win64" fn closed_caption_get(properties: *mut XClosedCaptionProperties) -> HRESULT {
+    if properties.is_null() {
+        return E_INVALIDARG;
+    }
+    let enabled = CLOSED_CAPTION_ENABLED.load(Ordering::Acquire);
+    std::ptr::write(properties, closed_caption_properties(enabled));
+    S_OK
+}
+
+unsafe extern "win64" fn closed_caption_set(enabled: u8) -> HRESULT {
+    CLOSED_CAPTION_ENABLED.store(enabled != 0, Ordering::Release);
+    S_OK
+}
+
+/// `XHighContrastGetMode(&mode)`: Linux has no high-contrast scheme; `OFF` is the real
+/// answer, not a failure.
+unsafe extern "win64" fn high_contrast_get(mode: *mut u32) -> HRESULT {
+    if mode.is_null() {
+        return E_INVALIDARG;
+    }
+    mode.write(0);
+    S_OK
+}
+
 fn classes() -> Vec<Class> {
     vec![
         Class { name: "XUser", clsid: XUSER, impls: xuser() },
@@ -356,6 +431,16 @@ fn classes() -> Vec<Class> {
         Class { name: "XGame", clsid: XGAME, impls: xgame() },
         Class { name: "XSystem", clsid: XSYSTEM, impls: xsystem() },
         Class { name: "XSystemAnalytics", clsid: XANALYTICS, impls: named![XSystemGetAnalyticsInfo] },
+        // accessibility / closed captions: the title queries this class during startup
+        Class {
+            name: "XClosed",
+            clsid: XCLOSED,
+            impls: vec![
+                ("XClosedCaptionGetProperties", closed_caption_get as usize),
+                ("XClosedCaptionSetEnabled", closed_caption_set as usize),
+                ("XHighContrastGetMode", high_contrast_get as usize),
+            ],
+        },
         Class { name: "XGameRuntimeFeature", clsid: XFEATURE, impls: vec![("XGameRuntimeIsFeatureAvailable", xr::XGameRuntimeIsFeatureAvailable as usize)] },
         Class {
             name: "XDisplay",
@@ -1428,6 +1513,40 @@ mod tests {
             // A null out-parameter is rejected, never dereferenced.
             assert_eq!(f(o, 0, std::ptr::null_mut()), E_INVALIDARG);
             assert_eq!(std::mem::size_of::<XDisplayHdrModeInfo>(), 16);
+        }
+    }
+
+    /// The startup closed-caption query (`QueryApiImpl 3e241977…/d722b373…`) must
+    /// answer with an XCL object: before this the title logged `XClosed: missing`,
+    /// raised `XErrorReport 0x89240107` and shut its runtime down.
+    #[test]
+    fn xclosed_accessibility_query_answers_with_real_captions() {
+        let (clsid, iid, slot_no) = slot_in_table("XClosedCaptionGetProperties");
+        assert_eq!(clsid, XCLOSED);
+        assert_eq!(iid, g(0xd722b373_8c4d_4692_9e51_d6ad9b37aa7d));
+        unsafe {
+            let (hr, o) = query(clsid, iid);
+            assert_eq!(hr, S_OK);
+            assert!(!o.is_null());
+            assert!(stats().apis.values().any(|v| v.starts_with("XClosed: XCL")), "{:?}", stats().apis);
+            let get: unsafe extern "win64" fn(*mut c_void, *mut XClosedCaptionProperties) -> HRESULT = slot(o, slot_no);
+            let set: unsafe extern "win64" fn(*mut c_void, u8) -> HRESULT =
+                slot(o, slot_in_table("XClosedCaptionSetEnabled").2);
+            let hc: unsafe extern "win64" fn(*mut c_void, *mut u32) -> HRESULT =
+                slot(o, slot_in_table("XHighContrastGetMode").2);
+            let mut p: XClosedCaptionProperties = std::mem::zeroed();
+            assert_eq!(get(o, &mut p), S_OK);
+            assert_eq!(p, closed_caption_properties(false));
+            assert_eq!(set(o, 1), S_OK);
+            assert_eq!(get(o, &mut p), S_OK);
+            assert_eq!(p.enabled, 1);
+            assert_eq!(set(o, 0), S_OK);
+            assert_eq!(get(o, std::ptr::null_mut()), E_INVALIDARG);
+            let mut mode = 9u32;
+            assert_eq!(hc(o, &mut mode), S_OK);
+            assert_eq!(mode, 0, "the host has no high-contrast scheme");
+            assert_eq!(hc(o, std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(std::mem::size_of::<XClosedCaptionProperties>(), 28);
         }
     }
 
