@@ -17,9 +17,10 @@ partial copy. The tail is therefore never written: pre-filling it with a
 sentinel proves all 1579 remaining dwords keep the sentinel. Entries
 `0..=0x7fd` are a coherent strictly increasing offset run (`0x9d8`, `0x9e0`,
 … `0x16f00`); entry `0x800` (`0xdb098fcc`) is heap leftovers, and
-`base + off - 8` faults. The fix is inside the title's stream layer; zeroing
-the allocation would move the fault to `base - 8` (`off = 0` wraps to
-`0xfffffff8`), not unblock the walk.
+`base + off - 8` faults. The measured stop is inside the title's stream
+layer; zeroing the allocation would not unblock the walk: `off = 0` gives
+`r9d = 0xfffffff8`, so the access is `base + 4 GiB - 8`, still outside the
+mapped base.
 
 ## File attribution correction
 
@@ -96,8 +97,8 @@ the request each time (the refill right after the partial copy is an
 The allocation is also not XCL's: the title's `operator new`
 (`exe+0x144f97130 → 0x144d9c170 → 0x140003a10`) goes to the title's own heap
 object at `gs:[0x58]`; it reuses the freed phase-1 block. XCL's
-`VirtualAlloc`/`XMemAlloc` commit zeroing is not on this path, and a
-`VirtualAlloc` fill would not help (`off = 0` → `base - 8`).
+`VirtualAlloc`/`XMemAlloc` commit zeroing is not on this path, and a fill
+would not help (`off = 0` indexes `base + 4 GiB - 8`).
 
 ## Verdict and next input
 
