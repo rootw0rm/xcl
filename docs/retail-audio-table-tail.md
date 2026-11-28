@@ -50,8 +50,9 @@ phase-1 bytes.
 At the phase-2 read (`exe+0x25a0840`, helper `0x1451d2260`):
 
 ```
-reader:  [0x10]=0x1000-byte page buffer, [0x18]=0x5e004,
-         [0x20]=4 (count consumed), [0x24]=0x1000, [0x28]=0x1000
+reader:  [0x10]=page base, [0x18]=0x5e004,
+         [0x20]=4 (count consumed), [0x24]=0x1000, [0x28]=0x1000;
+         [0x8] is the 0x1000-byte page buffer handed to `xsgetn`
 source:  [reader+0] -> object with vtable 0x1462fd480,
          xsgetn = [vtable+0x50] = 0x140314330, fast path 0x141330560
 ```
@@ -121,16 +122,18 @@ the request each time (the refill right after the partial copy is an
 (`0`, `0x1000`, `0xf000`, `0x10000`, `0x1b236000`, …).
 
 The allocation is also not XCL's: the title's `operator new`
-(`exe+0x144f97130 → 0x144d9c170 → 0x140003a10`) goes to the title's own heap
-object at `gs:[0x58]`; it reuses the freed phase-1 block. XCL's
-`VirtualAlloc`/`XMemAlloc` commit zeroing is not on this path, and a fill
-would not help (`off = 0` indexes `base + 4 GiB - 8`).
+(`0x144f97130`, i.e. `exe+0x4f97130` → `0x144d9c130` → `0x140003a10`) goes to
+the title's own heap object at `gs:[0x58]`; it reuses the freed phase-1 block.
+XCL's `VirtualAlloc`/`XMemAlloc` commit zeroing is not on this path, and a
+fill would not help (`off = 0` indexes `base + 4 GiB - 8`).
 
 ## Verdict and next input
 
-Title-side: the page-cached stream (helper `0x1451d2260` direct path plus
-source `xsgetn` `0x140314330`/`0x141330560`) copies one `0xFFC` fragment for
-a `10416`-byte request and reports success. The next consumer-visible input
+Title-side for the page-cached helper, but only at that layer: the source
+`xsgetn` returns success because its block decode goes through DirectStorage,
+and XCL's Linux slice refused the block's `ZlibDecompress` request. Step 55
+(`docs/retail-stream-short-copy.md`) found and fixed that refusal; this
+document's title-side wording covers the helper only. The next consumer-visible input
 is that stream's refill/copy contract; the backing `ReadFile`s already carry
 the full 8192 bytes.
 
