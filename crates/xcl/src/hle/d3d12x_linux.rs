@@ -91,7 +91,6 @@ pub enum Kind {
     QueryHeap,
     CommandSignature,
     PipelineLibrary,
-    StateObject,
     Blob,
     /// A console IDXGIDevice wrapper (1d follow-up): answers the DXGI device
     /// IIDs for a Vulkan or null device; its `value` holds the device object.
@@ -120,7 +119,6 @@ impl Kind {
             Kind::QueryHeap => "ID3D12QueryHeap",
             Kind::CommandSignature => "ID3D12CommandSignature",
             Kind::PipelineLibrary => "ID3D12PipelineLibrary",
-            Kind::StateObject => "ID3D12StateObject",
             Kind::Blob => "ID3DBlob",
             Kind::DxgiDevice => "IDXGIDevice",
             Kind::DxgiAdapter => "IDXGIAdapter",
@@ -214,7 +212,8 @@ fn vtable(kind: Kind) -> *const usize {
             v[55] = Device_CreateDerivedPipelineStateX as usize; // console derived PSO
             v[56] = Device_SerializePipelineStateX as usize; // E_ACCESSDENIED like the console
             v[60] = Device_CreateGraphicsPipelineStateX as usize; // console PSO
-            v[62] = Device_CreatePipelineState4 as usize; // CreateStateObject (Device5)
+            // console compute PSO (XboxBvhBuilder): (desc, a, b, riid, out) — PC #62 = CreateStateObject
+            v[62] = Device_CreateComputePipelineStateX as usize;
             v[73] = Device_CreateCommandListX as usize; // console list (DMA)
             v[74] = Device_RegisterPagePoolX as usize;
             v[75] = Device_UnregisterPagePoolX as usize;
@@ -538,7 +537,21 @@ unsafe extern "win64" fn Device_CreateCommandQueue(this: *mut NullObj, _d: *cons
 unsafe extern "win64" fn Device_CreateCommandAllocator(_t: *mut NullObj, _ty: u32, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     out_obj(ppv, Kind::CommandAllocator)
 }
-unsafe extern "win64" fn Device_CreatePipelineState4(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+/// Console device #62 `CreateComputePipelineState(desc, a, b, riid, out)`: two
+/// arguments more than the PC method (XboxBvhBuilder passes NULL, NULL), so the
+/// out pointer is the sixth argument and must never be taken from `r9`.
+unsafe extern "win64" fn Device_CreateComputePipelineStateX(
+    _t: *mut NullObj,
+    d: *const u8,
+    a: usize,
+    b: usize,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if a != 0 || b != 0 {
+        crate::xlog_warn!("CreateComputePipelineState (console, slot 62): unknown parameters {a:#x} {b:#x} ignored");
+    }
+    capture_compute_desc(d);
     out_obj(ppv, Kind::PipelineState)
 }
 
@@ -3059,6 +3072,37 @@ mod tests {
             assert_ne!(pool, u32::MAX);
             assert_eq!(unreg(dev, pool as u64), S_OK);
             assert!(unreg(dev, pool as u64) < 0);
+        }
+    }
+
+    /// Console device slot 62 is `CreateComputePipelineState` with two extra
+    /// arguments (desc, a, b, riid, out) — XboxBvhBuilder's call order — not the
+    /// PC `CreateStateObject`. The out pointer is the sixth argument; before the
+    /// console mapping `r9` (b) was read as `ppv`, so a null b gave S_FALSE and
+    /// left the caller's out slot unwritten.
+    #[test]
+    fn console_compute_pso_slot62_writes_the_sixth_argument() {
+        type ComputeX = unsafe extern "win64" fn(
+            *mut c_void,
+            *const u8,
+            usize,
+            usize,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> HRESULT;
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create: ComputeX = std::mem::transmute(slot(dev, 62));
+            let desc = [0u8; 0x38]; // D3D12_COMPUTE_PIPELINE_STATE_DESC
+            let mut out = std::ptr::null_mut();
+            assert_eq!(create(dev, desc.as_ptr(), 0, 0, std::ptr::null(), &mut out), S_OK);
+            assert!(!out.is_null(), "slot 62 did not write the sixth argument");
+            assert_eq!((*(out as *mut NullObj)).kind, Kind::PipelineState);
+            let mut out2 = std::ptr::null_mut();
+            assert_eq!(create(dev, desc.as_ptr(), 1, 1, std::ptr::null(), &mut out2), S_OK);
+            assert!(!out2.is_null(), "the two console extras shifted the out argument");
+            assert_eq!((*(out2 as *mut NullObj)).kind, Kind::PipelineState);
         }
     }
 
