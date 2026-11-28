@@ -1667,6 +1667,51 @@ pub unsafe extern "win64" fn strncpy(dst: *mut u8, src: *const u8, n: usize) -> 
     dst
 }
 
+/// `errno_t strncpy_s(dest, destsz, src, count)` — bounded copy that always
+/// NUL-terminates when it writes (MSVC Annex-K rules, retail Step 79):
+/// a null `dest`, a zero `destsz`, a null `src`, or a source that cannot fit
+/// in `destsz` writes `dest[0] = 0` where possible, sets `errno = EINVAL`
+/// and returns `EINVAL`; `count == 0` writes the terminator only; otherwise
+/// it copies `min(count, strlen(src))` bytes and the terminator, so
+/// `count < destsz` truncates instead of overflowing. Never writes past
+/// `destsz`, and never pads the tail (unlike `strncpy`).
+pub unsafe extern "win64" fn strncpy_s(
+    dest: *mut u8,
+    destsz: usize,
+    src: *const u8,
+    count: usize,
+) -> i32 {
+    if dest.is_null() || destsz == 0 {
+        set_win_errno(EINVAL_WIN);
+        return EINVAL_WIN;
+    }
+    if count == 0 {
+        *dest = 0;
+        return 0;
+    }
+    if src.is_null() {
+        *dest = 0;
+        set_win_errno(EINVAL_WIN);
+        return EINVAL_WIN;
+    }
+    if count >= destsz {
+        // The whole source (not just `count`) must fit with its terminator.
+        let len = strnlen(src, destsz);
+        if len == destsz {
+            *dest = 0;
+            set_win_errno(EINVAL_WIN);
+            return EINVAL_WIN;
+        }
+        std::ptr::copy_nonoverlapping(src, dest, len);
+        *dest.add(len) = 0;
+        return 0;
+    }
+    let len = strnlen(src, count);
+    std::ptr::copy_nonoverlapping(src, dest, len);
+    *dest.add(len) = 0;
+    0
+}
+
 /// `char* strcat(dst, src)` — append `src` (incl. NUL) after `dst`'s NUL, return `dst`.
 pub unsafe extern "win64" fn strcat(dst: *mut u8, src: *const u8) -> *mut u8 {
     let mut d = 0;
@@ -4600,6 +4645,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("qsort", qsort as usize),
         ("strcpy", strcpy as usize),
         ("strncpy", strncpy as usize),
+        ("strncpy_s", strncpy_s as usize),
         ("strcat", strcat as usize),
         ("strncat", strncat as usize),
         ("strchr", strchr as usize),
@@ -5128,6 +5174,65 @@ mod tests {
             wmemcpy(wzero.as_mut_ptr(), wsrc2.as_ptr(), 0);
             wmemmove(wzero.as_mut_ptr(), wsrc2.as_ptr(), 0);
             assert_eq!(&wzero, &[9, 9]);
+        }
+    }
+
+    #[test]
+    fn strncpy_s_copies_bounded_and_terminates() {
+        // Retail Step 79: api-ms-win-crt-string!strncpy_s (IAT 0x146794850)
+        // is called 35x/run; the auto-stub returned 0 without copying, so the
+        // callers hashed an all-zero 256-byte stack buffer and compared it
+        // with a constant name id.
+        assert!(
+            exports().iter().any(|(n, _)| *n == "strncpy_s"),
+            "strncpy_s must be wired"
+        );
+        type StrncpyS = unsafe extern "win64" fn(*mut u8, usize, *const u8, usize) -> i32;
+        let addr = exports()
+            .into_iter()
+            .find_map(|(n, a)| (n == "strncpy_s").then_some(a))
+            .expect("export");
+        let copy: StrncpyS = unsafe { std::mem::transmute(addr) };
+        unsafe {
+            *_errno() = 0;
+            // A short source copies with its NUL and pads nothing (unlike
+            // strncpy); the bytes after the NUL keep their sentinel.
+            let mut dst = [0xAAu8; 8];
+            assert_eq!(copy(dst.as_mut_ptr(), 8, b"hi\0".as_ptr(), 7), 0);
+            assert_eq!(&dst[..3], b"hi\0");
+            assert_eq!(&dst[3..], &[0xAAu8; 5]);
+            // count < destsz truncates at count and NUL-terminates there.
+            let mut t = [0xAAu8; 8];
+            assert_eq!(copy(t.as_mut_ptr(), 8, b"abcdef\0".as_ptr(), 3), 0);
+            assert_eq!(&t[..4], b"abc\0");
+            assert_eq!(t[4], 0xAA);
+            // count >= destsz with a source that fits is still a success.
+            let mut s = [0xAAu8; 4];
+            assert_eq!(copy(s.as_mut_ptr(), 4, b"ab\0".as_ptr(), 9), 0);
+            assert_eq!(&s[..3], b"ab\0");
+            assert_eq!(s[3], 0xAA);
+            // ... but a source that cannot fit is EINVAL, dest[0] = 0, and
+            // nothing past destsz is written.
+            let mut e = [0xAAu8; 4];
+            assert_eq!(copy(e.as_mut_ptr(), 4, b"abcd\0".as_ptr(), 9), EINVAL_WIN);
+            assert_eq!(e, [0, 0xAA, 0xAA, 0xAA]);
+            assert_eq!(*_errno(), EINVAL_WIN);
+            // count == 0 copies nothing and writes the terminator only.
+            let mut z = [0xAAu8; 4];
+            assert_eq!(copy(z.as_mut_ptr(), 4, b"xyz\0".as_ptr(), 0), 0);
+            assert_eq!(z, [0, 0xAA, 0xAA, 0xAA]);
+            // Invalid arguments: null source, zero destsz, null dest.
+            let mut n = [0xAAu8; 4];
+            assert_eq!(copy(n.as_mut_ptr(), 4, std::ptr::null(), 4), EINVAL_WIN);
+            assert_eq!(n, [0, 0xAA, 0xAA, 0xAA]);
+            let mut zs = [0xAAu8; 4];
+            assert_eq!(copy(zs.as_mut_ptr(), 0, b"x\0".as_ptr(), 1), EINVAL_WIN);
+            assert_eq!(zs, [0xAAu8; 4]);
+            assert_eq!(
+                copy(std::ptr::null_mut(), 4, b"x\0".as_ptr(), 1),
+                EINVAL_WIN
+            );
+            assert_eq!(*_errno(), EINVAL_WIN);
         }
     }
 
