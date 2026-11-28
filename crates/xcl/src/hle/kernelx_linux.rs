@@ -582,6 +582,14 @@ pub unsafe extern "win64" fn VirtualProtectEx(
 
 const CREATE_SUSPENDED: u32 = 0x4;
 
+/// Host floor for every guest thread stack (DEC-017). Retail requests as little as
+/// 0x8000 of stack, but HLE calls run on the guest thread and can descend deep into
+/// host libraries: the Vulkan loader/ICDs alone overflowed a 0x8000 stack inside
+/// `vkCreateInstance` from `Queue_PresentX`, faulting at the stack floor. The title's
+/// `dwStackSize` is a reserve hint, so a larger request is honoured and a smaller one
+/// is raised to this minimum; reservation is virtual only.
+const MIN_HOST_THREAD_STACK: usize = 8 << 20;
+
 type ThreadStart = unsafe extern "win64" fn(*mut c_void) -> u32;
 
 struct ThreadRecord {
@@ -800,10 +808,9 @@ pub unsafe extern "win64" fn CreateThread(
     let record_for_thread = record.clone();
     threads().lock().unwrap().insert(handle, record);
     let thread_name = format!("xcl-game-{handle:x}");
-    let mut builder = std::thread::Builder::new().name(thread_name);
-    if stack != 0 {
-        builder = builder.stack_size(stack);
-    }
+    let builder = std::thread::Builder::new()
+        .name(thread_name)
+        .stack_size(stack.max(MIN_HOST_THREAD_STACK));
     let spawned = builder.spawn(move || {
         // Record the kernel tid for affinity targeting.
         record_for_thread
@@ -10895,6 +10902,60 @@ mod tests {
                 "coalesce adjacent placeholders"
             );
             assert_eq!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 1);
+        }
+    }
+
+    /// The host mapping containing `addr`, from `/proc/self/maps`.
+    fn mapping_size_at(addr: usize) -> Option<usize> {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in maps.lines() {
+            let range = line.split_whitespace().next()?;
+            let (a, b) = range.split_once('-')?;
+            let (a, b) = (
+                usize::from_str_radix(a, 16).ok()?,
+                usize::from_str_radix(b, 16).ok()?,
+            );
+            if addr >= a && addr < b {
+                return Some(b - a);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn create_thread_stack_has_a_host_minimum() {
+        // Retail Step 50: the title asks for 0x8000 of stack, and the Vulkan loader
+        // overflowed it inside `vkCreateInstance` on the guest render thread. Every
+        // guest thread must get at least MIN_HOST_THREAD_STACK of host mapping,
+        // whether the title names a small size or asks for the default (0).
+        static STACK_BYTES: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "win64" fn probe(_param: *mut c_void) -> u32 {
+            let local = 0u8;
+            let size = mapping_size_at(&local as *const u8 as usize).unwrap_or(0);
+            STACK_BYTES.store(size, Ordering::Release);
+            0
+        }
+        unsafe {
+            for requested in [0x8000usize, 0] {
+                STACK_BYTES.store(0, Ordering::Release);
+                let h = CreateThread(
+                    std::ptr::null(),
+                    requested,
+                    probe as usize,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, 0);
+                assert_eq!(unsafe { WaitForSingleObject(h, 5000) }, WAIT_OBJECT_0);
+                let mapped = STACK_BYTES.load(Ordering::Acquire);
+                assert!(
+                    mapped >= MIN_HOST_THREAD_STACK,
+                    "CreateThread(stack {requested:#x}) mapped {mapped:#x} of host stack, \
+                     below the {MIN_HOST_THREAD_STACK:#x} minimum"
+                );
+                assert_eq!(unsafe { CloseHandle(h) }, 1);
+            }
         }
     }
 
