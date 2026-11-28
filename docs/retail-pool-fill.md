@@ -53,6 +53,24 @@ constructor writes `[region+0x20] = 0` at `0x14554f721`, so the **used
 counter starts at zero**; the 2.18 GiB is real allocations, not seeded
 state.
 
+### Pool size provenance
+
+The class-2 region size is a title static row, not a query. `0x141e1ced0`
+asks `0x140075140` whether `ConsoleMode == 6` (Series S), flips that byte
+(`xor al, 1`) and selects row `0x146186250 + 0x50 * index`: row 0
+`0x146186250` for Series S, row 1 `0x1461862a0` for every other mode. It
+copies the nine qwords at `row + 0x08` into `0x1471bf9b0` (two 32-byte
+`vmovdqu`/`vmovups` plus one qword); the copied entry 2 — raw row qword 3
+— is `0x4fd00000` (1,338,978,304 B) in row 0 and `0x89700000`
+(2,305,818,624 B) in row 1. XCL answers `ConsoleMode 0x64` (Series X), so
+retail takes row 1.
+
+`+disableSharedPools` (`0x1422103b0`) is consulted only after that copy
+(`0x141e1cf18`). When set, the adjust at `0x141e1cf33` subtracts
+`0xdc00000` from copied entry 7 (`0x1471bf9e8`) and adds
+`0x1461597a0` to entries 4/5 (the `vpaddq` at `0x1471bf9d0`); entry 2 is
+never touched. No host query or dynamic resize sits behind `0x89700000`.
+
 The allocation core is `0x1410ca6d0(region, size, align)`; it commits at
 `0x1410cab64` (`add [r14+0x20], r11`, `r11` = committed block size) and
 returns the block offset. The free core is `0x1453ea050(region, offset)`;
@@ -124,15 +142,36 @@ At the trap:
 
 The 500 MiB site is one block of `0x1f400000` plus two blocks summing
 4 KiB. Its direct consumer is the `dl=1` branch of the fail-fast helper
-`0x1456abf90`; that helper's static callers are `0x14022cb16`
-(`GetResourceAllocationInfo` size at `[rsp+0x28]`), `0x145b1a71a`
-(size `rcx` into `0x145b1a6e0`) and `0x145c0c469` (size `[rax]` after
-`0x144ee1860`). `0x145b1a6e0` also allocates `0x51000` at `0x145b1a73d`
-on its first call; that block is absent from the 548 allocations and
-from the live table, so this caller did not run. The 500 MiB block is
-therefore from `0x14022cb16` or `0x145c0c469`; the single run records the
-helper, not which of those two, and the launch budget forbade a second
-run to split it.
+`0x1456abf90` (`0x140075230` → `jmp 0x140075440` → aligned `new`
+`0x14221ad20`); that helper's static callers are `0x14022cb16`,
+`0x145b1a71a` (size `rcx` into `0x145b1a6e0`) and `0x145c0c469` (size
+`[rax]` after `0x144ee1860`).
+
+`0x14022cb16` is the **BVH prebuild → alloc → build loop**, not
+`GetResourceAllocationInfo`:
+
+```
+14022cb0c  call 0x1456abf80        ; prebuild: jmp 0x1456ac100
+14022cb11  mov  rcx, [rsp+0x28]    ; ResultDataMaxSizeInBytes
+14022cb16  call 0x1456abf90        ; alloc(size) + assert
+14022cb21  call 0x1456abfb0        ; build the node
+```
+
+`0x1456abf80` is `jmp 0x1456ac100`, which calls
+`XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo` through
+IAT `0x146793f98` and stores `ResultDataMaxSizeInBytes` /
+`ScratchDataSizeInBytes`. `0x1456abfb0` then builds the node from that
+allocation. The third caller `0x145c0c469` is the other BVH prebuild
+path (`0x144ee1860` → `jmp 0x140075480` → the same IAT slot), and it was
+the live caller in the Step-66 gdb sample
+(`docs/retail-failfast-helper.md`). Whichever of the two callers emitted
+the block, the 500 MiB belongs to the BVH builder, not to resource
+allocation info; the Step-69 run records the helper, not which caller,
+and the launch budget forbade a second run to split it.
+
+`0x145b1a6e0` also allocates `0x51000` at `0x145b1a73d` on its first
+call; that block is absent from the 548 allocations and from the live
+table, so this caller did not run.
 
 Requested-size shape (all sites): `0x10000` ×111, `0x12c0000` ×32,
 `0x20` ×16, `0x80` ×14, `0x4` ×12, `0x10` ×11, `0x8000` ×11,
@@ -216,10 +255,21 @@ no free was refused.
 
 ## Reopen trigger
 
-One new consumer-visible input: sample the same `[pool+0x58]` and the same
-block table at the first frame **on the console/Windows build**. If the
-console also sits at ~99 % used with the same seven consumers, this is
-closed. If the console is materially lower, the delta names what XCL
+The two local reopen triggers named when this pool became the frontier are
+**spent**; do not re-propose them:
+
+1. **Allocator identity and size provenance** — Step 67
+   (`docs/retail-alloc-throw.md`) named the allocator/vtable and the
+   static rows; the "Pool size provenance" section above records the
+   row copy and the `+disableSharedPools` adjust.
+2. **Alloc/free trace of the pool** — the Step-69 gdb run above (548
+   allocations, 6 frees, used counter == live-table sum, zero refused
+   frees) is that trace.
+
+One new consumer-visible input remains: sample the same `[pool+0x58]` and
+the same block table at the first frame **on the console/Windows build**.
+If the console also sits at ~99 % used with the same seven consumers, this
+is closed. If the console is materially lower, the delta names what XCL
 should release; then re-run this breakpoint set once with the largest
 blocks' free callers (currently none).
 

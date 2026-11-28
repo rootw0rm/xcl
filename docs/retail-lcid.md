@@ -65,12 +65,12 @@ backend:
 | `en-001` | `0x2409` | the title's compare string |
 | `""` (`LOCALE_NAME_INVARIANT`) | `0x007F` | |
 | `!x-sys-default-locale` | `0x0800` | `LOCALE_NAME_SYSTEM_DEFAULT` |
-| `en` | `0x0009` | neutral; only with `LOCALE_ALLOW_NEUTRAL_NAMES` (0x80) |
+| `en` | `0x0009` | neutral; only with `LOCALE_ALLOW_NEUTRAL_NAMES` (0x0800_0000) |
 | null | `0x0409` | `LOCALE_NAME_USER_DEFAULT` = the fixed `en-US` user |
 
 Names compare case-insensitively (`eq_ignore_ascii_case`), as Win32
-locale names do. Flags outside 0x80, an unknown name, and a neutral name
-without 0x80 return 0 with `ERROR_INVALID_PARAMETER`; successful calls
+locale names do. Flags outside 0x0800_0000, an unknown name, and a neutral name
+without that flag return 0 with `ERROR_INVALID_PARAMETER`; successful calls
 set `ERROR_SUCCESS` (module convention). Registered in `exports()`, so
 the unrouted api-set import resolves through the cross-HLE name lookup
 to the kernelx module instead of a logging stub.
@@ -81,8 +81,8 @@ to the kernelx module instead of a logging stub.
 assertion (parent tree failed with `LocaleNameToLCID must be wired`,
 RED 0/1; GREEN 1/0). It pins all table rows, case-insensitivity, the
 empty-string and `!x-sys-default-locale` names, the null user default,
-neutral `en` refused without 0x80 and accepted with it, an unknown name
-and a non-0x80 flag both returning 0 with `ERROR_INVALID_PARAMETER`.
+neutral `en` refused without 0x0800_0000 and accepted with it, an unknown name
+and a flag outside 0x0800_0000 both returning 0 with `ERROR_INVALID_PARAMETER`.
 
 Gates: `cargo check -p xcl --tests` 0, `cargo check --workspace` 0,
 focused **1/0**, lib **959 passed / 0 failed / 1 ignored**
