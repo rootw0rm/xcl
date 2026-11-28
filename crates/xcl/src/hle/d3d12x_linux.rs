@@ -1222,10 +1222,12 @@ unsafe extern "win64" fn Device_CheckFeatureSupport(_t: *mut NullObj, feature: u
 
 /// Console descriptor heaps live in unified-memory window 0 (the retail game's
 /// first placeholder begins with its view heap, and shader tables address them
-/// with 32 bits): the handle range comes from the high-VA graphics pool's next
-/// window-0 range, committed host memory (views write words into the slots) —
-/// never plain host memory below the windows. Falls back to plain memory when
-/// the pool has no window-0 room, so the heap still works.
+/// with 32 bits): the handle range comes from the title's allocation hook when it
+/// gives one — the retail game asserts the start is the base of its own arena — and
+/// otherwise from the high-VA graphics pool's next window-0 range, committed host
+/// memory (views write words into the slots) — never plain host memory below the
+/// windows. Falls back to plain memory when the pool has no window-0 room, so the
+/// heap still works.
 unsafe extern "win64" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
         return S_FALSE;
@@ -1234,9 +1236,14 @@ unsafe extern "win64" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *co
     if !desc.is_null() {
         std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 16);
         let n = *(desc.add(4) as *const u32) as usize;
-        let bytes = (n.max(1) * 32).min(64 << 20);
-        // 64 KiB floor is the pool grain; the title reads slots back, so commit.
-        let start = crate::hle::kernelx_linux::gfx_alloc_window0(bytes, 0x1_0000, true).unwrap_or(0);
+        // The title's allocator sees the requested size; only the pool fallback is capped.
+        let bytes = n.max(1) * 32;
+        let start = crate::hle::kernelx_linux::title_descriptor_heap_memory(bytes)
+            .or_else(|| {
+                // 64 KiB floor is the pool grain; the title reads slots back, so commit.
+                crate::hle::kernelx_linux::gfx_alloc_window0(bytes.min(64 << 20), 0x1_0000, true)
+            })
+            .unwrap_or(0);
         (*o).value.store(
             if start != 0 {
                 start as u64
@@ -2726,6 +2733,73 @@ mod tests {
                     assert_eq!(start(h), base, "slot {i}");
                 }
             }
+        }
+    }
+
+    /// Step 42: the retail title's shader-visible descriptor heap must start in the
+    /// memory the title's own allocation hook hands out (its arena base), not in a
+    /// fresh graphics-pool range. A hook answer outside the pool is rejected and
+    /// returned to the title, and the heap falls back to the window-0 range.
+    #[test]
+    fn descriptor_heap_memory_prefers_the_title_allocation_hook() {
+        use std::sync::atomic::AtomicUsize;
+        /// Serializes the two hook phases: `TITLE_HOOKS` is process-global.
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static TEST_BLOCK: AtomicUsize = AtomicUsize::new(0);
+        static TEST_BYTES: AtomicUsize = AtomicUsize::new(0);
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "win64" fn alloc(size: usize, _attrs: u64) -> *mut c_void {
+            let want = TEST_BYTES.load(Ordering::Relaxed);
+            if want != 0 && size == want {
+                TEST_BLOCK.load(Ordering::Relaxed) as *mut c_void
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+        unsafe extern "win64" fn free(p: *mut c_void, _attrs: u64) {
+            FREED.store(p as usize, Ordering::Relaxed);
+        }
+        struct ClearHooks;
+        impl Drop for ClearHooks {
+            fn drop(&mut self) {
+                unsafe { crate::hle::kernelx_linux::set_title_hooks_for_test(0, 0) };
+            }
+        }
+        let _serial = SERIAL.lock().unwrap();
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_heap: Fn4 = std::mem::transmute(slot(dev, 14));
+            let start_of = |h: *mut c_void| {
+                let f: unsafe extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(slot(h, 9));
+                f(h)
+            };
+            let desc = [0u32, 7, 1, 0]; // CBV_SRV_UAV, 7 slots, shader visible => 224 bytes
+
+            // 1) the title's hook supplies the heap memory: the handle is exactly it
+            let block = crate::hle::kernelx_linux::gfx_alloc_window0(7 * 32, 0x1_0000, true)
+                .expect("graphics-pool block for the synthetic title allocator");
+            TEST_BLOCK.store(block, Ordering::Relaxed);
+            TEST_BYTES.store(7 * 32, Ordering::Relaxed);
+            crate::hle::kernelx_linux::set_title_hooks_for_test(alloc as usize, free as usize);
+            let _clear = ClearHooks;
+            let mut h = std::ptr::null_mut();
+            assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), &mut h), S_OK);
+            assert_eq!(start_of(h), block as u64, "the heap starts in the title's memory");
+
+            // 2) a hook answer outside the pool is refused, freed, and the window-0
+            //    fallback still gives a nonzero start that is not the title's answer
+            let outside_buf = [0u8; 7 * 32];
+            let outside = outside_buf.as_ptr() as usize;
+            TEST_BLOCK.store(outside, Ordering::Relaxed);
+            FREED.store(0, Ordering::Relaxed);
+            let mut h2 = std::ptr::null_mut();
+            assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), &mut h2), S_OK);
+            let fallback = start_of(h2);
+            assert_eq!(FREED.load(Ordering::Relaxed), outside, "the refused title memory goes back");
+            assert_ne!(fallback, 0);
+            assert_ne!(fallback, outside as u64);
+            assert!(fallback >> 32 >= 4 && (fallback >> 32) & 3 == 0, "fallback {fallback:#x} is not window 0");
         }
     }
 

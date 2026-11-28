@@ -85,6 +85,7 @@ pub fn run_boot(boot: &Boot) -> u32 {
             return 0x7C1_0002;
         }
     };
+    unsafe { crate::hle::kernelx_linux::adopt_title_hooks(&main) };
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");

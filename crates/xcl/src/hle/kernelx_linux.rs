@@ -3236,6 +3236,56 @@ fn gfx_contains(addr: usize) -> bool {
     })
 }
 
+/// Whether all of `[addr, addr + len)` is inside the graphics pool.
+pub(crate) fn gfx_contains_range(addr: usize, len: usize) -> bool {
+    len != 0
+        && gfx_contains(addr)
+        && addr.checked_add(len - 1).is_some_and(gfx_contains)
+}
+
+/// Whether every page of `[p, p + len)` lies in a readable `/proc/self/maps` run: the
+/// Linux twin of `gpu::shader::readable` for graphics-pool memory (commit `mprotect`s
+/// the range `PROT_READ | PROT_WRITE`). That function stays a refusal on Linux because
+/// the crash handler calls it inside a signal context, where reading `/proc` would be
+/// async-signal-unsafe; this one is only used off that path (descriptor-heap creation).
+fn gfx_range_readable(p: usize, len: usize) -> bool {
+    if p == 0 || len == 0 || len > 256 << 20 {
+        return false;
+    }
+    let Some(end) = p.checked_add(len) else { return false };
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return false };
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    for line in maps.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(range), Some(perms)) = (it.next(), it.next()) else { continue };
+        let Some((a, b)) = range.split_once('-') else { continue };
+        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else {
+            continue;
+        };
+        if b > p && a < end {
+            runs.push((a.max(p), b.min(end), perms.starts_with('r')));
+        }
+    }
+    runs.sort_unstable_by_key(|r| r.0);
+    let mut cur = p;
+    for (a, b, readable) in runs {
+        if a > cur {
+            return false;
+        }
+        if b <= cur {
+            continue;
+        }
+        if !readable {
+            return false;
+        }
+        cur = b;
+        if cur >= end {
+            return true;
+        }
+    }
+    false
+}
+
 /// First-fit `size` bytes at `align` inside the graphics pool. Committed ranges are
 /// `mprotect`ed `READWRITE` and zeroed; reserved ranges stay `PROT_NONE`.
 pub(crate) fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
@@ -3565,6 +3615,90 @@ pub unsafe extern "win64" fn XMemFree(p: *mut c_void, attrs: u64) {
             g(p, attrs)
         }
     }
+}
+
+/// The exe's exported data `__XMemAllocationHooks__` {alloc, free, …}: the allocator functions
+/// of a title that replaces XMem's, which the console's runtime libraries call for the memory
+/// they need (`runtime_alloc`). Titles see there what the runtime allocates – and may supply the
+/// memory themselves. Linux twin of `hle/kernelx.rs`; the retail exe exports the table at RVA
+/// `0x6844380` with `{0x144deb420, 0x144e38ec0}` (`.data`).
+static TITLE_HOOKS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+
+pub unsafe fn adopt_title_hooks(main: &crate::modules::MappedModule) {
+    let Some(crate::pe::ExportTarget::Rva(rva)) = main.exports.by_name.get("__XMemAllocationHooks__") else { return };
+    let p = (main.base + *rva as usize) as *const usize;
+    let (alloc, free) = (p.read_unaligned(), p.add(1).read_unaligned());
+    let inside = |f: usize| f > main.base && f < main.base + main.size;
+    if inside(alloc) && inside(free) {
+        TITLE_HOOKS[1].store(free, Ordering::Release);
+        TITLE_HOOKS[0].store(alloc, Ordering::Release);
+        crate::xlog_info!(
+            "XMem: the title has allocation hooks ({}, {})",
+            crate::modules::describe_address(alloc),
+            crate::modules::describe_address(free)
+        );
+    }
+}
+
+/// XALLOC_ATTRIBUTES of a descriptor heap's memory: object type 4, 64 KiB pages and alignment,
+/// allocator 0x80 (the D3D runtime), graphics memory. The retail game's heap class (its alloc hook for
+/// allocator 0x80 compares object type and size) gives the memory of its heaps this way and
+/// asserts that they start there.
+pub const D3D_DESCRIPTOR_HEAP: u64 = 4 | 1 << 14 | 0x80 << 16 | 16 << 24 | 1 << 29;
+
+/// What the title's allocation hook gives a console runtime library (None: no hook, or null).
+pub unsafe fn runtime_alloc(size: usize, attrs: u64) -> Option<usize> {
+    let f = TITLE_HOOKS[0].load(Ordering::Acquire);
+    if f == 0 {
+        return None;
+    }
+    let p = std::mem::transmute::<usize, XMemAllocFn>(f)(size, attrs) as usize;
+    (p != 0).then_some(p)
+}
+
+pub unsafe fn runtime_free(p: usize, attrs: u64) {
+    let f = TITLE_HOOKS[1].load(Ordering::Acquire);
+    if f != 0 {
+        std::mem::transmute::<usize, XMemFreeFn>(f)(p as *mut c_void, attrs);
+    }
+}
+
+/// Memory for a descriptor heap of `bytes` from the title's allocation hook – where the title
+/// expects the heap then. Only a range descriptor tables can address (the graphics pool) that
+/// is committed and readable is accepted; anything else goes back to the title.
+pub(crate) unsafe fn title_descriptor_heap_memory(bytes: usize) -> Option<usize> {
+    let Some(p) = runtime_alloc(bytes, D3D_DESCRIPTOR_HEAP) else {
+        static NONE: AtomicU32 = AtomicU32::new(0);
+        if NONE.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_info!("console descriptor heap: the title's allocator gave no memory for {bytes:#x} bytes");
+        }
+        return None;
+    };
+    let in_pool = gfx_contains_range(p, bytes);
+    if in_pool && gfx_range_readable(p, bytes) {
+        static OK: AtomicU32 = AtomicU32::new(0);
+        if OK.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_info!("console descriptor heap: {bytes:#x} bytes from the title's memory at {p:#x}");
+        }
+        return Some(p);
+    }
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_warn!(
+            "console descriptor heap: the title's memory {p:#x} ({bytes:#x} bytes) not used (in the pool {in_pool}, readable {})",
+            gfx_range_readable(p, bytes)
+        );
+    }
+    runtime_free(p, D3D_DESCRIPTOR_HEAP);
+    None
+}
+
+/// Test seam: `Device_CreateDescriptorHeap` can be driven with a synthetic title allocator.
+/// `alloc == 0` clears both hooks.
+#[cfg(test)]
+pub(crate) unsafe fn set_title_hooks_for_test(alloc: usize, free: usize) {
+    TITLE_HOOKS[1].store(free, Ordering::Release);
+    TITLE_HOOKS[0].store(alloc, Ordering::Release);
 }
 
 /// `void* XMemVirtualAlloc(void*, SIZE_T, DWORD, XALLOC_ATTRIBUTES, DWORD)`:
