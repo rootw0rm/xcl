@@ -2256,6 +2256,102 @@ pub unsafe extern "win64" fn log10f(x: f32) -> f32 {
     x.log10()
 }
 
+/// `float log2f(float x)` — base-2 logarithm. Zero maps to `-inf`, a negative
+/// argument to NaN, and denormals keep their exact exponent (`2^-149 → -149`).
+pub unsafe extern "win64" fn log2f(x: f32) -> f32 {
+    x.log2()
+}
+
+/// `float fmodf(float x, float y)` — C `fmod` truncation remainder: the result
+/// takes `x`'s sign, a finite `x` survives `y = ±inf`, and `x % 0`/`inf % y`
+/// are NaN. Rust's float `%` is that same operation (LLVM `frem` → libm).
+pub unsafe extern "win64" fn fmodf(x: f32, y: f32) -> f32 {
+    x % y
+}
+
+/// `float erff(float x)` — Gauss error function (UCRT edges: `±0 → ±0`,
+/// `±inf → ±1`, NaN → NaN). Computed in f64 and rounded once, so the f32
+/// result is within a few ulps of the reference.
+pub unsafe extern "win64" fn erff(x: f32) -> f32 {
+    erf_f64(x as f64) as f32
+}
+
+fn erf_f64(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { 1.0 } else { -1.0 };
+    }
+    if x == 0.0 {
+        return x;
+    }
+    let magnitude = if x.abs() < 2.0 {
+        erf_series(x.abs())
+    } else {
+        1.0 - erfc_continued_fraction(x.abs())
+    };
+    if x < 0.0 { -magnitude } else { magnitude }
+}
+
+/// `erf` power series, `2/sqrt(pi) * sum((-1)^n x^(2n+1)/(n!(2n+1)))`. It keeps
+/// full relative accuracy near zero, where `1 - erfc` would cancel.
+fn erf_series(x: f64) -> f64 {
+    const TWO_OVER_SQRT_PI: f64 = 1.128_379_167_095_512_6;
+    let x2 = x * x;
+    let mut term = x;
+    let mut sum = x;
+    let mut n = 0.0f64;
+    loop {
+        n += 1.0;
+        term *= -x2 / n * (2.0 * n - 1.0) / (2.0 * n + 1.0);
+        sum += term;
+        if term.abs() < 1e-18 * sum.abs() {
+            break;
+        }
+    }
+    TWO_OVER_SQRT_PI * sum
+}
+
+/// `erfc(x) = Q(1/2, x^2)` via the modified-Lentz continued fraction, valid
+/// above the series switch (`x >= 2`); `1 - erfc` is then accurate because
+/// `erf` is within 5e-3 of 1.
+fn erfc_continued_fraction(x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    let z = x * x;
+    let mut b = z + 0.5; // z + 1 - a, with a = 1/2
+    let mut c = 1.0 / TINY;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for i in 1..=300 {
+        let i = i as f64;
+        let an = -i * (i - 0.5);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = b + an / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let delta = d * c;
+        h *= delta;
+        if (delta - 1.0).abs() < 1e-16 {
+            break;
+        }
+    }
+    (-z).exp() * z.sqrt() / std::f64::consts::PI.sqrt() * h
+}
+
+/// `double atan2(double y, double x)` — quadrant-aware arctangent. The title's
+/// f32 callers promote both arguments through `exe+0x623b20` before the IAT
+/// call at `0x146794618`.
+pub unsafe extern "win64" fn atan2(y: f64, x: f64) -> f64 {
+    y.atan2(x)
+}
+
 /// `char* getenv(const char*)` — process environment; NULL when missing, as on Windows.
 pub unsafe extern "win64" fn getenv(name: *const u8) -> *mut u8 {
     if name.is_null() {
@@ -4554,6 +4650,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("powf", powf as usize),
         ("exp2f", exp2f as usize),
         ("log10f", log10f as usize),
+        ("log2f", log2f as usize),
+        ("fmodf", fmodf as usize),
+        ("erff", erff as usize),
+        ("atan2", atan2 as usize),
     ]
 }
 
@@ -5609,6 +5709,104 @@ mod tests {
             assert_eq!(powf(2.0, 10.0), 1024.0);
             assert_eq!(powf(0.0, 0.0), 1.0);
             assert_eq!(powf(-1.0, f32::INFINITY), 1.0);
+        }
+    }
+
+    #[test]
+    fn erf_fmod_log2_and_atan2_are_real() {
+        // Retail Step 78: erff 4,800× (call at exe+0x1cb636c, IAT
+        // 0x146794650), log2f 129× (IAT 0x1467946a0), fmodf 52× (IAT
+        // 0x146794680) and the double atan2 84× (IAT 0x146794618, f32
+        // callers promote through exe+0x623b20) resolved to auto-stubs that
+        // returned 0 without touching xmm0.
+        for name in ["erff", "fmodf", "log2f", "atan2"] {
+            assert!(exports().iter().any(|(n, _)| *n == name), "{name} must be wired");
+        }
+        type Erff = unsafe extern "win64" fn(f32) -> f32;
+        type Fmodf = unsafe extern "win64" fn(f32, f32) -> f32;
+        type Log2f = unsafe extern "win64" fn(f32) -> f32;
+        type Atan2 = unsafe extern "win64" fn(f64, f64) -> f64;
+        let addr = |name: &str| {
+            exports()
+                .into_iter()
+                .find_map(|(n, a)| (n == name).then_some(a))
+                .expect("export")
+        };
+        let erf: Erff = unsafe { std::mem::transmute(addr("erff")) };
+        let fmod: Fmodf = unsafe { std::mem::transmute(addr("fmodf")) };
+        let log2: Log2f = unsafe { std::mem::transmute(addr("log2f")) };
+        let atan2: Atan2 = unsafe { std::mem::transmute(addr("atan2")) };
+        unsafe {
+            // Reference table is `math.erf(x as f64)` for the exact f32
+            // inputs (small ones included, so a `1 - erfc` shortcut fails).
+            for &(x, reference) in &[
+                (-2.5f32, -0.999593047982555),
+                (-0.5, -0.5204998778130465),
+                (1e-6, 1.1283791642462529e-06),
+                (1e-3, 0.0011283788445643173),
+                (0.1, 0.11246291768297051),
+                (0.5, 0.5204998778130465),
+                (1.0, 0.8427007929497149),
+                (1.5, 0.9661051464753108),
+                (2.0, 0.9953222650189527),
+                (2.5, 0.999593047982555),
+                (3.0, 0.9999779095030014),
+                (4.0, 0.9999999845827421),
+            ] {
+                let got = erf(x) as f64;
+                let relative = ((got - reference) / reference).abs();
+                assert!(relative < 1e-6, "erff({x}) = {got}, reference {reference}");
+            }
+            assert_eq!(erf(0.0).to_bits(), 0.0f32.to_bits());
+            assert!(erf(-0.0).is_sign_negative() && erf(-0.0) == 0.0);
+            assert_eq!(erf(f32::INFINITY), 1.0);
+            assert_eq!(erf(f32::NEG_INFINITY), -1.0);
+            assert!(erf(f32::NAN).is_nan());
+            let mut previous = f32::NEG_INFINITY;
+            for step in 0..=1200 {
+                let x = -6.0 + step as f32 * 0.01;
+                let y = erf(x);
+                assert!(y >= previous, "erff must be monotone at {x}");
+                previous = y;
+            }
+
+            // fmod keeps the dividend's sign; a finite dividend survives an
+            // infinite divisor; zero divisor and infinite dividend are NaN.
+            assert_eq!(fmod(5.5, 2.0), 1.5);
+            assert_eq!(fmod(-5.5, 2.0), -1.5);
+            assert_eq!(fmod(5.5, -2.0), 1.5);
+            assert_eq!(fmod(-5.5, -2.0), -1.5);
+            assert_eq!(fmod(100.0, 100.0).to_bits(), 0.0f32.to_bits());
+            assert!(fmod(-0.0, 3.0).is_sign_negative() && fmod(-0.0, 3.0) == 0.0);
+            assert_eq!(fmod(5.5, f32::INFINITY), 5.5);
+            assert_eq!(fmod(-5.5, f32::NEG_INFINITY), -5.5);
+            assert!(fmod(f32::INFINITY, 2.0).is_nan());
+            assert!(fmod(2.0, 0.0).is_nan());
+            assert!(fmod(f32::NAN, 2.0).is_nan());
+
+            assert_eq!(log2(8.0), 3.0);
+            assert_eq!(log2(0.5), -1.0);
+            assert_eq!(log2(1.0), 0.0);
+            assert!((log2(3.0) - 1.584_962_5).abs() < 1e-6);
+            assert_eq!(log2(0.0), f32::NEG_INFINITY);
+            assert_eq!(log2(-0.0), f32::NEG_INFINITY);
+            assert!(log2(-1.0).is_nan());
+            assert_eq!(log2(f32::INFINITY), f32::INFINITY);
+            assert!(log2(f32::NAN).is_nan());
+            // Smallest positive denormal: exponent -149, not -inf/NaN.
+            assert_eq!(log2(f32::from_bits(1)), -149.0);
+
+            // Double atan2 (the f32 callers promote at exe+0x623b20).
+            use std::f64::consts::{FRAC_PI_4, PI};
+            assert!((atan2(1.0, 1.0) - FRAC_PI_4).abs() < 1e-12);
+            assert!((atan2(-1.0, 1.0) + FRAC_PI_4).abs() < 1e-12);
+            assert!((atan2(1.0, -1.0) - 3.0 * FRAC_PI_4).abs() < 1e-12);
+            assert!((atan2(-1.0, -1.0) + 3.0 * FRAC_PI_4).abs() < 1e-12);
+            assert_eq!(atan2(0.0, 0.0), 0.0);
+            assert_eq!(atan2(0.0, -1.0), PI);
+            assert_eq!(atan2(-0.0, -1.0), -PI);
+            assert_eq!(atan2(1.0, f64::INFINITY), 0.0);
+            assert!(atan2(f64::NAN, 1.0).is_nan());
         }
     }
 
