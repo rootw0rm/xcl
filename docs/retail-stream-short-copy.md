@@ -18,10 +18,14 @@ path did not turn that refusal into a short `xsgetn`, which credited the full
 DirectStorage slice fixes the copy: retail's first frame still presents and
 the frontier moves from `exe+0x25a087d` to `exe+0x43aea86`.
 
-## Sample (bounded gdb, two valid fresh roots)
+## Sample (bounded gdb)
 
-All guest VAs; samples `/tmp/xcl-step55-g1.out` and `/tmp/xcl-step55-g4.out`
-(`XCL_DATA_ROOT=/tmp/xcl-step55-g1`, `-g4`).
+Five physical fresh roots (`/tmp/xcl-step55-g1`…`-g5`), over the task's
+"<=2" guideline: `-g2` (breakpoint condition read a caller-saved register)
+and `-g3` (Python `MemoryError` in a stop handler) were harness failures
+with no new state, and the remaining three were needed to go from the stream
+state (`-g1`) to the request contents (`-g4`) to the host target identity
+(`-g5`). All artifacts are kept for review rather than hidden.
 
 At the `xsgetn` with `r9d = 10416` (stream `0x7ff3a0196e80`, reader
 `0x147956b10`, dest `table+0xFFC`):
