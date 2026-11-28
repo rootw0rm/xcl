@@ -82,7 +82,7 @@ small-address skip.
 ## Mechanism
 
 - `NEWER_LIST_LAYOUT: AtomicBool` — the table's layout flag.
-- `layout_thunk(older, newer, flag)` generates 40 bytes of code that clobber
+- `layout_thunk(older, newer, flag)` generates 39 bytes of code that clobber
   only the volatile `rax`/`r10`:
 
   ```
@@ -131,6 +131,12 @@ RED at the parent tree (`0d796341`, temporary worktree): the parent's
 `null_list_shares_the_console_memory_methods` test now holds the layout
 serial lock and pins the older numbering; the queue `#16` signal tests hold
 it too so their latch cannot interleave with the older-layout assertions.
+The three device-slot tests that latch through `#108`, `#127` and `#133`
+(`console_resource_allocation_info2_writes_offsets_and_total`,
+`display_target_memory_comes_from_the_title_allocation_hook`,
+`console_placed_resource_layout_slot133_writes_the_resource`) take the same
+lock and clear `NEWER_LIST_LAYOUT` in a drop guard, so a test that runs after
+them cannot observe a layout they proved.
 
 ## Retail delta
 
