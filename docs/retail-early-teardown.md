@@ -82,10 +82,10 @@ title requested.
 
 ## Retail
 
-- `/tmp/xcl-step64-r1`: first frame at 6.9 s; four presented
-  `3840x2160` frames (`11.9 s`, `16.9 s` ×3). The TLS check returns
-  `1`, the fatal-init line is gone, and `+0x502b2f1` never occurs.
-  Exit 139 at `exe+0x18e10c7` at 19.8 s.
+- `/tmp/xcl-step64-r1`: first frame at 6.9 s; five presented
+  `3840x2160` frames (`6.9 s`, `11.9 s`, `16.9 s` ×3). The TLS check
+  returns `1`, the fatal-init line is gone, and `+0x502b2f1` never
+  occurs. Exit 139 at `exe+0x18e10c7` at 19.8 s.
 - `/tmp/xcl-step64-r2` (fresh root, final binary): first frame at
   6.8 s; exit 139 at the same `exe+0x18e10c7` at 7.9 s. The crash time
   varies with which thread reaches the next stub first; the PC does not.
