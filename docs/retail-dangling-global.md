@@ -73,3 +73,15 @@ first frame? Step 64 samples the caller of `0x14220f3b0` (the `lea` at
 XCL's headless window/message or an HLE return makes `main` exit early,
 that is the fix. The missing clear of `0x1498c0f20` is title-side; no
 allocator quarantine or fake lifetime extension.
+
+## Correction (Step 64)
+
+`0x14220f3b0` is never called. The ~7 s path is a failed engine runtime
+init: `0x143da1560` → `0x143da1a80` (all eight host subsystem inits OK) →
+TLS CA-bundle check `0x145aebb20`, whose certificate date validation
+called the `_gmtime64` auto-stub and got NULL. The fatal line 255 path
+tail-jumps from `0x143da19e6` into `0x143da2880` → `0x143da2fb0`
+(rollback), so the return address in a gdb `bt` belongs to the original
+caller, not to a teardown region; the stripped PE has no gdb-readable
+unwind data, so deeper frames were garbage. `docs/retail-early-teardown.md`
+has the full chain and the `_gmtime64` fix.
