@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(dxgi_format(133), Some((DXGI_FORMAT_B5G6R5_UNORM, [2, 1, 0, 3])));
         assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
         assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
-        assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
+        assert!(dxgi_format(44).is_none()); // 44 = 24_8_UNORM (depth/stencil): no colour DXGI format
         // 1_5_5_5 is B5G5R5A1 (and the format XCL writes into its views' T#s); 5_5_5_1 has none
         assert_eq!(dxgi_format(134), Some((DXGI_FORMAT_B5G5R5A1_UNORM, [2, 1, 0, 3])));
         assert!(dxgi_format(135).is_none());
@@ -639,8 +639,11 @@ mod tests {
         assert_eq!(gfx10_format_num(10), Some(71)); // R16G16B16A16_FLOAT
         assert_eq!(gfx10_format_num(2), Some(77)); // R32G32B32A32_FLOAT
         assert_eq!(gfx10_format_num(99), Some(182)); // BC7_UNORM_SRGB
+        assert_eq!(gfx10_format_num(85), Some(133)); // B5G6R5_UNORM
+        assert_eq!(gfx10_format_num(86), Some(134)); // B5G5R5A1_UNORM
+        assert_eq!(gfx10_format_num(115), Some(136)); // B4G4R4A4_UNORM
         assert_eq!(gfx10_format_num(0), None); // UNKNOWN / typeless
-        assert_eq!(gfx10_format_num(44), None); // R10G10B10A2 2_10_10_10 has no DXGI equivalent
+        assert_eq!(gfx10_format_num(44), None); // DXGI 44 = R24G8_TYPELESS: no SRV format
     }
 
     #[test]
@@ -691,7 +694,7 @@ pub fn xcl_image_for_view(srv_heap_index: u32, format: u32, ty: ImageType, width
 /// maps (`dxgi_format` itself needs the `windows` type; the title's descriptors
 /// carry the number). Ascending by GFX10, so the first match is the same one
 /// `gfx10_format` finds.
-const GFX10_TO_DXGI: [(u32, u32); 58] = [
+const GFX10_TO_DXGI: [(u32, u32); 61] = [
     (1, 61), (2, 63), (5, 62), (6, 64), (7, 56), (8, 58),
     (11, 57), (12, 59), (13, 54), (14, 49), (15, 51), (18, 50),
     (19, 52), (20, 42), (21, 43), (22, 41), (23, 35), (24, 37),
@@ -699,9 +702,9 @@ const GFX10_TO_DXGI: [(u32, u32); 58] = [
     (56, 28), (57, 31), (60, 30), (61, 32), (62, 17), (63, 18),
     (64, 16), (65, 11), (66, 13), (69, 12), (70, 14), (71, 10),
     (72, 7), (73, 8), (74, 6), (75, 3), (76, 4), (77, 2),
-    (130, 29), (132, 67), (169, 71), (170, 72), (171, 74), (172, 75),
-    (173, 77), (174, 78), (175, 80), (176, 81), (177, 83), (178, 84),
-    (179, 95), (180, 96), (181, 98), (182, 99),
+    (130, 29), (132, 67), (133, 85), (134, 86), (136, 115), (169, 71),
+    (170, 72), (171, 74), (172, 75), (173, 77), (174, 78), (175, 80),
+    (176, 81), (177, 83), (178, 84), (179, 95), (180, 96), (181, 98), (182, 99),
 ];
 
 /// GFX10 IMG_FORMAT of a DXGI format **number** (`DXGI_FORMAT_*`'s wire
@@ -715,7 +718,9 @@ pub fn gfx10_format_num(f: u32) -> Option<u32> {
 /// A console T# for the image at `address`: [`xcl_image_for_view`]'s format /
 /// size / type fields plus the console view's own base mip, last mip, highest
 /// mip, first array slice and component mapping, with BASE_ADDRESS in words
-/// 0 and 1 (as the title's console runtime writes it). `dst_sel` is the GFX
+/// 0 and 1 (as the title's console runtime writes it). `depth` is the absolute
+/// last array slice + 1 (`Image::depth`, so an array view's count is added to
+/// its first slice), not the view's slice count. `dst_sel` is the GFX
 /// component index of each channel (0/1, 4..7 = x..w).
 pub fn console_image_words(
     address: u64,
@@ -751,6 +756,18 @@ mod view_tests {
         for &(g, d) in GFX10_TO_DXGI.iter() {
             assert_eq!(gfx10_format_num(d), Some(g));
             assert_eq!(gfx10_format(DXGI_FORMAT(d as i32)), Some(g), "DXGI {d} -> GFX10 {g}");
+        }
+        // The loop above only sees table rows, so a missing row cannot fail it. Walk every
+        // GFX10 value the Windows decoder maps instead: a table omission (or a duplicate)
+        // must show up as a None or a different GFX10 number.
+        for g in 0..=182u32 {
+            let Some((d, _)) = dxgi_format(g) else { continue };
+            assert_eq!(
+                gfx10_format_num(d.0 as u32),
+                Some(g),
+                "GFX10 {g} -> DXGI {} missing from GFX10_TO_DXGI",
+                d.0
+            );
         }
     }
 

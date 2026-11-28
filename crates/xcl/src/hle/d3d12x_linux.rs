@@ -1665,12 +1665,22 @@ unsafe extern "win64" fn Device_CopyDescriptorsSimple(_t: *mut NullObj, n: u32, 
 /// `D3D12_SHADER_RESOURCE_VIEW_DESC` (union @8). The handler writes the
 /// console descriptor into the 32-byte slot at `cpu`: a V# for BUFFER, a T#
 /// with BASE_ADDRESS for dimensions 2–10, the BVH words for a ray-tracing
-/// view. `cpu` must be a graphics-pool address (a title heap slot), else
-/// nothing is written; the GPU address is encoded, never dereferenced.
+/// view. `cpu` must be a 32-byte-aligned graphics-pool address (a title heap
+/// slot) and `view` readable, else nothing is written; the GPU address is
+/// encoded, never dereferenced.
 unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rdesc: *const u8, view: *const u8, cpu: u64) {
     use crate::gpu::desc::{self, ImageType};
+    use crate::hle::kernelx_linux::{gfx_contains_range, gfx_range_readable};
     const SLOT: usize = 32;
-    if view.is_null() || cpu == 0 || !crate::hle::kernelx_linux::gfx_contains_range(cpu as usize, SLOT) {
+    let slot_ok = cpu & 0x1F == 0 && gfx_contains_range(cpu as usize, SLOT);
+    let view_ok = !view.is_null() && gfx_range_readable(view as usize, 0x30);
+    if !slot_ok || !view_ok {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "D3D12.X: CreateShaderResourceViewAt refused: slot {cpu:#x} (32-byte pool slot {slot_ok}), view {view:p} (readable {view_ok})"
+            );
+        }
         return;
     }
     let u32_at = |off: usize| (view.add(off) as *const u32).read_unaligned();
@@ -1690,7 +1700,9 @@ unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rde
             let n = u32_at(0x18);
             let stride = u32_at(0x1c);
             let raw = u32_at(0x20) & 1 != 0;
-            let fmt = desc::gfx10_format_num(u32_at(0)).unwrap_or(0);
+            // The Windows twin's `buffer_words_at` treats an unknown/typeless buffer format
+            // as R32_FLOAT (22); the title may stage a UNKNOWN-format raw buffer.
+            let fmt = desc::gfx10_format_num(u32_at(0)).unwrap_or(22);
             let (stride, elem) = if raw {
                 (0, 4)
             } else if stride > 0 {
@@ -1706,7 +1718,7 @@ unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rde
             words[..4].copy_from_slice(&desc::buffer_words(address, stride, records, fmt));
         }
         2..=10 => {
-            if rdesc.is_null() {
+            if rdesc.is_null() || !gfx_range_readable(rdesc as usize, 56) {
                 return;
             }
             let view_format = u32_at(0);
@@ -1718,17 +1730,23 @@ unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rde
             let array = (rdesc.add(28) as *const u16).read_unaligned() as u32;
             let mips = (rdesc.add(30) as *const u16).read_unaligned() as u32;
             let samples = (rdesc.add(36) as *const u32).read_unaligned().max(1);
+            // Array views: the console T# carries the absolute last slice + 1 (`Image::depth`),
+            // so add the view's count to its first slice instead of storing the count.
+            let (first, count) = (u32_at(0x18), u32_at(0x1c).max(1));
             let (ty, most, levels, first_slice, depth) = match dim {
                 2 => (ImageType::D1, u32_at(0x10), u32_at(0x14), 0, 1),
-                3 => (ImageType::D1Array, u32_at(0x10), u32_at(0x14), u32_at(0x18), u32_at(0x1c).max(1)),
+                3 => (ImageType::D1Array, u32_at(0x10), u32_at(0x14), first, first.saturating_add(count)),
                 4 => (ImageType::D2, u32_at(0x10), u32_at(0x14), 0, 1),
-                5 => (ImageType::D2Array, u32_at(0x10), u32_at(0x14), u32_at(0x18), u32_at(0x1c).max(1)),
+                5 => (ImageType::D2Array, u32_at(0x10), u32_at(0x14), first, first.saturating_add(count)),
                 6 => (ImageType::D2Msaa, 0, 1, 0, 1),
-                7 => (ImageType::D2MsaaArray, 0, 1, u32_at(0x10), u32_at(0x14).max(1)),
+                7 => {
+                    let first = u32_at(0x10);
+                    (ImageType::D2MsaaArray, 0, 1, first, first.saturating_add(u32_at(0x14).max(1)))
+                }
                 8 => (ImageType::D3, u32_at(0x10), u32_at(0x14), 0, array.max(1)),
                 9 => (ImageType::Cube, u32_at(0x10), u32_at(0x14), 0, array.max(6)),
-                // TEXTURECUBEARRAY: NumCubes faces, starting at First2DArrayFace
-                10 => (ImageType::Cube, u32_at(0x10), u32_at(0x14), u32_at(0x18), u32_at(0x1c).max(1).saturating_mul(6)),
+                // TEXTURECUBEARRAY: First2DArrayFace + NumCubes * 6 faces
+                10 => (ImageType::Cube, u32_at(0x10), u32_at(0x14), first, first.saturating_add(count.saturating_mul(6))),
                 _ => return,
             };
             let (base_level, last_level, max_mip) = if matches!(ty, ImageType::D2Msaa | ImageType::D2MsaaArray) {
@@ -1744,13 +1762,10 @@ unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rde
                 .min(15);
                 (base, last, res_max.min(15))
             };
-            let dst_sel = [0u32, 3, 6, 9].map(|shift| {
-                let c = (mapping >> shift) & 7;
-                if c < 4 {
-                    c + 4
-                } else {
-                    c
-                }
+            let dst_sel = [0u32, 3, 6, 9].map(|shift| match (mapping >> shift) & 7 {
+                c @ 0..=3 => c + 4, // FROM_MEMORY_n: GFX x..w
+                5 => 1,             // FORCE_VALUE_1: GFX DST_SEL 1
+                _ => 0,             // FORCE_VALUE_0 (and reserved 6/7): GFX DST_SEL 0
             });
             words = desc::console_image_words(va, fmt, ty, width, height, depth, base_level, last_level, max_mip, first_slice, dst_sel);
         }
@@ -3770,6 +3785,98 @@ mod tests {
         }
     }
 
+    /// Array views: the console T# carries the absolute last slice + 1
+    /// (`Image::depth`), so `FirstArraySlice` / `First2DArrayFace` is added to
+    /// the view's count. Writing the count alone made FirstArraySlice 2,
+    /// ArraySize 3 decode as the single slice 2.
+    #[test]
+    fn console_create_srv_at_array_depth_ends_at_first_plus_count() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let cpu = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("descriptor slot");
+            let mut rdesc = [0u8; 56];
+            rdesc[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+            rdesc[16..24].copy_from_slice(&64u64.to_le_bytes());
+            rdesc[24..28].copy_from_slice(&64u32.to_le_bytes());
+            rdesc[28..30].copy_from_slice(&12u16.to_le_bytes()); // 12 slices / 2 cubes
+            rdesc[30..32].copy_from_slice(&1u16.to_le_bytes());
+            rdesc[32..36].copy_from_slice(&28u32.to_le_bytes()); // R8G8B8A8_UNORM
+            rdesc[36..40].copy_from_slice(&1u32.to_le_bytes());
+            type SrvAt = unsafe extern "win64" fn(*mut c_void, *const u8, *const u8, u64);
+            let srv: SrvAt = std::mem::transmute(slot(dev, 70));
+            let va = 0x10_6000_0000u64;
+
+            let mut union = [0u8; 0x18];
+            union[8..12].copy_from_slice(&2u32.to_le_bytes()); // FirstArraySlice
+            union[12..16].copy_from_slice(&3u32.to_le_bytes()); // ArraySize
+            let view = srv_at_view(28, 5, &union, va); // TEXTURE2DARRAY
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
+            let words: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
+            let i = crate::gpu::desc::image(&words).expect("a console T#");
+            assert_eq!((i.ty, i.base_array, i.depth), (crate::gpu::desc::ImageType::D2Array, 2, 5), "slices 2..5");
+
+            let mut union = [0u8; 0x18];
+            union[8..12].copy_from_slice(&6u32.to_le_bytes()); // First2DArrayFace
+            union[12..16].copy_from_slice(&2u32.to_le_bytes()); // NumCubes
+            let view = srv_at_view(28, 10, &union, va); // TEXTURECUBEARRAY
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
+            let words: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
+            let i = crate::gpu::desc::image(&words).expect("a console T#");
+            assert_eq!((i.ty, i.base_array, i.depth), (crate::gpu::desc::ImageType::Cube, 6, 18), "faces 6..18");
+        }
+    }
+
+    /// `Shader4ComponentMapping` is D3D12-encoded: 0–3 are FROM_MEMORY and become
+    /// GFX x..w (4–7), 4/5 are FORCE_VALUE_0/1 and become GFX 0/1. 0x68C maps
+    /// to [0, 5, 6, 7]; leaving 4 as x (4) was the defect.
+    #[test]
+    fn console_create_srv_at_decodes_force_value_mapping() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let cpu = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("descriptor slot");
+            let mut rdesc = [0u8; 56];
+            rdesc[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+            rdesc[16..24].copy_from_slice(&64u64.to_le_bytes());
+            rdesc[24..28].copy_from_slice(&64u32.to_le_bytes());
+            rdesc[28..30].copy_from_slice(&1u16.to_le_bytes());
+            rdesc[30..32].copy_from_slice(&1u16.to_le_bytes());
+            rdesc[32..36].copy_from_slice(&28u32.to_le_bytes()); // R8G8B8A8_UNORM
+            rdesc[36..40].copy_from_slice(&1u32.to_le_bytes());
+            type SrvAt = unsafe extern "win64" fn(*mut c_void, *const u8, *const u8, u64);
+            let srv: SrvAt = std::mem::transmute(slot(dev, 70));
+            let mut view = srv_at_view(28, 4, &[0u8; 8], 0x10_7000_0000);
+            view[8..12].copy_from_slice(&0x68Cu32.to_le_bytes());
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
+            let words: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
+            let i = crate::gpu::desc::image(&words).expect("a console T#");
+            assert_eq!(i.dst_sel, [0, 5, 6, 7]);
+        }
+    }
+
+    /// A UNKNOWN/typeless buffer format falls back to R32_FLOAT (22) as the
+    /// Windows twin's `buffer_words_at` does, not GFX10 INVALID (0).
+    #[test]
+    fn console_create_srv_at_buffer_unknown_format_is_r32_float() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let cpu = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("descriptor slot");
+            let mut rdesc = [0u8; 56];
+            rdesc[0..4].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+            let mut union = [0u8; 0x18];
+            union[8..12].copy_from_slice(&64u32.to_le_bytes()); // NumElements
+            type SrvAt = unsafe extern "win64" fn(*mut c_void, *const u8, *const u8, u64);
+            let srv: SrvAt = std::mem::transmute(slot(dev, 70));
+            let view = srv_at_view(0, 1, &union, 0x10_2000_0000); // DXGI_FORMAT_UNKNOWN
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
+            let words: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
+            let b = crate::gpu::desc::buffer(&[words[0], words[1], words[2], words[3]]);
+            assert_eq!((b.stride, b.num_records, b.format), (4, 64, 22));
+        }
+    }
+
     /// No write outside the graphics pool, and no descriptor for a null GPU
     /// address: a wild view must not put bytes into host memory.
     #[test]
@@ -3789,12 +3896,18 @@ mod tests {
             srv(dev, rdesc.as_ptr(), view.as_ptr(), local.as_ptr() as u64);
             assert_eq!(local, [0x5A5A_5A5Au32; 8], "a slot outside the pool is not written");
 
+            let unaligned = crate::hle::kernelx_linux::gfx_alloc_window0(64, 0x1_0000, true).expect("descriptor slot");
+            std::ptr::write_bytes(unaligned as *mut u8, 0x5A, 64);
+            srv(dev, rdesc.as_ptr(), view.as_ptr(), unaligned as u64 + 8);
+            let bytes = std::slice::from_raw_parts(unaligned as *const u8, 64);
+            assert!(bytes.iter().all(|&b| b == 0x5A), "an unaligned in-pool address is not a 32-byte slot");
+
             let cpu = crate::hle::kernelx_linux::gfx_alloc_window0(32, 0x1_0000, true).expect("descriptor slot");
             std::ptr::write_bytes(cpu as *mut u8, 0x5A, 32);
             view[0x28..0x30].fill(0);
             srv(dev, rdesc.as_ptr(), view.as_ptr(), cpu as u64);
             let sentinel: [u32; 8] = std::ptr::read_unaligned(cpu as *const [u32; 8]);
-            assert_eq!(sentinel, [0x5A5A_5A5Au32; 8], "a null GPU address writes no descriptor");
+            assert_eq!(sentinel, [0x5A5A_5A5A_u32; 8], "a null GPU address writes no descriptor");
         }
     }
 

@@ -3279,8 +3279,9 @@ pub(crate) fn gfx_contains_range(addr: usize, len: usize) -> bool {
 /// Linux twin of `gpu::shader::readable` for graphics-pool memory (commit `mprotect`s
 /// the range `PROT_READ | PROT_WRITE`). That function stays a refusal on Linux because
 /// the crash handler calls it inside a signal context, where reading `/proc` would be
-/// async-signal-unsafe; this one is only used off that path (descriptor-heap creation).
-fn gfx_range_readable(p: usize, len: usize) -> bool {
+/// async-signal-unsafe; this one is only used off that path (descriptor-heap creation and
+/// console descriptor writes from title pointers).
+pub(crate) fn gfx_range_readable(p: usize, len: usize) -> bool {
     if p == 0 || len == 0 || len > 256 << 20 {
         return false;
     }
