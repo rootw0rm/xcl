@@ -1,5 +1,12 @@
 # Retail "CreateObject" chain trace (M1.3)
 
+> **Correction (2026-11-28):** the class-5/NULL branch below is real, but it
+> was not the boot path. XCL's `ReadFile` ignored the `OVERLAPPED` offset, so
+> the pack header byte `H[0x2e]` was read from file `0x102e` (`0x0b`, class 5)
+> instead of `0x2e` (`0x09`, class 4). With the offset honored the title
+> registers the pack and boots past this fault. See
+> `docs/retail-overlapped-pack-read.md`; do not re-probe the class-5 chain.
+
 Date: 2026-11-27. Tip: `linux` @ `58534aaa` (step-03 landed). Task key:
 `code-assist:xcl-first-frame:step-04:createobject-chain`.
 
