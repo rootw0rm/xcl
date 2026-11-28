@@ -45,10 +45,10 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::hle::vulkan_linux::{Backend, Selection, VulkanState, acquire, select_cached};
 use crate::util::{E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER, HRESULT, S_FALSE, S_OK};
@@ -228,8 +228,11 @@ fn vtable(kind: Kind) -> *const usize {
             v[10] = Queue_ExecuteCommandLists as usize;
             v[14] = Queue_Signal as usize;
             v[15] = Ret_S_OK as usize; // Wait
-            v[16] = Queue_GetTimestampFrequency as usize;
-            v[17] = Queue_GetClockCalibration as usize;
+            // #16/#17 are Signal/Wait on the newer console layout and the PC
+            // order's GetTimestampFrequency/GetClockCalibration on the older
+            // one; the fence registry tells the call shapes apart.
+            v[16] = Queue_Slot16 as usize;
+            v[17] = Queue_Slot17 as usize;
             // The title's runtime uses the newer console queue layout: #18 is
             // GetTimestampFrequency (HRESULT + u64 out), #19 GetClockCalibration,
             // #20 GetDesc. Retail call: exe+0x2484180.
@@ -250,6 +253,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[8] = Fence_GetCompletedValue as usize;
             v[9] = Fence_SetEventOnCompletion as usize;
             v[10] = Fence_Signal as usize;
+            v[12] = Fence_CompletedValueAddress as usize; // console completed value address
         }
         Kind::DescriptorHeap => {
             v[8] = Heap_GetDesc16 as usize;
@@ -401,6 +405,24 @@ fn new_obj(kind: Kind) -> *mut NullObj {
         mem: Mutex::new((0, 0)),
         desc: [0; 64],
     }))
+}
+
+/// Fences the title created. The newer console queue layout puts `Signal(fence, value)`
+/// and `Wait(fence, value)` at #16/#17, where the PC order has `GetTimestampFrequency` /
+/// `GetClockCalibration` (out pointers). Windows tells the shapes apart with the same
+/// registry (`real.rs::is_fence`) so a timing out-parameter is never dereferenced as a
+/// fence and a fence is never written through as a u64 out slot.
+static FENCES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn note_fence(o: *mut NullObj) {
+    FENCES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(o as usize);
+}
+
+fn is_title_fence(p: *mut c_void) -> bool {
+    !p.is_null() && FENCES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(p as usize))
 }
 
 unsafe fn out_obj(ppv: *mut *mut c_void, kind: Kind) -> HRESULT {
@@ -1577,6 +1599,7 @@ unsafe extern "win64" fn Device_CreateFence(_t: *mut NullObj, initial: u64, _f: 
     }
     let o = new_obj(Kind::Fence);
     (*o).value.store(initial, Ordering::Relaxed);
+    note_fence(o);
     *ppv = o as *mut c_void;
     S_OK
 }
@@ -2427,6 +2450,40 @@ unsafe extern "win64" fn Queue_GetTimestampFrequency(_t: *mut NullObj, f: *mut u
     *f = 10_000_000;
     S_OK
 }
+/// Console queue #16: the newer console layout shifts Signal from #14 to #16
+/// (two console methods sit before it), so a title call there passes
+/// `(fence, value)`; the PC order has `GetTimestampFrequency(out)` instead.
+/// Retail `exe+0x2482608` signalled through this slot — the frequency write used
+/// to land on the fence object's vtable and the title's later completed-value
+/// poll called `0x989680` as a function pointer at `exe+0x4fb0aec`.
+unsafe extern "win64" fn Queue_Slot16(this: *mut NullObj, a1: *mut c_void, a2: u64) -> HRESULT {
+    if is_title_fence(a1) {
+        Queue_Signal(this, a1 as *mut NullObj, a2)
+    } else {
+        Queue_GetTimestampFrequency(this, a1 as *mut u64)
+    }
+}
+
+/// Console queue #17: `Wait(fence, value)` on the newer layout, the PC order's
+/// `GetClockCalibration(gpu, cpu)` on the older one. The null GPU completes
+/// everything instantly, so Wait is `S_OK`.
+unsafe extern "win64" fn Queue_Slot17(this: *mut NullObj, a1: *mut c_void, a2: u64) -> HRESULT {
+    if is_title_fence(a1) {
+        S_OK
+    } else {
+        Queue_GetClockCalibration(this, a1 as *mut u64, a2 as usize as *mut u64)
+    }
+}
+
+/// Console fence #12: the address of the fence's completed value, which the
+/// title polls with `monitorx`/`mwaitx` (Windows `fence_x::completed_value_address`
+/// gives each fence a separate cell kept equal to `GetCompletedValue`). The null
+/// GPU completes instantly and every signal updates the fence's own `value`, so
+/// that field is the cell: no follower thread and no second allocation.
+unsafe extern "win64" fn Fence_CompletedValueAddress(this: *mut NullObj) -> *const u64 {
+    (*this).value.as_ptr()
+}
+
 unsafe extern "win64" fn Queue_GetClockCalibration(_t: *mut NullObj, gpu: *mut u64, cpu: *mut u64) -> HRESULT {
     let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
     let t = if libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) == 0 {
@@ -3359,6 +3416,86 @@ mod tests {
             assert_eq!(clock(q, &mut gpu, &mut cpu), S_OK);
             assert_ne!(gpu, 0);
             assert_eq!(gpu, cpu);
+        }
+    }
+
+    #[test]
+    fn console_queue_signal_slot16_does_not_overwrite_the_fence() {
+        // The newer console queue layout puts Signal(fence, value) at #16 (the
+        // PC order has GetTimestampFrequency(out) there). Retail calls it at
+        // exe+0x2482608 with the fence from its CreateFence; the frequency
+        // handler wrote 10 MHz over the fence object's vtable and the title's
+        // deferred-free poll then called it as a function pointer
+        // (`exe+0x4fb0aec`, fault `0x9896e0`) — Signal must only bump the
+        // fence's value.
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_queue: Fn4 = std::mem::transmute(slot(dev, 8));
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(dev, std::ptr::null(), std::ptr::null(), &mut q), S_OK);
+            let create_fence: unsafe extern "win64" fn(*mut c_void, u64, u32, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 36));
+            let mut fence = std::ptr::null_mut();
+            assert_eq!(create_fence(dev, 2, 0, std::ptr::null(), &mut fence), S_OK);
+            let obj = fence as *mut NullObj;
+            let vtbl = *fence.cast::<usize>();
+
+            let signal: unsafe extern "win64" fn(*mut c_void, *mut c_void, u64) -> HRESULT =
+                std::mem::transmute(slot(q, 16));
+            assert_eq!(signal(q, fence, 7), S_OK);
+            assert_eq!((*obj).value.load(Ordering::Acquire), 7, "console #16 is Signal");
+            assert_eq!(*fence.cast::<usize>(), vtbl, "Signal must not write the frequency over the fence");
+
+            let wait: unsafe extern "win64" fn(*mut c_void, *mut c_void, u64) -> HRESULT =
+                std::mem::transmute(slot(q, 17));
+            assert_eq!(wait(q, fence, 9), S_OK);
+            assert_eq!((*obj).value.load(Ordering::Acquire), 7, "console #17 is Wait");
+            assert_eq!(*fence.cast::<usize>(), vtbl);
+
+            // the PC-order call shape at the same slots still answers the timing queries
+            let freq: unsafe extern "win64" fn(*mut c_void, *mut u64) -> HRESULT = std::mem::transmute(slot(q, 16));
+            let mut hz = 0u64;
+            assert_eq!(freq(q, &mut hz), S_OK);
+            assert_eq!(hz, 10_000_000);
+            let clock: unsafe extern "win64" fn(*mut c_void, *mut u64, *mut u64) -> HRESULT =
+                std::mem::transmute(slot(q, 17));
+            let (mut gpu, mut cpu) = (0u64, 0u64);
+            assert_eq!(clock(q, &mut gpu, &mut cpu), S_OK);
+            assert_ne!(gpu, 0);
+            assert_eq!(gpu, cpu);
+            assert_eq!(*fence.cast::<usize>(), vtbl);
+        }
+    }
+
+    #[test]
+    fn fence_slot12_is_the_completed_value_address() {
+        // Console fence #12 is the address of the completed value the title
+        // polls (`monitorx`/`mwaitx`; Windows `fence_x::completed_value_address`).
+        // The null GPU completes instantly, so a signal advances the same cell.
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_queue: Fn4 = std::mem::transmute(slot(dev, 8));
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(dev, std::ptr::null(), std::ptr::null(), &mut q), S_OK);
+            let create_fence: unsafe extern "win64" fn(*mut c_void, u64, u32, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 36));
+            let mut fence = std::ptr::null_mut();
+            assert_eq!(create_fence(dev, 2, 0, std::ptr::null(), &mut fence), S_OK);
+
+            let cell: unsafe extern "win64" fn(*mut c_void) -> *const u64 = std::mem::transmute(slot(fence, 12));
+            let p = cell(fence);
+            assert!(!p.is_null(), "fence #12 must expose the completed value address");
+            assert_eq!(*p, 2);
+
+            let signal: unsafe extern "win64" fn(*mut c_void, *mut c_void, u64) -> HRESULT =
+                std::mem::transmute(slot(q, 16));
+            assert_eq!(signal(q, fence, 7), S_OK);
+            assert_eq!(*cell(fence), 7);
+            let cpu_signal: unsafe extern "win64" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(slot(fence, 10));
+            assert_eq!(cpu_signal(fence, 9), S_OK);
+            assert_eq!(*cell(fence), 9);
         }
     }
 
