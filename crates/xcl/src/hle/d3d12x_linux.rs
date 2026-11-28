@@ -148,9 +148,10 @@ unsafe impl Send for NullObj {}
 
 static CREATED: AtomicU64 = AtomicU64::new(0);
 
+static VTABLES: OnceLock<Mutex<Vec<(Kind, usize)>>> = OnceLock::new();
+
 fn vtable(kind: Kind) -> *const usize {
-    static TABLES: OnceLock<Mutex<Vec<(Kind, usize)>>> = OnceLock::new();
-    let t = TABLES.get_or_init(|| Mutex::new(Vec::new()));
+    let t = VTABLES.get_or_init(|| Mutex::new(Vec::new()));
     let mut g = t.lock().unwrap();
     if let Some(&(_, p)) = g.iter().find(|(k, _)| *k == kind) {
         return p as *const usize;
@@ -351,6 +352,29 @@ fn vtable(kind: Kind) -> *const usize {
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     g.push((kind, leaked.as_ptr() as usize));
     leaked.as_ptr()
+}
+
+/// Split the first two arguments of a method whose struct result travels
+/// through a hidden pointer. The retail title calls the C way — `(ret, this,
+/// …)` (`exe+0x247870d`: `rcx` = result buffer, `rdx` = device) — while
+/// windows-rs (the test title) calls `(this, ret, …)`. Like the Windows twin's
+/// `this_and_ret`, whichever argument is one of our objects is `this`; the
+/// other is the result buffer. Writing to the wrong one overwrites the
+/// `NullObj` header (`vtbl`/`refs`/`kind`) with the struct.
+unsafe fn this_and_ret(a: *mut c_void, b: *mut c_void) -> (*mut NullObj, *mut u8) {
+    // Unaligned: a 20-byte struct's buffer is 4-byte aligned.
+    let ours = |p: *mut c_void| {
+        !p.is_null()
+            && VTABLES.get().is_some_and(|t| {
+                let vt = (p as *const usize).read_unaligned();
+                t.lock().unwrap().iter().any(|&(_, v)| v == vt)
+            })
+    };
+    if ours(b) && !ours(a) {
+        (b as *mut NullObj, a as *mut u8)
+    } else {
+        (a as *mut NullObj, b as *mut u8)
+    }
 }
 
 fn new_obj(kind: Kind) -> *mut NullObj {
@@ -1299,23 +1323,27 @@ unsafe fn new_resource(hp: *const c_void, desc: *const u8, ppv: *mut *mut c_void
     S_OK
 }
 
-unsafe extern "win64" fn Device_GetResourceAllocationInfo(_t: *mut NullObj, ret: *mut u64, _mask: u32, n: u32, descs: *const u8) -> *mut u64 {
+unsafe extern "win64" fn Device_GetResourceAllocationInfo(a: *mut c_void, b: *mut c_void, _mask: u32, n: u32, descs: *const u8) -> *mut u8 {
+    let (_this, ret) = this_and_ret(a, b);
     let mut total = 0usize;
     for i in 0..n as usize {
         total += (approx_size(descs.add(i * 56)) + 0xFFFF) & !0xFFFF;
     }
     if !ret.is_null() {
-        *ret = total as u64;
-        *ret.add(1) = 0x10000;
+        // D3D12_RESOURCE_ALLOCATION_INFO { SizeInBytes, Alignment } — the buffer
+        // is only required to be 4-byte aligned, so never assume u64 alignment.
+        (ret as *mut u64).write_unaligned(total as u64);
+        (ret.add(8) as *mut u64).write_unaligned(0x10000);
     }
     ret
 }
-unsafe extern "win64" fn Device_GetCustomHeapProperties(_t: *mut NullObj, ret: *mut u8, _m: u32, ty: u32) -> *mut u8 {
+unsafe extern "win64" fn Device_GetCustomHeapProperties(a: *mut c_void, b: *mut c_void, _m: u32, ty: u32) -> *mut u8 {
+    let (_this, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 20);
-        *(ret as *mut u32) = 4; // CUSTOM
-        *(ret.add(4) as *mut u32) = if ty == 2 || ty == 3 { 3 } else { 1 }; // CPU page property
-        *(ret.add(8) as *mut u32) = 1; // memory pool L0
+        (ret as *mut u32).write_unaligned(4); // CUSTOM
+        (ret.add(4) as *mut u32).write_unaligned(if ty == 2 || ty == 3 { 3 } else { 1 }); // CPU page property
+        (ret.add(8) as *mut u32).write_unaligned(1); // memory pool L0
     }
     ret
 }
@@ -2616,6 +2644,54 @@ mod tests {
             let unknown: unsafe extern "win64" fn(*mut c_void) -> usize = std::mem::transmute(slot(dev, 200));
             assert_eq!(unknown(dev), 0);
             assert!(crate::stubs::all_stubs().iter().any(|s| s.name == "ID3D12Device::#200" && s.calls.load(Ordering::Relaxed) > 0));
+        }
+    }
+
+    /// The retail title calls slots 26/25 the C way: `rcx` = result buffer,
+    /// `rdx` = device (`exe+0x247870d`, `exe+0x14034413f`). Reading `rcx` as
+    /// `this` wrote the struct over the `NullObj` header — gdb showed
+    /// `[device] = 0x0000000100000004` and the next call faulting at
+    /// `0x1000000d4`. windows-rs (the test title) passes `(this, ret, …)`, so
+    /// both orders must fill the caller's buffer and leave the object alone.
+    #[test]
+    fn heap_properties_and_allocation_info_use_a_hidden_result_buffer() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let vtable_word = || (dev as *const usize).read();
+            let before = vtable_word();
+
+            // Each pair is (which argument, 0 = result buffer, 1 = device):
+            // retail, then windows-rs.
+            type HeapProps = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32) -> *mut u8;
+            let heap_props: HeapProps = std::mem::transmute(slot(dev, 26));
+            for buf_first in [true, false] {
+                let mut props = [0u8; 20];
+                let buf = props.as_mut_ptr() as *mut c_void;
+                let (c, d) = if buf_first { (buf, dev) } else { (dev, buf) };
+                assert_eq!(heap_props(c, d, 1, 2), props.as_mut_ptr(), "slot 26 returned the wrong buffer");
+                assert_eq!(u32::from_le_bytes(props[0..4].try_into().unwrap()), 4, "CUSTOM");
+                assert_eq!(u32::from_le_bytes(props[4..8].try_into().unwrap()), 3, "UPLOAD page property");
+                assert_eq!(u32::from_le_bytes(props[8..12].try_into().unwrap()), 1, "memory pool L0");
+                assert_eq!(vtable_word(), before, "slot 26 wrote over the device header");
+                assert_eq!((*(dev as *mut NullObj)).kind, Kind::Device);
+            }
+
+            type AllocInfo = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *const u8) -> *mut u8;
+            let alloc: AllocInfo = std::mem::transmute(slot(dev, 25));
+            let mut desc = [0u8; 56];
+            desc[0] = 1; // BUFFER
+            desc[16..24].copy_from_slice(&0x1234u64.to_le_bytes());
+            for buf_first in [true, false] {
+                let mut info = [0u8; 16];
+                let buf = info.as_mut_ptr() as *mut c_void;
+                let (c, d) = if buf_first { (buf, dev) } else { (dev, buf) };
+                assert_eq!(alloc(c, d, 1, 1, desc.as_ptr()), info.as_mut_ptr(), "slot 25 returned the wrong buffer");
+                assert_eq!(u64::from_le_bytes(info[0..8].try_into().unwrap()), 0x1_0000);
+                assert_eq!(u64::from_le_bytes(info[8..16].try_into().unwrap()), 0x1_0000);
+                assert_eq!(vtable_word(), before, "slot 25 wrote over the device header");
+                assert_eq!((*(dev as *mut NullObj)).kind, Kind::Device);
+            }
         }
     }
 
