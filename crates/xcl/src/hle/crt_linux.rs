@@ -206,6 +206,70 @@ pub unsafe extern "win64" fn _time64(dest: *mut i64) -> i64 {
     now
 }
 
+/// `struct tm` as MSVC's `_gmtime64` returns it: nine `int` fields, no timezone
+/// tail (the glibc layout is copied field by field, never reinterpreted).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Tm {
+    pub sec: i32,
+    pub min: i32,
+    pub hour: i32,
+    pub mday: i32,
+    pub mon: i32,
+    pub year: i32,
+    pub wday: i32,
+    pub yday: i32,
+    pub isdst: i32,
+}
+
+thread_local! {
+    /// Per-thread `struct tm` storage (the MSVC CRT contract: the caller's pointer
+    /// stays valid until the next `_gmtime64` in the same thread).
+    static GMTIME64_TM: std::cell::UnsafeCell<Tm> = std::cell::UnsafeCell::new(Tm {
+        sec: 0,
+        min: 0,
+        hour: 0,
+        mday: 0,
+        mon: 0,
+        year: 0,
+        wday: 0,
+        yday: 0,
+        isdst: 0,
+    });
+}
+
+/// `struct tm *_gmtime64(const __time64_t *time)` — a real UTC breakdown of the
+/// epoch value. Step 64: the title's TLS certificate loader validates the
+/// certificate validity window with this; a null auto-stub return rejected the
+/// shipped CA bundle and aborted the engine runtime init at ~7 s.
+pub unsafe extern "win64" fn _gmtime64(time: *const i64) -> *mut Tm {
+    if time.is_null() {
+        set_win_errno(EINVAL_WIN);
+        return std::ptr::null_mut();
+    }
+    let secs = *time;
+    let mut lt: libc::tm = std::mem::zeroed();
+    if libc::gmtime_r(&secs as *const i64 as *const libc::time_t, &mut lt).is_null() {
+        set_win_errno(EINVAL_WIN);
+        return std::ptr::null_mut();
+    }
+    GMTIME64_TM
+        .try_with(|cell| {
+            let out = cell.get();
+            (*out).sec = lt.tm_sec;
+            (*out).min = lt.tm_min;
+            (*out).hour = lt.tm_hour;
+            (*out).mday = lt.tm_mday;
+            (*out).mon = lt.tm_mon;
+            (*out).year = lt.tm_year;
+            (*out).wday = lt.tm_wday;
+            (*out).yday = lt.tm_yday;
+            (*out).isdst = lt.tm_isdst;
+            out
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// `errno_t _set_fmode(int mode)` — report success without applying `mode`: this HLE
 /// has no backed CRT stdio translation, and the title only checks the return. The
 /// `__p__fmode` cell keeps its zeroed default so a read-back stays stable.
@@ -4272,6 +4336,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("_errno", _errno as usize),
         ("__acrt_iob_func", __acrt_iob_func as usize),
         ("_time64", _time64 as usize),
+        ("_gmtime64", _gmtime64 as usize),
         ("_set_fmode", _set_fmode as usize),
         (
             "_register_thread_local_exe_atexit_callback",
@@ -4542,6 +4607,35 @@ mod tests {
             // seeds (it is never the auto-stub's constant).
             assert_ne!(mix64(1), mix64(2));
             assert_ne!(mix64(1), 0);
+        }
+    }
+
+    #[test]
+    fn gmtime64_returns_a_valid_utc_tm() {
+        // Retail Step 64: the TLS certificate loader calls `_gmtime64` for the
+        // certificate validity window; the auto-stub's null return rejects every
+        // certificate and the engine init fails at ~7 s.
+        assert!(exports().iter().any(|(n, _)| *n == "_gmtime64"), "_gmtime64 must be wired");
+        unsafe {
+            let epoch = 0i64;
+            let tm = _gmtime64(&epoch);
+            assert!(!tm.is_null(), "epoch 0 must convert");
+            assert_eq!(((*tm).sec, (*tm).min, (*tm).hour), (0, 0, 0));
+            assert_eq!(((*tm).mday, (*tm).mon, (*tm).year), (1, 0, 70));
+            assert_eq!((*tm).yday, 0);
+            // 2024-02-29T12:34:56Z.
+            let leap = 1_709_210_096i64;
+            let tm = _gmtime64(&leap);
+            assert!(!tm.is_null());
+            assert_eq!(((*tm).sec, (*tm).min, (*tm).hour), (56, 34, 12));
+            assert_eq!(((*tm).mday, (*tm).mon, (*tm).year), (29, 1, 124));
+            // Per-thread buffer: two calls on one thread share storage (MSVC contract).
+            assert_eq!(tm, _gmtime64(&epoch));
+            assert!(_gmtime64(std::ptr::null()).is_null());
+            assert_eq!(*_errno(), EINVAL_WIN);
+            let extreme = i64::MAX;
+            assert!(_gmtime64(&extreme).is_null(), "out-of-range time must be rejected");
+            assert_eq!(*_errno(), EINVAL_WIN);
         }
     }
 
