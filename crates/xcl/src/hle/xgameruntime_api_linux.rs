@@ -76,6 +76,9 @@ const XSYSTEM_V3_IID: Guid = g(0x6fd71f09_7513_49f0_89bc_bfaf5df6f852);
 const XANALYTICS: Guid = g(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b);
 const XFEATURE: Guid = g(0x8836fe87_edb9_4fe3_8dad_05f0d2cd5b40);
 const XDISPLAY: Guid = g(0x1b339674_328d_4283_a200_3171f18d3639);
+/// XDisplay HDR interface (`XDisplayTryEnableHdrMode`): the class the title's
+/// language/display init queries; its vtable slot comes from the GDK table.
+const XDISPLAY_HDR: Guid = g(0x03f0fe74_fdd9_4e5c_b630_f9339c47acc5);
 const XGAMEEVENT: Guid = g(0xbbfbdcc7_bfe7_409b_a5ca_edf054960b4d);
 pub const XNETWORKING: Guid = g(0x37e56907_2f10_41e8_b72f_36edb185331a);
 pub const XERROR: Guid = g(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
@@ -359,6 +362,9 @@ fn classes() -> Vec<Class> {
             clsid: XDISPLAY,
             impls: vec![("XLaunchUri", launch_uri as usize), ("XDisplayAcquireTimeoutDeferral", display_deferral as usize), ("XDisplayCloseTimeoutDeferralHandle", nothing as usize)],
         },
+        // display capability (`QueryApiImpl 03f0fe74…/35f07670…`): an SDR answer is a real
+        // answer — the renderer asks whether HDR can be enabled and otherwise stays SDR.
+        Class { name: "XDisplay", clsid: XDISPLAY_HDR, impls: vec![("XDisplayTryEnableHdrMode", try_enable_hdr_mode as usize)] },
         // telemetry: offline, accepted and dropped
         Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)] },
         Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking() },
@@ -805,6 +811,36 @@ unsafe extern "win64" fn display_deferral(out: *mut usize) -> HRESULT {
         return E_INVALIDARG;
     }
     *out = 1;
+    S_OK
+}
+
+/// GDK `XDisplayHdrModeResult`: the display cannot show HDR (SDR output).
+const XDISPLAY_HDR_MODE_DISABLED: i32 = 0;
+
+/// GDK `XDisplayHdrModeInfo` (result first, then the tone-map luminances).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct XDisplayHdrModeInfo {
+    pub result: i32,
+    pub min_tone_map_luminance: f32,
+    pub max_tone_map_luminance: f32,
+    pub max_full_frame_tone_map_luminance: f32,
+}
+
+/// `HRESULT XDisplayTryEnableHdrMode(XDisplayHdrModePreference, XDisplayHdrModeInfo*)` —
+/// XCL's output is SDR (Vulkan swapchain without an HDR format), so the call succeeds
+/// and reports `Disabled` with zero luminances. The title enables HDR only when the
+/// result says so, which keeps it on the same SDR path as the rest of XCL's presenter.
+unsafe extern "win64" fn try_enable_hdr_mode(_preference: i32, info: *mut XDisplayHdrModeInfo) -> HRESULT {
+    if info.is_null() {
+        return E_INVALIDARG;
+    }
+    *info = XDisplayHdrModeInfo {
+        result: XDISPLAY_HDR_MODE_DISABLED,
+        min_tone_map_luminance: 0.0,
+        max_tone_map_luminance: 0.0,
+        max_full_frame_tone_map_luminance: 0.0,
+    };
     S_OK
 }
 
@@ -1361,6 +1397,37 @@ mod tests {
             assert_eq!(hr, REGDB_E_CLASSNOTREG);
             assert!(o.is_null());
             assert!(stats().apis.values().any(|v| v.contains("missing")), "{:?}", stats().apis);
+        }
+    }
+
+    /// The title's display-capability query (`QueryApiImpl 03f0fe74…/35f07670…`) must
+    /// answer with an XCL object: before this the call logged `XDisplay: missing` and the
+    /// title raised `XErrorReport 0x89240107` ("missing required dependencies").
+    #[test]
+    fn xdisplay_hdr_query_answers_with_sdr_capability() {
+        let (clsid, iid, slot_no) = slot_in_table("XDisplayTryEnableHdrMode");
+        assert_eq!(clsid, XDISPLAY_HDR);
+        assert_eq!(iid, g(0x35f07670_706e_4bfb_9476_090798c5ebf3));
+        unsafe {
+            let (hr, o) = query(clsid, iid);
+            assert_eq!(hr, S_OK);
+            assert!(!o.is_null());
+            assert!(stats().apis.values().any(|v| v.starts_with("XDisplay: XCL")), "{:?}", stats().apis);
+            let f: unsafe extern "win64" fn(*mut c_void, i32, *mut XDisplayHdrModeInfo) -> HRESULT = slot(o, slot_no);
+            let mut info = XDisplayHdrModeInfo {
+                result: 7,
+                min_tone_map_luminance: 1.0,
+                max_tone_map_luminance: 2.0,
+                max_full_frame_tone_map_luminance: 3.0,
+            };
+            assert_eq!(f(o, 0, &mut info), S_OK);
+            assert_eq!(
+                info,
+                XDisplayHdrModeInfo { result: 0, min_tone_map_luminance: 0.0, max_tone_map_luminance: 0.0, max_full_frame_tone_map_luminance: 0.0 }
+            );
+            // A null out-parameter is rejected, never dereferenced.
+            assert_eq!(f(o, 0, std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(std::mem::size_of::<XDisplayHdrModeInfo>(), 16);
         }
     }
 
