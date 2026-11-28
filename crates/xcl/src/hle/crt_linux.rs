@@ -19,7 +19,7 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------------------
 // Process-lifetime cells (lazily `malloc`ed once; a lost race leaks a few bytes and the
@@ -905,6 +905,151 @@ fn trace_strnicmp(a: *const u8, b: *const u8, n: usize, result: i32) {
     let fa = strncmp_cstr_full(a);
     let fb = strncmp_cstr_full(b);
     crate::xlog_info!("[STRNICMP] n={n} a={pa:?} a_full={fa:?} b={pb:?} b_full={fb:?} -> {result}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Classify/parse/utility pack (retail Step 38): the boot path's language/config init
+// calls these through `api-ms-win-crt-*` imports. With no HLE they were auto-stubs:
+// `isspace` always 0 (204 calls, consumers branch on it), `atoi` always 0, `_stricmp`
+// always 0 ("equal"), `srand` a no-op, `qsort` a no-op that left arrays unsorted.
+// Each is the C-locale UCRT contract, no locale backend.
+// ---------------------------------------------------------------------------------------
+
+/// C-locale whitespace: HT(0x09)–CR(0x0D) and space. `EOF`/non-bytes are not space.
+#[inline]
+fn is_c_space(c: i32) -> bool {
+    matches!(c, 0x09..=0x0D | 0x20)
+}
+
+/// `int isspace(int c)` — nonzero for C-locale whitespace, `0` otherwise.
+pub unsafe extern "win64" fn isspace(c: i32) -> i32 {
+    is_c_space(c) as i32
+}
+
+/// Byte-wise ASCII fold of the C locale: `A`–`Z` only.
+#[inline]
+fn ascii_fold(b: u8) -> u8 {
+    if b.is_ascii_uppercase() {
+        b + 32
+    } else {
+        b
+    }
+}
+
+/// `int _stricmp(a, b)` — unbounded case-insensitive compare (ASCII fold), the
+/// difference of the first differing pair folded to lower case, `0` when equal.
+/// A null pointer reads as the empty string so a broken argument cannot fault.
+pub unsafe extern "win64" fn _stricmp(a: *const u8, b: *const u8) -> i32 {
+    let mut i = 0usize;
+    loop {
+        let x = if a.is_null() { 0 } else { *a.add(i) };
+        let y = if b.is_null() { 0 } else { *b.add(i) };
+        let fx = ascii_fold(x);
+        let fy = ascii_fold(y);
+        if fx != fy {
+            return fx as i32 - fy as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+}
+
+/// `int atoi(const char*)` — C-locale leading whitespace, optional sign, decimal
+/// digits, stop at the first non-digit. Out-of-range values clamp to `i32::MIN`/
+/// `i32::MAX` (the C contract leaves overflow undefined; a deterministic clamp is
+/// better than a wrap the title would branch on). Null reads as the empty string.
+pub unsafe extern "win64" fn atoi(s: *const u8) -> i32 {
+    let mut v: i64 = 0;
+    let mut neg = false;
+    if !s.is_null() {
+        let mut p = s;
+        while is_c_space(*p as i32) {
+            p = p.add(1);
+        }
+        if *p == b'+' {
+            p = p.add(1);
+        } else if *p == b'-' {
+            neg = true;
+            p = p.add(1);
+        }
+        while (*p).is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add((*p - b'0') as i64);
+            p = p.add(1);
+        }
+    }
+    let v = if neg { -v } else { v };
+    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// UCRT `rand` state (`srand` seeds it; the algorithm is MSVC's multiplicative
+/// generator, result `(state >> 16) & 0x7FFF`). The title imports both names, so a
+/// real `srand` needs the matching `rand` to be observable.
+static RAND_STATE: AtomicU32 = AtomicU32::new(1);
+
+/// `void srand(unsigned int seed)` — seed the process-wide UCRT sequence.
+pub unsafe extern "win64" fn srand(seed: u32) {
+    RAND_STATE.store(seed, Ordering::Relaxed);
+}
+
+/// `int rand(void)` — the UCRT sequence: `0..=RAND_MAX(0x7FFF)`.
+pub unsafe extern "win64" fn rand() -> i32 {
+    let mut cur = RAND_STATE.load(Ordering::Relaxed);
+    loop {
+        let next = cur.wrapping_mul(214_013).wrapping_add(2_531_011);
+        match RAND_STATE.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return ((next >> 16) & 0x7FFF) as i32,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+type QsortCmp = unsafe extern "win64" fn(*const u8, *const u8) -> i32;
+
+unsafe fn qsort_lt(base: *mut u8, width: usize, a: usize, b: usize, cmp: QsortCmp) -> bool {
+    cmp(base.add(a * width), base.add(b * width)) < 0
+}
+
+/// Sift the root of the max-heap at `root` down within `[0, end)`, swapping whole
+/// elements (the comparator sees element pointers, as the C contract implies).
+unsafe fn qsort_sift_down(base: *mut u8, width: usize, mut root: usize, end: usize, cmp: QsortCmp) {
+    loop {
+        let mut child = 2 * root + 1;
+        if child >= end {
+            break;
+        }
+        if child + 1 < end && qsort_lt(base, width, child, child + 1, cmp) {
+            child += 1;
+        }
+        if qsort_lt(base, width, root, child, cmp) {
+            std::ptr::swap_nonoverlapping(base.add(root * width), base.add(child * width), width);
+            root = child;
+        } else {
+            break;
+        }
+    }
+}
+
+/// `void qsort(void* base, size_t num, size_t width, int (*compare)(const void*, const void*))`
+/// — in-place heapsort with guest whole-element swaps (`O(n log n)`, no allocation,
+/// no Rust comparator panics across the FFI boundary). No-op for `<2` elements,
+/// a null base/comparator, or a zero/overflowing element count.
+pub unsafe extern "win64" fn qsort(base: *mut u8, num: usize, width: usize, compare: usize) {
+    if base.is_null() || compare == 0 || width == 0 || num < 2 {
+        return;
+    }
+    if num.checked_mul(width).is_none() {
+        return;
+    }
+    let cmp: QsortCmp = std::mem::transmute(compare);
+    for root in (0..num / 2).rev() {
+        qsort_sift_down(base, width, root, num, cmp);
+    }
+    for end in (1..num).rev() {
+        std::ptr::swap_nonoverlapping(base, base.add(end * width), width);
+        qsort_sift_down(base, width, 0, end, cmp);
+    }
 }
 
 /// `int wcscmp(a, b)` — UTF-16 unit order, `0` when equal.
@@ -3014,6 +3159,495 @@ unsafe fn render_one_wspec(
     Some(())
 }
 
+// ---------------------------------------------------------------------------------------
+// Scan (`sscanf` family) slice. `__stdio_common_vsscanf` is the UCRT entry the title's
+// `sscanf`/`_snscanf` wrappers land on. The auto-stub returned 0, so every scan read
+// nothing (the language/config init saw empty fields). This implements the C-locale
+// conversions the CRT wrappers can emit, writing through the caller's `va_list`
+// (one 8-byte stack slot per argument, like `vfprintf` above).
+// ---------------------------------------------------------------------------------------
+
+/// Store width of a scanf length modifier, in bytes (`l` is Windows `long`, 32-bit).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanLen {
+    Byte,
+    Word,
+    Dword,
+    Qword,
+}
+
+/// `scanf` destination writes (guest memory is mapped in this process). A null
+/// destination is skipped, never dereferenced.
+unsafe fn store_signed(ptr: usize, v: i64, len: ScanLen) {
+    if ptr == 0 {
+        return;
+    }
+    match len {
+        ScanLen::Byte => *(ptr as *mut i8) = v as i8,
+        ScanLen::Word => *(ptr as *mut i16) = v as i16,
+        ScanLen::Dword => *(ptr as *mut i32) = v as i32,
+        ScanLen::Qword => *(ptr as *mut i64) = v,
+    }
+}
+
+unsafe fn store_unsigned(ptr: usize, v: u64, len: ScanLen) {
+    if ptr == 0 {
+        return;
+    }
+    match len {
+        ScanLen::Byte => *(ptr as *mut u8) = v as u8,
+        ScanLen::Word => *(ptr as *mut u16) = v as u16,
+        ScanLen::Dword => *(ptr as *mut u32) = v as u32,
+        ScanLen::Qword => *(ptr as *mut u64) = v,
+    }
+}
+
+struct Scan<'a> {
+    input: &'a [u8],
+    pos: usize,
+    assigned: i32,
+    args: VaReader,
+}
+
+impl<'a> Scan<'a> {
+    fn at_end(&self) -> bool {
+        self.pos >= self.input.len()
+    }
+
+    fn skip_space(&mut self) {
+        while !self.at_end() && is_c_space(self.input[self.pos] as i32) {
+            self.pos += 1;
+        }
+    }
+
+    /// Field width caps the characters a conversion may consume.
+    fn field_end(&self, width: Option<usize>) -> usize {
+        match width {
+            Some(w) => self.pos.saturating_add(w).min(self.input.len()),
+            None => self.input.len(),
+        }
+    }
+
+    /// Input failure before the first conversion is `EOF`; afterwards the count.
+    fn input_fail(&self) -> i32 {
+        if self.assigned == 0 {
+            -1
+        } else {
+            self.assigned
+        }
+    }
+
+    fn next_arg(&mut self) -> Option<usize> {
+        self.args.next().map(|v| v as usize)
+    }
+}
+
+/// Parse an integer token (optional sign, base from the verb; `%i` auto-detects
+/// `0x`/leading `0`). Returns the magnitude and sign; `None` when no digit matched.
+fn scan_integer(input: &[u8], pos: &mut usize, width: Option<usize>, verb: u8) -> Option<(u128, bool)> {
+    let end = match width {
+        Some(w) => pos.saturating_add(w).min(input.len()),
+        None => input.len(),
+    };
+    let mut p = *pos;
+    if p >= end {
+        return None;
+    }
+    let mut neg = false;
+    if input[p] == b'+' {
+        p += 1;
+    } else if input[p] == b'-' {
+        neg = true;
+        p += 1;
+    }
+    let mut base: u32 = match verb {
+        b'd' | b'u' => 10,
+        b'o' => 8,
+        b'x' | b'X' | b'p' => 16,
+        b'i' => 0, // auto-detect
+        _ => 10,
+    };
+    if base == 0 {
+        if p + 1 < end && input[p] == b'0' && matches!(input[p + 1], b'x' | b'X') {
+            base = 16;
+            p += 2;
+        } else if p < end && input[p] == b'0' {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    } else if base == 16 && p + 1 < end && input[p] == b'0' && matches!(input[p + 1], b'x' | b'X') {
+        p += 2;
+    }
+    let digits = p;
+    let mut mag: u128 = 0;
+    while p < end {
+        let d = match input[p] {
+            b'0'..=b'9' => input[p] - b'0',
+            b'a'..=b'f' => input[p] - b'a' + 10,
+            b'A'..=b'F' => input[p] - b'A' + 10,
+            _ => break,
+        };
+        if u32::from(d) >= base {
+            break;
+        }
+        mag = mag.saturating_mul(base as u128).saturating_add(d as u128);
+        p += 1;
+    }
+    if p == digits {
+        return None;
+    }
+    *pos = p;
+    Some((mag, neg))
+}
+
+/// Parse one floating token, decimal (`strtod` grammar) or hex (`%a`).
+fn scan_float(input: &[u8], pos: &mut usize, width: Option<usize>) -> Option<f64> {
+    let end = match width {
+        Some(w) => pos.saturating_add(w).min(input.len()),
+        None => input.len(),
+    };
+    let start = *pos;
+    let mut p = start;
+    while p < end && matches!(input[p], b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E' | b'a'..=b'd' | b'f' | b'x' | b'X' | b'p' | b'P' | b'i' | b'n' | b'A'..=b'D' | b'F' | b'I' | b'N' | b't' | b'y' | b'T' | b'Y') {
+        p += 1;
+    }
+    if p == start {
+        return None;
+    }
+    let token = &input[start..p];
+    // Try the whole token first, then shorter prefixes: the scan above is deliberately
+    // over-inclusive (hex digits, inf/nan letters) and trailing junk belongs to the next
+    // format conversion (`"1.5f"` scans 1.5 and leaves `f`).
+    for cut in (1..=token.len()).rev() {
+        let Ok(text) = std::str::from_utf8(&token[..cut]) else { continue };
+        let v = if text.trim_start_matches(|c| c == '+' || c == '-').starts_with("0x") || text.trim_start_matches(|c| c == '+' || c == '-').starts_with("0X") {
+            parse_hex_float(text)
+        } else {
+            text.parse::<f64>().ok()
+        };
+        if let Some(v) = v {
+            *pos = start + cut;
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Hex float (`0x1.8p3`), what `%a` scans. Sign, `0x`, hex digits/fraction, `p` exponent.
+fn parse_hex_float(s: &str) -> Option<f64> {
+    let (neg, rest) = match s.as_bytes().first()? {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let body = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))?;
+    let (mantissa, exp) = match body.find(|c| c == 'p' || c == 'P') {
+        Some(k) => (&body[..k], body[k + 1..].parse::<i32>().ok()?),
+        None => (body, 0),
+    };
+    let (whole, frac) = match mantissa.find('.') {
+        Some(k) => (&mantissa[..k], &mantissa[k + 1..]),
+        None => (mantissa, ""),
+    };
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    let mut m = 0f64;
+    for b in whole.bytes() {
+        m = m * 16.0 + f64::from((b as char).to_digit(16)?);
+    }
+    let mut scale = 1.0 / 16.0;
+    for b in frac.bytes() {
+        m += f64::from((b as char).to_digit(16)?) * scale;
+        scale /= 16.0;
+    }
+    let v = m * 2f64.powi(exp);
+    Some(if neg { -v } else { v })
+}
+
+/// `int __stdio_common_vsscanf(options, buffer, count, format, locale, arglist)` —
+/// scan `buffer` (at most `count` characters, `SIZE_MAX` = unbounded) per the C
+/// format into the `arglist` pointers; returns the assigned-field count, `-1` on an
+/// input failure before the first field, or the count so far on a matching failure.
+pub unsafe extern "win64" fn __stdio_common_vsscanf(
+    _options: u64,
+    buffer: *const u8,
+    count: usize,
+    format: *const u8,
+    _locale: usize,
+    arglist: *const u64,
+) -> i32 {
+    if buffer.is_null() || format.is_null() {
+        return -1;
+    }
+    // `count` is the buffer size; for `sscanf` it is SIZE_MAX (unbounded).
+    let max = if count == usize::MAX { usize::MAX } else { count };
+    let mut len = 0usize;
+    while len < max && *buffer.add(len) != 0 {
+        len += 1;
+    }
+    let input = std::slice::from_raw_parts(buffer, len);
+    let mut s = Scan {
+        input,
+        pos: 0,
+        assigned: 0,
+        args: VaReader { cur: arglist, exhausted: arglist.is_null() },
+    };
+    let mut i = 0usize;
+    loop {
+        let f = *format.add(i);
+        if f == 0 {
+            break;
+        }
+        if is_c_space(f as i32) {
+            s.skip_space();
+            i += 1;
+            continue;
+        }
+        if f != b'%' {
+            if s.at_end() || s.input[s.pos] != f {
+                break;
+            }
+            s.pos += 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut fb = *format.add(i);
+        if fb == 0 {
+            break; // trailing '%'
+        }
+        if fb == b'%' {
+            if s.at_end() || s.input[s.pos] != b'%' {
+                break;
+            }
+            s.pos += 1;
+            i += 1;
+            continue;
+        }
+        let suppress = fb == b'*';
+        if suppress {
+            i += 1;
+            fb = *format.add(i);
+        }
+        let mut width: Option<usize> = None;
+        while fb.is_ascii_digit() {
+            width = Some(width.unwrap_or(0).saturating_mul(10).saturating_add(usize::from(fb - b'0')));
+            i += 1;
+            fb = *format.add(i);
+        }
+        if width == Some(0) {
+            // undefined in C; treat like an unmatchable field
+            break;
+        }
+        let mut len_mod = ScanLen::Dword;
+        let mut wide = false;
+        if fb == b'h' {
+            i += 1;
+            if *format.add(i) == b'h' {
+                len_mod = ScanLen::Byte;
+                i += 1;
+            } else {
+                len_mod = ScanLen::Word;
+            }
+        } else if fb == b'l' {
+            i += 1;
+            if *format.add(i) == b'l' {
+                len_mod = ScanLen::Qword;
+                i += 1;
+            } else {
+                wide = true; // `%ls`/`%lc` wide; `%lf` double
+            }
+        } else if fb == b'L' {
+            len_mod = ScanLen::Qword;
+            i += 1;
+        } else if matches!(fb, b'j' | b'z' | b't') {
+            len_mod = ScanLen::Qword;
+            i += 1;
+        } else if fb == b'I' {
+            i += 1;
+            if *format.add(i) == b'6' && *format.add(i + 1) == b'4' {
+                len_mod = ScanLen::Qword;
+                i += 2;
+            } else if *format.add(i) == b'3' && *format.add(i + 1) == b'2' {
+                len_mod = ScanLen::Dword;
+                i += 2;
+            } else {
+                len_mod = ScanLen::Qword;
+            }
+        }
+        let verb = *format.add(i);
+        if verb == 0 {
+            break;
+        }
+        i += 1;
+        // `%c`, `%[` and `%n` never skip leading whitespace.
+        if !matches!(verb, b'c' | b'[' | b'n') {
+            s.skip_space();
+        }
+        match verb {
+            b'd' | b'i' | b'u' | b'o' | b'x' | b'X' | b'p' => {
+                let Some((mag, neg)) = scan_integer(s.input, &mut s.pos, width, verb) else {
+                    if s.pos >= s.input.len() {
+                        return s.input_fail();
+                    }
+                    return s.assigned;
+                };
+                if !suppress {
+                    let Some(ptr) = s.next_arg() else { return s.assigned };
+                    if matches!(verb, b'd' | b'i') {
+                        let m = mag.min(i64::MAX as u128) as i64;
+                        store_signed(ptr, if neg { m.wrapping_neg() } else { m }, len_mod);
+                    } else {
+                        let m = mag.min(u64::MAX as u128) as u64;
+                        store_unsigned(ptr, if neg { m.wrapping_neg() } else { m }, len_mod);
+                    }
+                    s.assigned += 1;
+                }
+            }
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+                let Some(v) = scan_float(s.input, &mut s.pos, width) else {
+                    if s.pos >= s.input.len() {
+                        return s.input_fail();
+                    }
+                    return s.assigned;
+                };
+                if !suppress {
+                    let Some(ptr) = s.next_arg() else { return s.assigned };
+                    if wide || len_mod == ScanLen::Qword {
+                        if ptr != 0 {
+                            *(ptr as *mut f64) = v;
+                        }
+                    } else if ptr != 0 {
+                        *(ptr as *mut f32) = v as f32;
+                    }
+                    s.assigned += 1;
+                }
+            }
+            b'c' => {
+                let w = width.unwrap_or(1);
+                if s.pos.saturating_add(w) > s.input.len() {
+                    return s.input_fail();
+                }
+                if !suppress {
+                    let Some(ptr) = s.next_arg() else { return s.assigned };
+                    if ptr != 0 {
+                        if wide {
+                            for k in 0..w {
+                                *(ptr as *mut u16).add(k) = u16::from(s.input[s.pos + k]);
+                            }
+                        } else {
+                            std::ptr::copy_nonoverlapping(s.input.as_ptr().add(s.pos), ptr as *mut u8, w);
+                        }
+                    }
+                    s.assigned += 1;
+                }
+                s.pos += w;
+            }
+            b's' => {
+                let end = s.field_end(width);
+                let start = s.pos;
+                let mut p = start;
+                while p < end && !is_c_space(s.input[p] as i32) {
+                    p += 1;
+                }
+                if p == start {
+                    return s.assigned;
+                }
+                if !suppress {
+                    let Some(ptr) = s.next_arg() else { return s.assigned };
+                    if ptr != 0 {
+                        if wide {
+                            for k in 0..p - start {
+                                *(ptr as *mut u16).add(k) = u16::from(s.input[start + k]);
+                            }
+                            *(ptr as *mut u16).add(p - start) = 0;
+                        } else {
+                            std::ptr::copy_nonoverlapping(s.input.as_ptr().add(start), ptr as *mut u8, p - start);
+                            *(ptr as *mut u8).add(p - start) = 0;
+                        }
+                    }
+                    s.assigned += 1;
+                }
+                s.pos = p;
+            }
+            b'[' => {
+                let mut set = [false; 256];
+                let mut negate = false;
+                let mut fb = *format.add(i);
+                if fb == b'^' {
+                    negate = true;
+                    i += 1;
+                }
+                let mut first = true;
+                loop {
+                    let lo = *format.add(i);
+                    if lo == 0 {
+                        return s.assigned; // unterminated set
+                    }
+                    if lo == b']' && !first {
+                        i += 1;
+                        break;
+                    }
+                    first = false;
+                    i += 1;
+                    let next = *format.add(i);
+                    if next == b'-' && *format.add(i + 1) != b']' && *format.add(i + 1) != 0 {
+                        let hi = *format.add(i + 1);
+                        for c in lo..=hi {
+                            set[c as usize] = true;
+                        }
+                        i += 2;
+                    } else {
+                        set[lo as usize] = true;
+                    }
+                }
+                let end = s.field_end(width);
+                let start = s.pos;
+                let mut p = start;
+                while p < end && set[s.input[p] as usize] != negate {
+                    p += 1;
+                }
+                if p == start {
+                    return s.assigned;
+                }
+                if !suppress {
+                    let Some(ptr) = s.next_arg() else { return s.assigned };
+                    if ptr != 0 {
+                        if wide {
+                            for k in 0..p - start {
+                                *(ptr as *mut u16).add(k) = u16::from(s.input[start + k]);
+                            }
+                            *(ptr as *mut u16).add(p - start) = 0;
+                        } else {
+                            std::ptr::copy_nonoverlapping(s.input.as_ptr().add(start), ptr as *mut u8, p - start);
+                            *(ptr as *mut u8).add(p - start) = 0;
+                        }
+                    }
+                    s.assigned += 1;
+                }
+                s.pos = p;
+            }
+            b'n' => {
+                if !suppress {
+                    let Some(ptr) = s.next_arg() else { return s.assigned };
+                    store_signed(ptr, s.pos as i64, len_mod);
+                }
+            }
+            _ => {
+                // `%q`-style extension or a broken format: stop honestly.
+                static UNSUPPORTED: AtomicUsize = AtomicUsize::new(0);
+                if UNSUPPORTED.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("sscanf: conversion %{} is not supported – scanning stopped at field {}", verb as char, s.assigned);
+                }
+                return s.assigned;
+            }
+        }
+    }
+    s.assigned
+}
+
 /// `int __stdio_common_vswprintf_s(options, buffer, count, format, locale, args)` —
 /// secure wide format; `-1` on any failure (buffer emptied), else chars written.
 pub unsafe extern "win64" fn __stdio_common_vswprintf_s(
@@ -3298,6 +3932,12 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("strcmp", strcmp as usize),
         ("strncmp", strncmp as usize),
         ("_strnicmp", _strnicmp as usize),
+        ("_stricmp", _stricmp as usize),
+        ("isspace", isspace as usize),
+        ("atoi", atoi as usize),
+        ("srand", srand as usize),
+        ("rand", rand as usize),
+        ("qsort", qsort as usize),
         ("strcpy", strcpy as usize),
         ("strncpy", strncpy as usize),
         ("strcat", strcat as usize),
@@ -3338,6 +3978,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("fseek", fseek as usize),
         ("ftell", ftell as usize),
         ("__stdio_common_vfprintf", __stdio_common_vfprintf as usize),
+        ("__stdio_common_vsscanf", __stdio_common_vsscanf as usize),
         ("__stdio_common_vswprintf_s", __stdio_common_vswprintf_s as usize),
         ("__stdio_common_vswprintf", __stdio_common_vswprintf as usize),
         ("__stdio_common_vsprintf_s", __stdio_common_vsprintf_s as usize),
@@ -4375,6 +5016,145 @@ mod tests {
             assert_eq!(powf(2.0, 10.0), 1024.0);
             assert_eq!(powf(0.0, 0.0), 1.0);
             assert_eq!(powf(-1.0, f32::INFINITY), 1.0);
+        }
+    }
+
+    #[test]
+    fn classify_parse_sort_and_rng_contracts_are_live() {
+        // Retail Step 38: all six resolved to generic auto-stubs (0/0/"equal"/no-op),
+        // which the language/config init consumed as empty results. Wiring is only
+        // real when the export table carries the implementations.
+        for name in ["isspace", "atoi", "_stricmp", "srand", "rand", "qsort"] {
+            assert!(exports().iter().any(|(n, _)| *n == name), "{name} must be wired");
+        }
+        unsafe {
+            for c in [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20] {
+                assert_ne!(isspace(c), 0, "isspace({c:#x})");
+            }
+            for c in [0, b'A' as i32, b'0' as i32, 0x7F, 0xA0, -1] {
+                assert_eq!(isspace(c), 0, "isspace({c:#x})");
+            }
+
+            assert_eq!(atoi(c"  -42xyz".as_ptr() as *const u8), -42);
+            assert_eq!(atoi(c"+7".as_ptr() as *const u8), 7);
+            assert_eq!(atoi(c"abc".as_ptr() as *const u8), 0);
+            assert_eq!(atoi(c"2147483648".as_ptr() as *const u8), i32::MAX);
+            assert_eq!(atoi(std::ptr::null()), 0);
+
+            assert_eq!(_stricmp(c"AbC".as_ptr() as *const u8, c"aBc".as_ptr() as *const u8), 0);
+            assert!(_stricmp(c"abc".as_ptr() as *const u8, c"abd".as_ptr() as *const u8) < 0);
+            assert!(_stricmp(c"B".as_ptr() as *const u8, c"a".as_ptr() as *const u8) > 0);
+
+            // `srand` seeds the UCRT sequence: reseeding replays it exactly, and
+            // seed 1's first value is the MSVC generator's 41 (not a stub constant).
+            srand(1);
+            let first = rand();
+            srand(1);
+            assert_eq!(rand(), first);
+            assert_eq!(first, 41);
+            for _ in 0..100 {
+                assert!((0..=0x7FFF).contains(&rand()));
+            }
+
+            // `qsort` orders whole elements: a 16-byte element keeps its payload, so a
+            // key-only swap would fail the pad assertion.
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct E {
+                key: i32,
+                pad: [u8; 12],
+            }
+            unsafe extern "win64" fn by_key(a: *const u8, b: *const u8) -> i32 {
+                let x = &*(a as *const E);
+                let y = &*(b as *const E);
+                match x.key.cmp(&y.key) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            }
+            let mut arr = [
+                E { key: 5, pad: [5; 12] },
+                E { key: 1, pad: [1; 12] },
+                E { key: 4, pad: [4; 12] },
+                E { key: 2, pad: [2; 12] },
+                E { key: 3, pad: [3; 12] },
+            ];
+            qsort(arr.as_mut_ptr() as *mut u8, arr.len(), std::mem::size_of::<E>(), by_key as usize);
+            assert_eq!(arr.iter().map(|e| e.key).collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
+            for e in arr {
+                assert_eq!(e.pad, [e.key as u8; 12], "payload moved with its key");
+            }
+            // Degenerate inputs are no-ops, never faults.
+            qsort(arr.as_mut_ptr() as *mut u8, 0, 16, by_key as usize);
+            qsort(std::ptr::null_mut(), 5, 16, by_key as usize);
+            qsort(arr.as_mut_ptr() as *mut u8, 5, 0, by_key as usize);
+            qsort(arr.as_mut_ptr() as *mut u8, usize::MAX, 3, by_key as usize);
+        }
+    }
+
+    #[test]
+    fn vsscanf_assigns_fields_through_the_va_list() {
+        assert!(exports().iter().any(|(n, _)| *n == "__stdio_common_vsscanf"));
+        unsafe fn scan(input: &[u8], format: &[u8], args: &[u64]) -> i32 {
+            unsafe {
+                __stdio_common_vsscanf(0, input.as_ptr(), usize::MAX, format.as_ptr(), 0, args.as_ptr())
+            }
+        }
+        unsafe {
+            // Integer, string and hex fields; the format's spaces cross input whitespace.
+            let mut i = 0i32;
+            let mut buf = [0u8; 16];
+            let mut x = 0u32;
+            let args = [&mut i as *mut i32 as u64, buf.as_mut_ptr() as u64, &mut x as *mut u32 as u64];
+            let n = scan(c"  -7 hello 1F".to_bytes(), b"%d %s %x\0", &args);
+            assert_eq!(n, 3);
+            assert_eq!(i, -7);
+            assert_eq!(&buf[..6], b"hello\0");
+            assert_eq!(x, 0x1F);
+
+            // Floating point: `%lf` is a double, bare `%f` a float; `%n` records progress.
+            let mut d = 0f64;
+            let mut f = 0f32;
+            let mut used = -1i32;
+            let args = [&mut d as *mut f64 as u64, &mut f as *mut f32 as u64, &mut used as *mut i32 as u64];
+            assert_eq!(scan(c"1.5,-2.25".to_bytes(), b"%lf,%f%n\0", &args), 2);
+            assert_eq!(d, 1.5);
+            assert_eq!(f, -2.25);
+            assert_eq!(used, 9);
+
+            // Scanset, width, assignment suppression and a partial matching failure.
+            let mut word = [0u8; 8];
+            let mut v = 0i32;
+            let args = [word.as_mut_ptr() as u64, &mut v as *mut i32 as u64];
+            assert_eq!(scan(c"abcdef,42".to_bytes(), b"%[^,],%d\0", &args), 2);
+            assert_eq!(&word[..7], b"abcdef\0");
+            assert_eq!(v, 42);
+            let mut cut = [0u8; 8];
+            let args = [cut.as_mut_ptr() as u64];
+            assert_eq!(scan(c"abcdef".to_bytes(), b"%3s\0", &args), 1);
+            assert_eq!(&cut[..4], b"abc\0");
+            let mut only = 0i32;
+            let args = [&mut only as *mut i32 as u64];
+            assert_eq!(scan(c"7 9".to_bytes(), b"%*d %d\0", &args), 1);
+            assert_eq!(only, 9);
+            let mut a = 0i32;
+            let mut b = 0i32;
+            let args = [&mut a as *mut i32 as u64, &mut b as *mut i32 as u64];
+            assert_eq!(scan(c"12x".to_bytes(), b"%d%d\0", &args), 1);
+            assert_eq!(a, 12);
+            // Input failure before the first field is EOF, like UCRT.
+            assert_eq!(scan(c"".to_bytes(), b"%d\0", &args), -1);
+            // Wide `%ls` writes UTF-16 units.
+            let mut w = [0u16; 4];
+            let args = [w.as_mut_ptr() as u64];
+            assert_eq!(scan(c"ok".to_bytes(), b"%ls\0", &args), 1);
+            assert_eq!(&w[..3], &[b'o' as u16, b'k' as u16, 0]);
+            // `count` bounds the readable input (`_snscanf`): the trailing "x" is invisible.
+            let mut c = -1i32;
+            let args = [&mut c as *mut i32 as u64];
+            assert_eq!(__stdio_common_vsscanf(0, c" 42x".as_ptr() as *const u8, 3, b"%d\0".as_ptr(), 0, args.as_ptr()), 1);
+            assert_eq!(c, 42);
         }
     }
 }

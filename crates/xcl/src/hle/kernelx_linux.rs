@@ -7234,6 +7234,28 @@ pub unsafe extern "win64" fn GetUserDefaultGeoName(buf: *mut u16, len: i32) -> i
     n as i32
 }
 
+/// `int GetUserDefaultLocaleName(LPWSTR lpLocaleName, int cchLocaleName)` — the user's
+/// BCP-47 locale name (`L"en-US"`, matching the fixed `GetUserDefaultGeoName` region).
+/// Returns characters copied including the terminating NUL; `0` for a too-small buffer
+/// (ERROR_INSUFFICIENT_BUFFER) or an invalid argument, like `LCIDToLocaleName`.
+/// No OS locale lookup: deterministic for the title's language/config init.
+pub unsafe extern "win64" fn GetUserDefaultLocaleName(buf: *mut u16, len: i32) -> i32 {
+    const LOCALE: &[u16] = &[b'e' as u16, b'n' as u16, b'-' as u16, b'U' as u16, b'S' as u16];
+    const REQUIRED: i32 = 6; // "en-US" + NUL
+    if len <= 0 || buf.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if len < REQUIRED {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    std::ptr::copy_nonoverlapping(LOCALE.as_ptr(), buf, LOCALE.len());
+    *buf.add(LOCALE.len()) = 0;
+    set_error(ERROR_SUCCESS);
+    REQUIRED
+}
+
 // ---------------------------------------------------------------------------------------
 // Startup: command line, process heap, module file names (Phase C step 11b)
 // ---------------------------------------------------------------------------------------
@@ -10084,6 +10106,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("MultiByteToWideChar", MultiByteToWideChar as usize),
         ("WideCharToMultiByte", WideCharToMultiByte as usize),
         ("GetUserDefaultGeoName", GetUserDefaultGeoName as usize),
+        ("GetUserDefaultLocaleName", GetUserDefaultLocaleName as usize),
     ]
 }
 
@@ -14069,6 +14092,27 @@ mod tests {
             assert_eq!(&buf[..3], &['U' as u16, 'S' as u16, 0]);
             // Wired into the KERNELX export table so kernel32/api-set imports resolve.
             assert!(exports().iter().any(|(n, _)| *n == "GetUserDefaultGeoName"));
+        }
+    }
+
+    #[test]
+    fn user_default_locale_name_fills_en_us_and_reports_the_null() {
+        // Retail Step 38: the language/config init calls
+        // GetUserDefaultLocaleName(buf, 0x55) through
+        // api-ms-win-core-localization-l1-2-0.dll; the auto-stub returned 0 and left
+        // the buffer empty, so the title saw no locale.
+        unsafe {
+            let mut buf = [0xCCCCu16; 0x55];
+            let n = GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32);
+            assert_eq!(n, 6, "chars including NUL");
+            assert_eq!(&buf[..6], &[b'e' as u16, b'n' as u16, b'-' as u16, b'U' as u16, b'S' as u16, 0]);
+            // Too small / invalid arguments fail with 0 instead of a truncated name.
+            let mut small = [0xCCCCu16; 3];
+            assert_eq!(GetUserDefaultLocaleName(small.as_mut_ptr(), small.len() as i32), 0);
+            assert_eq!(&small, &[0xCCCC, 0xCCCC, 0xCCCC]);
+            assert_eq!(GetUserDefaultLocaleName(std::ptr::null_mut(), 0x55), 0);
+            assert_eq!(GetUserDefaultLocaleName(buf.as_mut_ptr(), 0), 0);
+            assert!(exports().iter().any(|(n, _)| *n == "GetUserDefaultLocaleName"));
         }
     }
 
