@@ -1530,6 +1530,18 @@ pub unsafe extern "win64" fn srand(seed: u32) {
     RAND_STATE.store(seed, Ordering::Relaxed);
 }
 
+/// `errno_t rand_s(unsigned int *value)` — fill `value` from the OS entropy
+/// source (same convention as `std::_Random_device`, never a second RNG).
+/// A null pointer is `EINVAL` with `errno` set and no write.
+pub unsafe extern "win64" fn rand_s(value: *mut u32) -> i32 {
+    if value.is_null() {
+        set_win_errno(EINVAL_WIN);
+        return EINVAL_WIN;
+    }
+    *value = os_entropy_u32().unwrap_or_else(entropy_fallback);
+    0
+}
+
 /// `int rand(void)` — the UCRT sequence: `0..=RAND_MAX(0x7FFF)`.
 pub unsafe extern "win64" fn rand() -> i32 {
     let mut cur = RAND_STATE.load(Ordering::Relaxed);
@@ -2495,6 +2507,26 @@ pub unsafe extern "win64" fn setvbuf(
     _mode: i32,
     _size: usize,
 ) -> i32 {
+    0
+}
+
+/// `errno_t _get_stream_buffer_pointers(FILE*, char***, char***, int**)` — the
+/// stdio buffer trio behind `stream`. XCL's `CrtFile` is unbuffered (`fread`/
+/// `fwrite` go straight to the host file), so the honest answer is three null
+/// pointers. A null stream or out slot is `EINVAL` and writes nothing.
+pub unsafe extern "win64" fn _get_stream_buffer_pointers(
+    stream: *mut u8,
+    base: *mut *mut u8,
+    pointer: *mut *mut u8,
+    count: *mut *mut i32,
+) -> i32 {
+    if stream.is_null() || base.is_null() || pointer.is_null() || count.is_null() {
+        set_win_errno(EINVAL_WIN);
+        return EINVAL_WIN;
+    }
+    *base = std::ptr::null_mut();
+    *pointer = std::ptr::null_mut();
+    *count = std::ptr::null_mut();
     0
 }
 
@@ -4784,6 +4816,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("_get_errno", _get_errno as usize),
         ("srand", srand as usize),
         ("rand", rand as usize),
+        ("rand_s", rand_s as usize),
         ("qsort", qsort as usize),
         ("strcpy", strcpy as usize),
         ("strncpy", strncpy as usize),
@@ -4817,6 +4850,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("wcrtomb", wcrtomb as usize),
         ("getenv", getenv as usize),
         ("setvbuf", setvbuf as usize),
+        ("_get_stream_buffer_pointers", _get_stream_buffer_pointers as usize),
         ("fopen", fopen as usize),
         ("fread", fread as usize),
         ("fwrite", fwrite as usize),
@@ -5448,6 +5482,89 @@ mod tests {
             *_errno() = 0;
             assert_eq!(stat(std::ptr::null(), buf.as_mut_ptr()), -1);
             assert_eq!(*_errno(), EINVAL_WIN);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rand_s_and_stream_buffer_pointers_follow_the_ucrt_contract() {
+        // Retail Step 86: msvcp140's DllMain calls rand_s (VA 0x1800038f1f)
+        // and _get_stream_buffer_pointers (VA 0x180006411) and got 0 from the
+        // auto-stub without either writing its out parameters.
+        for name in ["rand_s", "_get_stream_buffer_pointers"] {
+            assert!(exports().iter().any(|(n, _)| *n == name), "{name} must be wired");
+        }
+        type RandS = unsafe extern "win64" fn(*mut u32) -> i32;
+        type StreamPointers =
+            unsafe extern "win64" fn(*mut u8, *mut *mut u8, *mut *mut u8, *mut *mut i32) -> i32;
+        let addr = |name: &str| {
+            exports()
+                .into_iter()
+                .find_map(|(n, a)| (n == name).then_some(a))
+                .expect("export")
+        };
+        let rand_s: RandS = unsafe { std::mem::transmute(addr("rand_s")) };
+        let stream_ptrs: StreamPointers =
+            unsafe { std::mem::transmute(addr("_get_stream_buffer_pointers")) };
+
+        let dir = std::env::temp_dir().join(format!("xcl_crt_rand_s_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.bin");
+        std::fs::write(&file, b"probe").unwrap();
+        let path = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+
+        unsafe {
+            // rand_s is a live entropy draw, never the stub's constant/unwritten word.
+            *_errno() = 0;
+            let mut a = 0u32;
+            assert_eq!(rand_s(&mut a), 0);
+            let mut b = 0u32;
+            assert_eq!(rand_s(&mut b), 0);
+            assert_ne!(a, b, "two rand_s draws must differ");
+
+            *_errno() = 0;
+            assert_eq!(rand_s(std::ptr::null_mut()), EINVAL_WIN);
+            assert_eq!(*_errno(), EINVAL_WIN);
+
+            // XCL's CrtFile is unbuffered: the honest answer is three nulls.
+            let stream = fopen(path.as_ptr() as *const u8, b"rb\0".as_ptr());
+            assert!(!stream.is_null());
+            let mut base: *mut u8 = 0xAAAA_AAAA_AAAA_AAAAusize as *mut u8;
+            let mut ptr: *mut u8 = 0xBBBB_BBBB_BBBB_BBBBusize as *mut u8;
+            let mut count: *mut i32 = 0xCCCC_CCCC_CCCC_CCCCusize as *mut i32;
+            assert_eq!(
+                stream_ptrs(stream, &mut base, &mut ptr, &mut count),
+                0
+            );
+            assert!(base.is_null(), "unbuffered base");
+            assert!(ptr.is_null(), "unbuffered pointer");
+            assert!(count.is_null(), "unbuffered count");
+
+            // Null stream or null out pointer is EINVAL and writes nothing.
+            let keep_base: *mut u8 = 0xAAAA_AAAA_AAAA_AAAAusize as *mut u8;
+            let keep_ptr: *mut u8 = 0xBBBB_BBBB_BBBB_BBBBusize as *mut u8;
+            let keep_count: *mut i32 = 0xCCCC_CCCC_CCCC_CCCCusize as *mut i32;
+            base = keep_base;
+            ptr = keep_ptr;
+            count = keep_count;
+            *_errno() = 0;
+            assert_eq!(
+                stream_ptrs(std::ptr::null_mut(), &mut base, &mut ptr, &mut count),
+                EINVAL_WIN
+            );
+            assert_eq!(*_errno(), EINVAL_WIN);
+            assert_eq!(base, keep_base);
+            assert_eq!(ptr, keep_ptr);
+            assert_eq!(count, keep_count);
+
+            *_errno() = 0;
+            assert_eq!(stream_ptrs(stream, std::ptr::null_mut(), &mut ptr, &mut count), EINVAL_WIN);
+            assert_eq!(*_errno(), EINVAL_WIN);
+            assert_eq!(ptr, keep_ptr);
+            assert_eq!(count, keep_count);
+
+            assert_eq!(fclose(stream), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
