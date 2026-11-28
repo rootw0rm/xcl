@@ -926,6 +926,11 @@ pub unsafe extern "win64" fn isspace(c: i32) -> i32 {
     is_c_space(c) as i32
 }
 
+/// `int isalnum(int c)` — nonzero for ASCII digits and letters (C locale).
+pub unsafe extern "win64" fn isalnum(c: i32) -> i32 {
+    matches!(c, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A) as i32
+}
+
 /// Byte-wise ASCII fold of the C locale: `A`–`Z` only.
 #[inline]
 fn ascii_fold(b: u8) -> u8 {
@@ -4214,6 +4219,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("_strnicmp", _strnicmp as usize),
         ("_stricmp", _stricmp as usize),
         ("isspace", isspace as usize),
+        ("isalnum", isalnum as usize),
         ("atoi", atoi as usize),
         ("strtod", strtod as usize),
         ("_strtoui64", _strtoui64 as usize),
@@ -5536,6 +5542,37 @@ mod tests {
             assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 37), 0);
             assert_eq!(end, text.as_ptr() as *mut u8);
             assert_eq!(*_errno(), 22);
+        }
+    }
+
+    #[test]
+    fn isalnum_matches_the_c_locale() {
+        // Retail Step 53: the title's identifier scanner at exe+0x2749412 loops
+        // on the `api-ms-win-crt-string` isalnum import (exe+0x2749423); the
+        // auto-stub returned 0 for every byte, so no token ever matched.
+        assert!(
+            exports().iter().any(|(n, _)| *n == "isalnum"),
+            "isalnum must be wired"
+        );
+        let addr = exports()
+            .into_iter()
+            .find_map(|(n, a)| (n == "isalnum").then_some(a))
+            .expect("export");
+        type IsAlnum = unsafe extern "win64" fn(i32) -> i32;
+        let f: IsAlnum = unsafe { std::mem::transmute(addr) };
+        unsafe {
+            for c in b'0'..=b'9' {
+                assert_ne!(f(c as i32), 0, "{c:?} is alphanumeric");
+            }
+            for c in b'A'..=b'Z' {
+                assert_ne!(f(c as i32), 0, "{c:?} is alphanumeric");
+            }
+            for c in b'a'..=b'z' {
+                assert_ne!(f(c as i32), 0, "{c:?} is alphanumeric");
+            }
+            for c in [0i32, 0x20, b'_' as i32, b'#' as i32, b'/' as i32, b':' as i32, 0x7f, 0x80, 0x100, -1] {
+                assert_eq!(f(c), 0, "{c:#x} is not alphanumeric");
+            }
         }
     }
 }
