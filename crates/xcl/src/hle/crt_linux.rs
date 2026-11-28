@@ -1314,11 +1314,13 @@ fn scan_strtod(input: &[u8]) -> (usize, f64, bool) {
     (k, v, v.is_infinite() || (v == 0.0 && nonzero))
 }
 
-/// C-locale `strtoui64` subject sequence with `base` already validated:
-/// `(bytes consumed after the caller's pointer, value, overflow)`. Base 0
-/// auto-detects `0x`/leading `0`; an explicit base 16 also accepts (but does
-/// not require) the `0x` prefix. No digits means no conversion.
-fn scan_strtoull(input: &[u8], base: i32) -> (usize, u64, bool) {
+/// C-locale integer subject sequence with `base` already validated:
+/// `(bytes consumed after the caller's pointer, negative, magnitude, magnitude
+/// exceeds `u64`)`. Base 0 auto-detects `0x`/leading `0`; an explicit base 16
+/// also accepts (but does not require) the `0x` prefix. No digits consumes
+/// nothing. The magnitude stays exact in `u128` so the signed and unsigned
+/// consumers apply their own limits.
+fn scan_int_magnitude(input: &[u8], base: i32) -> (usize, bool, u128, bool) {
     let len = input.len();
     let mut i = 0usize;
     while i < len && is_c_space(input[i] as i32) {
@@ -1330,21 +1332,25 @@ fn scan_strtoull(input: &[u8], base: i32) -> (usize, u64, bool) {
         neg = input[j] == b'-';
         j += 1;
     }
-    if base == 0 {
+    let (used, mag, big) = if base == 0 {
         if j + 2 < len && input[j] == b'0' && matches!(input[j + 1], b'x' | b'X') && input[j + 2].is_ascii_hexdigit() {
             j += 2;
-            return scan_strtoull_digits(input, j, 16, neg);
+            scan_int_digits(input, j, 16)
+        } else {
+            let radix = if j < len && input[j] == b'0' { 8 } else { 10 };
+            scan_int_digits(input, j, radix)
         }
-        let radix = if j < len && input[j] == b'0' { 8 } else { 10 };
-        scan_strtoull_digits(input, j, radix, neg)
     } else if base == 16 && j + 2 < len && input[j] == b'0' && matches!(input[j + 1], b'x' | b'X') && input[j + 2].is_ascii_hexdigit() {
-        scan_strtoull_digits(input, j + 2, 16, neg)
+        scan_int_digits(input, j + 2, 16)
     } else {
-        scan_strtoull_digits(input, j, base as u32, neg)
-    }
+        scan_int_digits(input, j, base as u32)
+    };
+    (used, neg, mag, big)
 }
 
-fn scan_strtoull_digits(input: &[u8], start: usize, radix: u32, neg: bool) -> (usize, u64, bool) {
+/// `(bytes consumed after the caller's pointer, magnitude, exceeds `u64`)` for
+/// one run of digits in `radix` starting at `start`.
+fn scan_int_digits(input: &[u8], start: usize, radix: u32) -> (usize, u128, bool) {
     let len = input.len();
     let mut j = start;
     let mut mag: u128 = 0;
@@ -1366,11 +1372,22 @@ fn scan_strtoull_digits(input: &[u8], start: usize, radix: u32, neg: bool) -> (u
     if j == start {
         return (0, 0, false);
     }
-    if overflow {
-        return (j, u64::MAX, true);
+    (j, mag, overflow)
+}
+
+/// C-locale `strtoui64` subject sequence: `(bytes consumed after the caller's
+/// pointer, value, overflow)`. A minus sign negates modulo 2^64; overflow
+/// returns `u64::MAX` and reports the range error.
+fn scan_strtoull(input: &[u8], base: i32) -> (usize, u64, bool) {
+    let (used, neg, mag, big) = scan_int_magnitude(input, base);
+    if used == 0 {
+        return (0, 0, false);
+    }
+    if big {
+        return (used, u64::MAX, true);
     }
     let v = mag as u64;
-    (j, if neg { v.wrapping_neg() } else { v }, false)
+    (used, if neg { v.wrapping_neg() } else { v }, false)
 }
 
 /// `double strtod(const char *nptr, char **endptr)` — C-locale parse of the
@@ -1420,6 +1437,64 @@ pub unsafe extern "win64" fn _strtoui64(nptr: *const u8, endptr: *mut *mut u8, b
         set_win_errno(ERANGE_WIN);
     }
     v
+}
+
+/// `unsigned long long strtoull(const char *nptr, char **endptr, int base)` —
+/// UCRT unsigned parse, identical to `_strtoui64` under the standard name.
+pub unsafe extern "win64" fn strtoull(nptr: *const u8, endptr: *mut *mut u8, base: i32) -> u64 {
+    _strtoui64(nptr, endptr, base)
+}
+
+/// `long long strtoll(const char *nptr, char **endptr, int base)` — UCRT
+/// signed parse (`base` 0 or 2–36), `*endptr` at the first unconsumed byte,
+/// `LLONG_MAX`/`LLONG_MIN` + `ERANGE` outside the signed range, `EINVAL` and a
+/// `nptr` `endptr` for a bad base.
+pub unsafe extern "win64" fn strtoll(nptr: *const u8, endptr: *mut *mut u8, base: i32) -> i64 {
+    if nptr.is_null() {
+        if !endptr.is_null() {
+            *endptr = std::ptr::null_mut();
+        }
+        return 0;
+    }
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            *endptr = nptr as *mut u8;
+        }
+        set_win_errno(EINVAL_WIN);
+        return 0;
+    }
+    let input = std::slice::from_raw_parts(nptr, c_str_len(nptr));
+    let (used, neg, mag, big) = scan_int_magnitude(input, base);
+    if !endptr.is_null() {
+        *endptr = nptr.add(used) as *mut u8;
+    }
+    if used == 0 {
+        return 0;
+    }
+    let limit = if neg { 1u128 << 63 } else { i64::MAX as u128 };
+    if big || mag > limit {
+        set_win_errno(ERANGE_WIN);
+        return if neg { i64::MIN } else { i64::MAX };
+    }
+    let v = mag as i64;
+    if neg { v.wrapping_neg() } else { v }
+}
+
+/// `errno_t _set_errno(int value)` — store `value` in the calling thread's
+/// `errno`; UCRT reports success for any value.
+pub unsafe extern "win64" fn _set_errno(value: i32) -> i32 {
+    *_errno() = value;
+    0
+}
+
+/// `errno_t _get_errno(int *value)` — copy the calling thread's `errno` out.
+/// A null `value` is `EINVAL` and writes nothing.
+pub unsafe extern "win64" fn _get_errno(value: *mut i32) -> i32 {
+    if value.is_null() {
+        return EINVAL_WIN;
+    }
+    *value = *_errno();
+    0
 }
 
 /// UCRT `rand` state (`srand` seeds it; the algorithm is MSVC's multiplicative
@@ -4420,6 +4495,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("atoi", atoi as usize),
         ("strtod", strtod as usize),
         ("_strtoui64", _strtoui64 as usize),
+        ("strtoll", strtoll as usize),
+        ("strtoull", strtoull as usize),
+        ("_set_errno", _set_errno as usize),
+        ("_get_errno", _get_errno as usize),
         ("srand", srand as usize),
         ("rand", rand as usize),
         ("qsort", qsort as usize),
@@ -5768,6 +5847,115 @@ mod tests {
             assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 37), 0);
             assert_eq!(end, text.as_ptr() as *mut u8);
             assert_eq!(*_errno(), 22);
+        }
+    }
+
+    #[test]
+    fn strtoll_strtoull_and_errno_write_their_outputs() {
+        // Retail Step 65: caller exe+0x1418e1060 does `_set_errno(0)`, then
+        // `strtoll(str, &endptr, 10)` (IAT 0x146794768) or, for a `0x` prefix,
+        // `strtoull(str + 2, &endptr, 16)` (0x146794778), then dereferences
+        // `endptr` at exe+0x18e10c7. The auto-stub returned 0 without writing
+        // `*endptr`, so the title read through a NULL pointer.
+        for name in ["strtoll", "strtoull", "_set_errno", "_get_errno"] {
+            assert!(exports().iter().any(|(n, _)| *n == name), "{name} must be wired");
+        }
+        type Strtoll = unsafe extern "win64" fn(*const u8, *mut *mut u8, i32) -> i64;
+        type Strtoull = unsafe extern "win64" fn(*const u8, *mut *mut u8, i32) -> u64;
+        type SetErrno = unsafe extern "win64" fn(i32) -> i32;
+        type GetErrno = unsafe extern "win64" fn(*mut i32) -> i32;
+        let addr = |name: &str| {
+            exports()
+                .into_iter()
+                .find_map(|(n, a)| (n == name).then_some(a))
+                .expect("export")
+        };
+        let parse_i64: Strtoll = unsafe { std::mem::transmute(addr("strtoll")) };
+        let parse_u64: Strtoull = unsafe { std::mem::transmute(addr("strtoull")) };
+        let set_errno: SetErrno = unsafe { std::mem::transmute(addr("_set_errno")) };
+        let get_errno: GetErrno = unsafe { std::mem::transmute(addr("_get_errno")) };
+        unsafe {
+            let mut end: *mut u8 = std::ptr::null_mut();
+
+            // The caller's decimal path: leading space, sign, then junk.
+            let text = c" -42rest";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 10), -42);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(4));
+            // The `0x` path passes base 16 with the prefix already skipped.
+            let text = c"1f";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 16), 31);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(2));
+            let text = c"0x1f";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 16), 31);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(4));
+            // Both signed limits are valid and do not set errno.
+            set_errno(0);
+            let text = c"9223372036854775807";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 10), i64::MAX);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(19));
+            assert_eq!(*_errno(), 0);
+            let text = c"-9223372036854775808";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 10), i64::MIN);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(20));
+            assert_eq!(*_errno(), 0);
+            // One past either limit saturates and reports ERANGE, consuming all
+            // of the digits so `endptr` still lands on the trailing junk.
+            set_errno(0);
+            let text = c"9223372036854775808x";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 10), i64::MAX);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(19));
+            assert_eq!(*_errno(), 34);
+            set_errno(0);
+            let text = c"-9223372036854775809x";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 10), i64::MIN);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(20));
+            assert_eq!(*_errno(), 34);
+            // No conversion leaves `endptr` at the caller's pointer, and a bad
+            // base reports EINVAL the same way `_strtoui64` does.
+            let text = c"+#ff";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 10), 0);
+            assert_eq!(end, text.as_ptr() as *mut u8);
+            set_errno(0);
+            let text = c"7";
+            assert_eq!(parse_i64(text.as_ptr() as *const u8, &mut end, 37), 0);
+            assert_eq!(end, text.as_ptr() as *mut u8);
+            assert_eq!(*_errno(), 22);
+            // Signed parse of a negative is not an overflow of `i64`.
+            assert_eq!(parse_i64(c"-1".as_ptr() as *const u8, &mut end, 10), -1);
+            assert_eq!(parse_i64(c"10".as_ptr() as *const u8, std::ptr::null_mut(), 10), 10);
+
+            // `strtoull` is `_strtoui64` under its own name.
+            let text = c"0x1f";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 0), 31);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(4));
+            let text = c"-1";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), u64::MAX);
+            set_errno(0);
+            let text = c"18446744073709551616x";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), u64::MAX);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(20));
+            assert_eq!(*_errno(), 34);
+            set_errno(0);
+            let text = c"xyz";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), 0);
+            assert_eq!(end, text.as_ptr() as *mut u8);
+            assert_eq!(*_errno(), 0);
+            // `0x` with no hex digit in base 16 is the digit `0`, then stops.
+            let text = c"0x";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 16), 0);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(1));
+            assert_eq!(parse_u64(c"42".as_ptr() as *const u8, std::ptr::null_mut(), 10), 42);
+
+            // errno accessors: the caller clears with `_set_errno(0)` and reads
+            // back with `_get_errno(&value)` at exe+0x1418e1118.
+            let mut value = -1;
+            assert_eq!(set_errno(34), 0);
+            assert_eq!(get_errno(&mut value), 0);
+            assert_eq!(value, 34);
+            assert_eq!(set_errno(0), 0);
+            assert_eq!(get_errno(&mut value), 0);
+            assert_eq!(value, 0);
+            assert_eq!(get_errno(std::ptr::null_mut()), 22);
         }
     }
 
