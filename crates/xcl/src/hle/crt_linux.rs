@@ -3501,7 +3501,11 @@ pub unsafe extern "win64" fn __stdio_common_vsscanf(
                         store_signed(ptr, if neg { m.wrapping_neg() } else { m }, len_mod);
                     } else {
                         let m = mag.min(u64::MAX as u128) as u64;
-                        store_unsigned(ptr, if neg { m.wrapping_neg() } else { m }, len_mod);
+                        // `%p` is a pointer conversion: UCRT stores
+                        // pointer-width regardless of the (absent) length
+                        // modifier.
+                        let len = if verb == b'p' { ScanLen::Qword } else { len_mod };
+                        store_unsigned(ptr, if neg { m.wrapping_neg() } else { m }, len);
                     }
                     s.assigned += 1;
                 }
@@ -5155,6 +5159,15 @@ mod tests {
             let args = [&mut c as *mut i32 as u64];
             assert_eq!(__stdio_common_vsscanf(0, c" 42x".as_ptr() as *const u8, 3, b"%d\0".as_ptr(), 0, args.as_ptr()), 1);
             assert_eq!(c, 42);
+
+            // `%p` is a pointer conversion: UCRT stores pointer-width even
+            // without an `l` modifier. The title round-trips a static address
+            // as "0x14688e110" and re-parses it with `%p`; a 32-bit store
+            // truncates it to an unmapped pointer.
+            let mut p = 0xDEAD_BEEF_0000_0000u64;
+            let args = [&mut p as *mut u64 as u64];
+            assert_eq!(scan(c"0x14688e110".to_bytes(), b"%p\0", &args), 1);
+            assert_eq!(p, 0x1_4688_e110);
         }
     }
 }
