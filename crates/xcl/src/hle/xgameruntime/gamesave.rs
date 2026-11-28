@@ -117,9 +117,22 @@ const LONG_PREFIX: &str = "~xcllong.";
 /// stay case-insensitive like every other container folder on NTFS.
 fn container_dir_name(root: &Path, name: &str) -> String {
     let e = enc(name);
-    if e.len() <= MAX_CONTAINER_ENC || root.join(&e).is_dir() {
+    if e.len() <= MAX_CONTAINER_ENC {
+        if root.join(&e).is_dir() {
+            return e;
+        }
+        // NTFS aliases a differently-cased name to the folder that already exists; a
+        // case-sensitive host (Linux) must reuse it too, or one container becomes two.
+        let existing = std::fs::read_dir(root).into_iter().flatten().flatten().find_map(|d| {
+            let f = d.file_name().to_string_lossy().into_owned();
+            (!f.starts_with(LONG_PREFIX) && dec(&f).eq_ignore_ascii_case(name)).then_some(f)
+        });
+        return existing.unwrap_or(e);
+    }
+    if root.join(&e).is_dir() {
         return e;
     }
+    // Hashed folders are keyed on the lowercased name, so they alias case already.
     format!("{LONG_PREFIX}{:016x}", crate::gpu::shader::fnv64(name.to_ascii_lowercase().as_bytes()))
 }
 
@@ -178,6 +191,22 @@ fn try_blobs_of(dir: &Path) -> std::io::Result<Vec<(String, PathBuf, u64)>> {
 
 fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     try_blobs_of(dir).unwrap_or_default()
+}
+
+/// `blobs/<enc(name)>`, or the existing blob file that differs only in case. NTFS
+/// aliases the two; a case-sensitive host must replace that one file, not add a second.
+fn blob_file(blobs: &Path, name: &str) -> PathBuf {
+    let encoded = blobs.join(enc(name));
+    if encoded.is_file() {
+        return encoded;
+    }
+    std::fs::read_dir(blobs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.file_name().is_some_and(|f| dec(&f.to_string_lossy()).eq_ignore_ascii_case(name)))
+        .unwrap_or(encoded)
 }
 
 fn mtime_secs(p: &Path) -> i64 {
@@ -806,7 +835,7 @@ fn apply(dir: &Path, name: &str, display: Option<&str>, ops: &[(String, Option<V
         let last: Vec<&(String, Option<Vec<u8>>)> =
             ops.iter().rev().filter(|(name, _)| !seen.iter().any(|s| s.eq_ignore_ascii_case(name)) && { seen.push(name); true }).collect();
         for (name, data) in last.into_iter().rev() {
-            let path = blobs.join(enc(name));
+            let path = blob_file(&blobs, name);
             match data {
                 Some(d) => writes.push((write_temp(&path, d)?, path)),
                 None => deletes.push(path),
@@ -1014,7 +1043,7 @@ mod tests {
         // Another test temporarily routes the process-global XAsync entry points
         // through the system runtime. Keep this invalid-block status check on the
         // local implementation, like every other test that exercises XAsync.
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK
+        let _g = ASYNC_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -1096,7 +1125,7 @@ mod tests {
     /// the `extern "system"` call that aborts the process.
     #[test]
     fn enumerating_a_container_with_a_bad_escape_does_not_abort() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-325-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1114,7 +1143,7 @@ mod tests {
 
     #[test]
     fn names_windows_would_change_round_trip() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-names-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1156,7 +1185,7 @@ mod tests {
     /// hashed folder; the real name round-trips through enumeration, lookup and delete.
     #[test]
     fn long_container_names_round_trip_through_a_hashed_folder() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-long-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1247,7 +1276,7 @@ mod tests {
 
     #[test]
     fn containers_blobs_round_trip() {
-    let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1318,7 +1347,7 @@ mod tests {
     /// and the display name it wrote before stay as they were, and no temp file is left.
     #[test]
     fn a_failed_update_leaves_the_container_as_it_was() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-324-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1374,7 +1403,7 @@ mod tests {
 
     #[test]
     fn atomic_writes_preserve_xcltmp_blobs_and_skip_leftover_temps() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-atomic-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1438,7 +1467,7 @@ mod tests {
             let blocker = blobs_dir.join("dir_blocker");
             std::fs::create_dir_all(&blocker).unwrap();
             let ops = [("dir_blocker".to_string(), Some(b"cannot-replace-dir".to_vec()))];
-            assert_eq!(apply(blobs_dir.parent().unwrap(), None, &ops), crate::util::E_FAIL);
+            assert_eq!(apply(blobs_dir.parent().unwrap(), "slot", None, &ops), crate::util::E_FAIL);
             let remaining_tmps: Vec<_> = std::fs::read_dir(&blobs_dir)
                 .unwrap()
                 .flatten()
@@ -1454,7 +1483,7 @@ mod tests {
 
     #[test]
     fn case_insensitive_blob_and_container_matching_on_ntfs() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-case-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1521,7 +1550,7 @@ mod tests {
 
     #[test]
     fn initialize_provider_result_rejects_null_out_without_consuming_async() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-null-out-{}\0", std::process::id());
             let mut blk: XAsyncBlock = std::mem::zeroed();
@@ -1542,7 +1571,7 @@ mod tests {
 
     #[test]
     fn delete_container_rejects_empty_name_without_wiping_provider_root() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-empty-del-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1617,7 +1646,7 @@ mod tests {
 
     #[test]
     fn blob_enumeration_sees_one_submitted_update() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct Temp(PathBuf);
         impl Drop for Temp {
             fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -1744,7 +1773,7 @@ mod tests {
 
     #[test]
     fn blob_name_bounds_and_empty_validation() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-blob-bounds-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1788,7 +1817,7 @@ mod tests {
 
     #[test]
     fn container_quota_validation_enforces_limit_and_atomicity() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-quota-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
@@ -1850,7 +1879,7 @@ mod tests {
     /// is not called, as on the console (first launch).
     #[test]
     fn get_container_info_of_a_container_without_saved_data_succeeds_without_a_result() {
-        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-info-missing-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();
