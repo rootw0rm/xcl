@@ -372,11 +372,11 @@ mod tests {
         // Every import routed to an HLE module is Stub metadata (address 0) but resolves
         // to a callable auto-stub thunk, never null. Step-10c file APIs are HLE now, so
         // they are covered by `kernelx_core_imports_resolve_to_hle` instead.
-        // Steps 11r/12f/12g made d3d12_xs/mfplat/xcrdapi HLE, and the APU memory
-        // slice, the AcpHal shape/channel and the XApu decoder channel made those
-        // acphal names HLE, so the stub probe uses the XDsp side (still Stub).
+        // Steps 11r/12f/12g made d3d12_xs/mfplat/xcrdapi HLE, and the acphal
+        // slices made every acphal name HLE, so the stub probe uses a d3d12x
+        // device slot that is still stub metadata.
         for (dll, sym) in [
-            ("acphal.dll", "XDspDisconnect"),
+            ("d3d12_xs.dll", "ID3D12Device::#70"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert_eq!(src, Source::Stub, "{dll}!{sym}");

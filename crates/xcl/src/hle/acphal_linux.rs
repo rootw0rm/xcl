@@ -864,9 +864,98 @@ pub unsafe extern "win64" fn XApuGetUtilization(_a: u32, _b: u32, u: *mut u32) -
     S_OK
 }
 
-/// Implemented exports with real code addresses. Everything else in the acphal route
-/// (the XApu/XDsp command channels) stays stub metadata in `hle_linux` until a measured
-/// consumer reaches it.
+// ---------------------------------------------------------------------------------------
+// the DSP (chad.dll): connected, with nothing to run
+// ---------------------------------------------------------------------------------------
+//
+// The processor's DSP is a second command channel: the title connects it, activates
+// streams, submits commands and disconnects. Nothing has to run for boot; the
+// commands are acknowledged and no audio is produced.
+
+/// a DSP connection (what the handle points at)
+struct XDsp {
+    streams: u32,
+}
+
+/// XDspConnectWithMaximumStreamLimit(a, b, c, max streams, flags, &handle)
+pub unsafe extern "win64" fn XDspConnectWithMaximumStreamLimit(
+    _a: usize,
+    _b: u32,
+    _c: u32,
+    streams: u32,
+    _flags: u32,
+    handle: *mut *mut c_void,
+) -> HRESULT {
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    *handle = Box::into_raw(Box::new(XDsp { streams })) as *mut c_void;
+    crate::xlog_info!(
+        "acphal: DSP connected ({streams} streams) – its commands are taken, nothing runs"
+    );
+    S_OK
+}
+
+/// XDspDisconnect(handle)
+pub unsafe extern "win64" fn XDspDisconnect(handle: *mut c_void) -> HRESULT {
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    drop(Box::from_raw(handle as *mut XDsp));
+    S_OK
+}
+
+/// XDspActivate(handle, …)
+pub unsafe extern "win64" fn XDspActivate(
+    handle: *mut c_void,
+    _a: usize,
+    _b: usize,
+    _c: usize,
+) -> HRESULT {
+    if handle.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
+}
+
+/// XDspDeactivate(handle, …)
+pub unsafe extern "win64" fn XDspDeactivate(
+    handle: *mut c_void,
+    _a: usize,
+    _b: usize,
+    _c: usize,
+) -> HRESULT {
+    if handle.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
+}
+
+/// XDspSubmitCommand(handle, …): taken, not run
+pub unsafe extern "win64" fn XDspSubmitCommand(
+    handle: *mut c_void,
+    _a: usize,
+    _b: usize,
+    _c: usize,
+) -> HRESULT {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    if handle.is_null() {
+        return E_INVALIDARG;
+    }
+    FIRST.call_once(|| {
+        crate::xlog_info!(
+            "acphal: first DSP command ({} streams) – taken, not run",
+            (*(handle as *const XDsp)).streams
+        )
+    });
+    S_OK
+}
+
+/// Implemented exports with real code addresses. This is the whole acphal surface the
+/// console's audio engine asks for during boot in M1: APU memory, SHAPE contexts, the
+/// AcpHal channel, the XApu decoder (silence) and the DSP.
 pub fn exports() -> Vec<(&'static str, usize)> {
     vec![
         ("ApuCreateHeap", ApuCreateHeap as usize),
@@ -885,6 +974,11 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("XApuDequeueResult", XApuDequeueResult as usize),
         ("XApuGetResultCount", XApuGetResultCount as usize),
         ("XApuGetUtilization", XApuGetUtilization as usize),
+        ("XDspConnectWithMaximumStreamLimit", XDspConnectWithMaximumStreamLimit as usize),
+        ("XDspDisconnect", XDspDisconnect as usize),
+        ("XDspActivate", XDspActivate as usize),
+        ("XDspDeactivate", XDspDeactivate as usize),
+        ("XDspSubmitCommand", XDspSubmitCommand as usize),
     ]
 }
 
@@ -1246,6 +1340,57 @@ mod tests {
             assert_eq!(dequeue(std::ptr::null_mut(), &mut r), E_INVALIDARG);
             assert_eq!(disconnect(h), S_OK);
             assert_eq!(disconnect(std::ptr::null_mut()), E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn xdsp_entry_points_are_wired() {
+        for name in [
+            "XDspConnectWithMaximumStreamLimit",
+            "XDspDisconnect",
+            "XDspActivate",
+            "XDspDeactivate",
+            "XDspSubmitCommand",
+        ] {
+            acphal_addr(name);
+        }
+    }
+
+    #[test]
+    fn xdsp_connects_acknowledges_and_disconnects() {
+        type Connect = unsafe extern "win64" fn(
+            usize,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut *mut c_void,
+        ) -> HRESULT;
+        type Simple = unsafe extern "win64" fn(*mut c_void, usize, usize, usize) -> HRESULT;
+        type Disconnect = unsafe extern "win64" fn(*mut c_void) -> HRESULT;
+        let connect: Connect =
+            unsafe { std::mem::transmute(acphal_addr("XDspConnectWithMaximumStreamLimit")) };
+        let disconnect: Disconnect = unsafe { std::mem::transmute(acphal_addr("XDspDisconnect")) };
+        let activate: Simple = unsafe { std::mem::transmute(acphal_addr("XDspActivate")) };
+        let deactivate: Simple = unsafe { std::mem::transmute(acphal_addr("XDspDeactivate")) };
+        let submit: Simple = unsafe { std::mem::transmute(acphal_addr("XDspSubmitCommand")) };
+        unsafe {
+            // Retail's shape from 0x145b52600: 128 streams, flags 1.
+            let mut h: *mut c_void = std::ptr::null_mut();
+            assert_eq!(connect(0x1234, 0x5678, 0x80, 0x80, 1, &mut h), S_OK);
+            assert!(!h.is_null());
+            assert_eq!(activate(h, 1, 2, 3), S_OK);
+            assert_eq!(deactivate(h, 1, 2, 3), S_OK);
+            assert_eq!(submit(h, 1, 2, 3), S_OK);
+            assert_eq!(disconnect(h), S_OK);
+            assert_eq!(disconnect(std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(
+                connect(0, 0, 0, 0, 0, std::ptr::null_mut()),
+                E_INVALIDARG
+            );
+            assert_eq!(activate(std::ptr::null_mut(), 0, 0, 0), E_INVALIDARG);
+            assert_eq!(deactivate(std::ptr::null_mut(), 0, 0, 0), E_INVALIDARG);
+            assert_eq!(submit(std::ptr::null_mut(), 0, 0, 0), E_INVALIDARG);
         }
     }
 }
