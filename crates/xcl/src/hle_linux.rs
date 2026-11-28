@@ -422,9 +422,10 @@ fn build(config: &Config) -> Registry {
     // first (Hle) and `find_any` second (HleOther), skipping the game-DLL
     // branch that would otherwise load the bundled files.
     let ucrt = idx(UCRT);
+    // msvcp140 is NOT routed: the title ships the real C++ runtime and its
+    // iostream/mutex/locale objects must be constructed (Step 62).
     for pat in [
         "vcruntime140.dll",
-        "msvcp140.dll",
         "concrt140.dll",
         "vcomp140.dll",
         "vccorlib140.dll",
@@ -509,13 +510,17 @@ mod tests {
         let r = build(&Config::default());
         for dll in [
             "vcruntime140.dll",
-            "msvcp140.dll",
             "concrt140.dll",
             "vcomp140.dll",
             "vccorlib140.dll",
         ] {
             assert_eq!(r.hle_for(dll).map(|m| m.name), Some(UCRT), "{dll}");
         }
+        assert_eq!(
+            r.hle_for("msvcp140.dll").map(|m| m.name),
+            None,
+            "msvcp140 is the shipped real DLL, not the UCRT HLE"
+        );
         assert_eq!(r.hle_for("ucrtbase.dll").map(|m| m.name), None);
         assert_eq!(r.hle_for("api-ms-win-crt-runtime-l1-1-0.dll").map(|m| m.name), None);
     }

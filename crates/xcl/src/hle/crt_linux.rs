@@ -931,6 +931,131 @@ pub unsafe extern "win64" fn isalnum(c: i32) -> i32 {
     matches!(c, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A) as i32
 }
 
+// ---------------------------------------------------------------------------------------
+// C-locale ctype table and locale locks (the shipped msvcp140 DllMain)
+// ---------------------------------------------------------------------------------------
+//
+// Reactivating the real `msvcp140.dll` (Step 62) makes its DllMain build its
+// `ctype<char>` table from UCRT's `__pctype_func`: it copies the 256 `unsigned short`
+// entries. The same DllMain imports the locale locks and the code page. The C
+// locale's classifications are fixed, so the table is a static; the locale locks
+// have nothing to protect (the table never changes).
+
+const CTYPE_UPPER: u16 = 0x1;
+const CTYPE_LOWER: u16 = 0x2;
+const CTYPE_DIGIT: u16 = 0x4;
+const CTYPE_SPACE: u16 = 0x8;
+const CTYPE_PUNCT: u16 = 0x10;
+const CTYPE_CONTROL: u16 = 0x20;
+const CTYPE_BLANK: u16 = 0x40;
+const CTYPE_HEX: u16 = 0x80;
+const CTYPE_ALPHA: u16 = 0x100;
+
+fn c_locale_ctype_table() -> &'static [u16; 256] {
+    static TABLE: std::sync::LazyLock<[u16; 256]> = std::sync::LazyLock::new(|| {
+        let mut t = [0u16; 256];
+        for (b, slot) in t.iter_mut().enumerate() {
+            *slot = match b as u8 {
+                0x00..=0x08 | 0x0E..=0x1F | 0x7F => CTYPE_CONTROL,
+                0x09..=0x0D => CTYPE_CONTROL | CTYPE_SPACE,
+                0x20 => CTYPE_SPACE | CTYPE_BLANK,
+                0x21..=0x2F | 0x3A..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E => CTYPE_PUNCT,
+                0x30..=0x39 => CTYPE_DIGIT | CTYPE_HEX,
+                0x41..=0x46 | 0x61..=0x66 => {
+                    let letter = if (b as u8).is_ascii_uppercase() {
+                        CTYPE_UPPER
+                    } else {
+                        CTYPE_LOWER
+                    };
+                    letter | CTYPE_HEX | CTYPE_ALPHA
+                }
+                0x47..=0x5A => CTYPE_UPPER | CTYPE_ALPHA,
+                0x67..=0x7A => CTYPE_LOWER | CTYPE_ALPHA,
+                // The C locale does not classify bytes above ASCII.
+                _ => 0,
+            };
+        }
+        t
+    });
+    &TABLE
+}
+
+/// `unsigned short* __pctype_func(void)` — the C-locale classification table.
+pub unsafe extern "win64" fn __pctype_func() -> *const u16 {
+    c_locale_ctype_table().as_ptr()
+}
+
+/// `unsigned int ___lc_codepage_func(void)` — XCL's ANSI code page is UTF-8, which the
+/// conversion helpers spell as `CP_ACP` (`0`); a real Windows C locale would say 1252,
+/// but 1252 is not an XCL conversion code page.
+pub unsafe extern "win64" fn ___lc_codepage_func() -> u32 {
+    0
+}
+
+/// `void _lock_locales(void)` — the C-locale tables are immutable.
+pub unsafe extern "win64" fn _lock_locales() {}
+
+/// `void _unlock_locales(void)` — see `_lock_locales`.
+pub unsafe extern "win64" fn _unlock_locales() {}
+
+/// `int ___mb_cur_max_func(void)` — the C locale is single-byte.
+pub unsafe extern "win64" fn ___mb_cur_max_func() -> i32 {
+    1
+}
+
+/// The C-locale names UCRT keeps per category (`LC_ALL` … `LC_TIME`, 6 entries).
+/// The table is `usize` so the static stays `Sync`; the guest sees the same
+/// pointer-sized entries.
+static C_LOCALE_NAME: [u8; 2] = *b"C\0";
+
+fn c_locale_names() -> &'static [usize; 6] {
+    static NAMES: std::sync::LazyLock<[usize; 6]> = std::sync::LazyLock::new(|| {
+        [C_LOCALE_NAME.as_ptr() as usize; 6]
+    });
+    &NAMES
+}
+
+/// `const char** ___lc_locale_name_func(void)` — the per-category C-locale names.
+pub unsafe extern "win64" fn ___lc_locale_name_func() -> *const *const u8 {
+    c_locale_names().as_ptr() as *const *const u8
+}
+
+/// MSVC's LC_* categories (`LC_ALL` … `LC_TIME`).
+const LC_ALL: i32 = 0;
+const LC_TIME: i32 = 5;
+
+fn c_locale_matches(locale: *const u8) -> bool {
+    // `""` selects the environment, which XCL keeps at "C"; "C" and "POSIX" are
+    // the portable names for that locale.
+    let mut i = 0usize;
+    unsafe {
+        if *locale.add(0) == 0 {
+            return true;
+        }
+        let mut buf = [0u8; 8];
+        while i < buf.len() && *locale.add(i) != 0 {
+            buf[i] = *locale.add(i);
+            i += 1;
+        }
+        if *locale.add(i) != 0 {
+            return false;
+        }
+        let name = &buf[..i];
+        name.eq_ignore_ascii_case(b"C") || name.eq_ignore_ascii_case(b"POSIX")
+    }
+}
+
+/// `char* setlocale(int category, const char* locale)` — C locale only.
+pub unsafe extern "win64" fn setlocale(category: i32, locale: *const u8) -> *const u8 {
+    if !(LC_ALL..=LC_TIME).contains(&category) {
+        return std::ptr::null();
+    }
+    if !locale.is_null() && !c_locale_matches(locale) {
+        return std::ptr::null();
+    }
+    b"C\0".as_ptr()
+}
+
 /// Byte-wise ASCII fold of the C locale: `A`–`Z` only.
 #[inline]
 fn ascii_fold(b: u8) -> u8 {
@@ -4220,6 +4345,13 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("_stricmp", _stricmp as usize),
         ("isspace", isspace as usize),
         ("isalnum", isalnum as usize),
+        ("__pctype_func", __pctype_func as usize),
+        ("___lc_codepage_func", ___lc_codepage_func as usize),
+        ("_lock_locales", _lock_locales as usize),
+        ("_unlock_locales", _unlock_locales as usize),
+        ("___mb_cur_max_func", ___mb_cur_max_func as usize),
+        ("___lc_locale_name_func", ___lc_locale_name_func as usize),
+        ("setlocale", setlocale as usize),
         ("atoi", atoi as usize),
         ("strtod", strtod as usize),
         ("_strtoui64", _strtoui64 as usize),
@@ -5573,6 +5705,57 @@ mod tests {
             for c in [0i32, 0x20, b'_' as i32, b'#' as i32, b'/' as i32, b':' as i32, 0x7f, 0x80, 0x100, -1] {
                 assert_eq!(f(c), 0, "{c:#x} is not alphanumeric");
             }
+        }
+    }
+
+    #[test]
+    fn c_locale_ctype_table_and_setlocale_match_ucrt() {
+        unsafe {
+            let table = __pctype_func();
+            assert!(!table.is_null(), "__pctype_func must return a table");
+            let t = std::slice::from_raw_parts(table, 256);
+            for c in b'A'..=b'F' {
+                assert_ne!(t[c as usize] & CTYPE_UPPER, 0, "{c:?} upper");
+                assert_ne!(t[c as usize] & CTYPE_HEX, 0, "{c:?} hex");
+                assert_ne!(t[c as usize] & CTYPE_ALPHA, 0, "{c:?} alpha");
+            }
+            for c in b'a'..=b'f' {
+                assert_ne!(t[c as usize] & CTYPE_LOWER, 0, "{c:?} lower");
+                assert_ne!(t[c as usize] & CTYPE_HEX, 0, "{c:?} hex");
+            }
+            assert_eq!(t[b'G' as usize] & CTYPE_HEX, 0, "G is a letter, not hex");
+            assert_eq!(t[b'G' as usize] & CTYPE_ALPHA, CTYPE_ALPHA);
+            for c in b'0'..=b'9' {
+                assert_ne!(t[c as usize] & CTYPE_DIGIT, 0, "{c:?} digit");
+                assert_ne!(t[c as usize] & CTYPE_HEX, 0, "{c:?} hex");
+            }
+            assert_eq!(t[b' ' as usize] & CTYPE_SPACE, CTYPE_SPACE);
+            assert_eq!(t[0x09] & CTYPE_SPACE, CTYPE_SPACE);
+            assert_eq!(t[0x00] & CTYPE_CONTROL, CTYPE_CONTROL);
+            assert_eq!(t[0x7F] & CTYPE_CONTROL, CTYPE_CONTROL);
+            assert_eq!(t[0x80], 0, "the C locale does not classify high bytes");
+
+            assert_eq!(___lc_codepage_func(), 0, "XCL's ANSI page is UTF-8 (CP_ACP)");
+            assert_eq!(___mb_cur_max_func(), 1, "the C locale is single-byte");
+            _lock_locales();
+            _unlock_locales();
+            let names = ___lc_locale_name_func();
+            assert!(!names.is_null());
+            for i in 0..6 {
+                let name = *names.add(i);
+                assert!(!name.is_null(), "category {i}");
+                assert_eq!(std::ffi::CStr::from_ptr(name as *const _).to_bytes(), b"C");
+            }
+
+            let c = setlocale(LC_ALL, std::ptr::null());
+            assert!(!c.is_null());
+            assert_eq!(std::ffi::CStr::from_ptr(c as *const _).to_bytes(), b"C");
+            for name in [b"C\0".as_slice(), b"\0".as_slice(), b"POSIX\0".as_slice()] {
+                assert!(!setlocale(LC_ALL, name.as_ptr()).is_null(), "{name:?}");
+            }
+            assert!(setlocale(LC_ALL, b"fr_FR\0".as_ptr()).is_null());
+            assert!(setlocale(-1, std::ptr::null()).is_null());
+            assert!(setlocale(6, std::ptr::null()).is_null());
         }
     }
 }

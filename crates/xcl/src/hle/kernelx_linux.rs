@@ -1435,6 +1435,28 @@ pub unsafe extern "win64" fn InitializeCriticalSection(cs: *mut CritSec) -> i32 
     InitializeCriticalSectionAndSpinCount(cs, 0)
 }
 
+/// `BOOL InitializeCriticalSectionEx(cs, spin, flags)`: the flags select debug info and
+/// a few legacy behaviours; XCL's CS has no debug metadata, so they are accepted and the
+/// spin count is used.
+pub unsafe extern "win64" fn InitializeCriticalSectionEx(
+    cs: *mut CritSec,
+    spin: u32,
+    _flags: u32,
+) -> i32 {
+    InitializeCriticalSectionAndSpinCount(cs, spin)
+}
+
+/// `PVOID EncodePointer(PVOID)` — XCL has no pointer cookies; identity is the
+/// documented "no encoding" behaviour and keeps `DecodePointer` symmetric.
+pub unsafe extern "win64" fn EncodePointer(p: *mut c_void) -> *mut c_void {
+    p
+}
+
+/// `PVOID DecodePointer(PVOID)` — see `EncodePointer`.
+pub unsafe extern "win64" fn DecodePointer(p: *mut c_void) -> *mut c_void {
+    p
+}
+
 pub unsafe extern "win64" fn InitializeCriticalSectionAndSpinCount(
     cs: *mut CritSec,
     spin: u32,
@@ -10414,6 +10436,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("WaitForSingleObject", WaitForSingleObject as usize),
         ("WaitForMultipleObjects", WaitForMultipleObjects as usize),
         ("InitializeCriticalSection", InitializeCriticalSection as usize),
+        ("InitializeCriticalSectionEx", InitializeCriticalSectionEx as usize),
+        ("EncodePointer", EncodePointer as usize),
+        ("DecodePointer", DecodePointer as usize),
         (
             "InitializeCriticalSectionAndSpinCount",
             InitializeCriticalSectionAndSpinCount as usize,
@@ -14850,6 +14875,21 @@ mod tests {
             assert!(!read_physical_pages(&[page, 0], 0, &mut dst));
             assert_eq!(dst, vec![0xCCu8; PHYS_PAGE + 1], "a failed read leaves the destination untouched");
             assert_eq!(FreeTitlePhysicalPages(0, 1, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    #[test]
+    fn critical_section_ex_and_pointer_cookies() {
+        unsafe {
+            let mut cs: CritSec = std::mem::zeroed();
+            assert_eq!(InitializeCriticalSectionEx(&mut cs, 0x400, 1), 1);
+            EnterCriticalSection(&mut cs);
+            LeaveCriticalSection(&mut cs);
+            assert_eq!(DeleteCriticalSection(&mut cs), 1);
+            let p = &mut cs as *mut CritSec as *mut c_void;
+            assert_eq!(EncodePointer(p), p);
+            assert_eq!(DecodePointer(p), p);
+            assert_eq!(EncodePointer(std::ptr::null_mut()), std::ptr::null_mut());
         }
     }
 }

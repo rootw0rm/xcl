@@ -618,7 +618,6 @@ mod tests {
         let reg = registry();
         for dll in [
             "vcruntime140.dll",
-            "msvcp140.dll",
             "concrt140.dll",
             "vcomp140.dll",
             "vccorlib140.dll",
@@ -629,71 +628,53 @@ mod tests {
                 "{dll} must route to ucrtbase"
             );
         }
+        // Step 62: msvcp140 is NOT routed. The title ships the real C++ runtime
+        // and its objects must be constructed by the DLL, not by CRT stubs.
+        assert_eq!(
+            reg.hle_for("msvcp140.dll").map(|m| m.name),
+            None,
+            "msvcp140 must load the shipped real DLL, not the UCRT stubs"
+        );
         // Routed CRT primitives are real HLE, callable directly (never a stub).
         for (dll, sym) in [
             ("vcruntime140.dll", "memcpy"),
             ("vcruntime140.dll", "memset"),
             ("vcruntime140.dll", "malloc"),
-            ("msvcp140.dll", "memcpy"),
-            ("msvcp140.dll", "memmove"),
             ("concrt140.dll", "malloc"),
             ("vcomp140.dll", "memset"),
             ("vccorlib140.dll", "free"),
             ("vcruntime140.dll", "__stdio_common_vfprintf"),
-            ("msvcp140.dll", "__stdio_common_vfprintf"),
-            ("msvcp140.dll", "strcmp"),
             ("vcruntime140.dll", "strncmp"),
-            ("msvcp140.dll", "strcpy"),
             ("vcruntime140.dll", "strncpy"),
-            ("msvcp140.dll", "strcat"),
             ("vcruntime140.dll", "strncat"),
-            ("msvcp140.dll", "wcscpy"),
             ("vcruntime140.dll", "wcscat"),
-            ("msvcp140.dll", "wmemcpy"),
             ("vcruntime140.dll", "wmemmove"),
-            ("msvcp140.dll", "strstr"),
             ("vcruntime140.dll", "strrchr"),
-            ("msvcp140.dll", "strdup"),
             ("vcruntime140.dll", "_strdup"),
-            ("msvcp140.dll", "wcschr"),
             ("vcruntime140.dll", "wcsstr"),
-            ("msvcp140.dll", "_wcsdup"),
             ("vcruntime140.dll", "wcsdup"),
-            ("msvcp140.dll", "mbrtowc"),
             ("vcruntime140.dll", "wcrtomb"),
             ("concrt140.dll", "_execute_onexit_table"),
-            ("msvcp140.dll", "wcscmp"),
             ("vcruntime140.dll", "strchr"),
             ("concrt140.dll", "memchr"),
-            ("msvcp140.dll", "??2@YAPAXI@Z"),
             ("vcruntime140.dll", "??2@YAPEAX_K@Z"),
-            ("msvcp140.dll", "??_U@YAPAXI@Z"),
             ("vcruntime140.dll", "??_U@YAPEAX_K@Z"),
-            ("msvcp140.dll", "??3@YAXPAX@Z"),
             ("vcruntime140.dll", "??3@YAXPEAX@Z"),
-            ("msvcp140.dll", "??_V@YAXPAX@Z"),
             ("vcruntime140.dll", "??_V@YAXPEAX@Z"),
             ("vcruntime140.dll", "??3@YAXPEAX_K@Z"),
-            ("msvcp140.dll", "_callnewh"),
             ("vcruntime140.dll", "_set_new_handler"),
             ("concrt140.dll", "_query_new_handler"),
             ("vcruntime140.dll", "_purecall"),
-            ("msvcp140.dll", "_set_purecall_handler"),
             ("concrt140.dll", "_get_purecall_handler"),
             ("vcruntime140.dll", "_invoke_watson"),
-            ("msvcp140.dll", "_invalid_parameter"),
             ("vcruntime140.dll", "_invalid_parameter_noinfo"),
             ("concrt140.dll", "_get_invalid_parameter_handler"),
-            ("msvcp140.dll", "terminate"),
             ("vcruntime140.dll", "_set_terminate"),
             ("concrt140.dll", "_get_terminate"),
             ("vcomp140.dll", "_set_unexpected"),
             ("vccorlib140.dll", "_get_unexpected"),
-            ("msvcp140.dll", "_CxxThrowException"),
             ("vcruntime140.dll", "__CxxFrameHandler3"),
-            ("msvcp140.dll", "__CxxFrameHandler4"),
             // M1.1a: `std::_Random_device` is real OS entropy, not the constant stub.
-            ("msvcp140.dll", "?_Random_device@std@@YAIXZ"),
         ] {
             let (addr, src) = resolve_inner(&dll_key(dll), &name(sym), 0);
             assert!(
