@@ -222,6 +222,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[75] = Device_UnregisterPagePoolX as usize;
             v[108] = Device_GetResourceAllocationInfo2 as usize; // console allocation info (desc1)
             v[127] = Device_CreateCommittedResourceLayoutX as usize; // console committed resource (barrier layout)
+            v[133] = Device_CreatePlacedResourceLayoutX as usize; // console placed title memory (barrier layout)
         }
         Kind::CommandQueue | Kind::VulkanQueue => {
             v[10] = Queue_ExecuteCommandLists as usize;
@@ -1813,6 +1814,29 @@ unsafe extern "win64" fn Device_CreatePlacedResourceX(
     S_OK
 }
 
+/// device #133 `CreatePlacedResourceX` with a barrier layout (`D3D12_BARRIER_LAYOUT`)
+/// where the initial state sits (`real.rs`'s `create_placed_resource_layout_x`).
+///
+/// The retail title creates its streamed textures through its renderer with this
+/// console form and keeps the returned resource in the texture wrapper's `+0x20`;
+/// that field is later read back through `ID3D12Resource::GetDesc` (slot 10), so a
+/// stub that leaves the out pointer untouched makes the title call `[null+0x50]`
+/// (`exe+0x501f808`). This is the same title memory as [`Device_CreatePlacedResourceX`]
+/// (slot #44): the layout only replaces the initial state, which the null device
+/// does not consume.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "win64" fn Device_CreatePlacedResourceLayoutX(
+    this: *mut NullObj,
+    va: u64,
+    desc: *const u8,
+    _layout: u32,
+    clear: *const c_void,
+    riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    Device_CreatePlacedResourceX(this, va, desc, 0, clear, riid, ppv)
+}
+
 /// `CreateCommandQueueX(desc[4], riid, out)`: `desc[0]` is the queue type (0x10 DMA).
 unsafe extern "win64" fn Device_CreateCommandQueueX(
     this: *mut NullObj,
@@ -3271,6 +3295,45 @@ mod tests {
             assert_eq!(f(dev, desc.as_ptr(), std::ptr::null(), &mut out), S_OK);
             assert!(!out.is_null());
             assert_eq!((*(out as *mut NullObj)).kind, Kind::PipelineState);
+        }
+    }
+
+    /// Step 49: device #133 console `CreatePlacedResourceX(va, desc, layout,
+    /// clear, riid, out)`. The retail title keeps the returned resource in its
+    /// texture wrapper (`+0x20`) and reads it back with
+    /// `ID3D12Resource::GetDesc` (slot 10); the logging stub returned `S_OK`
+    /// with the out pointer untouched, so the title's `call [null+0x50]`
+    /// faulted at `exe+0x501f808`.
+    #[test]
+    fn console_placed_resource_layout_slot133_writes_the_resource() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let f: unsafe extern "win64" fn(*mut c_void, u64, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 133));
+            // console D3D12_RESOURCE_DESC of the streamed texture (TEXTURE2D,
+            // 256x256 RGBA8, console flags +0x30).
+            let mut d = [0u8; 0x38];
+            d[0..4].copy_from_slice(&3u32.to_le_bytes());
+            d[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
+            d[0x18..0x1c].copy_from_slice(&256u32.to_le_bytes());
+            d[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+            d[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+            d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+            d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            d[0x30..0x34].copy_from_slice(&0x30_0005u32.to_le_bytes());
+            let va = 0x1_2345_6780_u64;
+            let mut out = std::ptr::null_mut();
+            assert_eq!(f(dev, va, d.as_ptr(), 6, std::ptr::null(), std::ptr::null(), &mut out), S_OK);
+            assert!(!out.is_null(), "slot 133 must write the resource");
+            assert_eq!((*(out as *mut NullObj)).kind, Kind::PlacedResource);
+            // the title's next call is ID3D12Resource::GetDesc on that object
+            let gpu: unsafe extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(slot(out, 11));
+            assert_eq!(gpu(out), va, "the placed resource reports the title's address");
+            let desc: unsafe extern "win64" fn(*mut c_void, *mut u8) -> *mut u8 = std::mem::transmute(slot(out, 10));
+            let mut got = [0u8; 0x38];
+            desc(out, got.as_mut_ptr());
+            assert_eq!(got, d, "GetDesc round-trips the console description");
         }
     }
 
