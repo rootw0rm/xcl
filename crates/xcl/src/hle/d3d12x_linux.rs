@@ -1057,9 +1057,9 @@ pub unsafe fn record_graphics_pso(obj: *mut NullObj, desc: *const u8) {
         return;
     }
     // Null-shim trust, like `Device_CreateDescriptorHeap` above: the title
-    // hands host pointers, so read them directly. (`shader::readable` is a
-    // no-op false on Linux — gating on it would store an empty record on
-    // the one platform S3 needs bytes on. A null desc stores nothing.)
+    // hands host pointers, so read them directly, without a
+    // `shader::readable` maps check: gating would drop the record on the one
+    // platform S3 needs bytes on. A null desc stores nothing.
     let mut r = PsoRecord::default();
     r.vs_ptr = *(desc.add(8) as *const usize);
     r.vs_len = *(desc.add(16) as *const usize);
@@ -1745,14 +1745,14 @@ unsafe extern "win64" fn Device_CopyDescriptorsSimple(_t: *mut NullObj, n: u32, 
 /// an unaligned slot or an unreadable descriptor writes nothing and logs one
 /// warning per eight calls.
 unsafe extern "win64" fn Device_CreateSamplerX(_t: *mut NullObj, desc: *const u8, cpu: u64) {
-    use crate::hle::kernelx_linux::gfx_range_readable;
+    use crate::gpu::shader::readable;
     const SLOT: usize = 32;
     let heap = descriptor_heap_at(cpu);
     // Slots advance by the heap's increment (32 bytes here), so a handle is
     // aligned when it is a whole slot from the heap base — not necessarily
     // 32-byte aligned in host memory (the exhaustion fallback is malloc-backed).
     let aligned = heap.is_some_and(|(base, _, _)| (cpu - base) % SLOT as u64 == 0);
-    let desc_ok = !desc.is_null() && gfx_range_readable(desc as usize, 0x6C);
+    let desc_ok = !desc.is_null() && readable(desc as usize, 0x6C);
     let Some((base, _bytes, _ty)) = heap.filter(|_| aligned && desc_ok) else {
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -1977,14 +1977,15 @@ unsafe fn console_view_words(kind: ConsoleViewKind, rdesc: &[u8; 56], va: u64, d
 /// one of our resources, and a non-NULL view descriptor must be readable;
 /// otherwise nothing is written and one warning per eight calls is logged.
 unsafe fn write_console_view(kind: ConsoleViewKind, res: *mut c_void, desc: *const u8, cpu: u64) {
-    use crate::hle::kernelx_linux::{gfx_contains_range, gfx_range_readable};
+    use crate::gpu::shader::readable;
+    use crate::hle::kernelx_linux::gfx_contains_range;
     const SLOT: usize = 32;
     let slot_ok = cpu & 0x1F == 0 && gfx_contains_range(cpu as usize, SLOT);
     let res_ok = matches!(our_object_kind(res), Some(Kind::Resource | Kind::PlacedResource));
     // A NULL resource with a descriptor is D3D12's null view (retail's #19
     // wrapper passes it while unbinding): valid, with a zero GPU address.
     let null_view = res.is_null() && !desc.is_null();
-    let desc_ok = desc.is_null() || gfx_range_readable(desc as usize, 0x20);
+    let desc_ok = desc.is_null() || readable(desc as usize, 0x20);
     if !slot_ok || !desc_ok || !(res_ok || null_view) {
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -2064,10 +2065,11 @@ unsafe extern "win64" fn Device_CreateDepthStencilView(_t: *mut NullObj, res: *m
 /// encoded, never dereferenced.
 unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rdesc: *const u8, view: *const u8, cpu: u64) {
     use crate::gpu::desc::{self, ImageType};
-    use crate::hle::kernelx_linux::{gfx_contains_range, gfx_range_readable};
+    use crate::gpu::shader::readable;
+    use crate::hle::kernelx_linux::gfx_contains_range;
     const SLOT: usize = 32;
     let slot_ok = cpu & 0x1F == 0 && gfx_contains_range(cpu as usize, SLOT);
-    let view_ok = !view.is_null() && gfx_range_readable(view as usize, 0x30);
+    let view_ok = !view.is_null() && readable(view as usize, 0x30);
     if !slot_ok || !view_ok {
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -2102,7 +2104,7 @@ unsafe extern "win64" fn Device_CreateShaderResourceViewAt(_t: *mut NullObj, rde
             words[..4].copy_from_slice(&v);
         }
         2..=10 => {
-            let rdesc_ok = !rdesc.is_null() && gfx_range_readable(rdesc as usize, 56);
+            let rdesc_ok = !rdesc.is_null() && crate::gpu::shader::readable(rdesc as usize, 56);
             if !rdesc_ok {
                 static N: AtomicU32 = AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -3415,8 +3417,8 @@ unsafe extern "win64" fn Queue_ExecuteCommandListsX(
 /// Host RGBA bytes of a back-buffer resource (R8G8B8A8 2D texture only):
 /// committed resources from their Map backing, placed ones straight from
 /// title memory. Unmodelled shapes return `None` and the caller presents
-/// nothing. Linux trusts the pointers (no `/proc/self/maps` walk yet —
-/// `gpu::shader::readable` is windows-only), like every other Linux slot.
+/// nothing. Linux trusts the pointers without a `shader::readable` maps
+/// check, like every other Linux slot.
 unsafe fn read_rgba(o: *mut NullObj) -> Option<(u32, u32, Vec<u8>)> {
     // D3D12_RESOURCE_DESC: Dimension u32 @0, Width u64 @16, Height u32 @24,
     // Format u32 @32.

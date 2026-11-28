@@ -281,9 +281,9 @@ static ANCILLARY: Mutex<[Vec<usize>; TYPES]> = Mutex::new([Vec::new(), Vec::new(
 /// Parse a schedule ancillary block (`{ u32 count; HANDLE* list @8;
 /// i32* signaled @0x10 }`, null = none) and remember its handles for `ty`.
 /// `E_INVALIDARG` when the count exceeds the console's 63-handle cap, like
-/// Windows. Linux trusts the title's block (no `/proc/self/maps` walk yet —
-/// `gpu::shader::readable` is windows-only); a garbage block faults like any
-/// other Linux slot instead of failing closed.
+/// Windows. Linux trusts the title's block without a `shader::readable` maps
+/// check; a garbage block faults like any other Linux slot instead of failing
+/// closed.
 pub fn register_ancillary(ty: u32, block: *const u8, unschedule: bool) -> HRESULT {
     let mut handles = Vec::new();
     if !block.is_null() {

@@ -231,11 +231,48 @@ pub fn readable(p: usize, len: usize) -> bool {
     true
 }
 
-/// Linux: no `/proc/self/maps` walk yet, so refuse (never dereference) any game pointer.
-// LINUX-TODO: Phase C — answer from the loader's mapped ranges once it exists.
+/// Linux: answer from `/proc/self/maps`. Every byte of `[p, p+len)` must lie in mappings
+/// whose permission field starts with `r`; a gap, a `PROT_NONE` page or an unreadable
+/// mapping refuses. Only the maps text is read, never `[p, p+len)` itself, so a garbage
+/// title pointer cannot fault here. This is off the crash path (`eh_linux` has its own
+/// syscall-only maps parse for signal context); the per-call parse runs at PSO creation
+/// and descriptor checks, not per draw.
 #[cfg(not(windows))]
 pub fn readable(p: usize, len: usize) -> bool {
-    let _ = (p, len);
+    if p == 0 || len == 0 || len > 256 << 20 {
+        return false;
+    }
+    let Some(end) = p.checked_add(len) else { return false };
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return false };
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    for line in maps.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(range), Some(perms)) = (it.next(), it.next()) else { continue };
+        let Some((a, b)) = range.split_once('-') else { continue };
+        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else {
+            continue;
+        };
+        if b > p && a < end {
+            runs.push((a.max(p), b.min(end), perms.starts_with('r')));
+        }
+    }
+    runs.sort_unstable_by_key(|r| r.0);
+    let mut cur = p;
+    for (a, b, readable) in runs {
+        if a > cur {
+            return false; // a hole before this run
+        }
+        if b <= cur {
+            continue;
+        }
+        if !readable {
+            return false;
+        }
+        cur = b;
+        if cur >= end {
+            return true;
+        }
+    }
     false
 }
 
@@ -505,6 +542,51 @@ mod tests {
         assert!(!readable(0x10, 10));
         let v = vec![1u8; 100];
         assert!(readable(v.as_ptr() as usize, 100));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn readable_answers_from_proc_self_maps() {
+        // the guards answer before any pointer is considered
+        assert!(!readable(0, 8));
+        assert!(!readable(0x10, 8), "the zero page is not a title pointer");
+        assert!(!readable(1, 0));
+        assert!(!readable(1, (256 << 20) + 1));
+        assert!(!readable(usize::MAX, 2), "overflow is never readable");
+
+        // host heap (where the title's blobs live in the Linux build)
+        let v = vec![1u8; 100];
+        assert!(readable(v.as_ptr() as usize, v.len()));
+
+        let page = 0x1000;
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                3 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED);
+            let a = p as usize;
+            assert!(readable(a, 3 * page));
+            assert!(readable(a + page + 0x10, 8));
+
+            // a PROT_NONE page is mapped but not readable
+            assert_eq!(libc::mprotect((a + page) as *mut libc::c_void, page, libc::PROT_NONE), 0);
+            assert!(!readable(a + page, 1));
+            assert!(!readable(a + page - 8, 16), "a range crossing into PROT_NONE");
+            assert_eq!(libc::mprotect((a + page) as *mut libc::c_void, page, libc::PROT_READ | libc::PROT_WRITE), 0);
+
+            // a hole between two readable mappings is not readable
+            assert_eq!(libc::munmap((a + page) as *mut libc::c_void, page), 0);
+            assert!(!readable(a + page, 1));
+            assert!(!readable(a, 3 * page));
+            assert!(!readable(a + page - 1, 2));
+            assert_eq!(libc::munmap(p, 3 * page), 0);
+            assert!(!readable(a, 1), "unmapped after munmap");
+        }
     }
 
     #[cfg(windows)]

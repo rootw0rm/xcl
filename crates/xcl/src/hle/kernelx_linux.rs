@@ -3275,50 +3275,6 @@ pub(crate) fn gfx_contains_range(addr: usize, len: usize) -> bool {
         && addr.checked_add(len - 1).is_some_and(gfx_contains)
 }
 
-/// Whether every page of `[p, p + len)` lies in a readable `/proc/self/maps` run: the
-/// Linux twin of `gpu::shader::readable` for graphics-pool memory (commit `mprotect`s
-/// the range `PROT_READ | PROT_WRITE`). That function stays a refusal on Linux because
-/// the crash handler calls it inside a signal context, where reading `/proc` would be
-/// async-signal-unsafe; this one is only used off that path (descriptor-heap creation and
-/// console descriptor writes from title pointers).
-pub(crate) fn gfx_range_readable(p: usize, len: usize) -> bool {
-    if p == 0 || len == 0 || len > 256 << 20 {
-        return false;
-    }
-    let Some(end) = p.checked_add(len) else { return false };
-    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return false };
-    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
-    for line in maps.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(range), Some(perms)) = (it.next(), it.next()) else { continue };
-        let Some((a, b)) = range.split_once('-') else { continue };
-        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else {
-            continue;
-        };
-        if b > p && a < end {
-            runs.push((a.max(p), b.min(end), perms.starts_with('r')));
-        }
-    }
-    runs.sort_unstable_by_key(|r| r.0);
-    let mut cur = p;
-    for (a, b, readable) in runs {
-        if a > cur {
-            return false;
-        }
-        if b <= cur {
-            continue;
-        }
-        if !readable {
-            return false;
-        }
-        cur = b;
-        if cur >= end {
-            return true;
-        }
-    }
-    false
-}
-
 /// First-fit `size` bytes at `align` inside the graphics pool. Committed ranges are
 /// `mprotect`ed `READWRITE` and zeroed; reserved ranges stay `PROT_NONE`.
 pub(crate) fn gfx_alloc(size: usize, align: usize, commit: bool) -> Option<usize> {
@@ -3735,7 +3691,7 @@ pub(crate) unsafe fn title_descriptor_heap_memory(bytes: usize) -> Option<usize>
         return None;
     };
     let in_pool = gfx_contains_range(p, bytes);
-    if in_pool && gfx_range_readable(p, bytes) {
+    if in_pool && crate::gpu::shader::readable(p, bytes) {
         static OK: AtomicU32 = AtomicU32::new(0);
         if OK.fetch_add(1, Ordering::Relaxed) < 8 {
             crate::xlog_info!("console descriptor heap: {bytes:#x} bytes from the title's memory at {p:#x}");
@@ -3746,7 +3702,7 @@ pub(crate) unsafe fn title_descriptor_heap_memory(bytes: usize) -> Option<usize>
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
         crate::xlog_warn!(
             "console descriptor heap: the title's memory {p:#x} ({bytes:#x} bytes) not used (in the pool {in_pool}, readable {})",
-            gfx_range_readable(p, bytes)
+            crate::gpu::shader::readable(p, bytes)
         );
     }
     runtime_free(p, D3D_DESCRIPTOR_HEAP);
