@@ -2119,6 +2119,10 @@ const EILSEQ_WIN: i32 = 42;
 const ERANGE_WIN: i32 = 34;
 /// Windows `EINVAL` — `_strtoui64` called with a base outside 0/2..=36.
 const EINVAL_WIN: i32 = 22;
+/// Windows `ENOENT` — `_wstat64` on a path the VFS does not resolve.
+const ENOENT_WIN: i32 = 2;
+/// Windows `EACCES` — `_wstat64` on a path the host refuses.
+const EACCES_WIN: i32 = 13;
 
 fn set_win_errno(code: i32) {
     unsafe {
@@ -2676,6 +2680,82 @@ pub unsafe extern "win64" fn ftell(stream: *mut u8) -> i64 {
         Ok(p) => p as i64,
         Err(_) => -1,
     }
+}
+
+/// Map a host `io::Error` to the MSVC `errno` `_wstat64` reports.
+fn stat_errno(e: &std::io::Error) -> i32 {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => EACCES_WIN,
+        std::io::ErrorKind::InvalidInput => EINVAL_WIN,
+        _ => e.raw_os_error().unwrap_or(ENOENT_WIN),
+    }
+}
+
+/// `int _wstat64(const wchar_t *path, struct _stat64 *buffer)` — resolve `path`
+/// through the process VFS (`Vfs::real_path_for_read`, the same resolver the
+/// DirectStorage/loader readers use), `stat` the host file and fill the
+/// 0x38-byte MSVC `_stat64`:
+///
+/// ```text
+/// 0x00 st_dev (u32)   0x04 st_ino (u16)    0x06 st_mode (u16)
+/// 0x08 st_nlink (i16) 0x0a st_uid (i16)    0x0c st_gid (i16)
+/// 0x10 st_rdev (u32)  0x18 st_size (i64)
+/// 0x20 st_atime       0x28 st_mtime        0x30 st_ctime  (i64 POSIX seconds)
+/// ```
+///
+/// `st_mode` carries `_S_IFREG`/`_S_IFDIR` plus the `_S_IREAD`/`_S_IWRITE`/
+/// `_S_IEXEC` permission bits; directories report size 0 like Windows (the
+/// host's directory length is meaningless there). Returns 0 on success, or -1
+/// with `errno` = `EINVAL` (null path/buffer) or the host failure (`ENOENT` for
+/// a missing or hidden path). A failed call writes nothing into `buffer`.
+pub unsafe extern "win64" fn _wstat64(path: *const u16, buffer: *mut u8) -> i32 {
+    if buffer.is_null() {
+        set_win_errno(EINVAL_WIN);
+        return -1;
+    }
+    let Some(path) = crate::util::from_wide_ptr(path) else {
+        set_win_errno(EINVAL_WIN);
+        return -1;
+    };
+    let host = match crate::vfs::get() {
+        Some(v) => match v.real_path_for_read(&path) {
+            Some(p) => p,
+            None => {
+                // Hidden by a whiteout or refused by the VFS containment checks.
+                set_win_errno(ENOENT_WIN);
+                return -1;
+            }
+        },
+        None => path,
+    };
+    let meta = match std::fs::metadata(&host) {
+        Ok(m) => m,
+        Err(e) => {
+            set_win_errno(stat_errno(&e));
+            return -1;
+        }
+    };
+
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let perm = meta.permissions().mode();
+    let mode = if meta.is_dir() { 0x4000u16 } else { 0x8000u16 }
+        | if perm & 0o444 != 0 { 0x0100 } else { 0 }
+        | if perm & 0o222 != 0 { 0x0080 } else { 0 }
+        | if perm & 0o111 != 0 { 0x0040 } else { 0 };
+    let size = if meta.is_dir() { 0 } else { meta.len().min(i64::MAX as u64) as i64 };
+
+    let mut out = [0u8; 0x38];
+    out[0x00..0x04].copy_from_slice(&(meta.dev() as u32).to_le_bytes());
+    out[0x04..0x06].copy_from_slice(&(meta.ino() as u16).to_le_bytes());
+    out[0x06..0x08].copy_from_slice(&mode.to_le_bytes());
+    out[0x08..0x0a].copy_from_slice(&(meta.nlink().min(u16::MAX as u64) as u16).to_le_bytes());
+    // st_uid/st_gid/st_rdev stay 0 (Windows has no POSIX owner mapping).
+    out[0x18..0x20].copy_from_slice(&size.to_le_bytes());
+    out[0x20..0x28].copy_from_slice(&meta.atime().to_le_bytes());
+    out[0x28..0x30].copy_from_slice(&meta.mtime().to_le_bytes());
+    out[0x30..0x38].copy_from_slice(&meta.ctime().to_le_bytes());
+    std::ptr::copy_nonoverlapping(out.as_ptr(), buffer, out.len());
+    0
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4706,6 +4786,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("fclose", fclose as usize),
         ("fseek", fseek as usize),
         ("ftell", ftell as usize),
+        ("_wstat64", _wstat64 as usize),
         ("__stdio_common_vfprintf", __stdio_common_vfprintf as usize),
         ("__stdio_common_vsscanf", __stdio_common_vsscanf as usize),
         ("__stdio_common_vswprintf_s", __stdio_common_vswprintf_s as usize),
@@ -5257,6 +5338,77 @@ mod tests {
             );
             assert_eq!(*_errno(), EINVAL_WIN);
         }
+    }
+
+    #[test]
+    fn wstat64_reports_real_files_and_directories_through_the_vfs() {
+        // Retail Step 81: api-ms-win-crt-filesystem!_wstat64 (IAT
+        // 0x146794798) is called 9x/run from exe+0x1a994ad. The auto-stub
+        // returned 0 without writing the 0x38-byte `_stat64`, so the caller
+        // copied stale size/atime/mtime for every probed name (and treated
+        // every `.dds`/`.sif`/`.pvr`/`.tga` candidate as present).
+        assert!(
+            exports().iter().any(|(n, _)| *n == "_wstat64"),
+            "_wstat64 must be wired"
+        );
+        type Wstat64 = unsafe extern "win64" fn(*const u16, *mut u8) -> i32;
+        let addr = exports()
+            .into_iter()
+            .find_map(|(n, a)| (n == "_wstat64").then_some(a))
+            .expect("export");
+        let stat: Wstat64 = unsafe { std::mem::transmute(addr) };
+
+        fn u16_at(b: &[u8], o: usize) -> u16 {
+            u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
+        }
+        fn i64_at(b: &[u8], o: usize) -> i64 {
+            i64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+        }
+
+        let dir = std::env::temp_dir().join(format!("xcl_crt_wstat64_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let file_w = crate::util::wide(file.to_str().unwrap());
+        let dir_w = crate::util::wide(dir.to_str().unwrap());
+        let missing_w = crate::util::wide(dir.join("absent.bin").to_str().unwrap());
+
+        unsafe {
+            // A regular file: exact size, `_S_IFREG`, a real link count and
+            // non-zero POSIX-second times.
+            *_errno() = 0;
+            let mut buf = [0xAAu8; 0x38];
+            assert_eq!(stat(file_w.as_ptr(), buf.as_mut_ptr()), 0);
+            assert_eq!(i64_at(&buf, 0x18), 10);
+            assert_eq!(u16_at(&buf, 0x06) & 0xF000, 0x8000);
+            assert!(u16_at(&buf, 0x08) >= 1);
+            assert_ne!(i64_at(&buf, 0x20), 0, "atime");
+            assert_ne!(i64_at(&buf, 0x28), 0, "mtime");
+            assert_ne!(i64_at(&buf, 0x30), 0, "ctime");
+
+            // A directory: `_S_IFDIR` and the Windows zero directory size.
+            let mut dbuf = [0xAAu8; 0x38];
+            assert_eq!(stat(dir_w.as_ptr(), dbuf.as_mut_ptr()), 0);
+            assert_eq!(u16_at(&dbuf, 0x06) & 0xF000, 0x4000);
+            assert_eq!(i64_at(&dbuf, 0x18), 0);
+
+            // A missing path is -1/ENOENT and leaves the buffer untouched.
+            *_errno() = 0;
+            let mut keep = [0x5Au8; 0x38];
+            assert_eq!(stat(missing_w.as_ptr(), keep.as_mut_ptr()), -1);
+            assert_eq!(*_errno(), ENOENT_WIN);
+            assert_eq!(keep, [0x5Au8; 0x38]);
+
+            // Null buffer and null path are EINVAL.
+            *_errno() = 0;
+            assert_eq!(stat(file_w.as_ptr(), std::ptr::null_mut()), -1);
+            assert_eq!(*_errno(), EINVAL_WIN);
+            *_errno() = 0;
+            assert_eq!(stat(std::ptr::null(), buf.as_mut_ptr()), -1);
+            assert_eq!(*_errno(), EINVAL_WIN);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
