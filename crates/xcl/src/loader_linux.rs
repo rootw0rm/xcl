@@ -2,11 +2,11 @@
 //! `mmap(MAP_FIXED_NOREPLACE)`.
 //!
 //! Semantics kept identical to `loader.rs` (Windows): the image is mapped at its
-//! `ImageBase`, headers and raw section bytes are copied, base relocations are applied (a
-//! no-op while the base equals the link address), the import and delay-import tables are
-//! parsed with the same name/ordinal rules, the TLS directory's callbacks are recorded in
-//! order, and the entry RVA is preserved. An occupied link address is a hard error: there is
-//! no relocation-based fallback, because the title's pointers assume the link address.
+//! `ImageBase`, headers and raw section bytes are copied, base relocations are applied, the
+//! import and delay-import tables are parsed with the same name/ordinal rules, the TLS
+//! directory's callbacks are recorded in order, and the entry RVA is preserved. An occupied
+//! link address falls back to an OS-chosen address when the image has relocations; a
+//! reloc-stripped image is a hard error naming the address (Windows parity).
 //!
 //! Not ported yet (explicit Phase C work, no silent stubs):
 //! * `.pdata` translation / C++ unwinding — later Phase C work,
@@ -122,7 +122,10 @@ struct Mapping {
 }
 
 impl Mapping {
-    fn new(base_addr: usize, len: usize) -> Result<Self, String> {
+    /// Reserve `len` bytes at `base_addr`, like the Windows twin's first `VirtualAlloc`.
+    /// An occupied preferred address falls back to an OS-chosen one when the image has base
+    /// relocations (`has_relocs`); a reloc-stripped image stays a hard error.
+    fn new(base_addr: usize, len: usize, relocatable: bool) -> Result<Self, String> {
         let p = unsafe {
             libc::mmap(
                 base_addr as *mut c_void,
@@ -133,15 +136,38 @@ impl Mapping {
                 0,
             )
         };
-        if p == libc::MAP_FAILED {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EEXIST) {
-                return Err(format!(
-                    "preferred address {base_addr:#x} is occupied ({e}); the image is mapped only at its link address (no relocation fallback)"
-                ));
-            }
+        if p != libc::MAP_FAILED {
+            return Ok(Mapping {
+                base: p,
+                len,
+                armed: true,
+            });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EEXIST) {
             return Err(format!(
                 "cannot map preferred address {base_addr:#x} ({len:#x} bytes): {e}"
+            ));
+        }
+        if !relocatable {
+            return Err(format!(
+                "preferred address {base_addr:#x} is occupied ({e}) and the image has no relocations"
+            ));
+        }
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(format!(
+                "cannot map {len:#x} bytes for a relocated image: {}",
+                std::io::Error::last_os_error()
             ));
         }
         Ok(Mapping {
@@ -171,7 +197,8 @@ impl Drop for Mapping {
     }
 }
 
-/// Map an image at its link address. Does not run any code of the image.
+/// Map an image at its link address (or an OS-chosen one when that is occupied and the
+/// image is relocatable). Does not run any code of the image.
 pub fn map_image(path: &Path) -> Result<Arc<MappedModule>, String> {
     map_image_ex(path, false)
 }
@@ -261,7 +288,9 @@ fn deinit_dll(m: &Arc<MappedModule>) {
 /// Map + initialise a DLL that ships with the game (idempotent by file name).
 ///
 /// Serialized with the main-image load and concurrent DLL loads; an occupied preferred
-/// base stays a hard error (DEC-010), never a silent relocation.
+/// address relocates the image (as Windows does for a `DYNAMIC_BASE` DLL), so two game
+/// DLLs that share a link address – `msvcp140.dll` and `XboxBvhBuilder.dll` both use
+/// `0x180000000` – can be loaded together.
 pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
     let key = crate::util::dll_key(&path.to_string_lossy());
     let _guard = LoadGuard::enter();
@@ -382,12 +411,17 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     }
     let map_len = round_up(size, page);
 
-    // 1. reserve + commit at the link address. No fallback: a relocated image would break
-    // every pointer the title holds. The anonymous mapping is zero-filled, like a PE's
-    // zero-filled section tails.
-    let mapping = Mapping::new(base_addr, map_len).map_err(|e| format!("{name}: {e}"))?;
+    // 1. reserve + commit at the link address (Windows parity: an occupied address falls
+    // back to an OS-chosen one when the image has base relocations). The anonymous mapping
+    // is zero-filled, like a PE's zero-filled section tails.
+    let mapping = Mapping::new(base_addr, map_len, pe.has_relocs())
+        .map_err(|e| format!("{name}: {e}"))?;
     let base = mapping.addr();
-    debug_assert_eq!(base, base_addr);
+    if base != base_addr {
+        crate::xlog_info!(
+            "{name}: preferred address {base_addr:#x} is occupied; mapped at {base:#x} with relocations"
+        );
+    }
 
     // 2. headers + sections
     unsafe {
@@ -412,8 +446,8 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
-    // 3. relocations. The image is at its link address, so this is a no-op today; the same
-    // fixups run should a future backend map elsewhere (never silently: that is an error).
+    // 3. relocations. Zero delta at the link address; a relocated image gets the same
+    // fixups the Windows loader applies.
     let delta = (base as u64).wrapping_sub(pe.image_base);
     apply_relocations(&pe, base, delta).map_err(|e| format!("{name}: {e}"))?;
 
@@ -793,6 +827,15 @@ mod tests {
         p32(f, o + 0x70 + 5 * 8 + 4, block as u32);
     }
 
+    /// Mark the image `RELOCS_STRIPPED` and drop its relocation directory.
+    fn strip_relocs(f: &mut [u8]) {
+        let o = 0x58;
+        let chars = u16::from_le_bytes([f[0x56], f[0x57]]) | pe::IMAGE_FILE_RELOCS_STRIPPED;
+        p16(f, 0x56, chars);
+        p32(f, o + 0x70 + 5 * 8, 0);
+        p32(f, o + 0x70 + 5 * 8 + 4, 0);
+    }
+
     /// TLS directory at RVA 0x2000 (.data), callback list at 0x2040, 8-byte template at
     /// 0x2080 (first byte `template`, already-relocated zeros after it) and the image's
     /// `_tls_index` at 0x2088. The callbacks are two distinct `ret`s in .text, so a thread
@@ -871,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_occupied_link_address() {
+    fn relocates_a_relocatable_image_when_the_link_address_is_occupied() {
         let len = page_size() * 2;
         let p = unsafe {
             libc::mmap(
@@ -885,10 +928,44 @@ mod tests {
         };
         assert_ne!(p, libc::MAP_FAILED);
         let base = p as u64;
-        let path = write("xcl_occupied.dll", &tiny_dll(base, &[0xC3], None));
-        let e = map_image(&path).err().expect("image must be rejected");
+        let code = [0xB8, 1, 0, 0, 0, 0xC3];
+        let path = write("xcl_occupied_reloc.dll", &tiny_dll(base, &code, None));
+        let m = map_image(&path).expect("a relocatable image must map elsewhere");
+        assert_ne!(m.base, base as usize);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((m.base + 0x1000) as *const u8, code.len()) },
+            code
+        );
+        modules::unregister_mapped(m.base);
+        unsafe {
+            libc::munmap(p, len);
+        }
+    }
+
+    /// A reloc-stripped image cannot be placed anywhere but its link address (the Windows
+    /// loader also refuses it); the error names the occupied address.
+    #[test]
+    fn rejects_an_occupied_link_address_without_relocations() {
+        let len = page_size() * 2;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let base = p as u64;
+        let mut file = tiny_dll(base, &[0xC3], None);
+        strip_relocs(&mut file);
+        let path = write("xcl_occupied_stripped.dll", &file);
+        let e = map_image(&path).err().expect("reloc-stripped image must be rejected");
         assert!(e.contains(&format!("{base:#x}")), "{e}");
         assert!(e.contains("occupied"), "{e}");
+        assert!(e.contains("no relocations"), "{e}");
         unsafe {
             libc::munmap(p, len);
         }
@@ -1547,7 +1624,8 @@ mod tests {
     }
 
     #[test]
-    fn load_game_dll_rejects_an_occupied_base() {        let len = page_size() * 2;
+    fn load_game_dll_relocates_a_dll_whose_base_is_occupied() {
+        let len = page_size() * 2;
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1560,12 +1638,47 @@ mod tests {
         };
         assert_ne!(p, libc::MAP_FAILED);
         let base = p as u64;
-        let path = write("xcl_occupied_dll.dll", &dll_with_tls_and_main(base, 5));
+        let code = [0xB8, 1, 0, 0, 0, 0xC3]; // DllMain: return TRUE
+        let path = write("xcl_occupied_reloc_dll.dll", &tiny_dll(base, &code, None));
+        let m = load_game_dll(&path).expect("a relocatable DLL must load elsewhere");
+        assert_ne!(m.base, base as usize);
+        assert_eq!(
+            modules::find_mapped_by_name("xcl_occupied_reloc_dll.dll").map(|m| m.base),
+            Some(m.base)
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((m.base + 0x1000) as *const u8, code.len()) },
+            code
+        );
+        unsafe {
+            libc::munmap(p, len);
+        }
+    }
+
+    #[test]
+    fn load_game_dll_rejects_an_occupied_base_without_relocations() {
+        let len = page_size() * 2;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let base = p as u64;
+        let mut file = dll_with_tls_and_main(base, 5);
+        strip_relocs(&mut file);
+        let path = write("xcl_occupied_noreloc_dll.dll", &file);
         let e = load_game_dll(&path).err().expect("occupied base must fail");
         assert!(e.contains(&format!("{base:#x}")), "{e}");
         assert!(e.contains("occupied"), "{e}");
+        assert!(e.contains("no relocations"), "{e}");
         assert!(modules::find_mapped_by_base(base as usize).is_none());
-        assert!(modules::find_mapped_by_name("xcl_occupied_dll.dll").is_none());
+        assert!(modules::find_mapped_by_name("xcl_occupied_noreloc_dll.dll").is_none());
         unsafe {
             libc::munmap(p, len);
         }
