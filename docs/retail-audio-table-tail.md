@@ -69,6 +69,31 @@ consistent with that: dwords `0..=0x7fd` are the coherent offset run
 (`0x9d8, 0x9e0, …, 0x16f00`, 2046 entries); everything from `0x7fe` on is
 pre-existing heap data.
 
+### Static map of the helper's branch
+
+`0x1451d2260` is an `sgetn` over a page-cached reader (`rcx` = reader,
+`rdx` = destination, `r8d` = count; fields `+0x0` inner source, `+0x8` page
+buffer, `+0x10` page base, `+0x18` stream offset, `+0x20` consumed, `+0x24`
+page length, `+0x28` page capacity):
+
+- `0x1451d2290`: `count <= page length - consumed` → copy and return.
+- `0x1451d22e2` / `0x1451d237a`: otherwise copy the `page length - consumed`
+  residue (`0xFFC` here), advance the offset by the full page and shrink
+  `count`; fall into the direct/buffered decision.
+- `0x1451d2302`: `cmp count, [reader+0x28]`. `count >= capacity` takes the
+  direct path at `0x1451d2346`; otherwise it refills `[reader+0x8]` and
+  copies from the page.
+- `0x1451d2346`: calls the inner source's `xsgetn` (inner vtable `+0x50`, the
+  `0x140314330` → `0x141330560` stream) with `(inner, [reader+0x8],
+  destination, count)` and the still-unconsumed `10416`; adds the return to
+  the copied total and zeroes consumed/length at `0x1451d236d`.
+
+The capacity is `0x1000`, so the `10416`-byte remainder can never take the
+buffered branch: it is handed whole to the title's pack stream one call
+after the `0xFFC` residue copy. The next consumer-visible inputs are inside
+that stream: the block table read via `0x14550db40` in the loop at
+`0x141330621` and the writers at `0x1413307e0` / `0x1413308e0`.
+
 ## Sentinel proof that the tail is never written
 
 At `exe+0x25a0840`, gdb pre-fills the table tail with a sentinel, then
@@ -120,5 +145,8 @@ the tail is removed as a factor; do not add an XCL fill workaround for it.
 - Retail `/tmp/xcl-step54-r1` (fresh root, debug binary at this tree): first
   frame `presented 3840x2160`, exit 133 in the shell, report SIGSEGV
   `exe+0x25a087d`, **26** called stubs — unchanged from Step 53.
+- Re-confirmed at `c5318bcd` (fresh root `/tmp/xcl-step54-r2`): same frame,
+  same crash PC/code bytes, 26 stubs; `check -p xcl --tests` 0,
+  `check --workspace` 0, lib **892/0/1**, launcher **7/0**.
 
 No product code changed; the gdb fills above were diagnostic only.
