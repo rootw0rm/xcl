@@ -3646,6 +3646,12 @@ pub unsafe fn adopt_title_hooks(main: &crate::modules::MappedModule) {
 /// asserts that they start there.
 pub const D3D_DESCRIPTOR_HEAP: u64 = 4 | 1 << 14 | 0x80 << 16 | 16 << 24 | 1 << 29;
 
+/// XALLOC_ATTRIBUTES of a display target's memory: 4 MiB pages (the retail game's hook for its back
+/// buffers takes every request with them), allocator 0x80, graphics memory. The bits 0xc000 = 0x8000
+/// are the event its registered region bumps on: the retail title hands its back buffers one block
+/// and asserts that the block is used up.
+pub const D3D_DISPLAY_TARGET: u64 = 2 << 14 | 0x80 << 16 | 16 << 24 | 1 << 29;
+
 /// What the title's allocation hook gives a console runtime library (None: no hook, or null).
 pub unsafe fn runtime_alloc(size: usize, attrs: u64) -> Option<usize> {
     let f = TITLE_HOOKS[0].load(Ordering::Acquire);

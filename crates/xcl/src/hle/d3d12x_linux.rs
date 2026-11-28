@@ -218,6 +218,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[73] = Device_CreateCommandListX as usize; // console list (DMA)
             v[74] = Device_RegisterPagePoolX as usize;
             v[75] = Device_UnregisterPagePoolX as usize;
+            v[127] = Device_CreateCommittedResourceLayoutX as usize; // console committed resource (barrier layout)
         }
         Kind::CommandQueue | Kind::VulkanQueue => {
             v[10] = Queue_ExecuteCommandLists as usize;
@@ -1359,6 +1360,60 @@ unsafe extern "win64" fn Device_CreateCommittedResource(_t: *mut NullObj, hp: *c
 unsafe extern "win64" fn Device_CreateCommittedResource1(_t: *mut NullObj, hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _ps: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     new_resource(hp, desc, ppv)
 }
+
+/// Console slot 127 `CreateCommittedResourceX` with a barrier layout in the PC's
+/// initial-state place (`real.rs`'s `dev_create_committed_resource_layout_x`).
+///
+/// A display target (`flags & ALLOW_DISPLAY`, console `D3D12_HEAP_FLAGS` value
+/// `0x8`) gets its memory from the title's allocation hook, exactly as the
+/// console runtime's committed-resource path does: the retail title registers
+/// one display-target block and asserts that it is used up
+/// (`exe+0x247ad10`/`+0x247af2e`, two 3840x2160 back buffers in a 64/82 MiB
+/// region). The null device keeps those bytes as the resource's VA.
+///
+/// Every other committed resource keeps the plain [`new_resource`] path.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "win64" fn Device_CreateCommittedResourceLayoutX(
+    _t: *mut NullObj,
+    props: *const c_void,
+    flags: u32,
+    desc: *const u8,
+    _layout: u32,
+    _clear: *const c_void,
+    _protected: *mut c_void,
+    _castable: u32,
+    _formats: *const c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    const ALLOW_DISPLAY: u32 = 0x8;
+    if flags & ALLOW_DISPLAY != 0 && !desc.is_null() && !ppv.is_null() {
+        let x = (desc as *const [u8; 0x38]).read_unaligned();
+        let size = crate::hle::xg_linux::Texture::new(&x).map_or(0, |t| t.size() as usize);
+        if size > 0 {
+            if let Some(p) = crate::hle::kernelx_linux::runtime_alloc(size, crate::hle::kernelx_linux::D3D_DISPLAY_TARGET) {
+                let o = new_obj(Kind::Resource);
+                std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 56);
+                *(*o).mem.lock().unwrap() = (p, size);
+                (*o).value.store(p as u64, Ordering::Relaxed);
+                *ppv = o as *mut c_void;
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    let at = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+                    crate::xlog_info!(
+                        "console display target {}x{} format {}: {size:#x} bytes from the title's memory at {p:#x}",
+                        at(0x10),
+                        at(0x18),
+                        at(0x20)
+                    );
+                }
+                return S_OK;
+            }
+        }
+    }
+    new_resource(props, desc, ppv)
+}
+
 /// Back a console buffer heap with the high-VA graphics pool: the pool address is a
 /// real committable host address in window 0, so placed buffers on it get VA == Map
 /// address (the console's unified memory) with title-side offsets aliasing. Returns 0
@@ -2616,6 +2671,13 @@ mod tests {
         S.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    /// `TITLE_HOOKS` is process-global: every test that installs a synthetic
+    /// title allocator holds this across its phases.
+    fn title_hooks_serial() -> &'static std::sync::Mutex<()> {
+        static S: std::sync::LazyLock<std::sync::Mutex<()>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+        &S
+    }
+
     #[test]
     fn device_queue_fence_resource_roundtrip() {
         unsafe {
@@ -2743,8 +2805,6 @@ mod tests {
     #[test]
     fn descriptor_heap_memory_prefers_the_title_allocation_hook() {
         use std::sync::atomic::AtomicUsize;
-        /// Serializes the two hook phases: `TITLE_HOOKS` is process-global.
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         static TEST_BLOCK: AtomicUsize = AtomicUsize::new(0);
         static TEST_BYTES: AtomicUsize = AtomicUsize::new(0);
         static FREED: AtomicUsize = AtomicUsize::new(0);
@@ -2765,7 +2825,7 @@ mod tests {
                 unsafe { crate::hle::kernelx_linux::set_title_hooks_for_test(0, 0) };
             }
         }
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = title_hooks_serial().lock().unwrap();
         unsafe {
             let mut dev = std::ptr::null_mut();
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
@@ -2800,6 +2860,99 @@ mod tests {
             assert_ne!(fallback, 0);
             assert_ne!(fallback, outside as u64);
             assert!(fallback >> 32 >= 4 && (fallback >> 32) & 3 == 0, "fallback {fallback:#x} is not window 0");
+        }
+    }
+
+    /// Step 43: a console display target (`#127`, `CreateCommittedResourceX`
+    /// with a barrier layout, `ALLOW_DISPLAY = 0x8`) takes its memory from the
+    /// title's allocation hook with `D3D_DISPLAY_TARGET`, which is the event
+    /// the title's registered display-target region bumps on (the retail title
+    /// asserts at `exe+0x247af2e` that the region is used up).
+    ///
+    /// RED before the slot is routed: the logging stub returns S_OK but writes
+    /// no resource and never calls the title's allocator.
+    #[test]
+    fn display_target_memory_comes_from_the_title_allocation_hook() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        static TEST_BLOCK: AtomicUsize = AtomicUsize::new(0);
+        static TEST_BYTES: AtomicUsize = AtomicUsize::new(0);
+        static ALLOC_SIZE: AtomicUsize = AtomicUsize::new(0);
+        static ALLOC_ATTRS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "win64" fn alloc(size: usize, attrs: u64) -> *mut c_void {
+            ALLOC_SIZE.store(size, Ordering::Relaxed);
+            ALLOC_ATTRS.store(attrs, Ordering::Relaxed);
+            if size == TEST_BYTES.load(Ordering::Relaxed) {
+                TEST_BLOCK.load(Ordering::Relaxed) as *mut c_void
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+        unsafe extern "win64" fn free(_p: *mut c_void, _attrs: u64) {}
+        struct ClearHooks;
+        impl Drop for ClearHooks {
+            fn drop(&mut self) {
+                unsafe { crate::hle::kernelx_linux::set_title_hooks_for_test(0, 0) };
+            }
+        }
+        let _serial = title_hooks_serial().lock().unwrap();
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            // console D3D12_RESOURCE_DESC of the retail back buffer: 3840x2160
+            // R8G8B8A8_UNORM, 1 mip / 1 array slice, console flags +0x30.
+            let mut d = [0u8; 0x38];
+            d[0..4].copy_from_slice(&3u32.to_le_bytes()); // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            d[0x10..0x18].copy_from_slice(&3840u64.to_le_bytes());
+            d[0x18..0x1c].copy_from_slice(&2160u32.to_le_bytes());
+            d[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+            d[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+            d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes()); // DXGI_FORMAT_R8G8B8A8_UNORM
+            d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            d[0x30..0x34].copy_from_slice(&0x30_0005u32.to_le_bytes());
+            let size = crate::hle::xg_linux::Texture::new(&d).expect("console 4K RGBA8 desc").size() as usize;
+            assert!(size > 0);
+            let block = crate::hle::kernelx_linux::gfx_alloc_window0(size, 0x1_0000, true)
+                .expect("graphics-pool block for the synthetic title allocator");
+            TEST_BYTES.store(size, Ordering::Relaxed);
+            TEST_BLOCK.store(block, Ordering::Relaxed);
+            crate::hle::kernelx_linux::set_title_hooks_for_test(alloc as usize, free as usize);
+            let _clear = ClearHooks;
+            type CreateLayout = unsafe extern "win64" fn(
+                *mut c_void,
+                *const c_void,
+                u32,
+                *const u8,
+                u32,
+                *const c_void,
+                *mut c_void,
+                u32,
+                *const c_void,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> HRESULT;
+            let create: CreateLayout = std::mem::transmute(slot(dev, 127));
+            let props = [1u32, 0, 0, 1, 1]; // D3D12_HEAP_PROPERTIES DEFAULT
+            let mut res: *mut c_void = std::ptr::null_mut();
+            let hr = create(
+                dev,
+                props.as_ptr() as *const c_void,
+                0x8, // console D3D12_HEAP_FLAG_ALLOW_DISPLAY
+                d.as_ptr(),
+                3, // barrier layout
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut res,
+            );
+            assert_eq!(hr, S_OK);
+            assert!(!res.is_null(), "the display target resource was not created");
+            assert_eq!(ALLOC_ATTRS.load(Ordering::Relaxed), crate::hle::kernelx_linux::D3D_DISPLAY_TARGET);
+            assert_eq!(ALLOC_SIZE.load(Ordering::Relaxed), size);
+            let o = res as *mut NullObj;
+            assert_eq!((*o).value.load(Ordering::Relaxed), block as u64, "the resource VA is the title's memory");
+            assert_eq!(*(*o).mem.lock().unwrap(), (block, size));
         }
     }
 
