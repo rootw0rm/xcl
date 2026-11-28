@@ -25,9 +25,9 @@
 //! #60/#61/#69/#70/#71/#72/#89/#93/#146/#148, null + Vulkan-device AS SRV
 //! #18, Vulkan-device frame clock
 //! #78–#81 (Linux twin + ancillary routing) and Vulkan-queue #30 `PresentX`
-//! (real swapchain present, 1d(ii)); a Vulkan device also answers the DXGI
-//! device IIDs with an adapter/output chain (GetAdapter/GetDesc/EnumOutputs,
-//! 1d follow-up). Null stays default behind
+//! (real swapchain present, 1d(ii)); both devices answer the DXGI device
+//! IIDs with an adapter/output chain (GetAdapter/GetDesc/EnumOutputs, 1d
+//! follow-up; the null device since step 40). Null stays default behind
 //! `XCL_VULKAN_BACKEND`: unrouted slots keep logging stubs. No fake-success:
 //! a routed slot presents a real frame or stays an honest logging stub.
 //
@@ -94,8 +94,7 @@ pub enum Kind {
     StateObject,
     Blob,
     /// A console IDXGIDevice wrapper (1d follow-up): answers the DXGI device
-    /// IIDs for a Vulkan device; its `value` holds the device object. The
-    /// null device keeps answering queries with itself (no change unset).
+    /// IIDs for a Vulkan or null device; its `value` holds the device object.
     DxgiDevice,
     /// The adapter behind a [`Kind::DxgiDevice`]: GetDesc with the device's
     /// LUID (plus the Vulkan name when one backs it).
@@ -455,10 +454,10 @@ unsafe extern "win64" fn QueryInterface(this: *mut NullObj, riid: *const c_void,
     if ppv.is_null() {
         return E_INVALIDARG;
     }
-    // A Vulkan device is also an IDXGIDevice (the Windows twin's `dxgi_device`):
+    // Both devices are also IDXGIDevices (the Windows twin's `dxgi_device`):
     // DXGI queries get an adapter-chain wrapper; every other interface keeps
-    // the old answer. The null device is untouched (no change while unset).
-    if !this.is_null() && (*this).kind == Kind::VulkanDevice && dxgi_device_iid(riid) {
+    // the old answer (self). Retail asks the null device at `0x142481cd5`.
+    if !this.is_null() && matches!((*this).kind, Kind::Device | Kind::VulkanDevice) && dxgi_device_iid(riid) {
         let o = new_obj(Kind::DxgiDevice);
         (*o).value.store(this as u64, Ordering::Relaxed);
         (*this).refs.fetch_add(1, Ordering::AcqRel);
@@ -1557,14 +1556,15 @@ unsafe extern "win64" fn Dxgi_QI(this: *mut NullObj, riid: *const c_void, ppv: *
 }
 
 /// IDXGIDevice slot 7: the device's adapter (one reference, the caller's);
-/// the name is the Vulkan adapter's when one backs the device.
+/// the name is the Vulkan adapter's when one backs the device, otherwise the
+/// honest headless name.
 unsafe extern "win64" fn Dxgi_GetAdapter(this: *mut NullObj, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
         return E_POINTER;
     }
     *ppv = std::ptr::null_mut();
     let o = new_obj(Kind::DxgiAdapter);
-    let mut name: &[u8] = b"XCL Vulkan adapter";
+    let mut name: &[u8] = b"XCL console adapter";
     if !this.is_null() {
         let dev = (*this).value.load(Ordering::Relaxed) as *const NullObj;
         if !dev.is_null() && (*dev).kind == Kind::VulkanDevice {
@@ -3671,7 +3671,8 @@ mod tests {
         // 1d follow-up: a Vulkan device answers the DXGI device IIDs with a
         // wrapper whose GetAdapter/GetDesc/EnumOutputs chain works (adapter
         // LUID == device LUID, D3D12 identity round-trips, output 0 exists);
-        // the null device keeps answering with itself (no change unset).
+        // the null device now answers the same way (step 40), and both keep
+        // answering self for every non-DXGI IID.
         unsafe {
             type Qi = unsafe extern "win64" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
             let null_sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
@@ -3680,7 +3681,10 @@ mod tests {
             let nqi: Qi = std::mem::transmute(slot(ndev, 0));
             let mut p = std::ptr::null_mut();
             assert_eq!(nqi(ndev, IID_DXGI_DEVICE1.as_ptr() as *const c_void, &mut p), S_OK);
-            assert_eq!(p, ndev, "null QI keeps handing back the device itself");
+            assert_eq!((*(p as *mut NullObj)).kind, Kind::DxgiDevice);
+            let mut selfq = std::ptr::null_mut();
+            assert_eq!(nqi(ndev, IID_D3D12DEVICE.as_ptr() as *const c_void, &mut selfq), S_OK);
+            assert_eq!(selfq, ndev, "non-DXGI IIDs still get the device itself");
             // Vulkan device: DXGI queries get a wrapper, not the device.
             let vd = new_obj(Kind::VulkanDevice) as *mut c_void;
             let vqi: Qi = std::mem::transmute(slot(vd, 0));
@@ -3725,6 +3729,65 @@ mod tests {
             for i in [78usize, 79, 80, 81] {
                 assert!(crate::stubs::info_of_stub(slot(vd, i)).is_none(), "slot {i} routes");
             }
+        }
+    }
+
+    /// Step 40: retail asks the null device for `IID_IDXGIDevice` at
+    /// `0x142481cd5` and then calls slot 7 (`GetAdapter`) on the answer. The
+    /// answer must be the `DxgiDevice` wrapper, not the device (whose slot 7
+    /// is `GetNodeCount`), and the wrapper chain must reach a real adapter,
+    /// its LUID desc and output 0 in that call order.
+    #[test]
+    fn null_device_dxgi_chain_serves_adapter_and_output() {
+        unsafe {
+            type Qi = unsafe extern "win64" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+            let sel = Selection { backend: Backend::Null, lane: None, reason: "test".into() };
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(create_device_for(&sel, None, &mut dev), S_OK);
+            let dqi: Qi = std::mem::transmute(slot(dev, 0));
+            // retail's query: IID_IDXGIDevice on the null device
+            let mut dx = std::ptr::null_mut();
+            assert_eq!(dqi(dev, IID_DXGI_DEVICE.as_ptr() as *const c_void, &mut dx), S_OK);
+            assert_ne!(dx, dev, "DXGI QI must not hand back the device");
+            assert_eq!((*(dx as *mut NullObj)).kind, Kind::DxgiDevice);
+            assert_eq!(
+                (*(dx as *mut NullObj)).value.load(Ordering::Relaxed),
+                dev as u64,
+                "wrapper keeps the device it came from"
+            );
+            // wrapper identity: DXGI1 answers itself, D3D12 round-trips
+            let wqi: Qi = std::mem::transmute(slot(dx, 0));
+            let mut obj = std::ptr::null_mut();
+            assert_eq!(wqi(dx, IID_DXGI_DEVICE1.as_ptr() as *const c_void, &mut obj), S_OK);
+            assert_eq!(obj, dx, "wrapper answers DXGI1 with itself");
+            let mut back = std::ptr::null_mut();
+            assert_eq!(wqi(dx, IID_D3D12DEVICE.as_ptr() as *const c_void, &mut back), S_OK);
+            assert_eq!(back, dev, "D3D12 identity round-trips to the null device");
+            // slot 7 on the wrapper is GetAdapter, not GetNodeCount
+            type GetAd = unsafe extern "win64" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+            let get_ad: GetAd = std::mem::transmute(slot(dx, 7));
+            let mut ad = std::ptr::null_mut();
+            assert_eq!(get_ad(dx, &mut ad), S_OK);
+            assert!(!ad.is_null());
+            assert_eq!((*(ad as *mut NullObj)).kind, Kind::DxgiAdapter);
+            // adapter desc: named, LUID == the device's GetAdapterLuid (slot 43)
+            type AdDesc = unsafe extern "win64" fn(*mut c_void, *mut u8) -> HRESULT;
+            let get_desc: AdDesc = std::mem::transmute(slot(ad, 8));
+            let mut desc = [0u8; 304];
+            assert_eq!(get_desc(ad, desc.as_mut_ptr()), S_OK);
+            assert_ne!(u16::from_le_bytes([desc[0], desc[1]]), 0, "description is named");
+            let mut luid = 0u64;
+            Device_GetAdapterLuid(dev as *mut NullObj, &mut luid);
+            assert_eq!(&desc[296..304], &luid.to_le_bytes(), "adapter LUID == device LUID");
+            // EnumOutputs(0) is a real output; 1 is NOT_FOUND
+            type EnumOut = unsafe extern "win64" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
+            let outputs: EnumOut = std::mem::transmute(slot(ad, 7));
+            let mut o = std::ptr::null_mut();
+            assert_eq!(outputs(ad, 0, &mut o), S_OK);
+            assert_eq!((*(o as *mut NullObj)).kind, Kind::DxgiOutput);
+            let mut o1 = std::ptr::null_mut();
+            assert_eq!(outputs(ad, 1, &mut o1), 0x887A_0002u32 as i32);
+            assert!(o1.is_null());
         }
     }
 
