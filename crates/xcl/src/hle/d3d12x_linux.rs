@@ -227,7 +227,9 @@ fn console_list_base_slot(console: usize) -> Option<usize> {
 fn console_base_handler(pc: usize) -> Option<usize> {
     Some(match pc {
         28 => List_SetDescriptorHeapsX as usize, // no heaps to bind: 2-arg ack
+        29 => List_SetComputeRootSignature as usize, // console #33 (store-only)
         30 => List_SetGraphicsRootSignature as usize, // S2 root sig (store-only)
+        31 => List_SetComputeRootDescriptorTable as usize, // console #35 (store-only)
         32 => List_SetGraphicsRootDescriptorTable as usize,
         40 => List_SetGraphicsRootShaderResourceView as usize,
         43 => List_IASetIndexBuffer as usize, // S2 index buffer (store-only)
@@ -536,6 +538,7 @@ fn vtable(kind: Kind) -> *const usize {
         // #29 (End), #30 (Resolve) and DrawIndexedX #81 feed the same counter.
         v[12] = List_NoteDraw as usize;
         v[13] = List_NoteDraw as usize;
+        v[14] = List_Dispatch as usize; // PC Dispatch (retail exe+0x1236d2 path)
         v[28] = List_BeginQuery as usize;
         v[29] = List_EndQuery as usize;
         v[30] = List_ResolveQueryData as usize;
@@ -986,6 +989,16 @@ pub struct ListDrawRecord {
     /// Console list #44 `SetGraphicsRootShaderResourceView` (PC #40): the
     /// last `(root parameter, buffer location)`.
     pub root_srv: Option<(u32, u64)>,
+    /// Console list #33 `SetComputeRootSignature` (PC #29): the bound compute
+    /// root signature. Store-only; the null backend has no compute replay.
+    pub compute_root_sig: usize,
+    /// Console list #35 `SetComputeRootDescriptorTable` (PC #31): the last
+    /// `(root parameter, base descriptor)` for the compute root.
+    pub compute_root_table: Option<(u32, u64)>,
+    /// PC list slot 14 `Dispatch(x, y, z)`: the group counts are acknowledged
+    /// and counted. A dispatch is not a draw, so it never feeds the #28/#29
+    /// occlusion counter.
+    pub dispatches: u64,
     /// Console list #48 `IASetVertexBuffers` (PC #44): the first slot and the
     /// raw 16-byte `D3D12_VERTEX_BUFFER_VIEW`s that follow it.
     pub vb_start: u32,
@@ -1095,6 +1108,26 @@ unsafe extern "win64" fn List_SetGraphicsRootSignature(this: *mut NullObj, rs: *
     list_store().lock().unwrap().entry(this as usize).or_default().root_sig = rs as usize;
 }
 
+/// Console list #33 `SetComputeRootSignature(rs)` (PC #29): stash the bound
+/// compute root signature. Store-only; a compute dispatch is never replayed by
+/// the null backend.
+unsafe extern "win64" fn List_SetComputeRootSignature(this: *mut NullObj, rs: *mut c_void) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().compute_root_sig = rs as usize;
+}
+
+/// PC list slot 14 `Dispatch(x, y, z)`: acknowledge the group counts and count
+/// the call for diagnostics. Unlike `List_NoteDraw` this never creates a draw
+/// op or advances the occlusion-query counter.
+unsafe extern "win64" fn List_Dispatch(this: *mut NullObj, _x: u32, _y: u32, _z: u32) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().dispatches += 1;
+}
+
 /// List slot 50 `OMSetRenderTargets(n, rtvs, single, dsv)`: stash the target
 /// handles (CPU-descriptor-sized words; capped at 8 RTVs).
 unsafe extern "win64" fn List_OMSetRenderTargets(
@@ -1177,6 +1210,15 @@ unsafe extern "win64" fn List_SetGraphicsRootDescriptorTable(this: *mut NullObj,
         return;
     }
     list_store().lock().unwrap().entry(this as usize).or_default().root_table = Some((param, base));
+}
+
+/// Console list #35 `SetComputeRootDescriptorTable(param, base)` (PC #31):
+/// the compute counterpart of the graphics table above. Store-only.
+unsafe extern "win64" fn List_SetComputeRootDescriptorTable(this: *mut NullObj, param: u32, base: u64) {
+    if this.is_null() {
+        return;
+    }
+    list_store().lock().unwrap().entry(this as usize).or_default().compute_root_table = Some((param, base));
 }
 
 /// Console list #44 `SetGraphicsRootShaderResourceView(param, location)`
@@ -6771,9 +6813,10 @@ mod tests {
         assert_eq!(console_list_base_slot(56), None);
         // Only the implemented PC methods get a handler; the retail-called
         // ones are the title's ClearRenderTargetView #52, IASetVertexBuffers
-        // #48, root table #36, root SRV #44 plus the S2 stores.
+        // #48, root table #36, root SRV #44, compute root signature #33 and
+        // compute root table #35 plus the S2 stores.
         let wired: Vec<usize> = (28..=55).filter(|&c| console_list_base_slot(c).and_then(console_base_handler).is_some()).collect();
-        assert_eq!(wired, vec![32, 34, 36, 44, 47, 48, 50, 52]);
+        assert_eq!(wired, vec![32, 33, 34, 35, 36, 44, 47, 48, 50, 52]);
     }
 
     /// End to end through the vtable: the retail title's console slots store
@@ -6786,6 +6829,8 @@ mod tests {
             let obj = list as *mut c_void;
             assert_eq!(slot(obj, 23), List_OMSetBlendFactor as usize);
             assert_eq!(slot(obj, 24), List_OMSetStencilRef as usize);
+            assert_eq!(slot(obj, 33), List_SetComputeRootSignature as usize);
+            assert_eq!(slot(obj, 35), List_SetComputeRootDescriptorTable as usize);
             assert_eq!(slot(obj, 36), List_SetGraphicsRootDescriptorTable as usize);
             assert_eq!(slot(obj, 44), List_SetGraphicsRootShaderResourceView as usize);
             assert_eq!(slot(obj, 48), List_IASetVertexBuffers as usize);
@@ -6794,6 +6839,7 @@ mod tests {
             type F2 = unsafe extern "win64" fn(*mut c_void, *const f32);
             type U32 = unsafe extern "win64" fn(*mut c_void, u32);
             type Root = unsafe extern "win64" fn(*mut c_void, u32, u64);
+            type Sig = unsafe extern "win64" fn(*mut c_void, *mut c_void);
             type Vb = unsafe extern "win64" fn(*mut c_void, u32, u32, *const u8);
             type Clear = unsafe extern "win64" fn(*mut c_void, u64, *const f32, u32, *const c_void);
 
@@ -6802,6 +6848,10 @@ mod tests {
             blend(obj, factor.as_ptr());
             let stencil: U32 = std::mem::transmute(slot(obj, 24));
             stencil(obj, 7);
+            let compute_sig: Sig = std::mem::transmute(slot(obj, 33));
+            compute_sig(obj, 0x6000_0000 as *mut c_void);
+            let compute_table: Root = std::mem::transmute(slot(obj, 35));
+            compute_table(obj, 7, 0xfeed_0000_1234);
             let table: Root = std::mem::transmute(slot(obj, 36));
             table(obj, 3, 0x1234_5678_9abc);
             let srv: Root = std::mem::transmute(slot(obj, 44));
@@ -6819,6 +6869,8 @@ mod tests {
             let r = list_record_for(obj as usize).expect("the calls store a list record");
             assert_eq!(r.blend_factor, Some(factor));
             assert_eq!(r.stencil_ref, Some(7));
+            assert_eq!(r.compute_root_sig, 0x6000_0000);
+            assert_eq!(r.compute_root_table, Some((7, 0xfeed_0000_1234)));
             assert_eq!(r.root_table, Some((3, 0x1234_5678_9abc)));
             assert_eq!(r.root_srv, Some((2, 0x1400_0000)));
             assert_eq!(r.vb_start, 5);
@@ -6826,6 +6878,46 @@ mod tests {
             assert_eq!(r.clear_rtv, Some((0xab, color, 0)));
             // console #49 is PC #45 SOSetTargets, which this backend keeps a stub
             assert_eq!(slot(obj, 49), list_stub(49));
+        }
+    }
+
+    /// PC #14 `Dispatch(x, y, z)` is its own handler on the null list (the
+    /// retail wrapper `0x140056a20` tail-jumps the slot with the three group
+    /// counts). It counts the call but is not a draw and must not advance the
+    /// #28/#29 occlusion-query counter.
+    #[test]
+    fn console_dispatch_counts_without_drawing() {
+        unsafe {
+            let list = new_obj(Kind::CommandList);
+            let obj = list as *mut c_void;
+            assert_eq!(slot(obj, 14), List_Dispatch as usize);
+            assert_ne!(slot(obj, 14), list_stub(14));
+
+            type D = unsafe extern "win64" fn(*mut c_void, u32, u32, u32);
+            let dispatch: D = std::mem::transmute(slot(obj, 14));
+            dispatch(obj, 5, 0x21, 1);
+            let r = list_record_for(obj as usize).expect("dispatch stores a list record");
+            assert_eq!(r.dispatches, 1);
+            assert_eq!(r.draws, 0, "a dispatch is not a draw");
+            assert!(r.ops.is_empty(), "a dispatch must not create a draw op");
+
+            dispatch(obj, 1, 1, 1);
+            assert_eq!(list_record_for(obj as usize).unwrap().dispatches, 2);
+        }
+    }
+
+    /// The per-frame console-only slots with no named semantics stay honest
+    /// logging stubs: #75 (a boolean derived from the framebuffer flag at
+    /// `[framebuffer+0x10]+0x55` bit 6), #126 (an enum plus a 0x20-byte state
+    /// struct) and #142 (a resource pointer with a `-1` sentinel) have no
+    /// public, observed, or static API name (`docs/retail-list-per-frame.md`).
+    #[test]
+    fn per_frame_console_only_slots_stay_honest_stubs() {
+        unsafe {
+            let obj = new_obj(Kind::CommandList) as *mut c_void;
+            for s in [75usize, 126, 142] {
+                assert_eq!(slot(obj, s), list_stub(s), "console #{s} is not named");
+            }
         }
     }
 
