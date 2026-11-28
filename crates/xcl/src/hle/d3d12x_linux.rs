@@ -211,9 +211,12 @@ fn vtable(kind: Kind) -> *const usize {
             v[54] = Device_CreateHeap1 as usize;
             v[55] = Device_CreateDerivedPipelineStateX as usize; // console derived PSO
             v[56] = Device_SerializePipelineStateX as usize; // E_ACCESSDENIED like the console
+            v[57] = Device_DeserializePipelineStateX as usize; // console pipeline cache: E_NOTIMPL
             v[60] = Device_CreateGraphicsPipelineStateX as usize; // console PSO
             // console compute PSO (XboxBvhBuilder): (desc, a, b, riid, out) — PC #62 = CreateStateObject
             v[62] = Device_CreateComputePipelineStateX as usize;
+            v[67] = Device_DeserializePipelineStateX as usize; // console pipeline cache: E_NOTIMPL
+            v[86] = Device_CreatePipelineStateX as usize; // console CreatePipelineState (stream desc)
             v[73] = Device_CreateCommandListX as usize; // console list (DMA)
             v[74] = Device_RegisterPagePoolX as usize;
             v[75] = Device_UnregisterPagePoolX as usize;
@@ -560,6 +563,39 @@ unsafe extern "win64" fn Device_CreateComputePipelineStateX(
         crate::xlog_warn!("CreateComputePipelineState (console, slot 62): unknown parameters {a:#x} {b:#x} ignored");
     }
     capture_compute_desc(d);
+    out_obj(ppv, Kind::PipelineState)
+}
+
+/// Console device #57/#67 `Deserialize{Graphics,Compute}PipelineStateX(state,
+/// riid, pipeline)`: the serialised form is the console driver's, so the
+/// Windows twin returns `E_NOTIMPL` with a null out pointer and the title
+/// creates the pipeline from its desc. A plain stub returned `S_OK` and left
+/// the title's out pointer untouched (585 + 42 calls in the first frame run).
+unsafe extern "win64" fn Device_DeserializePipelineStateX(
+    _t: *mut NullObj,
+    _state: *const u8,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    static WARNED: AtomicU32 = AtomicU32::new(0);
+    if WARNED.swap(1, Ordering::Relaxed) == 0 {
+        crate::xlog_warn!("D3D12.X: DeserializePipelineStateX – console pipeline caches are not supported");
+    }
+    if !ppv.is_null() {
+        *ppv = std::ptr::null_mut();
+    }
+    E_NOTIMPL
+}
+
+/// Console device #86 `CreatePipelineState(stream desc, riid, pipeline)`: the
+/// null device hands back a pipeline object (Windows builds the PC pipeline
+/// from the same stream desc).
+unsafe extern "win64" fn Device_CreatePipelineStateX(
+    _t: *mut NullObj,
+    _desc: *const u8,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::PipelineState)
 }
 
@@ -3199,6 +3235,42 @@ mod tests {
             assert_eq!(out[0], 0x30000, "total size of the two 64 KiB-rounded buffers");
             assert_eq!(out[1], 0x10000, "alignment");
             assert_eq!(infos, [[0, 0x10000, 0x20000], [0x20000, 0x10000, 0x10000]]);
+        }
+    }
+
+    #[test]
+    fn console_deserialize_pso_slots_return_e_notimpl_and_null_the_out() {
+        // Windows' #57/#67 Deserialize{Graphics,Compute}PipelineStateX returns
+        // E_NOTIMPL and nulls the out pointer: console pipeline caches are not
+        // supported, and the title creates the pipeline from its desc instead.
+        // A stub returning S_OK leaves a garbage out pointer the title uses.
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            for s in [57usize, 67] {
+                let f: unsafe extern "win64" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> HRESULT =
+                    std::mem::transmute(slot(dev, s));
+                let mut out = 0xdead_usize as *mut c_void;
+                assert_eq!(f(dev, std::ptr::null(), std::ptr::null(), &mut out), E_NOTIMPL, "slot {s}");
+                assert!(out.is_null(), "slot {s} must clear the out pointer");
+            }
+        }
+    }
+
+    #[test]
+    fn console_create_pipeline_state_slot86_returns_a_pso() {
+        // Windows' #86 CreatePipelineState(stream desc, riid, pipeline) creates
+        // the PC pipeline; the null device hands back a PipelineState object.
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let f: unsafe extern "win64" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 86));
+            let desc = [0u8; 0x38];
+            let mut out = std::ptr::null_mut();
+            assert_eq!(f(dev, desc.as_ptr(), std::ptr::null(), &mut out), S_OK);
+            assert!(!out.is_null());
+            assert_eq!((*(out as *mut NullObj)).kind, Kind::PipelineState);
         }
     }
 
