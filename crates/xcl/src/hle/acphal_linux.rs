@@ -20,13 +20,16 @@
 
 #![allow(non_snake_case)]
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::util::{HRESULT, S_OK};
 
 const E_INVALIDARG: HRESULT = 0x8007_0057u32 as HRESULT;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000Eu32 as HRESULT;
+const E_UNEXPECTED: HRESULT = 0x8000_FFFFu32 as HRESULT;
 
 // The Win32 constants `kernelx_linux` keeps private; same values.
 const MEM_COMMIT: u32 = 0x1000;
@@ -261,9 +264,279 @@ pub unsafe extern "win64" fn ApuHeapGetState(state: *mut u32, _flags: u32) -> HR
     S_OK
 }
 
+// ---------------------------------------------------------------------------------------
+// SHAPE contexts (AcpHalAllocateShapeContexts)
+// ---------------------------------------------------------------------------------------
+//
+// The processor's SHAPE mixer contexts: five arrays, one per kind, 64 bytes each,
+// allocated in APU memory. Retail's audio init passes a global `ShapeContexts` and
+// asserts when this returns a failure. The mixer does not run here – XCL presents its
+// own frame and the title mixes its audio itself – so the arrays only have to exist.
+
+/// AcpHalAllocateShapeContexts' argument: counts of the five kinds, then an array of each
+#[repr(C)]
+pub struct ShapeContexts {
+    counts: [u32; 5],
+    reserved: u32,
+    contexts: [*mut c_void; 5],
+}
+
+/// bytes of a context entry (the largest seen)
+const CONTEXT_BYTES: u32 = 64;
+static SHAPE: Mutex<[usize; 5]> = Mutex::new([0; 5]);
+
+unsafe fn allocate_shape_contexts_with<F>(c: *mut ShapeContexts, mut alloc_fn: F) -> HRESULT
+where
+    F: FnMut(usize, u32) -> Result<*mut c_void, HRESULT>,
+{
+    if c.is_null() {
+        return E_INVALIDARG;
+    }
+    let c = &mut *c;
+    let mut sizes = [0u32; 5];
+    for i in 0..5 {
+        if c.counts[i] != 0 {
+            let Some(bytes) = c.counts[i].checked_mul(CONTEXT_BYTES) else {
+                c.contexts = [std::ptr::null_mut(); 5];
+                return E_OUTOFMEMORY;
+            };
+            sizes[i] = bytes;
+        }
+    }
+    let mut new_arrays = [0usize; 5];
+    let mut new_ptrs = [std::ptr::null_mut(); 5];
+    for i in 0..5 {
+        if sizes[i] == 0 {
+            continue;
+        }
+        match alloc_fn(i, sizes[i]) {
+            Ok(va) => {
+                new_arrays[i] = va as usize;
+                new_ptrs[i] = va;
+            }
+            Err(hr) => {
+                for &a in &new_arrays[..i] {
+                    if a != 0 {
+                        ApuFree(a as *mut c_void);
+                    }
+                }
+                c.contexts = [std::ptr::null_mut(); 5];
+                return hr;
+            }
+        }
+    }
+    let old_arrays = {
+        let mut arrays = SHAPE.lock().unwrap();
+        let old = std::mem::replace(&mut *arrays, new_arrays);
+        c.contexts = new_ptrs;
+        old
+    };
+    for a in old_arrays.into_iter().filter(|&a| a != 0) {
+        ApuFree(a as *mut c_void);
+    }
+    crate::xlog_info!(
+        "acphal: SHAPE contexts {:?} (they do not run: no audio from the console's mixer)",
+        c.counts
+    );
+    S_OK
+}
+
+/// AcpHalAllocateShapeContexts(&contexts): an array of each kind in APU memory (none run)
+pub unsafe extern "win64" fn AcpHalAllocateShapeContexts(c: *mut ShapeContexts) -> HRESULT {
+    allocate_shape_contexts_with(c, |_, bytes| {
+        let mut va = std::ptr::null_mut();
+        let hr = ApuAlloc(&mut va, std::ptr::null_mut(), bytes, 256, 0);
+        if hr < 0 { Err(hr) } else { Ok(va) }
+    })
+}
+
+/// AcpHalReleaseShapeContexts()
+pub unsafe extern "win64" fn AcpHalReleaseShapeContexts() -> HRESULT {
+    let arrays = std::mem::take(&mut *SHAPE.lock().unwrap());
+    for a in arrays.into_iter().filter(|&a| a != 0) {
+        ApuFree(a as *mut c_void);
+    }
+    S_OK
+}
+
+// ---------------------------------------------------------------------------------------
+// the processor's command / message channel (AcpHalCreate)
+// ---------------------------------------------------------------------------------------
+//
+// An object whose vtable is Connect(commands, messages), Disconnect,
+// SubmitCommand(kind, id, frame, data, size), PopMessage(&message) -> bool,
+// GetNumMessages, Release. Messages are `{u32 kind, u32, u64 value, u64 id}`; the
+// channel acknowledges every command with id != 0 and ticks a 128-sample audio frame
+// every 2667 µs once connected. No audio is mixed.
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub kind: u32,
+    pub reserved: u32,
+    pub value: u64,
+    pub id: u64,
+}
+
+pub const MSG_AUDIO_FRAME: u32 = 2;
+pub const MSG_COMMAND_DONE: u32 = 0x10;
+pub const MSG_DISCONNECTED: u32 = 0x80;
+
+/// one audio frame: 128 samples at 48 kHz
+const FRAME: Duration = Duration::from_micros(2667);
+
+/// What the channel holds: queued messages and when the next audio frame is due.
+#[derive(Default)]
+pub struct Channel {
+    messages: VecDeque<Message>,
+    connected: bool,
+    next_frame: Option<Instant>,
+}
+
+impl Channel {
+    pub fn connect(&mut self, now: Instant) {
+        self.connected = true;
+        // A reconnect starts a fresh channel: messages queued for the old one
+        // (a MSG_DISCONNECT nobody popped, stale command acks) must not surface.
+        self.messages.clear();
+        self.next_frame = Some(now + FRAME);
+    }
+
+    pub fn disconnect(&mut self) {
+        self.connected = false;
+        self.messages.push_back(Message { kind: MSG_DISCONNECTED, ..Default::default() });
+    }
+
+    /// A command: done at once (a message for it unless its id is 0 – nobody waits).
+    pub fn submit(&mut self, id: u64) -> bool {
+        if !self.connected {
+            return false;
+        }
+        if id != 0 {
+            self.messages.push_back(Message { kind: MSG_COMMAND_DONE, id, ..Default::default() });
+        }
+        true
+    }
+
+    fn frame_due(&self, now: Instant) -> bool {
+        self.connected && self.next_frame.is_some_and(|t| now >= t)
+    }
+
+    /// The next message: queued ones first, else an audio frame when one is due (a frame
+    /// late by more than 8 is not made up for).
+    pub fn pop(&mut self, now: Instant) -> Option<Message> {
+        if let Some(m) = self.messages.pop_front() {
+            return Some(m);
+        }
+        if self.frame_due(now) {
+            let t = self.next_frame.unwrap_or(now) + FRAME;
+            self.next_frame = Some(match now.checked_sub(FRAME * 8) {
+                Some(floor) => t.max(floor),
+                None => t,
+            });
+            return Some(Message { kind: MSG_AUDIO_FRAME, ..Default::default() });
+        }
+        None
+    }
+
+    pub fn count(&self, now: Instant) -> u32 {
+        self.messages.len() as u32 + self.frame_due(now) as u32
+    }
+}
+
+#[repr(C)]
+struct Hal {
+    vtable: *const usize,
+    channel: Mutex<Channel>,
+}
+
+unsafe extern "win64" fn hal_connect(h: *mut Hal, commands: u32, messages: u32) -> HRESULT {
+    (*h).channel.lock().unwrap().connect(Instant::now());
+    crate::xlog_info!(
+        "acphal: audio processor connected ({commands} commands, {messages} messages) – commands are acknowledged, nothing runs"
+    );
+    S_OK
+}
+
+unsafe extern "win64" fn hal_disconnect(h: *mut Hal) -> HRESULT {
+    (*h).channel.lock().unwrap().disconnect();
+    S_OK
+}
+
+unsafe extern "win64" fn hal_submit(
+    h: *mut Hal,
+    kind: u32,
+    id: u64,
+    _frame: u32,
+    _data: *const c_void,
+    _size: u32,
+) -> HRESULT {
+    static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    {
+        let mut s = SEEN.lock().unwrap();
+        if !s.contains(&kind) && s.len() < 64 {
+            s.push(kind);
+            crate::xlog_info!("acphal: audio processor command {kind:#x} first seen");
+        }
+    }
+    if (*h).channel.lock().unwrap().submit(id) {
+        S_OK
+    } else {
+        E_UNEXPECTED
+    }
+}
+
+unsafe extern "win64" fn hal_pop(h: *mut Hal, m: *mut Message) -> bool {
+    if m.is_null() {
+        return false;
+    }
+    match (*h).channel.lock().unwrap().pop(Instant::now()) {
+        Some(x) => {
+            *m = x;
+            true
+        }
+        None => false,
+    }
+}
+
+unsafe extern "win64" fn hal_count(h: *mut Hal) -> u32 {
+    (*h).channel.lock().unwrap().count(Instant::now())
+}
+
+unsafe extern "win64" fn hal_release(h: *mut Hal) {
+    drop(Box::from_raw(h));
+}
+
+/// the channel object's vtable (function addresses are not constants, but the table is
+/// process-global and lives for the process)
+static HAL_VTABLE: LazyLock<[usize; 6]> = LazyLock::new(|| {
+    [
+        hal_connect as usize,
+        hal_disconnect as usize,
+        hal_submit as usize,
+        hal_pop as usize,
+        hal_count as usize,
+        hal_release as usize,
+    ]
+});
+
+fn hal_vtable() -> *const usize {
+    HAL_VTABLE.as_ptr()
+}
+
+/// AcpHalCreate(&hal)
+pub unsafe extern "win64" fn AcpHalCreate(out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let h = Box::new(Hal { vtable: hal_vtable(), channel: Mutex::new(Channel::default()) });
+    *out = Box::into_raw(h) as *mut c_void;
+    S_OK
+}
+
 /// Implemented exports with real code addresses. Everything else in the acphal route
-/// (SHAPE contexts, AcpHalCreate, the XApu/XDsp channels) stays stub metadata in
-/// `hle_linux` until a measured consumer reaches it.
+/// (the XApu/XDsp command channels) stays stub metadata in `hle_linux` until a measured
+/// consumer reaches it.
 pub fn exports() -> Vec<(&'static str, usize)> {
     vec![
         ("ApuCreateHeap", ApuCreateHeap as usize),
@@ -273,6 +546,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("ApuMapApuAddress", ApuMapApuAddress as usize),
         ("ApuIsVirtualAddressValid", ApuIsVirtualAddressValid as usize),
         ("ApuHeapGetState", ApuHeapGetState as usize),
+        ("AcpHalAllocateShapeContexts", AcpHalAllocateShapeContexts as usize),
+        ("AcpHalReleaseShapeContexts", AcpHalReleaseShapeContexts as usize),
+        ("AcpHalCreate", AcpHalCreate as usize),
     ]
 }
 
@@ -382,6 +658,132 @@ mod tests {
                 E_INVALIDARG
             );
             assert_eq!(out, 0xDEAD_BEEF);
+        }
+    }
+
+    #[test]
+    fn acphal_shape_and_channel_entry_points_are_wired() {
+        for name in [
+            "AcpHalAllocateShapeContexts",
+            "AcpHalReleaseShapeContexts",
+            "AcpHalCreate",
+        ] {
+            acphal_addr(name);
+        }
+    }
+
+    #[test]
+    fn shape_contexts_allocate_release_and_roll_back() {
+        type AllocShape = unsafe extern "win64" fn(*mut ShapeContexts) -> HRESULT;
+        type ReleaseShape = unsafe extern "win64" fn() -> HRESULT;
+        let alloc: AllocShape =
+            unsafe { std::mem::transmute(acphal_addr("AcpHalAllocateShapeContexts")) };
+        let release: ReleaseShape =
+            unsafe { std::mem::transmute(acphal_addr("AcpHalReleaseShapeContexts")) };
+        unsafe {
+            let mut c = ShapeContexts {
+                counts: [2, 1, 0, 0, 0],
+                reserved: 0,
+                contexts: [std::ptr::null_mut(); 5],
+            };
+            assert_eq!(alloc(&mut c), S_OK);
+            assert!(!c.contexts[0].is_null() && !c.contexts[1].is_null());
+            assert!(c.contexts[2..].iter().all(|p| p.is_null()));
+            assert_eq!(release(), S_OK);
+            assert_eq!(release(), S_OK, "release with nothing allocated is a no-op");
+            assert_eq!(alloc(std::ptr::null_mut()), E_INVALIDARG);
+
+            // A partial failure frees what the earlier kinds allocated and nulls every
+            // pointer, so the caller cannot keep a half-built context table.
+            let mut c = ShapeContexts {
+                counts: [1, 1, 0, 0, 0],
+                reserved: 0,
+                contexts: [std::ptr::null_mut(); 5],
+            };
+            let mut first = 0usize;
+            let hr = allocate_shape_contexts_with(&mut c, |i, bytes| {
+                if i == 1 {
+                    return Err(E_OUTOFMEMORY);
+                }
+                let mut va = std::ptr::null_mut();
+                let hr = ApuAlloc(&mut va, std::ptr::null_mut(), bytes, 256, 0);
+                if hr < 0 {
+                    return Err(hr);
+                }
+                first = va as usize;
+                Ok(va)
+            });
+            assert_eq!(hr, E_OUTOFMEMORY);
+            assert!(c.contexts.iter().all(|p| p.is_null()));
+            assert_ne!(first, 0);
+            assert!(
+                !APU.lock().unwrap().regions.iter().any(|r| r.va == first),
+                "the successful first allocation is rolled back"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_acknowledges_and_ticks() {
+        let t0 = Instant::now();
+        let mut c = Channel::default();
+        assert!(!c.submit(7), "not connected yet");
+        c.connect(t0);
+        assert!(c.submit(7));
+        assert!(c.submit(0), "id 0: no message");
+        assert_eq!(c.count(t0), 1);
+        assert_eq!(c.pop(t0), Some(Message { kind: MSG_COMMAND_DONE, id: 7, ..Default::default() }));
+        assert_eq!(c.pop(t0), None, "no frame due yet");
+        let later = t0 + FRAME * 3;
+        assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_AUDIO_FRAME));
+        c.disconnect();
+        assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_DISCONNECTED));
+    }
+
+    #[test]
+    fn reconnect_drops_messages_queued_for_the_old_channel() {
+        let t0 = Instant::now();
+        let mut c = Channel::default();
+        c.connect(t0);
+        c.disconnect(); // queues MSG_DISCONNECTED; the title never pops it
+        c.connect(t0);
+        assert_eq!(c.pop(t0), None, "the stale disconnect must not surface on the new channel");
+        let later = t0 + FRAME * 3;
+        assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_AUDIO_FRAME));
+    }
+
+    #[test]
+    fn hal_object_connects_acknowledges_and_releases() {
+        type Create = unsafe extern "win64" fn(*mut *mut c_void) -> HRESULT;
+        type Connect = unsafe extern "win64" fn(*mut c_void, u32, u32) -> HRESULT;
+        type Disconnect = unsafe extern "win64" fn(*mut c_void) -> HRESULT;
+        type Submit =
+            unsafe extern "win64" fn(*mut c_void, u32, u64, u32, *const c_void, u32) -> HRESULT;
+        type Pop = unsafe extern "win64" fn(*mut c_void, *mut Message) -> bool;
+        type Release = unsafe extern "win64" fn(*mut c_void);
+        let create: Create = unsafe { std::mem::transmute(acphal_addr("AcpHalCreate")) };
+        unsafe {
+            let mut h: *mut c_void = std::ptr::null_mut();
+            assert_eq!(create(&mut h), S_OK);
+            assert!(!h.is_null());
+            let vt = *(h as *const usize);
+            let slot = |i: usize| *((vt as *const usize).add(i));
+            let connect: Connect = std::mem::transmute(slot(0));
+            let disconnect: Disconnect = std::mem::transmute(slot(1));
+            let submit: Submit = std::mem::transmute(slot(2));
+            let pop: Pop = std::mem::transmute(slot(3));
+            let release: Release = std::mem::transmute(slot(5));
+            assert_eq!(connect(h, 0x1000, 0x1000), S_OK);
+            // Retail's first command: type 2, id 0xf0f0f0f0, frame -1, size 0.
+            assert_eq!(submit(h, 2, 0xf0f0_f0f0, u32::MAX, std::ptr::null(), 0), S_OK);
+            let mut m = Message::default();
+            assert!(pop(h, &mut m));
+            assert_eq!((m.kind, m.id), (MSG_COMMAND_DONE, 0xf0f0_f0f0));
+            assert!(!pop(h, std::ptr::null_mut()), "a null message pointer is refused");
+            assert_eq!(disconnect(h), S_OK);
+            assert!(pop(h, &mut m));
+            assert_eq!(m.kind, MSG_DISCONNECTED);
+            release(h);
         }
     }
 }
