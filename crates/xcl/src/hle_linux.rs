@@ -13,6 +13,8 @@
 //! They are duplicated here until the implementation bodies move to `_windows.rs`
 //! (DEC-002); `inspect` and the registry tests pin the counts.
 
+#[path = "hle/acphal_linux.rs"]
+pub mod acphal_linux;
 #[path = "hle/kernelx_linux.rs"]
 pub mod kernelx_linux;
 #[path = "hle/crt_linux.rs"]
@@ -339,13 +341,22 @@ fn xg_exports() -> Vec<(&'static str, usize)> {
 }
 
 fn acphal_exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![
+    let mut v = crate::hle_exports![
         XDspConnectWithMaximumStreamLimit, XDspDisconnect, XDspActivate, XDspDeactivate,
         XDspSubmitCommand, ApuCreateHeap, ApuAlloc, ApuFree, ApuMapVirtualAddress,
         ApuMapApuAddress, ApuIsVirtualAddressValid, ApuHeapGetState, AcpHalCreate,
         AcpHalAllocateShapeContexts, AcpHalReleaseShapeContexts, XApuConnect, XApuDisconnect,
         XApuEnqueueCommand, XApuDequeueResult, XApuGetResultCount, XApuGetUtilization,
-    ]
+    ];
+    // Phase C: the APU memory slice has real code; the rest stays stub metadata.
+    for (name, addr) in acphal_linux::exports() {
+        if let Some(slot) = v.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = addr;
+        } else {
+            v.push((name, addr));
+        }
+    }
+    v
 }
 
 fn gameinput_exports() -> Vec<(&'static str, usize)> {
@@ -537,6 +548,7 @@ mod tests {
                     || m.name == MFPLAT
                     || m.name == XCRDAPI
                     || m.name == XG
+                    || m.name == ACPHAL
                     || m.name == D3DCOMPILER47)
                     && addr != 0
                 {
