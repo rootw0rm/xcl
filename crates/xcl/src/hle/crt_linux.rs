@@ -983,6 +983,251 @@ pub unsafe extern "win64" fn atoi(s: *const u8) -> i32 {
     v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// Length of the C string at `p` up to (excluding) its NUL terminator.
+unsafe fn c_str_len(p: *const u8) -> usize {
+    let mut n = 0usize;
+    while *p.add(n) != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Case-insensitive ASCII match of the lowercase `word` at byte `at`.
+fn matches_ci(input: &[u8], at: usize, word: &[u8]) -> bool {
+    input.len() >= at + word.len()
+        && input[at..at + word.len()].iter().zip(word).all(|(a, b)| ascii_fold(*a) == *b)
+}
+
+/// C-locale `strtod` subject sequence: `(bytes consumed after the caller's
+/// pointer, value, out-of-range)`. Zero bytes means no conversion, in which
+/// case `endptr` must stay at the caller's pointer (not after leading space or
+/// a sign). Out-of-range is overflow to infinity or underflow to zero from a
+/// nonzero mantissa; `%a`'s `parse_hex_float` supplies the hex form.
+fn scan_strtod(input: &[u8]) -> (usize, f64, bool) {
+    let len = input.len();
+    let mut i = 0usize;
+    while i < len && is_c_space(input[i] as i32) {
+        i += 1;
+    }
+    let start = i;
+    let mut j = i;
+    let mut neg = false;
+    if j < len && (input[j] == b'+' || input[j] == b'-') {
+        neg = input[j] == b'-';
+        j += 1;
+    }
+    if matches_ci(input, j, b"infinity") || matches_ci(input, j, b"inf") {
+        let n = if matches_ci(input, j, b"infinity") { 8 } else { 3 };
+        let v = if neg { f64::NEG_INFINITY } else { f64::INFINITY };
+        return (j + n, v, false);
+    }
+    if matches_ci(input, j, b"nan") {
+        let mut k = j + 3;
+        if k < len && input[k] == b'(' {
+            let mut m = k + 1;
+            while m < len && (input[m].is_ascii_alphanumeric() || input[m] == b'_') {
+                m += 1;
+            }
+            if m < len && input[m] == b')' {
+                k = m + 1;
+            }
+        }
+        return (k, f64::NAN, false);
+    }
+    // Hexadecimal constant. An incomplete prefix (`0x`, `0x.`) is not part of
+    // the subject sequence, so the decimal fallback below consumes just `0`.
+    if j + 1 < len && input[j] == b'0' && matches!(input[j + 1], b'x' | b'X') {
+        let mut k = j + 2;
+        let mut digits = 0usize;
+        let mut nonzero = false;
+        while k < len && input[k].is_ascii_hexdigit() {
+            nonzero |= input[k] != b'0';
+            k += 1;
+            digits += 1;
+        }
+        if k < len && input[k] == b'.' {
+            let mut m = k + 1;
+            let mut frac = 0usize;
+            while m < len && input[m].is_ascii_hexdigit() {
+                nonzero |= input[m] != b'0';
+                m += 1;
+                frac += 1;
+            }
+            if digits + frac > 0 {
+                k = m;
+                digits += frac;
+            }
+        }
+        if digits > 0 {
+            if k < len && matches!(input[k], b'p' | b'P') {
+                let mut m = k + 1;
+                if m < len && (input[m] == b'+' || input[m] == b'-') {
+                    m += 1;
+                }
+                let first = m;
+                while m < len && input[m].is_ascii_digit() {
+                    m += 1;
+                }
+                if m > first {
+                    k = m;
+                }
+            }
+            let text = unsafe { std::str::from_utf8_unchecked(&input[j..k]) };
+            let v = parse_hex_float(text).unwrap_or(0.0);
+            let v = if neg { -v } else { v };
+            return (k, v, v.is_infinite() || (v == 0.0 && nonzero));
+        }
+    }
+    let mut k = j;
+    let mut digits = 0usize;
+    let mut nonzero = false;
+    while k < len && input[k].is_ascii_digit() {
+        nonzero |= input[k] != b'0';
+        k += 1;
+        digits += 1;
+    }
+    if k < len && input[k] == b'.' {
+        let mut m = k + 1;
+        let mut frac = 0usize;
+        while m < len && input[m].is_ascii_digit() {
+            nonzero |= input[m] != b'0';
+            m += 1;
+            frac += 1;
+        }
+        if digits + frac > 0 {
+            k = m;
+            digits += frac;
+        }
+    }
+    if digits == 0 {
+        return (0, 0.0, false);
+    }
+    if k < len && matches!(input[k], b'e' | b'E') {
+        let mut m = k + 1;
+        if m < len && (input[m] == b'+' || input[m] == b'-') {
+            m += 1;
+        }
+        let first = m;
+        while m < len && input[m].is_ascii_digit() {
+            m += 1;
+        }
+        if m > first {
+            k = m;
+        }
+    }
+    let text = unsafe { std::str::from_utf8_unchecked(&input[start..k]) };
+    let v = text.parse::<f64>().unwrap_or(0.0);
+    (k, v, v.is_infinite() || (v == 0.0 && nonzero))
+}
+
+/// C-locale `strtoui64` subject sequence with `base` already validated:
+/// `(bytes consumed after the caller's pointer, value, overflow)`. Base 0
+/// auto-detects `0x`/leading `0`; an explicit base 16 also accepts (but does
+/// not require) the `0x` prefix. No digits means no conversion.
+fn scan_strtoull(input: &[u8], base: i32) -> (usize, u64, bool) {
+    let len = input.len();
+    let mut i = 0usize;
+    while i < len && is_c_space(input[i] as i32) {
+        i += 1;
+    }
+    let mut j = i;
+    let mut neg = false;
+    if j < len && (input[j] == b'+' || input[j] == b'-') {
+        neg = input[j] == b'-';
+        j += 1;
+    }
+    if base == 0 {
+        if j + 2 < len && input[j] == b'0' && matches!(input[j + 1], b'x' | b'X') && input[j + 2].is_ascii_hexdigit() {
+            j += 2;
+            return scan_strtoull_digits(input, j, 16, neg);
+        }
+        let radix = if j < len && input[j] == b'0' { 8 } else { 10 };
+        scan_strtoull_digits(input, j, radix, neg)
+    } else if base == 16 && j + 2 < len && input[j] == b'0' && matches!(input[j + 1], b'x' | b'X') && input[j + 2].is_ascii_hexdigit() {
+        scan_strtoull_digits(input, j + 2, 16, neg)
+    } else {
+        scan_strtoull_digits(input, j, base as u32, neg)
+    }
+}
+
+fn scan_strtoull_digits(input: &[u8], start: usize, radix: u32, neg: bool) -> (usize, u64, bool) {
+    let len = input.len();
+    let mut j = start;
+    let mut mag: u128 = 0;
+    let mut overflow = false;
+    while j < len {
+        let d = match input[j] {
+            b'0'..=b'9' => (input[j] - b'0') as u128,
+            b'a'..=b'z' => (input[j] - b'a' + 10) as u128,
+            b'A'..=b'Z' => (input[j] - b'A' + 10) as u128,
+            _ => break,
+        };
+        if d >= radix as u128 {
+            break;
+        }
+        mag = mag.saturating_mul(radix as u128).saturating_add(d);
+        overflow |= mag > u64::MAX as u128;
+        j += 1;
+    }
+    if j == start {
+        return (0, 0, false);
+    }
+    if overflow {
+        return (j, u64::MAX, true);
+    }
+    let v = mag as u64;
+    (j, if neg { v.wrapping_neg() } else { v }, false)
+}
+
+/// `double strtod(const char *nptr, char **endptr)` — C-locale parse of the
+/// longest valid prefix (decimal, hex, `inf`, `nan`), with `*endptr` advanced
+/// past it. A null `nptr` reads as an empty string; a null `endptr` is ignored.
+pub unsafe extern "win64" fn strtod(nptr: *const u8, endptr: *mut *mut u8) -> f64 {
+    if nptr.is_null() {
+        if !endptr.is_null() {
+            *endptr = std::ptr::null_mut();
+        }
+        return 0.0;
+    }
+    let input = std::slice::from_raw_parts(nptr, c_str_len(nptr));
+    let (used, v, out_of_range) = scan_strtod(input);
+    if !endptr.is_null() {
+        *endptr = nptr.add(used) as *mut u8;
+    }
+    if out_of_range {
+        set_win_errno(ERANGE_WIN);
+    }
+    v
+}
+
+/// `unsigned long long _strtoui64(const char *nptr, char **endptr, int base)` —
+/// UCRT unsigned parse (`base` 0 or 2–36), `*endptr` at the first unconsumed
+/// byte, `ULLONG_MAX` + `ERANGE` on overflow, a minus sign negating modulo 2^64.
+pub unsafe extern "win64" fn _strtoui64(nptr: *const u8, endptr: *mut *mut u8, base: i32) -> u64 {
+    if nptr.is_null() {
+        if !endptr.is_null() {
+            *endptr = std::ptr::null_mut();
+        }
+        return 0;
+    }
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            *endptr = nptr as *mut u8;
+        }
+        set_win_errno(EINVAL_WIN);
+        return 0;
+    }
+    let input = std::slice::from_raw_parts(nptr, c_str_len(nptr));
+    let (used, v, overflow) = scan_strtoull(input, base);
+    if !endptr.is_null() {
+        *endptr = nptr.add(used) as *mut u8;
+    }
+    if overflow {
+        set_win_errno(ERANGE_WIN);
+    }
+    v
+}
+
 /// UCRT `rand` state (`srand` seeds it; the algorithm is MSVC's multiplicative
 /// generator, result `(state >> 16) & 0x7FFF`). The title imports both names, so a
 /// real `srand` needs the matching `rand` to be observable.
@@ -1533,6 +1778,10 @@ pub unsafe extern "win64" fn strtok_s(
 
 /// Windows `EILSEQ` (`errno` value set by `mbrtowc`/`wcrtomb` on bad sequences).
 const EILSEQ_WIN: i32 = 42;
+/// Windows `ERANGE` — `strtod`/`_strtoui64` overflow or underflow.
+const ERANGE_WIN: i32 = 34;
+/// Windows `EINVAL` — `_strtoui64` called with a base outside 0/2..=36.
+const EINVAL_WIN: i32 = 22;
 
 fn set_win_errno(code: i32) {
     unsafe {
@@ -3334,6 +3583,33 @@ fn scan_float(input: &[u8], pos: &mut usize, width: Option<usize>) -> Option<f64
     None
 }
 
+/// Binary exponent of a hex float, saturating at the `i32` range so a huge
+/// exponent still yields `inf`/`0` instead of failing the whole conversion.
+fn parse_hex_exponent(s: &str) -> Option<i32> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut neg = false;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    if i == bytes.len() {
+        return None;
+    }
+    let mut v: i64 = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            return None;
+        }
+        v = v.saturating_mul(10).saturating_add((bytes[i] - b'0') as i64);
+        if v > i32::MAX as i64 {
+            v = i32::MAX as i64;
+        }
+        i += 1;
+    }
+    Some(if neg { -v } else { v } as i32)
+}
+
 /// Hex float (`0x1.8p3`), what `%a` scans. Sign, `0x`, hex digits/fraction, `p` exponent.
 fn parse_hex_float(s: &str) -> Option<f64> {
     let (neg, rest) = match s.as_bytes().first()? {
@@ -3343,7 +3619,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
     };
     let body = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))?;
     let (mantissa, exp) = match body.find(|c| c == 'p' || c == 'P') {
-        Some(k) => (&body[..k], body[k + 1..].parse::<i32>().ok()?),
+        Some(k) => (&body[..k], parse_hex_exponent(&body[k + 1..])?),
         None => (body, 0),
     };
     let (whole, frac) = match mantissa.find('.') {
@@ -3939,6 +4215,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("_stricmp", _stricmp as usize),
         ("isspace", isspace as usize),
         ("atoi", atoi as usize),
+        ("strtod", strtod as usize),
+        ("_strtoui64", _strtoui64 as usize),
         ("srand", srand as usize),
         ("rand", rand as usize),
         ("qsort", qsort as usize),
@@ -5168,6 +5446,96 @@ mod tests {
             let args = [&mut p as *mut u64 as u64];
             assert_eq!(scan(c"0x14688e110".to_bytes(), b"%p\0", &args), 1);
             assert_eq!(p, 0x1_4688_e110);
+        }
+    }
+
+    #[test]
+    fn strtod_and_strtoui64_write_their_end_pointers() {
+        // Retail Step 52: both names resolved to the generic auto-stub, which
+        // returned 0 without writing `*endptr`; the consumer at exe+0x5270e4d
+        // then dereferenced null (`cmpb $0x23,(%rcx)` at exe+0x5270e50).
+        // Wiring is only real when the export table carries the implementation.
+        for name in ["strtod", "_strtoui64"] {
+            assert!(exports().iter().any(|(n, _)| *n == name), "{name} must be wired");
+        }
+        type Strtod = unsafe extern "win64" fn(*const u8, *mut *mut u8) -> f64;
+        type Strtou64 = unsafe extern "win64" fn(*const u8, *mut *mut u8, i32) -> u64;
+        let addr = |name: &str| {
+            exports()
+                .into_iter()
+                .find_map(|(n, a)| (n == name).then_some(a))
+                .expect("export")
+        };
+        let parse_f64: Strtod = unsafe { std::mem::transmute(addr("strtod")) };
+        let parse_u64: Strtou64 = unsafe { std::mem::transmute(addr("_strtoui64")) };
+        unsafe {
+            let mut end: *mut u8 = std::ptr::null_mut();
+
+            let text = c"  3.5e2xyz";
+            assert_eq!(parse_f64(text.as_ptr() as *const u8, &mut end), 350.0);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(7));
+            let text = c"0x1.8p3!";
+            assert_eq!(parse_f64(text.as_ptr() as *const u8, &mut end), 12.0);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(7));
+            let text = c"-inf";
+            assert_eq!(parse_f64(text.as_ptr() as *const u8, &mut end), f64::NEG_INFINITY);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(4));
+            let text = c"nan(0x7)";
+            assert!(parse_f64(text.as_ptr() as *const u8, &mut end).is_nan());
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(8));
+            // No conversion: `endptr` stays at the caller's pointer, not after `+`.
+            let text = c"+#ff";
+            assert_eq!(parse_f64(text.as_ptr() as *const u8, &mut end), 0.0);
+            assert_eq!(end, text.as_ptr() as *mut u8);
+            // An incomplete hex prefix is only the decimal `0`.
+            let text = c"0xzz";
+            assert_eq!(parse_f64(text.as_ptr() as *const u8, &mut end), 0.0);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(1));
+            // Overflow returns infinity with ERANGE and still consumes the token.
+            *_errno() = 0;
+            let text = c"1e999";
+            assert_eq!(parse_f64(text.as_ptr() as *const u8, &mut end), f64::INFINITY);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(5));
+            assert_eq!(*_errno(), 34);
+            assert_eq!(parse_f64(c"2.5".as_ptr() as *const u8, std::ptr::null_mut()), 2.5);
+
+            let text = c"0x1f";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 0), 31);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(4));
+            let text = c"0777";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 0), 511);
+            let text = c"101";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 2), 5);
+            let text = c"z";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 36), 35);
+            let text = c"-1";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), u64::MAX);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(2));
+            *_errno() = 0;
+            let text = c"18446744073709551615";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), u64::MAX);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(20));
+            assert_eq!(*_errno(), 0);
+            *_errno() = 0;
+            let text = c"18446744073709551616";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), u64::MAX);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(20));
+            assert_eq!(*_errno(), 34);
+            let text = c"  +42rest";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), 42);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(5));
+            let text = c"xyz";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 10), 0);
+            assert_eq!(end, text.as_ptr() as *mut u8);
+            // `0x` with no hex digit in base 16 is the digit `0`, then stops at `x`.
+            let text = c"0x";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 16), 0);
+            assert_eq!(end, (text.as_ptr() as *mut u8).add(1));
+            *_errno() = 0;
+            let text = c"7";
+            assert_eq!(parse_u64(text.as_ptr() as *const u8, &mut end, 37), 0);
+            assert_eq!(end, text.as_ptr() as *mut u8);
+            assert_eq!(*_errno(), 22);
         }
     }
 }
