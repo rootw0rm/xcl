@@ -19,6 +19,8 @@ pub mod acphal_linux;
 pub mod kernelx_linux;
 #[path = "hle/crt_linux.rs"]
 pub mod crt_linux;
+#[path = "hle/bcrypt_linux.rs"]
+pub mod bcrypt_linux;
 #[path = "hle/xgameruntime_linux.rs"]
 pub mod xgameruntime_linux;
 #[path = "hle/xgameruntime_api_linux.rs"]
@@ -69,6 +71,11 @@ pub const UCRT: &str = "ucrtbase.dll";
 /// route: `d3dcompiler_47.dll!D3DCompile` resolves through `find_any`, so the static
 /// import and any dynamic `GetProcAddress` probe both land on the fake compiler.
 pub const D3DCOMPILER47: &str = "d3dcompiler_47.dll";
+
+/// Canonical name of the Linux CNG randomness shim (`BCryptOpenAlgorithmProvider`,
+/// `BCryptGenRandom`, `BCryptCloseAlgorithmProvider`). The title imports these from
+/// `bcrypt.dll`, a Windows system DLL with no Linux twin.
+pub const BCRYPT: &str = "bcrypt.dll";
 
 /// Linux form: keep the name, store `0` as `Stub` metadata. The Windows form keeps
 /// `$name as usize`. Only one of the two is compiled (see `lib.rs` `#[path]`).
@@ -393,6 +400,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(ACPHAL, acphal_exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput_exports(), &[]),
         HleModule::new(UCRT, crt_exports(), &[]),
+        HleModule::new(BCRYPT, bcrypt_linux::exports(), &[]),
     ];
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
@@ -415,6 +423,9 @@ fn build(config: &Config) -> Registry {
     for &(pattern, module) in &crate::hle_routes::ROUTES {
         routes.push((pattern.into(), Route::Hle(idx(module))));
     }
+    // Step 82: the CNG randomness triple. `bcrypt.dll` is a Windows system DLL; the
+    // route keeps any stray host/title `bcrypt.dll` from shadowing the shim.
+    routes.push(("bcrypt.dll".into(), Route::Hle(idx(BCRYPT))));
     // Phase C frontier: the game ships its own CRT DLLs; their imports of each
     // other and of api-ms-win-crt-*/ucrtbase must resolve to the real
     // implementations in `crt_linux`, never to bundled GameDll code or logging
@@ -489,6 +500,22 @@ mod tests {
         assert!(!r.hle_for("mfplat.dll").unwrap().aliases_are_system());
         assert_eq!(name("ucrtbase.dll"), None);
         assert_eq!(name("api-ms-win-crt-runtime-l1-1-0.dll"), None);
+        assert_eq!(name("bcrypt.dll"), Some(BCRYPT));
+    }
+
+    #[test]
+    fn bcrypt_rng_resolves_to_real_exports() {
+        // Step 82: the title's RNG helper opens "RNG", fills 52 bytes, closes.
+        let r = build(&Config::default());
+        for name in [
+            "BCryptOpenAlgorithmProvider",
+            "BCryptGenRandom",
+            "BCryptCloseAlgorithmProvider",
+        ] {
+            let (m, addr) = r.find_any(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(m.name, BCRYPT);
+            assert_ne!(addr, 0, "{name} must be real code, not a stub");
+        }
     }
 
     #[test]
@@ -554,6 +581,7 @@ mod tests {
                     || m.name == XCRDAPI
                     || m.name == XG
                     || m.name == ACPHAL
+                    || m.name == BCRYPT
                     || m.name == D3DCOMPILER47)
                     && addr != 0
                 {
@@ -574,6 +602,7 @@ mod tests {
         assert_eq!(r.module_by_name(UCRT).unwrap().exports.len(), crt_linux::exports().len());
         assert_eq!(r.module_by_name(XG).unwrap().exports.len(), 2);
         assert_eq!(r.module_by_name(D3DCOMPILER47).unwrap().exports.len(), 1);
+        assert_eq!(r.module_by_name(BCRYPT).unwrap().exports.len(), 3);
         assert!(r.find_any("XMemAlloc").is_some());
         assert!(r.find_any("D3D12XboxCreateDevice").is_some());
         assert!(r.find_any("XGCreateTextureComputer").is_some());
