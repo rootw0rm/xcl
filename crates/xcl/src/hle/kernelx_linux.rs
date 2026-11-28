@@ -30,7 +30,7 @@ use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::pe::ImportName;
-use crate::util::{from_ansi_ptr, from_wide_ptr};
+use crate::util::{from_ansi_ptr, from_wide_ptr, E_INVALIDARG, HRESULT, S_FALSE, S_OK};
 
 // ---------------------------------------------------------------------------------------
 // Last error (per-thread, as on Windows)
@@ -7350,6 +7350,101 @@ pub unsafe extern "win64" fn FormatMessageA(
 }
 
 // ---------------------------------------------------------------------------------------
+// COM apartment + activation (retail `CoCreateInstance(CLSID_MMDeviceEnumerator)`)
+// ---------------------------------------------------------------------------------------
+//
+// XCL hosts no COM servers and registers no classes, so every activation must fail.
+// Retail's audio init calls `CoCreateInstance` at `exe+0x43aea6a` and, on success,
+// dereferences the returned `IMMDeviceEnumerator` at `exe+0x43aea86`; the generic
+// auto-stub answered `S_OK` without writing the out pointer, hence the NULL `this`
+// fault. COM's contract is to clear `*ppv` on every failure, and the honest failure
+// for an unregistered class is `REGDB_E_CLASSNOTAVAILABLE`. `CoInitializeEx` keeps a
+// real per-thread apartment so a title's init/uninit balance and a changed-mode
+// mistake behave as on Windows (XAudio2 asks the same question).
+//
+// If XCL ever implements a COM class, `CoCreateInstance` is the single seam: match
+// the CLSID here before returning the class-not-available result.
+
+const RPC_E_CHANGED_MODE: HRESULT = 0x8001_0106u32 as HRESULT;
+const REGDB_E_CLASSNOTAVAILABLE: HRESULT = 0x8004_0154u32 as HRESULT;
+/// `COINIT_APARTMENTTHREADED`; `COINIT_MULTITHREADED` is 0.
+const COINIT_APARTMENTTHREADED: u32 = 0x2;
+/// `COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE | COINIT_SPEED_OVER_MEMORY`.
+const COINIT_VALID_MASK: u32 = 0xE;
+
+/// `(apartment mode, CoInitializeEx success count)` for the calling thread.
+thread_local! {
+    static COM_APARTMENT: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Log each requested class once: the CLSIDs on retail's non-graphics path tell the
+/// next slice which host service the title expects.
+fn log_com_class_once(clsid: *const c_void) {
+    static LOGGED: LazyLock<Mutex<std::collections::BTreeSet<[u8; 16]>>> =
+        LazyLock::new(|| Mutex::new(std::collections::BTreeSet::new()));
+    let key = unsafe { std::ptr::read_unaligned(clsid as *const [u8; 16]) };
+    let mut g = LOGGED.lock().unwrap();
+    if g.insert(key) {
+        crate::xlog_info!(
+            "COM: no class is registered on Linux; CoCreateInstance CLSID {key:02x?} → REGDB_E_CLASSNOTAVAILABLE"
+        );
+    }
+}
+
+/// `HRESULT CoInitializeEx(void*, DWORD)`: per-thread apartment, as documented.
+pub unsafe extern "win64" fn CoInitializeEx(_reserved: *mut c_void, coinit: u32) -> HRESULT {
+    if coinit & !COINIT_VALID_MASK != 0 {
+        return E_INVALIDARG;
+    }
+    let mode = coinit & COINIT_APARTMENTTHREADED;
+    COM_APARTMENT.with(|apt| {
+        let (current, count) = apt.get();
+        if count == 0 {
+            apt.set((mode, 1));
+            S_OK
+        } else if current != mode {
+            RPC_E_CHANGED_MODE
+        } else {
+            apt.set((current, count + 1));
+            S_FALSE
+        }
+    })
+}
+
+/// `void CoUninitialize()`: drop one `CoInitializeEx` from the calling thread.
+pub unsafe extern "win64" fn CoUninitialize() {
+    COM_APARTMENT.with(|apt| {
+        let (mode, count) = apt.get();
+        if count > 0 {
+            apt.set((mode, count - 1));
+        }
+    });
+}
+
+/// `HRESULT CoCreateInstance(REFCLSID, IUnknown*, DWORD, REFIID, void**)`.
+///
+/// The GUIDs are opaque: XCL has no class registry. The out pointer is cleared on
+/// every failure path, so a caller that ignores the HRESULT still cannot call a
+/// stale object; retail checks `eax` and skips its audio device path.
+pub unsafe extern "win64" fn CoCreateInstance(
+    rclsid: *const c_void,
+    _outer: *mut c_void,
+    _context: u32,
+    riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_INVALIDARG;
+    }
+    ppv.write(std::ptr::null_mut());
+    if rclsid.is_null() || riid.is_null() {
+        return E_INVALIDARG;
+    }
+    log_com_class_once(rclsid);
+    REGDB_E_CLASSNOTAVAILABLE
+}
+
+// ---------------------------------------------------------------------------------------
 // String conversion: MultiByteToWideChar / WideCharToMultiByte (retail abort 0x2237179)
 // ---------------------------------------------------------------------------------------
 //
@@ -10218,6 +10313,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         ("RegQueryValueExW", RegQueryValueExW as usize),
         ("RegCloseKey", RegCloseKey as usize),
         ("LsaOpenPolicy", LsaOpenPolicy as usize),
+        ("CoInitializeEx", CoInitializeEx as usize),
+        ("CoUninitialize", CoUninitialize as usize),
+        ("CoCreateInstance", CoCreateInstance as usize),
         ("VirtualAlloc", VirtualAlloc as usize),
         ("VirtualAllocEx", VirtualAllocEx as usize),
         ("VirtualFree", VirtualFree as usize),
@@ -11180,6 +11278,129 @@ mod tests {
         // NULL is a safe no-op, and the name is wired into the export table.
         unsafe { GetSystemTimePreciseAsFileTime(std::ptr::null_mut()) };
         assert!(exports().iter().any(|(n, _)| *n == "GetSystemTimePreciseAsFileTime"));
+    }
+
+    // Resolve a COM export by name. The tests compile on a tree without the
+    // implementation (no direct symbol references), so the pre-fix failure is a
+    // clean "must be wired" RED instead of a compile error. Values come from
+    // util/combaseapi and are duplicated here for the same reason.
+    fn com_export(name: &str) -> usize {
+        let addr = exports()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("{name} must be wired"))
+            .1;
+        assert_ne!(addr, 0, "{name} must be implemented, not stub metadata");
+        addr
+    }
+
+    #[test]
+    fn com_entry_points_are_wired() {
+        for name in ["CoInitializeEx", "CoUninitialize", "CoCreateInstance"] {
+            com_export(name);
+        }
+    }
+
+    #[test]
+    fn com_activation_fails_closed_and_clears_the_out_pointer() {
+        const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+        const REGDB_E_CLASSNOTAVAILABLE: i32 = 0x8004_0154u32 as i32;
+        let create: unsafe extern "win64" fn(
+            *const std::ffi::c_void,
+            *mut std::ffi::c_void,
+            u32,
+            *const std::ffi::c_void,
+            *mut *mut std::ffi::c_void,
+        ) -> i32 = unsafe { std::mem::transmute(com_export("CoCreateInstance")) };
+        // CLSID_MMDeviceEnumerator / IID_IMMDeviceEnumerator, as retail passes them.
+        let clsid = [
+            0x95u8, 0x03, 0xde, 0xbc, 0x2f, 0xe5, 0x7c, 0x46, 0x8e, 0x3d, 0xc4, 0x57, 0x92,
+            0x91, 0x69, 0x2e,
+        ];
+        let iid = [
+            0xd2u8, 0x64, 0x56, 0xa9, 0x14, 0x96, 0x35, 0x4f, 0xa7, 0x46, 0xde, 0x8d, 0xb6,
+            0x36, 0x17, 0xe6,
+        ];
+        unsafe {
+            let mut out = 1usize as *mut std::ffi::c_void;
+            assert_eq!(
+                create(
+                    clsid.as_ptr() as *const std::ffi::c_void,
+                    std::ptr::null_mut(),
+                    0x17,
+                    iid.as_ptr() as *const std::ffi::c_void,
+                    &mut out
+                ),
+                REGDB_E_CLASSNOTAVAILABLE
+            );
+            assert!(out.is_null(), "a failed activation must clear *ppv");
+            // A stale object must not survive any failure path.
+            let mut out = 1usize as *mut std::ffi::c_void;
+            assert_eq!(
+                create(
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0x17,
+                    iid.as_ptr() as *const std::ffi::c_void,
+                    &mut out
+                ),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+            assert_eq!(
+                create(
+                    clsid.as_ptr() as *const std::ffi::c_void,
+                    std::ptr::null_mut(),
+                    0x17,
+                    std::ptr::null(),
+                    &mut out
+                ),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+            // A NULL out pointer is invalid, not a crash.
+            assert_eq!(
+                create(
+                    clsid.as_ptr() as *const std::ffi::c_void,
+                    std::ptr::null_mut(),
+                    0x17,
+                    iid.as_ptr() as *const std::ffi::c_void,
+                    std::ptr::null_mut()
+                ),
+                E_INVALIDARG
+            );
+        }
+    }
+
+    #[test]
+    fn com_apartments_follow_the_windows_init_contract() {
+        const S_OK: i32 = 0;
+        const S_FALSE: i32 = 1;
+        const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+        const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+        const COINIT_APARTMENTTHREADED: u32 = 0x2;
+        // A fresh thread, so no other test's apartment state leaks in.
+        std::thread::spawn(|| {
+            let init: unsafe extern "win64" fn(*mut std::ffi::c_void, u32) -> i32 =
+                unsafe { std::mem::transmute(com_export("CoInitializeEx")) };
+            let uninit: unsafe extern "win64" fn() =
+                unsafe { std::mem::transmute(com_export("CoUninitialize")) };
+            unsafe {
+                assert_eq!(init(std::ptr::null_mut(), 0x10), E_INVALIDARG);
+                assert_eq!(init(std::ptr::null_mut(), 0), S_OK);
+                assert_eq!(init(std::ptr::null_mut(), 0x4), S_FALSE);
+                assert_eq!(
+                    init(std::ptr::null_mut(), COINIT_APARTMENTTHREADED),
+                    RPC_E_CHANGED_MODE
+                );
+                uninit();
+                uninit();
+                assert_eq!(init(std::ptr::null_mut(), COINIT_APARTMENTTHREADED), S_OK);
+                uninit();
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
