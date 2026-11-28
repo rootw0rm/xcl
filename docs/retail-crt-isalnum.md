@@ -26,6 +26,8 @@ Fresh root `/tmp/xcl-step53-r1` at this commit:
 - `isalnum` is gone from `xcl.log` and from `called_stubs`;
 - `report.json` completes: exit `139`, SIGSEGV at `exe+0x25a087d`
   (`mov r10d,[rax+r9]`), fault `0x7f4e73c1a128`;
+- the shell observed exit `133` (SIGTRAP) after that reported fault; the
+  report records the SIGSEGV and the writer completed;
 - 26 first-call stubs, the same Step-49 d3d12/Bink surface.
 
 ## Crash sample (bounded gdb, fresh roots)
