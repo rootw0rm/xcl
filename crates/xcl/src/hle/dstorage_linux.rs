@@ -45,6 +45,7 @@ const E_QUEUE_PRIORITY: HRESULT = 0x8924_0013u32 as HRESULT;
 const E_FILE_HANDLE: HRESULT = 0x8924_0017u32 as HRESULT;
 const E_SOURCE_TYPE: HRESULT = 0x8924_001Bu32 as HRESULT;
 const E_DECOMPRESSION: HRESULT = 0x8924_0030u32 as HRESULT;
+const E_ZLIB_DATA: HRESULT = 0x8924_0032u32 as HRESULT;
 const E_QUEUE_TYPE: HRESULT = 0x8924_00F5u32 as HRESULT;
 
 /// Console `DSTORAGE_REQUEST_OPTIONS` bits the title uses (Xbox `dstorage_xs.h`):
@@ -512,8 +513,8 @@ impl Request {
         ((self.options & SWIZZLE_MASK) >> 5) as u16
     }
 
-    /// Title verbs only: uncompressed file→memory (or physical pages). Anything else
-    /// fails closed so later slices can port it from `hle/dstorage.rs` when needed.
+    /// Title verbs: file→memory (or physical pages), uncompressed or zlib. BCPack,
+    /// swizzle and memory sources still fail closed until a slice ports them.
     fn check(&self, source_memory: bool) -> Result<(), HRESULT> {
         if self.options & SOURCE_MEMORY_BIT != 0 || self.options & SOURCE_PHYS_PAGES_BIT != 0 {
             return Err(E_SOURCE_TYPE);
@@ -521,13 +522,25 @@ impl Request {
         if source_memory {
             return Err(E_SOURCE_TYPE);
         }
-        if self.options & ZLIB_BIT != 0 || self.bcpack() != 0 || self.swizzle() != 0 {
+        if self.bcpack() != 0 || self.swizzle() != 0 {
             return Err(E_DECOMPRESSION);
         }
         if self.destination == 0 {
             return Err(E_ACCESS_VIOLATION);
         }
-        if self.destination_size != self.source_size
+        if self.options & ZLIB_BIT != 0 {
+            // The stream inflates to `intermediate_size`, or straight to the
+            // destination when the title names none (same rule as `hle/dstorage.rs`).
+            if self.intermediate_size == 0 {
+                if self.destination_size <= self.source_size {
+                    return Err(E_DESTINATION_SIZE);
+                }
+            } else if self.intermediate_size <= self.source_size
+                || self.intermediate_size > self.destination_size
+            {
+                return Err(E_DESTINATION_SIZE);
+            }
+        } else if self.destination_size != self.source_size
             || (self.intermediate_size != 0 && self.intermediate_size != self.destination_size)
         {
             return Err(E_DESTINATION_SIZE);
@@ -588,16 +601,37 @@ unsafe fn execute(
         read_exact_at(handle, r.offset, &mut src)?;
         src
     };
+    // zlib stage, ported from the Windows path: inflate into `intermediate_size`
+    // (or straight to the destination size when the title names none), then
+    // zero-pad up to the destination size.
+    let payload = if r.options & ZLIB_BIT != 0 {
+        let stage1_len = if r.intermediate_size != 0 {
+            r.intermediate_size as usize
+        } else {
+            n
+        };
+        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len)
+            .map_err(|_| E_ZLIB_DATA)?;
+        if d.len() != stage1_len {
+            return Err(E_ZLIB_DATA);
+        }
+        if d.len() < n {
+            d.resize(n, 0);
+        }
+        d
+    } else {
+        src
+    };
     if r.dest_phys_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
         if !crate::hle::kernelx_linux::write_physical_pages(
             pages,
             r.destination_page_offset as usize,
-            &src[..n.min(src.len())],
+            &payload[..n.min(payload.len())],
         ) {
             return Err(E_ACCESS_VIOLATION);
         }
-        if n != src.len() {
+        if n != payload.len() {
             return Err(E_DESTINATION_SIZE);
         }
     } else {
@@ -606,7 +640,7 @@ unsafe fn execute(
         }
         if n > 0 {
             unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), r.destination as *mut u8, n);
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
             }
         }
     }
@@ -1234,10 +1268,11 @@ mod tests {
             assert_eq!(get(s, 0), S_OK);
             assert_eq!(&dst[..], &want[..]);
             assert_eq!(fake_value(fence), 1);
-            // Compressed / swizzle / memory-source requests fail closed.
-            let mut req_z = req;
-            req_z[0] = 1; // ZlibDecompress
-            enq(q, req_z.as_ptr());
+            // BCPack / swizzle / memory-source requests fail closed (zlib is the
+            // one compressed verb the Linux queue executes).
+            let mut req_bc = req;
+            req_bc[0..8].copy_from_slice(&(2u64 << 1).to_le_bytes()); // BcpackMode 2
+            enq(q, req_bc.as_ptr());
             enq_st(q, s, 0);
             submit(q);
             assert_eq!(get(s, 0), E_DECOMPRESSION);
@@ -1257,6 +1292,129 @@ mod tests {
             let release_s: Release = std::mem::transmute(slot(s, 2));
             let _ = release_s(s);
             fake_free(fence);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn zlib_requests_inflate_file_blocks_into_the_destination() {
+        // Local copy of `E_ZLIB_DATA` so the expectation can be grafted onto a
+        // pre-fix tree (the product constant does not exist there yet).
+        const ZLIB_DATA: HRESULT = 0x8924_0032u32 as HRESULT;
+        unsafe {
+            // Retail `exe+0x25a087d` streams a zlib pack block through
+            // `IDStorageQueueX::EnqueueRequest` (options bit 0). The Linux slice used
+            // to refuse it, so the stream credited a full block that never arrived.
+            let dir = std::env::temp_dir().join(format!(
+                "xcl-dstorage-zlib-{}-{}",
+                std::process::id(),
+                line!()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("pack.bin");
+
+            let block: Vec<u8> = (0..0x18B4u32).map(|i| (i / 7 % 251) as u8).collect();
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&block, 6);
+            assert!(packed.len() < block.len(), "fixture must be compressed");
+            let short: Vec<u8> = block[..0x100].to_vec();
+            let short_packed = miniz_oxide::deflate::compress_to_vec_zlib(&short, 6);
+            let mut corrupt = packed.clone();
+            corrupt.truncate(packed.len() / 2);
+
+            let mut bytes = vec![0xAA; 0x100];
+            bytes.extend_from_slice(&packed);
+            let packed_off = 0x100u64;
+            let short_off = bytes.len() as u64;
+            bytes.extend_from_slice(&short_packed);
+            let corrupt_off = bytes.len() as u64;
+            bytes.extend_from_slice(&corrupt);
+            std::fs::write(&path, &bytes).unwrap();
+            let wpath: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
+
+            let mut factory: *mut c_void = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut factory), S_OK);
+            type Open = unsafe extern "win64" fn(
+                *mut c_void,
+                *const u16,
+                *const Guid,
+                *mut *mut c_void,
+            ) -> HRESULT;
+            let open: Open = std::mem::transmute(slot(factory, 4));
+            let mut file: *mut c_void = std::ptr::null_mut();
+            assert_eq!(open(factory, wpath.as_ptr(), &IID_FILE, &mut file), S_OK);
+
+            let q = make_queue(64);
+            let s = make_status(factory, 6);
+            type EnqReq = unsafe extern "win64" fn(*mut c_void, *const u8);
+            type EnqStatus = unsafe extern "win64" fn(*mut c_void, *mut c_void, u32);
+            type Submit = unsafe extern "win64" fn(*mut c_void);
+            type GetHr = unsafe extern "win64" fn(*mut c_void, u32) -> HRESULT;
+            let enq: EnqReq = std::mem::transmute(slot(q, 3));
+            let enq_st: EnqStatus = std::mem::transmute(slot(q, 4));
+            let submit: Submit = std::mem::transmute(slot(q, 6));
+            let get: GetHr = std::mem::transmute(slot(s, 4));
+
+            let request = |dst: &mut [u8], off: u64, src_size: u32, inter: u32| {
+                let mut req = [0u8; REQUEST_BYTES];
+                req[0..8].copy_from_slice(&ZLIB_BIT.to_le_bytes());
+                req[8..16].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
+                req[0x18..0x1C].copy_from_slice(&(dst.len() as u32).to_le_bytes());
+                req[0x20..0x28].copy_from_slice(&(file as u64).to_le_bytes());
+                req[0x28..0x30].copy_from_slice(&off.to_le_bytes());
+                req[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
+                req[0x34..0x38].copy_from_slice(&inter.to_le_bytes());
+                req
+            };
+
+            // 1: straight inflate into the destination.
+            let mut dst = vec![0u8; block.len()];
+            let req = request(&mut dst, packed_off, packed.len() as u32, 0);
+            enq(q, req.as_ptr());
+            enq_st(q, s, 0);
+            // 2: intermediate buffer, zero-padded into a larger destination.
+            let mut dst_pad = vec![0xEEu8; block.len()];
+            let req_pad = request(&mut dst_pad, short_off, short_packed.len() as u32, 0x100);
+            enq(q, req_pad.as_ptr());
+            enq_st(q, s, 1);
+            // 3: a truncated stream never reaches the destination.
+            let mut dst_bad = vec![0xC3u8; block.len()];
+            let req_bad = request(&mut dst_bad, corrupt_off, 4, 0);
+            enq(q, req_bad.as_ptr());
+            enq_st(q, s, 2);
+            // 4: a valid stream that inflates to fewer bytes than the destination names.
+            let mut dst_short = vec![0xC4u8; block.len()];
+            let req_short = request(&mut dst_short, short_off, short_packed.len() as u32, 0);
+            enq(q, req_short.as_ptr());
+            enq_st(q, s, 3);
+            // 5: refused at enqueue: the destination cannot hold the compressed stream.
+            let mut dst_size = vec![0u8; 1];
+            let req_size = request(&mut dst_size, packed_off, packed.len() as u32, 0);
+            enq(q, req_size.as_ptr());
+            enq_st(q, s, 4);
+            submit(q);
+
+            assert_eq!(get(s, 0), S_OK);
+            assert_eq!(&dst[..], &block[..]);
+            assert_eq!(get(s, 1), S_OK);
+            assert_eq!(&dst_pad[..0x100], &short[..]);
+            assert!(dst_pad[0x100..].iter().all(|&b| b == 0), "pad must be zeroed");
+            assert_eq!(get(s, 2), ZLIB_DATA);
+            assert!(
+                dst_bad.iter().all(|&b| b == 0xC3),
+                "a failed inflate must not write a partial block"
+            );
+            assert_eq!(get(s, 3), ZLIB_DATA);
+            assert!(dst_short.iter().all(|&b| b == 0xC4));
+            assert_eq!(get(s, 4), E_DESTINATION_SIZE);
+            assert!(dst_size.iter().all(|&b| b == 0));
+
+            type Release = unsafe extern "win64" fn(*mut c_void) -> u32;
+            let release: Release = std::mem::transmute(slot(q, 2));
+            let _ = release(q);
+            let release_f: Release = std::mem::transmute(slot(file, 2));
+            let _ = release_f(file);
+            let release_s: Release = std::mem::transmute(slot(s, 2));
+            let _ = release_s(s);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
